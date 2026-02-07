@@ -144,7 +144,6 @@ log/
 runs/
 
 *.png
-*.jpg
 *.mp4
 *.gif
 *.pkl

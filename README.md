@@ -1,12 +1,13 @@
-# (Preview) TextOp: Real-time Interactive Text-Driven Humanoid Robot Motion Generation and Control
+# TextOp: Real-time Interactive Text-Driven Humanoid Robot Motion Generation and Control
 
-![Cover](docs/Cover-v2.png)
+![Cover](docs/Cover.jpg)
 
-[[**website**](https://text-op.github.io/)] | [[**demo**](https://arxiv.org/abs/2410.05260)] 
+[[**website**](https://text-op.github.io/)] | [[**demo**](https://youtu.be/nKxE7ff1FwY)] 
 
 
 ## News
-- **[2026-01]** Updated `TextOpDeploy` modules to fix several bugs and add support for keyboard-based joystick in `unitree_mujoco`. You can now run sim2sim experiments in `TextOpDeploy` more smoothly.  
+- **[2026-02]** Release the official version of TextOp. Note: The latest code and dataset are not yet updated.
+- \[2026-01\] Updated `TextOpDeploy` modules to fix several bugs and add support for keyboard-based joystick in `unitree_mujoco`. You can now run sim2sim experiments in `TextOpDeploy` more smoothly.  
 - \[2025-11\] We release the preview version of TextOp, including **code**, **pretrained models** and **demo**.
 
 
