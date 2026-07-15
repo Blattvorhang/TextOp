@@ -40,11 +40,12 @@ dependencies = [
     "omegaconf==2.3.0",
     "scipy==1.10.1",
     "toolz==1.0.0",
-    "torch",
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "torch_tensorrt==2.10.0",
     "tqdm==4.66.4",
     "wandb==0.16.6",
     'einops==0.8.1',
-    "torch_tensorrt", 
     "tensorboard"
 ]
 
