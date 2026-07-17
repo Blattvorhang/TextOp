@@ -44,10 +44,30 @@ Usage:
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import joblib
 import numpy as np
+from scipy.interpolate import interp1d
 from scipy.spatial import transform
+from scipy.spatial.transform import Slerp, Rotation as R
+
+# ---------------------------------------------------------------------------
+# FK-based contact detection — lazy imports to keep multiprocessing light
+# ---------------------------------------------------------------------------
+_SKELETON = None       # RobotSkeleton singleton (fork-safe via multiprocessing)
+_MJCF_DIR = None        # cached mjcf_dir for lazy init
+
+# 29-DOF → 23-DOF crop mask (drops wrist joints, matches G1 dof_names order)
+_DOF_29_TO_23 = np.array([
+    True,  True,  True,  True,  True,  True,    # left leg  0-5
+    True,  True,  True,  True,  True,  True,    # right leg 6-11
+    True,  True,  True,                          # waist     12-14
+    True,  True,  True,  True,                   # left arm  15-18
+    False, False, False,                         # left wrist 19-21
+    True,  True,  True,  True,                   # right arm 22-25
+    False, False, False,                         # right wrist 26-28
+])
 
 # IsaacLab ↔ MuJoCo joint reordering (29 DOFs for G1).
 # MJ_TO_IL[mj] = il: for MuJoCo DOF index mj, gives the IsaacLab index il.
@@ -303,25 +323,151 @@ def convert_sequence(seq_data: dict, fps: int, humanoid_fk=None) -> dict:  # noq
     }
 
 
-def downsample_sequence(entry: dict, fps_source: int, fps_target: int) -> dict:
-    """Downsample a motion_lib entry using stride-based frame skipping.
+def _get_skeleton(mjcf_dir: str):
+    """Lazy-init RobotSkeleton for FK contact detection (shared across workers via fork)."""
+    global _SKELETON, _MJCF_DIR
+    if _SKELETON is not None and _MJCF_DIR == mjcf_dir:
+        return _SKELETON
 
-    Matches process_bones_to_motionlib.py: jump = int(fps_source / fps_target).
-    Best used when fps_source is an exact multiple of fps_target (e.g. 120→30).
-    The resulting PKL is stored at fps_target; fk_batch handles the final
-    resampling to target_fps at load time using the canonical interploate_pose formula.
+    # Lazy imports — torch is heavy, only pull in when FK is actually used
+    import torch  # noqa: F811
+    from omegaconf import OmegaConf  # noqa: F811
+    from robotmdar.skeleton.robot import RobotSkeleton  # noqa: F811
+
+    mjcf_path = Path(mjcf_dir).resolve()
+    cfg = OmegaConf.create(
+        {
+            "asset": {
+                "assetRoot": str(mjcf_path) + "/",
+                "assetFileName": "g1_23dof_lock_wrist_fitmotionONLY.xml",
+            },
+            "foot_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+            "extend_config": [],
+        }
+    )
+    _SKELETON = RobotSkeleton(device="cpu", cfg=cfg)
+    _MJCF_DIR = mjcf_dir
+    return _SKELETON
+
+
+def compute_contact_mask(
+    root_trans_offset: np.ndarray,
+    root_rot: np.ndarray,
+    dof_29: np.ndarray,
+    fps: float,
+    mjcf_dir: str,
+    height_thresh: float = 0.05,
+    vel_thresh: float = 0.15,
+) -> np.ndarray:
+    """Per-foot contact mask using FK + G1FootContactLoss formula (NVIDIA SONIC).
+
+    Uses RobotSkeleton forward kinematics to get actual foot world positions,
+    then applies frame-rate-independent contact detection:
+
+        contact = (foot_z < height_thresh) AND (||foot_vel|| < vel_thresh)
+
+    Default thresholds match G1FootContactLoss in gear_sonic/trl/losses/token_losses.py.
+
+    Args:
+        root_trans_offset: (T, 3) pelvis world translation, meters.
+        root_rot:          (T, 4) pelvis rotation, xyzw quaternion.
+        dof_29:            (T, 29) joint angles in radians (MuJoCo/MJCF order).
+        fps:               frame rate of the input data.
+        mjcf_dir:          path to directory containing g1_23dof_lock_wrist_fitmotionONLY.xml.
+        height_thresh:     contact height threshold in meters (default 0.05).
+        vel_thresh:        contact velocity threshold in m/s (default 0.15).
+
+    Returns:
+        (T, 2) float32 array: [:, 0] = left foot contact, [:, 1] = right foot contact.
+    """
+    import torch  # noqa: F811
+
+    skeleton = _get_skeleton(mjcf_dir)
+
+    # Crop 29 → 23 DOF
+    dof_23 = dof_29[:, _DOF_29_TO_23]  # (T, 23)
+
+    T = root_trans_offset.shape[0]
+
+    # Build motion_dict (unbatched — FK adds batch dim internally)
+    motion_dict: dict = {
+        "root_trans_offset": torch.from_numpy(root_trans_offset).float(),
+        "root_rot": torch.from_numpy(root_rot).float(),
+        "dof": torch.from_numpy(dof_23).float(),
+    }
+
+    fk_result = skeleton.forward_kinematics(motion_dict, return_full=False)
+
+    # global_translation: (1, T, num_bodies, 3) or (T, num_bodies, 3)
+    world_pos = fk_result["global_translation"]
+    if world_pos.dim() == 4:
+        world_pos = world_pos[0]  # (T, num_bodies, 3)
+    foot_pos = world_pos[:, skeleton.foot_id, :]  # (T, 2, 3)
+
+    # ── G1FootContactLoss contact condition ──
+    dt = 1.0 / fps
+    foot_z = foot_pos[:, :, 2]  # (T, 2)
+    # Velocity: ||pos[t+1] - pos[t]|| / dt, pad first frame
+    foot_vel = torch.cat(
+        [torch.zeros(1, 2), torch.norm(foot_pos[1:] - foot_pos[:-1], dim=-1) / dt], dim=0
+    )
+
+    contact = ((foot_z < height_thresh) & (foot_vel < vel_thresh)).float()
+    return contact.numpy().astype(np.float32)
+
+
+def resample_sequence(entry: dict, fps_source: int, fps_target: int, mjcf_dir: str) -> dict:
+    """Resample a motion_lib entry using LERP (translation, DOFs) + SLERP (rotation).
+
+    Handles arbitrary non-integer frame-rate ratios (e.g. 120→50).
+    When fps_source == fps_target, returns the entry unchanged.
     """
     if fps_source == fps_target:
+        entry["contact_mask"] = compute_contact_mask(
+            entry["root_trans_offset"], entry["root_rot"], entry["dof"], fps_target, mjcf_dir
+        )
         return entry
-    jump = int(fps_source / fps_target)
-    if jump <= 1:
-        return entry
+
+    T_src = entry["root_trans_offset"].shape[0]
+    t_src = np.linspace(0, (T_src - 1) / fps_source, T_src, dtype=np.float64)
+    T_tgt = max(int(T_src * fps_target / fps_source), 2)
+    t_tgt = np.linspace(0, (T_src - 1) / fps_source, T_tgt, dtype=np.float64)
+
+    # ── Translation: per-channel linear interpolation ──
+    trans_src = entry["root_trans_offset"].astype(np.float64)  # (T_src, 3)
+    trans_tgt = interp1d(t_src, trans_src, axis=0, kind="linear")(t_tgt).astype(np.float32)
+
+    # ── Rotation: SLERP on xyzw quaternion ──
+    quat_xyzw = entry["root_rot"].astype(np.float64)  # (T_src, 4) xyzw
+    slerp = Slerp(t_src, R.from_quat(quat_xyzw))
+    quat_tgt = slerp(t_tgt).as_quat().astype(np.float32)  # (T_tgt, 4) xyzw
+
+    # ── DOFs: per-channel linear interpolation ──
+    dof_src = entry["dof"].astype(np.float64)  # (T_src, D)
+    dof_tgt = interp1d(t_src, dof_src, axis=0, kind="linear")(t_tgt).astype(np.float32)
+
+    # ── pose_aa: reconstruct from interpolated root_rot + dof ──
+    # Body 0 = root rotation (axis-angle from quat_tgt)
+    # Bodies 1..29 = DOF axis * dof_value
+    NUM_DOF_LOCAL = dof_tgt.shape[1]
+    NUM_BODIES_LOCAL = NUM_DOF_LOCAL + 1
+    DOF_AXIS_LOCAL = DOF_AXIS[:NUM_DOF_LOCAL]  # subset if not 29
+    pose_aa_tgt = np.zeros((T_tgt, NUM_BODIES_LOCAL, 3), dtype=np.float32)
+    pose_aa_tgt[:, 0, :] = R.from_quat(quat_tgt).as_rotvec().astype(np.float32)
+    pose_aa_tgt[:, 1:, :] = DOF_AXIS_LOCAL[None, :, :] * dof_tgt[:, :, None]
+
+    # ── smpl_joints: per-channel linear interpolation (placeholder) ──
+    smpl_src = entry["smpl_joints"].astype(np.float64)
+    smpl_tgt = interp1d(t_src, smpl_src.reshape(T_src, -1), axis=0, kind="linear")(t_tgt)
+    smpl_tgt = smpl_tgt.reshape(T_tgt, -1, 3).astype(np.float32)
+
     return {
-        "root_trans_offset": entry["root_trans_offset"][::jump],
-        "pose_aa": entry["pose_aa"][::jump],
-        "dof": entry["dof"][::jump],
-        "root_rot": entry["root_rot"][::jump],
-        "smpl_joints": entry["smpl_joints"][::jump],
+        "root_trans_offset": trans_tgt,
+        "pose_aa": pose_aa_tgt,
+        "dof": dof_tgt,
+        "root_rot": quat_tgt,
+        "smpl_joints": smpl_tgt,
+        "contact_mask": compute_contact_mask(trans_tgt, quat_tgt, dof_tgt, fps_target, mjcf_dir),
         "fps": fps_target,
     }
 
@@ -351,7 +497,7 @@ def init_humanoid_fk():
 
 def process_session_csvs(args_tuple):
     """Process all CSVs in a single session directory. Used by multiprocessing."""
-    session_dir, session_name, out_dir, fps, fps_source = args_tuple
+    session_dir, session_name, out_dir, fps, fps_source, mjcf_dir = args_tuple
     import warnings
 
     warnings.filterwarnings("ignore")
@@ -374,7 +520,7 @@ def process_session_csvs(args_tuple):
             fps_for_convert = fps_source if fps_source else fps
             entry = convert_sequence(seq, fps_for_convert)
             if fps_source and fps_source != fps:
-                entry = downsample_sequence(entry, fps_source, fps)
+                entry = resample_sequence(entry, fps_source, fps, mjcf_dir)
             joblib.dump({name: entry}, out_path, compress=True)
             converted += 1
         except Exception:  # noqa: BLE001
@@ -414,6 +560,13 @@ def main():
         default=8,
         help="Number of parallel workers for --individual mode",
     )
+    parser.add_argument(
+        "--mjcf_dir",
+        type=str,
+        default="description/robots/g1",
+        help="Path to directory containing g1_23dof_lock_wrist_fitmotionONLY.xml "
+        "(default: description/robots/g1, relative to repo root)",
+    )
     args = parser.parse_args()
 
     print(f"G1 {NUM_DOF} DOFs, {NUM_BODIES} bodies (hardcoded axes)")
@@ -443,10 +596,10 @@ def main():
             for d in subdirs:
                 subdir = os.path.join(args.input, d)
                 if any(f.endswith(".csv") for f in os.listdir(subdir)):
-                    session_dirs.append((subdir, d, args.output, args.fps, args.fps_source))
+                    session_dirs.append((subdir, d, args.output, args.fps, args.fps_source, args.mjcf_dir))
         elif has_csvs:
             session_name = os.path.basename(args.input.rstrip("/"))
-            session_dirs.append((args.input, session_name, args.output, args.fps, args.fps_source))
+            session_dirs.append((args.input, session_name, args.output, args.fps, args.fps_source, args.mjcf_dir))
 
         print(f"\nBatch converting {len(session_dirs)} sessions with {args.num_workers} workers")
         print(f"Output: {args.output}")
@@ -570,7 +723,12 @@ def main():
         fps_for_convert = args.fps_source if args.fps_source else args.fps
         entry = convert_sequence(seq_data, fps_for_convert)
         if args.fps_source and args.fps_source != args.fps:
-            entry = downsample_sequence(entry, args.fps_source, args.fps)
+            entry = resample_sequence(entry, args.fps_source, args.fps, args.mjcf_dir)
+        else:
+            entry["contact_mask"] = compute_contact_mask(
+                entry["root_trans_offset"], entry["root_rot"], entry["dof"],
+                args.fps, args.mjcf_dir,
+            )
         motion_lib_dict[name] = entry
 
     # Save
