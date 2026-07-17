@@ -423,10 +423,10 @@ def resample_sequence(entry: dict, fps_source: int, fps_target: int, mjcf_dir: s
     When fps_source == fps_target, returns the entry unchanged.
     """
     if fps_source == fps_target:
-        entry["contact_mask"] = compute_contact_mask(
+        contact = compute_contact_mask(
             entry["root_trans_offset"], entry["root_rot"], entry["dof"], fps_target, mjcf_dir
         )
-        return entry
+        return {**entry, "contact_mask": contact}
 
     T_src = entry["root_trans_offset"].shape[0]
     t_src = np.linspace(0, (T_src - 1) / fps_source, T_src, dtype=np.float64)
@@ -521,6 +521,11 @@ def process_session_csvs(args_tuple):
             entry = convert_sequence(seq, fps_for_convert)
             if fps_source and fps_source != fps:
                 entry = resample_sequence(entry, fps_source, fps, mjcf_dir)
+            else:
+                entry = {**entry, "contact_mask": compute_contact_mask(
+                    entry["root_trans_offset"], entry["root_rot"], entry["dof"],
+                    fps, mjcf_dir,
+                )}
             joblib.dump({name: entry}, out_path, compress=True)
             converted += 1
         except Exception:  # noqa: BLE001
