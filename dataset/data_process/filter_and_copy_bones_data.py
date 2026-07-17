@@ -246,6 +246,7 @@ def main():
             "box_dips",
             "walking_on_edge",
             "push_obstacle",
+            "choreography",
         ],
         nargs="+",
         help="Keywords to filter out from filenames",
