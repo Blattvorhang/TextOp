@@ -79,6 +79,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.split = split
         self.device = "cpu"  # Keep embeddings on CPU initially
 
+        # DDP rank and world_size, set externally by training script
+        self.rank = 0
+        self.world_size = 1
+
         # Load and prepare data
         self._load_data()
 
@@ -528,7 +532,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         worker_info = data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         generator = torch.Generator()
-        generator.manual_seed(worker_id + np.random.randint(0, 1000000))
+        # Use rank and world_size to ensure each DDP process gets different data
+        # Each rank's workers get seeds offset by rank to avoid data overlap
+        seed_offset = self.rank + worker_id * self.world_size + np.random.randint(0, 1000000)
+        generator.manual_seed(seed_offset)
 
         while True:
             yield self._generate_batch_optimized(generator=generator)

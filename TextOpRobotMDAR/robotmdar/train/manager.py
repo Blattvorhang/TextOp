@@ -7,6 +7,7 @@ import errno
 import shutil
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from loguru import logger
 from omegaconf import DictConfig
 from tqdm import tqdm
@@ -15,6 +16,20 @@ import copy
 from robotmdar.dtype.motion import get_zero_feature, perturb_feature_v3, FeatureVersion
 from robotmdar.dtype.rotation import rot6d_to_matrix, matrix_to_rot6d, quaternion_to_matrix, xyzw_to_wxyz
 from isaac_utils.rotations import get_euler_xyz
+
+
+def is_main_process():
+    """Check if current process is the main (rank 0) process."""
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def get_ddp_model(model):
+    """Unwrap DDP model to get the underlying model."""
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
 
 
 class BaseManager(ABC):
@@ -52,6 +67,10 @@ class BaseManager(ABC):
         for k, v in kwargs.items():
             setattr(self, k, v)
 
+        # DDP rank and world_size, set externally after instantiation
+        self.rank = 0
+        self.world_size = 1
+
         # 设置默认值
         self.stage_idx = -1
         self._stage_steps = torch.cumsum(torch.tensor(self.stages).int(), dim=0)
@@ -83,7 +102,7 @@ class BaseManager(ABC):
         self.stage_idx = torch.searchsorted(self._stage_steps, self.step, out_int32=True).item()  # type:ignore
         self.extra['stage'] = self.stage_idx
 
-        if not self._tqdm:
+        if not self._tqdm and is_main_process():
             self._tqdm = tqdm(total=self.max_steps, initial=self.step, ncols=120, desc="Training")
         if self.anneal_lr:
             frac = 1.0 - self.step / self.max_steps
@@ -111,7 +130,7 @@ class BaseManager(ABC):
                 self._total_eval_loss_dict[k] += v
             for k, v in extras.items():
                 self._total_eval_extras_dict[k] += v
-            if self._to_eval_steps == 0:
+            if self._to_eval_steps == 0 and is_main_process():
                 # 报告 loss 到 "loss" group
                 for k, v in self._total_eval_loss_dict.items():
                     self.platform.report_scalar(
@@ -132,24 +151,30 @@ class BaseManager(ABC):
                     tqdm.write(f"Eval extras * {self.eval_steps}: {dict(self._total_eval_extras_dict)}")
                 self._total_eval_loss_dict = defaultdict(lambda: torch.tensor(0.0))
                 self._total_eval_extras_dict = defaultdict(lambda: torch.tensor(0.0))
+            elif self._to_eval_steps == 0:
+                # Non-rank-0: just reset the accumulators without logging
+                self._total_eval_loss_dict = defaultdict(lambda: torch.tensor(0.0))
+                self._total_eval_extras_dict = defaultdict(lambda: torch.tensor(0.0))
             return
 
         self.step += 1
 
-        assert self._tqdm is not None
-        self._tqdm.update(1)
-        self._tqdm.set_postfix({'stage': self.stage_idx, 'loss': loss_dict["total"].item(), 'lr': self.extra['lr']})
-        if self.step >= self.max_steps:
+        if is_main_process():
+            assert self._tqdm is not None
+            self._tqdm.update(1)
+            self._tqdm.set_postfix({'stage': self.stage_idx, 'loss': loss_dict["total"].item(), 'lr': self.extra['lr']})
+        if self.step >= self.max_steps and self._tqdm is not None:
             self._tqdm.close()
 
-        for k, v in loss_dict.items():
-            self.platform.report_scalar("train_" + k, v.cpu().numpy(), self.step, group_name="loss")
-        for k, v in extras.items():
-            self.platform.report_scalar(
-                "train_" + k, v.cpu().numpy() if isinstance(v, torch.Tensor) else v, self.step, group_name="extras"
-            )
-        for k, v in self.extra.items():
-            self.platform.report_scalar(k, v, self.step, group_name="extras")
+        if is_main_process():
+            for k, v in loss_dict.items():
+                self.platform.report_scalar("train_" + k, v.cpu().numpy(), self.step, group_name="loss")
+            for k, v in extras.items():
+                self.platform.report_scalar(
+                    "train_" + k, v.cpu().numpy() if isinstance(v, torch.Tensor) else v, self.step, group_name="extras"
+                )
+            for k, v in self.extra.items():
+                self.platform.report_scalar(k, v, self.step, group_name="extras")
 
         # 更新EMA模型
         self.update_ema_models()
@@ -642,11 +667,17 @@ class MVAEManager(BaseManager, GeometryLoss):
         return terms, extras
 
     def save_model(self) -> None:
+        if not is_main_process():
+            return
+
         save_path = self.save_dir / f"ckpt_{self.step}.pth"
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Unwrap DDP model to save the underlying model's state_dict
+        model_to_save = get_ddp_model(self.vae)
+
         save_dict = {
-            'vae': self.vae.state_dict(),
+            'vae': model_to_save.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'step': self.step,
         }
@@ -660,8 +691,9 @@ class MVAEManager(BaseManager, GeometryLoss):
         logger.info(f"Current step: {self.step}")
 
     def load_model(self, ckpt_path: Path):
-        state_dict = torch.load(ckpt_path)
-        self.vae.load_state_dict(state_dict['vae'])
+        state_dict = torch.load(ckpt_path, map_location='cpu')
+        model_to_load = get_ddp_model(self.vae)
+        model_to_load.load_state_dict(state_dict['vae'])
         if self.optimizer is not None:
             self.optimizer.load_state_dict(state_dict['optimizer'])
         self.step = state_dict['step']
@@ -860,11 +892,17 @@ class DARManager(BaseManager, GeometryLoss):
         return terms, extras
 
     def save_model(self) -> None:
+        if not is_main_process():
+            return
+
         save_path = self.save_dir / f"ckpt_{self.step}.pth"
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Unwrap DDP model if needed
+        model_to_save = get_ddp_model(self.denoiser)
+
         save_dict = {
-            'denoiser': self.denoiser.state_dict(),
+            'denoiser': model_to_save.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'step': self.step,
         }
@@ -879,7 +917,8 @@ class DARManager(BaseManager, GeometryLoss):
 
     def load_model(self, ckpt_path: Path):
         state_dict = torch.load(ckpt_path, map_location=self.device)
-        self.denoiser.load_state_dict(state_dict['denoiser'])
+        model_to_load = get_ddp_model(self.denoiser)
+        model_to_load.load_state_dict(state_dict['denoiser'])
         if self.optimizer is not None:
             self.optimizer.load_state_dict(state_dict['optimizer'])
         self.step = state_dict['step']

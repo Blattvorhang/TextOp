@@ -1,24 +1,69 @@
+import os
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig
 from hydra.utils import instantiate
 
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
 
-from robotmdar.train.manager import DARManager
+from robotmdar.train.manager import DARManager, is_main_process, get_ddp_model
 
 USE_VAE = True
 
 
+def ddp_setup():
+    """Initialize DDP environment variables and process group."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    if world_size > 1:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl')
+    else:
+        torch.cuda.set_device(local_rank)
+
+    return rank, world_size, local_rank
+
+
 def main(cfg: DictConfig):
-    seed.set(cfg.seed)
+    # Initialize DDP
+    rank, world_size, local_rank = ddp_setup()
+    device = torch.device(f'cuda:{local_rank}')
+
+    seed.set(cfg.seed + rank)
     logger.set(cfg)
+
+    # Override device in config for downstream components
+    cfg.device = str(device)
 
     train_data: Dataset = instantiate(cfg.data.train)
     val_data: Dataset = instantiate(cfg.data.val)
 
+    # Set rank/world_size on datasets for distributed data sharding
+    train_data.rank = rank
+    train_data.world_size = world_size
+    val_data.rank = rank
+    val_data.world_size = world_size
+
     vae: VAE = instantiate(cfg.vae)
     denoiser: Denoiser = instantiate(cfg.denoiser)
+    vae = vae.to(device)
+    denoiser = denoiser.to(device)
+
+    if world_size > 1:
+        denoiser = torch.nn.parallel.DistributedDataParallel(
+            denoiser, device_ids=[local_rank], output_device=local_rank
+        )
+        # Note: VAE is frozen during DAR training, so it doesn't need DDP wrapping
+        if is_main_process():
+            print(f"[DDP] Using DistributedDataParallel with {world_size} GPUs")
 
     schedule_sampler: SSampler = instantiate(cfg.diffusion.schedule_sampler)
     diffusion: Diffusion = schedule_sampler.diffusion
@@ -29,6 +74,8 @@ def main(cfg: DictConfig):
     manager: DARManager = instantiate(cfg.train.manager)
 
     manager.hold_model(vae, denoiser, optimizer, train_data)
+    manager.rank = rank
+    manager.world_size = world_size
 
     num_primitive: int = cfg.data.num_primitive
     future_len: int = cfg.data.future_len
@@ -46,7 +93,7 @@ def main(cfg: DictConfig):
         for pidx in range(num_primitive):
             manager.pre_step()
             motion, cond = batch[pidx]
-            motion, cond = motion.to(cfg.device), cond.to(cfg.device)
+            motion, cond = motion.to(device), cond.to(device)
 
             future_motion_gt = motion[:, -future_len:, :]
             gt_history = motion[:, :history_len, :]
@@ -57,7 +104,7 @@ def main(cfg: DictConfig):
 
             # Sample timesteps
             batch_size = motion.shape[0]
-            t, weights = schedule_sampler.sample(batch_size, device=cfg.device)
+            t, weights = schedule_sampler.sample(batch_size, device=device)
 
             if USE_VAE:
                 # Encode using VAE
@@ -113,7 +160,8 @@ def main(cfg: DictConfig):
             optimizer.zero_grad()
             loss.backward()
             has_nan_grad = False
-            for param in denoiser.parameters():
+            raw_model = get_ddp_model(denoiser)
+            for param in raw_model.parameters():
                 if param.grad is not None:
                     # 检查 NaN 和 Inf
                     if torch.isnan(param.grad).any() or torch.isinf(
@@ -175,14 +223,14 @@ def main(cfg: DictConfig):
             for pidx in range(num_primitive):
                 manager.pre_step(is_eval=True)
                 motion, cond = batch[pidx]
-                motion, cond = motion.to(cfg.device), cond.to(cfg.device)
+                motion, cond = motion.to(device), cond.to(device)
 
                 future_motion_gt = motion[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]
 
                 with torch.no_grad():
                     t, weights = schedule_sampler.sample(motion.shape[0],
-                                                         device=cfg.device)
+                                                         device=device)
 
                     if USE_VAE:
                         latent_gt, _ = vae.encode(

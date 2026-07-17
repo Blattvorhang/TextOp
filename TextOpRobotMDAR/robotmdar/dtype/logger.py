@@ -28,24 +28,35 @@ class HydraLoggerBridge(logging.Handler):
 
 def set(cfg):
     """Set up logging for the training session."""
+    # Only rank 0 writes to file and console
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+
     # Create logs directory if it doesn't exist
     log_dir = Path(cfg.experiment_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    hydra_log_path = os.path.join(cfg.experiment_dir, "run.log")
     logger.remove()
-    logger.add(hydra_log_path, level="DEBUG")
 
-    console_log_level = os.environ.get("LOGURU_LEVEL", "INFO").upper()
-    logger.add(sys.stdout, level=console_log_level, colorize=True)
+    if local_rank == 0:
+        hydra_log_path = os.path.join(cfg.experiment_dir, "run.log")
+        logger.add(hydra_log_path, level="DEBUG")
 
-    logging.basicConfig(level=logging.DEBUG)
-    logging.getLogger().addHandler(HydraLoggerBridge())
+        console_log_level = os.environ.get("LOGURU_LEVEL", "INFO").upper()
+        logger.add(sys.stdout, level=console_log_level, colorize=True)
 
-    logger.info(f"Logging initialized for experiment: {cfg.expname}")
-    logger.info(f"Experiment directory: {cfg.experiment_dir}")
+        logging.basicConfig(level=logging.DEBUG)
+        logging.getLogger().addHandler(HydraLoggerBridge())
 
-    hydra_cfg_path = os.path.join(cfg.experiment_dir, "cfg.yaml")
-    OmegaConf.save(cfg, hydra_cfg_path, resolve=True)
+        logger.info(f"Logging initialized for experiment: {cfg.expname}")
+        logger.info(f"Experiment directory: {cfg.experiment_dir}")
+
+        hydra_cfg_path = os.path.join(cfg.experiment_dir, "cfg.yaml")
+        OmegaConf.save(cfg, hydra_cfg_path, resolve=True)
+
+    if world_size > 1:
+        # Add per-rank log file for debugging non-rank-0 processes
+        rank_log_path = os.path.join(cfg.experiment_dir, f"run_rank{local_rank}.log")
+        logger.add(rank_log_path, level="DEBUG")
 
     return logger
