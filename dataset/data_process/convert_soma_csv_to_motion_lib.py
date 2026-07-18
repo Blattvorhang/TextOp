@@ -529,6 +529,10 @@ def process_session_csvs(args_tuple):
             joblib.dump({name: entry}, out_path, compress=True)
             converted += 1
         except Exception:  # noqa: BLE001
+            if failed == 0:  # print first error per session
+                import traceback
+                print(f"\n  [{session_name}] ERROR on {csv_f}:\n  {traceback.format_exc().strip().replace(chr(10), chr(10) + '  ')}",
+                      file=sys.stderr)
             failed += 1
     return session_name, converted, failed, len(csv_files)
 
