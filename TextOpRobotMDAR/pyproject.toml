@@ -37,6 +37,7 @@ dependencies = [
     "matplotlib",
     "mujoco==3.2.3",
     "numpy==1.24.4",
+    "pandas==2.3.3",
     "omegaconf==2.3.0",
     "scipy==1.10.1",
     "toolz==1.0.0",
