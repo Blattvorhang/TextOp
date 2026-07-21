@@ -44,6 +44,7 @@ Usage:
 import argparse
 import os
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import joblib
@@ -51,23 +52,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 from scipy.spatial import transform
 from scipy.spatial.transform import Slerp, Rotation as R
-
-# ---------------------------------------------------------------------------
-# FK-based contact detection — lazy imports to keep multiprocessing light
-# ---------------------------------------------------------------------------
-_SKELETON = None       # RobotSkeleton singleton (fork-safe via multiprocessing)
-_MJCF_DIR = None        # cached mjcf_dir for lazy init
-
-# 29-DOF → 23-DOF crop mask (drops wrist joints, matches G1 dof_names order)
-_DOF_29_TO_23 = np.array([
-    True,  True,  True,  True,  True,  True,    # left leg  0-5
-    True,  True,  True,  True,  True,  True,    # right leg 6-11
-    True,  True,  True,                          # waist     12-14
-    True,  True,  True,  True,                   # left arm  15-18
-    False, False, False,                         # left wrist 19-21
-    True,  True,  True,  True,                   # right arm 22-25
-    False, False, False,                         # right wrist 26-28
-])
+from tqdm import tqdm
 
 # IsaacLab ↔ MuJoCo joint reordering (29 DOFs for G1).
 # MJ_TO_IL[mj] = il: for MuJoCo DOF index mj, gives the IsaacLab index il.
@@ -106,6 +91,21 @@ MJ_TO_IL = np.array(
     ],
     dtype=np.int32,
 )
+
+# ---------------------------------------------------------------------------
+# MuJoCo FK — lazy imports to keep multiprocessing light
+# ---------------------------------------------------------------------------
+_MJ_MODEL = None       # MjModel singleton (fork-safe via multiprocessing)
+_MJ_MODEL_PATH = None  # cached path for lazy init
+
+# Default MOB parameters (same as occHIPC/utils/g1_mob.py)
+DEFAULT_MOB_UNIT = 0.08     # voxel resolution in meters
+DEFAULT_MOB_MARGIN = 0.16   # padding around swept volume in meters
+
+# MuJoCo joint ordering for G1 (matches g1_hardware.py mujoco_joint_names).
+# 29 DOFs in MuJoCo/MJCF actuator order — same as BONES_CSV_JOINT_NAMES.
+MUJOCO_QPOS_END = 36  # 7 (freejoint: 3 pos + 4 quat) + 29 (actuated joints)
+
 
 # G1 29-DOF axis definitions (from Humanoid_Batch / g1_29dof_rev_1_0.xml).
 # Each DOF rotates around a single axis. Hardcoded to avoid torch dependency.
@@ -323,110 +323,326 @@ def convert_sequence(seq_data: dict, fps: int, humanoid_fk=None) -> dict:  # noq
     }
 
 
-def _get_skeleton(mjcf_dir: str):
-    """Lazy-init RobotSkeleton for FK contact detection (shared across workers via fork)."""
-    global _SKELETON, _MJCF_DIR
-    if _SKELETON is not None and _MJCF_DIR == mjcf_dir:
-        return _SKELETON
+# ---------------------------------------------------------------------------
+# MuJoCo-based unified FK pipeline (contact_mask + optional MOB)
+# ---------------------------------------------------------------------------
 
-    # Lazy imports — torch is heavy, only pull in when FK is actually used
-    import torch  # noqa: F811
-    from omegaconf import OmegaConf  # noqa: F811
-    from robotmdar.skeleton.robot import RobotSkeleton  # noqa: F811
+def _get_mj_model(xml_path: str):
+    """Lazy-init MuJoCo MjModel + MjData (fork-safe singleton for multiprocessing).
 
-    mjcf_path = Path(mjcf_dir).resolve()
-    cfg = OmegaConf.create(
-        {
-            "asset": {
-                "assetRoot": str(mjcf_path) + "/",
-                "assetFileName": "g1_23dof_lock_wrist_fitmotionONLY.xml",
-            },
-            "foot_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
-            "extend_config": [],
-        }
-    )
-    _SKELETON = RobotSkeleton(device="cpu", cfg=cfg)
-    _MJCF_DIR = mjcf_dir
-    return _SKELETON
+    MjModel is read-only after creation — cached at module level and inherited
+    via fork.  MjData is mutable per-step — created fresh each call (~us cost).
+
+    Mesh geoms (group=2, type=mesh) are stripped before compilation so that
+    STL asset files are not required.  Only primitive collision geoms
+    (group=3, sphere/capsule) remain — these are sufficient for MOB + contact.
+    """
+    import mujoco
+
+    global _MJ_MODEL, _MJ_MODEL_PATH
+    xml_path = str(Path(xml_path).resolve())
+    if _MJ_MODEL is None or _MJ_MODEL_PATH != xml_path:
+        # Strip mesh geoms/assets so STL files aren't required
+        xml_str = _strip_mesh_geoms(xml_path)
+        _MJ_MODEL = mujoco.MjModel.from_xml_string(xml_str)
+        _MJ_MODEL_PATH = xml_path
+    return _MJ_MODEL, mujoco.MjData(_MJ_MODEL)
 
 
-def compute_contact_mask(
-    root_trans_offset: np.ndarray,
-    root_rot: np.ndarray,
-    dof_29: np.ndarray,
-    fps: float,
-    mjcf_dir: str,
-    height_thresh: float = 0.05,
-    vel_thresh: float = 0.15,
-) -> np.ndarray:
-    """Per-foot contact mask using FK + G1FootContactLoss formula (NVIDIA SONIC).
+def _strip_mesh_geoms(xml_path: str) -> str:
+    """Return MuJoCo XML string with mesh geoms and mesh assets removed.
 
-    Uses RobotSkeleton forward kinematics to get actual foot world positions,
-    then applies frame-rate-independent contact detection:
+    Ported from occHIPC/utils/g1_mob.py.  The checked-in G1 XML references
+    visual STL meshes that may not exist.  MOB occupancy comes from collision
+    primitives (group=3) only, so mesh geoms are safely removed.
+    """
+    root = ET.parse(xml_path).getroot()
+    # Remove geom elements that reference a mesh
+    for parent in root.iter():
+        for child in list(parent):
+            if child.tag == "geom" and child.get("mesh"):
+                parent.remove(child)
+    # Remove mesh assets (not needed after geoms are stripped)
+    asset = root.find("asset")
+    if asset is not None:
+        for child in list(asset):
+            if child.tag == "mesh":
+                asset.remove(child)
+    # Point meshdir somewhere harmless (no meshes remain to load)
+    compiler = root.find("compiler")
+    if compiler is not None:
+        compiler.set("meshdir", "/tmp")
+    return ET.tostring(root, encoding="unicode")
 
-        contact = (foot_z < height_thresh) AND (||foot_vel|| < vel_thresh)
 
-    Default thresholds match G1FootContactLoss in gear_sonic/trl/losses/token_losses.py.
+def _find_foot_body_ids(model) -> tuple:
+    """Return (left_foot_body_id, right_foot_body_id) for contact detection.
+
+    Uses the same body names as RobotSkeleton foot_names config:
+    left_ankle_roll_link and right_ankle_roll_link.
+    """
+    import mujoco
+
+    left_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link")
+    right_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link")
+    return left_id, right_id
+
+
+def _get_collision_geom_ids(model) -> list:
+    """Return geom IDs for MOB voxelization (group=3 collision geoms).
+
+    Mirrors _collision_geom_ids() from occHIPC/utils/g1_mob.py.
+    Excludes mjGEOM_PLANE.
+    """
+    import mujoco
+
+    ids = []
+    for gid in range(model.ngeom):
+        gtype = int(model.geom_type[gid])
+        group = int(model.geom_group[gid])
+        if gtype == mujoco.mjtGeom.mjGEOM_PLANE:
+            continue
+        if group == 3:
+            ids.append(gid)
+    if not ids:
+        raise ValueError("No collision geoms (group=3) found in the MJCF model")
+    return ids
+
+
+def _geom_local_half_extents(model, gid: int) -> np.ndarray:
+    """Local AABB half-extents for a collision geom (sphere/capsule/cylinder/box).
+
+    Mirrors _geom_local_half_extents() from occHIPC/utils/g1_mob.py.
+    """
+    import mujoco
+
+    gtype = int(model.geom_type[gid])
+    size = model.geom_size[gid]
+    if gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+        r = float(size[0])
+        return np.array([r, r, r], dtype=np.float64)
+    if gtype == mujoco.mjtGeom.mjGEOM_CAPSULE:
+        r, h = float(size[0]), float(size[1])
+        return np.array([r, r, h + r], dtype=np.float64)
+    if gtype == mujoco.mjtGeom.mjGEOM_CYLINDER:
+        r, h = float(size[0]), float(size[1])
+        return np.array([r, r, h], dtype=np.float64)
+    if gtype == mujoco.mjtGeom.mjGEOM_BOX:
+        return np.asarray(size, dtype=np.float64).copy()
+    raise ValueError(f"Unsupported geom type {gtype} for geom id {gid}")
+
+
+def _geom_world_aabb(model, data, gid: int):
+    """World-space AABB for a geom at the current mj_forward state."""
+    center = np.asarray(data.geom_xpos[gid], dtype=np.float64)
+    rot = np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
+    half_world = np.abs(rot) @ _geom_local_half_extents(model, gid)
+    return center - half_world, center + half_world
+
+
+def _world_to_index_bounds(lo, hi, llb, unit, shape):
+    """Map world-space AABB corners to voxel index ranges."""
+    vmin = np.floor((lo - llb) / unit).astype(np.int64)
+    vmax = np.ceil((hi - llb) / unit).astype(np.int64)
+    vmin = np.clip(vmin, 0, shape)
+    vmax = np.clip(vmax, 0, shape)
+    return vmin, vmax
+
+
+def _mark_geom(occu, llb, unit, model, data, gid, cached_aabb=None):
+    """Rasterize one MuJoCo geom into the voxel grid occu (mutated in-place).
 
     Args:
-        root_trans_offset: (T, 3) pelvis world translation, meters.
-        root_rot:          (T, 4) pelvis rotation, xyzw quaternion.
-        dof_29:            (T, 29) joint angles in radians (MuJoCo/MJCF order).
-        fps:               frame rate of the input data.
-        mjcf_dir:          path to directory containing g1_23dof_lock_wrist_fitmotionONLY.xml.
-        height_thresh:     contact height threshold in meters (default 0.05).
-        vel_thresh:        contact velocity threshold in m/s (default 0.15).
+        cached_aabb: optional (lo, hi) tuple from a previous _geom_world_aabb
+                     call, to skip redundant AABB recomputation.
+    """
+    import mujoco
+
+    if cached_aabb is not None:
+        lo, hi = cached_aabb
+    else:
+        lo, hi = _geom_world_aabb(model, data, gid)
+    vmin, vmax = _world_to_index_bounds(lo, hi, llb, unit, np.asarray(occu.shape))
+    if np.any(vmax <= vmin):
+        return
+
+    xs = np.arange(vmin[0], vmax[0])
+    ys = np.arange(vmin[1], vmax[1])
+    zs = np.arange(vmin[2], vmax[2])
+    wx = llb[0] + (xs + 0.5) * unit
+    wy = llb[1] + (ys + 0.5) * unit
+    wz = llb[2] + (zs + 0.5) * unit
+    grid = np.stack(np.meshgrid(wx, wy, wz, indexing="ij"), axis=-1)
+
+    center = np.asarray(data.geom_xpos[gid], dtype=np.float64)
+    rot = np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
+    local = (grid - center) @ rot
+
+    gtype = int(model.geom_type[gid])
+    size = model.geom_size[gid]
+    if gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+        mask = np.sum(local * local, axis=-1) <= float(size[0]) ** 2
+    elif gtype == mujoco.mjtGeom.mjGEOM_CAPSULE:
+        r, h = float(size[0]), float(size[1])
+        z = np.clip(local[..., 2], -h, h)
+        closest = np.stack([np.zeros_like(z), np.zeros_like(z), z], axis=-1)
+        delta = local - closest
+        mask = np.sum(delta * delta, axis=-1) <= r ** 2
+    elif gtype == mujoco.mjtGeom.mjGEOM_CYLINDER:
+        r, h = float(size[0]), float(size[1])
+        mask = (
+            (local[..., 0] ** 2 + local[..., 1] ** 2 <= r ** 2)
+            & (np.abs(local[..., 2]) <= h)
+        )
+    elif gtype == mujoco.mjtGeom.mjGEOM_BOX:
+        half = np.asarray(size, dtype=np.float64)
+        mask = np.all(np.abs(local) <= half, axis=-1)
+    else:
+        return
+
+    occu[vmin[0]:vmax[0], vmin[1]:vmax[1], vmin[2]:vmax[2]] |= mask
+
+
+def compute_contact_and_mob(
+    root_trans_offset: np.ndarray,
+    root_rot_xyzw: np.ndarray,
+    dof_mj: np.ndarray,
+    fps: float,
+    xml_path: str,
+    height_thresh: float = 0.05,
+    vel_thresh: float = 0.15,
+    mob: bool = False,
+    mob_unit: float = DEFAULT_MOB_UNIT,
+    mob_margin: float = DEFAULT_MOB_MARGIN,
+    mob_frame_stride: int = 1,
+    verbose: bool = False,
+) -> dict:
+    """Compute contact_mask and optionally MOB occupancy via MuJoCo mj_forward.
+
+    Uses a single FK pass per frame for contact_mask, plus a second pass for
+    MOB voxel marking.  The body positions of left_ankle_roll_link and
+    right_ankle_roll_link are used for foot contact detection (same formula as
+    SONIC G1FootContactLoss).
+
+    Args:
+        root_trans_offset:  (T, 3) pelvis world translation, meters.
+        root_rot_xyzw:      (T, 4) pelvis rotation, xyzw quaternion (scipy).
+        dof_mj:             (T, 29) joint angles, radians, MuJoCo/MJCF order.
+        fps:                frame rate of the input data.
+        xml_path:           path to g1_29dof_with_collision.xml.
+        height_thresh:      contact height threshold in meters (default 0.05).
+        vel_thresh:         contact velocity threshold in m/s (default 0.15).
+        mob:                if True, also compute MOB swept occupancy.
+        mob_unit:           voxel resolution for MOB (default 0.08 m).
+        mob_margin:         padding around swept volume (default 0.16 m).
+        mob_frame_stride:   subsample frames for MOB (default 1 = all frames).
 
     Returns:
-        (T, 2) float32 array: [:, 0] = left foot contact, [:, 1] = right foot contact.
+        dict with:
+            contact_mask: (T, 2) float32, [:, 0]=left foot, [:, 1]=right foot.
+            If mob=True, also:
+                mob_occu_global:   bool ndarray [X, Y, Z], 1 = free space (robot never
+                                   occupies this voxel).  Complement of swept volume.
+                mob_unit:          float, voxel size in meters.
+                mob_llb:           (1, 3) float32, lower-left-back corner.
     """
-    import torch  # noqa: F811
+    import mujoco
 
-    skeleton = _get_skeleton(mjcf_dir)
-
-    # Crop 29 → 23 DOF
-    dof_23 = dof_29[:, _DOF_29_TO_23]  # (T, 23)
+    model, data = _get_mj_model(xml_path)
+    left_body_id, right_body_id = _find_foot_body_ids(model)
 
     T = root_trans_offset.shape[0]
 
-    # Build motion_dict (unbatched — FK adds batch dim internally)
-    motion_dict: dict = {
-        "root_trans_offset": torch.from_numpy(root_trans_offset).float(),
-        "root_rot": torch.from_numpy(root_rot).float(),
-        "dof": torch.from_numpy(dof_23).float(),
-    }
+    # MuJoCo freejoint quaternion is wxyz; input is xyzw (scipy convention)
+    root_rot_wxyz = root_rot_xyzw[:, [3, 0, 1, 2]].astype(np.float64)
 
-    fk_result = skeleton.forward_kinematics(motion_dict, return_full=False)
+    foot_z = np.zeros((T, 2), dtype=np.float64)
 
-    # global_translation: (1, T, num_bodies, 3) or (T, num_bodies, 3)
-    world_pos = fk_result["global_translation"]
-    if world_pos.dim() == 4:
-        world_pos = world_pos[0]  # (T, num_bodies, 3)
-    foot_pos = world_pos[:, skeleton.foot_id, :]  # (T, 2, 3)
+    mob_geom_ids = _get_collision_geom_ids(model) if mob else []
+    n_geoms = len(mob_geom_ids)
 
-    # ── G1FootContactLoss contact condition ──
+    # Pre-allocate AABB arrays (Pass 1 writes directly into these)
+    if mob:
+        n_aabbs = T * n_geoms
+        mob_mins = np.empty((n_aabbs, 3), dtype=np.float64)
+        mob_maxs = np.empty((n_aabbs, 3), dtype=np.float64)
+        # Cache: [t][gid] = (xpos, xmat, lo, hi)
+        mob_geom_cache: list = []
+    else:
+        mob_mins = mob_maxs = None  # type: ignore[assignment]
+        mob_geom_cache = []  # unused, keeps linter happy
+
+    _frame_iter = tqdm(range(T), desc="FK+contact", unit="f", leave=False) if verbose else range(T)
+
+    # ── Pass 1: FK all frames → foot_z + MOB global AABB ──
+    aabb_idx = 0
+    for t in _frame_iter:
+        data.qpos[0:3] = root_trans_offset[t]
+        data.qpos[3:7] = root_rot_wxyz[t]
+        data.qpos[7:MUJOCO_QPOS_END] = dof_mj[t]
+        mujoco.mj_forward(model, data)
+
+        foot_z[t, 0] = data.xpos[left_body_id, 2]
+        foot_z[t, 1] = data.xpos[right_body_id, 2]
+
+        if mob:
+            frame_cache = []
+            for i, gid in enumerate(mob_geom_ids):
+                lo, hi = _geom_world_aabb(model, data, gid)
+                mob_mins[aabb_idx] = lo
+                mob_maxs[aabb_idx] = hi
+                aabb_idx += 1
+                # Cache geom poses + AABB so Pass 2 skips FK & AABB entirely
+                frame_cache.append((
+                    np.asarray(data.geom_xpos[gid], dtype=np.float64).copy(),
+                    np.asarray(data.geom_xmat[gid], dtype=np.float64).copy(),
+                    lo.copy(),
+                    hi.copy(),
+                ))
+            mob_geom_cache.append(frame_cache)
+
+    # ── Contact mask from foot_z ──
     dt = 1.0 / fps
-    foot_z = foot_pos[:, :, 2]  # (T, 2)
-    # Velocity: ||pos[t+1] - pos[t]|| / dt, pad first frame
-    foot_vel = torch.cat(
-        [torch.zeros(1, 2), torch.norm(foot_pos[1:] - foot_pos[:-1], dim=-1) / dt], dim=0
-    )
+    foot_vel = np.zeros((T, 2), dtype=np.float64)
+    foot_vel[1:] = np.abs(foot_z[1:] - foot_z[:-1]) / dt
 
-    contact = ((foot_z < height_thresh) & (foot_vel < vel_thresh)).float()
-    return contact.numpy().astype(np.float32)
+    contact = ((foot_z < height_thresh) & (foot_vel < vel_thresh)).astype(np.float32)
+
+    result: dict = {"contact_mask": contact}
+
+    # ── MOB: Pass 2 — create grid and mark voxels (replay cached poses + AABBs) ──
+    if mob:
+        llb = mob_mins.min(axis=0) - mob_margin
+        rub = mob_maxs.max(axis=0) + mob_margin
+        shape = np.ceil((rub - llb) / mob_unit).astype(np.int64) + 1
+        swept_occu = np.zeros(tuple(shape.tolist()), dtype=bool)
+
+        frame_ids = list(range(0, T, mob_frame_stride))
+        voxel_iter = tqdm(frame_ids, desc="MOB rasterize", unit="f", leave=False) if verbose else frame_ids
+        for t in voxel_iter:
+            frame_cache = mob_geom_cache[t]
+            for i, gid in enumerate(mob_geom_ids):
+                xpos, xmat, lo, hi = frame_cache[i]
+                data.geom_xpos[gid] = xpos
+                data.geom_xmat[gid] = xmat
+                _mark_geom(swept_occu, llb, mob_unit, model, data, gid, cached_aabb=(lo, hi))
+
+        # Store as free space: 1 = robot NEVER occupies this voxel
+        result["mob_occu_global"] = ~swept_occu
+        result["mob_unit"] = mob_unit
+        result["mob_llb"] = llb.reshape(1, 3).astype(np.float32)
+
+    return result
 
 
-def resample_sequence(entry: dict, fps_source: int, fps_target: int, mjcf_dir: str) -> dict:
+def resample_sequence(entry: dict, fps_source: int, fps_target: int) -> dict:
     """Resample a motion_lib entry using LERP (translation, DOFs) + SLERP (rotation).
 
     Handles arbitrary non-integer frame-rate ratios (e.g. 120→50).
     When fps_source == fps_target, returns the entry unchanged.
     """
     if fps_source == fps_target:
-        contact = compute_contact_mask(
-            entry["root_trans_offset"], entry["root_rot"], entry["dof"], fps_target, mjcf_dir
-        )
-        return {**entry, "contact_mask": contact}
+        return {**entry}
 
     T_src = entry["root_trans_offset"].shape[0]
     t_src = np.linspace(0, (T_src - 1) / fps_source, T_src, dtype=np.float64)
@@ -467,37 +683,14 @@ def resample_sequence(entry: dict, fps_source: int, fps_target: int, mjcf_dir: s
         "dof": dof_tgt,
         "root_rot": quat_tgt,
         "smpl_joints": smpl_tgt,
-        "contact_mask": compute_contact_mask(trans_tgt, quat_tgt, dof_tgt, fps_target, mjcf_dir),
         "fps": fps_target,
     }
 
 
-def init_humanoid_fk():
-    """Initialize Humanoid_Batch from the G1 MJCF config.
-
-    Only needed for non-Bones-SEED inputs (deploy PKL, SOMA CSV dirs).
-    Bones-SEED path uses hardcoded DOF_AXIS constants instead.
-    """
-    import omegaconf
-
-    motion_cfg = omegaconf.OmegaConf.create(
-        {
-            "asset": {
-                "assetRoot": "gear_sonic/data/assets/robot_description/mjcf/",
-                "assetFileName": "g1_29dof_rev_1_0.xml",
-                "urdfFileName": "",
-            },
-            "extend_config": [],
-        }
-    )
-    from gear_sonic.utils.motion_lib import torch_humanoid_batch
-
-    return torch_humanoid_batch.Humanoid_Batch(motion_cfg)
-
-
 def process_session_csvs(args_tuple):
     """Process all CSVs in a single session directory. Used by multiprocessing."""
-    session_dir, session_name, out_dir, fps, fps_source, mjcf_dir = args_tuple
+    session_dir, session_name, out_dir, fps, fps_source, mjcf_dir, mob_cfg, worker_pos = args_tuple
+    import time
     import warnings
 
     warnings.filterwarnings("ignore")
@@ -507,26 +700,61 @@ def process_session_csvs(args_tuple):
     session_out = os.path.join(out_dir, session_name)
     os.makedirs(session_out, exist_ok=True)
 
+    xml_path = os.path.join(mjcf_dir, "g1_29dof_with_collision.xml")
+
     converted = 0
     failed = 0
-    for csv_f in csv_files:
+    t_csv = t_convert = t_resample = t_fk = t_dump = 0.0
+    csv_iter = tqdm(
+        csv_files, desc=session_name[:20], unit="csv",
+        position=worker_pos, leave=False,
+    )
+    for csv_f in csv_iter:
         name = os.path.splitext(csv_f)[0]
         out_path = os.path.join(session_out, name + ".pkl")
         if os.path.exists(out_path):
             converted += 1  # skip existing
             continue
         try:
-            seq = load_bones_csv(os.path.join(session_dir, csv_f))
+            csv_path = os.path.join(session_dir, csv_f)
+            t0 = time.time()
+            seq = load_bones_csv(csv_path)
+            t_csv += time.time() - t0
+
             fps_for_convert = fps_source if fps_source else fps
+
+            t0 = time.time()
             entry = convert_sequence(seq, fps_for_convert)
+            t_convert += time.time() - t0
+
+            t0 = time.time()
             if fps_source and fps_source != fps:
-                entry = resample_sequence(entry, fps_source, fps, mjcf_dir)
-            else:
-                entry = {**entry, "contact_mask": compute_contact_mask(
-                    entry["root_trans_offset"], entry["root_rot"], entry["dof"],
-                    fps, mjcf_dir,
-                )}
+                entry = resample_sequence(entry, fps_source, fps)
+            t_resample += time.time() - t0
+
+            # ── Unified FK: contact_mask + optional MOB ──
+            t0 = time.time()
+            fk_result = compute_contact_and_mob(
+                entry["root_trans_offset"],
+                entry["root_rot"],
+                entry["dof"],
+                fps,
+                xml_path,
+                mob=mob_cfg.get("enabled", False),
+                mob_unit=mob_cfg.get("unit", DEFAULT_MOB_UNIT),
+                mob_margin=mob_cfg.get("margin", DEFAULT_MOB_MARGIN),
+                mob_frame_stride=mob_cfg.get("frame_stride", 1),
+            )
+            entry["contact_mask"] = fk_result["contact_mask"]
+            if mob_cfg.get("enabled", False):
+                entry["mob_occu_global"] = fk_result["mob_occu_global"]
+                entry["mob_unit"] = fk_result["mob_unit"]
+                entry["mob_llb"] = fk_result["mob_llb"]
+            t_fk += time.time() - t0
+
+            t0 = time.time()
             joblib.dump({name: entry}, out_path, compress=True)
+            t_dump += time.time() - t0
             converted += 1
         except Exception:  # noqa: BLE001
             if failed == 0:  # print first error per session
@@ -534,6 +762,19 @@ def process_session_csvs(args_tuple):
                 print(f"\n  [{session_name}] ERROR on {csv_f}:\n  {traceback.format_exc().strip().replace(chr(10), chr(10) + '  ')}",
                       file=sys.stderr)
             failed += 1
+
+    if converted > 0:
+        elapsed_csv = t_csv / converted * 1000
+        elapsed_convert = t_convert / converted * 1000
+        elapsed_resample = t_resample / converted * 1000
+        elapsed_fk = t_fk / converted * 1000
+        elapsed_dump = t_dump / converted * 1000
+        fk_label = "fk+mob" if mob_cfg.get("enabled") else "fk+contact"
+        print(f"  {session_name}: {converted}/{len(csv_files)} converted "
+              f"(csv {elapsed_csv:.0f}ms  convert {elapsed_convert:.0f}ms  "
+              f"resample {elapsed_resample:.0f}ms  {fk_label} {elapsed_fk:.0f}ms  "
+              f"dump {elapsed_dump:.0f}ms)"
+              + (f"  {failed} failed" if failed else ""))
     return session_name, converted, failed, len(csv_files)
 
 
@@ -572,13 +813,47 @@ def main():
     parser.add_argument(
         "--mjcf_dir",
         type=str,
-        default="description/robots/g1",
-        help="Path to directory containing g1_23dof_lock_wrist_fitmotionONLY.xml "
-        "(default: description/robots/g1, relative to repo root)",
+        default="TextOpRobotMDAR/description/robots/g1",
+        help="Path to directory containing g1_29dof_with_collision.xml "
+        "(default: TextOpRobotMDAR/description/robots/g1, relative to repo root)",
+    )
+    parser.add_argument(
+        "--mob",
+        action="store_true",
+        help="Also compute MOB swept occupancy grid for each motion "
+        "(1=free space complement of swept robot volume, requires MuJoCo)",
+    )
+    parser.add_argument(
+        "--mob_unit",
+        type=float,
+        default=DEFAULT_MOB_UNIT,
+        help=f"MOB voxel resolution in meters (default: {DEFAULT_MOB_UNIT})",
+    )
+    parser.add_argument(
+        "--mob_margin",
+        type=float,
+        default=DEFAULT_MOB_MARGIN,
+        help=f"MOB grid padding around swept volume in meters (default: {DEFAULT_MOB_MARGIN})",
+    )
+    parser.add_argument(
+        "--mob_frame_stride",
+        type=int,
+        default=1,
+        help="MOB frame subsampling factor (default: 1 = all frames). "
+        "Set to 2 for 2x speedup with negligible quality loss at 50fps.",
     )
     args = parser.parse_args()
 
+    mob_cfg = {
+        "enabled": args.mob,
+        "unit": args.mob_unit,
+        "margin": args.mob_margin,
+        "frame_stride": args.mob_frame_stride,
+    }
+
     print(f"G1 {NUM_DOF} DOFs, {NUM_BODIES} bodies (hardcoded axes)")
+    if args.mob:
+        print(f"MOB enabled: unit={args.mob_unit}m, margin={args.mob_margin}m, stride={args.mob_frame_stride}")
 
     # Individual PKL mode: skip scanning, go straight to parallel per-session processing
     if args.individual:
@@ -602,13 +877,19 @@ def main():
 
         session_dirs = []
         if has_session_subdirs:
-            for d in subdirs:
+            for i, d in enumerate(subdirs):
                 subdir = os.path.join(args.input, d)
                 if any(f.endswith(".csv") for f in os.listdir(subdir)):
-                    session_dirs.append((subdir, d, args.output, args.fps, args.fps_source, args.mjcf_dir))
+                    session_dirs.append(
+                        (subdir, d, args.output, args.fps, args.fps_source,
+                         args.mjcf_dir, mob_cfg, i)
+                    )
         elif has_csvs:
             session_name = os.path.basename(args.input.rstrip("/"))
-            session_dirs.append((args.input, session_name, args.output, args.fps, args.fps_source, args.mjcf_dir))
+            session_dirs.append(
+                (args.input, session_name, args.output, args.fps, args.fps_source,
+                 args.mjcf_dir, mob_cfg, 0)
+            )
 
         print(f"\nBatch converting {len(session_dirs)} sessions with {args.num_workers} workers")
         print(f"Output: {args.output}")
@@ -620,15 +901,19 @@ def main():
         total_failed = 0
         total_csvs = 0
         with multiprocessing.Pool(processes=args.num_workers) as pool:
-            for session_name, converted, failed, n_csvs in pool.imap_unordered(
-                process_session_csvs, session_dirs
-            ):
+            pbar = tqdm(
+                pool.imap_unordered(process_session_csvs, session_dirs),
+                total=len(session_dirs),
+                desc="Sessions",
+                unit="sess",
+                position=args.num_workers,
+            )
+            for session_name, converted, failed, n_csvs in pbar:
                 total_converted += converted
                 total_failed += failed
                 total_csvs += n_csvs
-                print(
-                    f"  {session_name}: {converted}/{n_csvs} converted"
-                    + (f" ({failed} failed)" if failed else "")
+                pbar.set_postfix_str(
+                    f"{total_converted}/{total_csvs} ok" + (f" {total_failed} fail" if total_failed else "")
                 )
 
         print(
@@ -725,19 +1010,35 @@ def main():
         sys.exit(1)
 
     # Convert each sequence (combined PKL mode)
+    xml_path = os.path.join(args.mjcf_dir, "g1_29dof_with_collision.xml")
     motion_lib_dict = {}
-    for name, seq_data in sequences.items():
+    seq_iter = tqdm(sequences.items(), desc="Converting", unit="seq")
+    for name, seq_data in seq_iter:
+        seq_iter.set_postfix_str(name[:40])
         T = seq_data["joint_pos"].shape[0]
-        print(f"  Converting {name}: {T} frames @ {args.fps} fps")
         fps_for_convert = args.fps_source if args.fps_source else args.fps
         entry = convert_sequence(seq_data, fps_for_convert)
         if args.fps_source and args.fps_source != args.fps:
-            entry = resample_sequence(entry, args.fps_source, args.fps, args.mjcf_dir)
-        else:
-            entry["contact_mask"] = compute_contact_mask(
-                entry["root_trans_offset"], entry["root_rot"], entry["dof"],
-                args.fps, args.mjcf_dir,
-            )
+            entry = resample_sequence(entry, args.fps_source, args.fps)
+
+        # ── Unified FK: contact_mask + optional MOB ──
+        fk_result = compute_contact_and_mob(
+            entry["root_trans_offset"],
+            entry["root_rot"],
+            entry["dof"],
+            args.fps,
+            xml_path,
+            mob=mob_cfg["enabled"],
+            mob_unit=mob_cfg["unit"],
+            mob_margin=mob_cfg["margin"],
+            mob_frame_stride=mob_cfg["frame_stride"],
+            verbose=True,
+        )
+        entry["contact_mask"] = fk_result["contact_mask"]
+        if mob_cfg["enabled"]:
+            entry["mob_occu_global"] = fk_result["mob_occu_global"]
+            entry["mob_unit"] = fk_result["mob_unit"]
+            entry["mob_llb"] = fk_result["mob_llb"]
         motion_lib_dict[name] = entry
 
     # Save
