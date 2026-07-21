@@ -30,8 +30,7 @@ BONES_SEED_DIR="${BONES_SEED_DIR:-/home/lenovo/data/bones-seed}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-data}"
 FPS_TARGET="${FPS_TARGET:-50}"
 FPS_SOURCE="${FPS_SOURCE:-120}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-MJCF_DIR="${MJCF_DIR:-TextOpRobotMDAR/description/robots/g1}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
 VAL_RATIO="${VAL_RATIO:-0.05}"
 SEED="${SEED:-42}"
 
@@ -60,7 +59,8 @@ else
         --fps_source "${FPS_SOURCE}" \
         --individual \
         --num_workers "${NUM_WORKERS}" \
-        --mjcf_dir "${MJCF_DIR}"
+        --mob \
+        --mob_frame_stride 2
     touch "${S1_DONE}"
     echo "  [DONE]"
 fi

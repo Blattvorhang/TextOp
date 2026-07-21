@@ -541,10 +541,11 @@ def compute_contact_and_mob(
         dict with:
             contact_mask: (T, 2) float32, [:, 0]=left foot, [:, 1]=right foot.
             If mob=True, also:
-                mob_occu_global:   bool ndarray [X, Y, Z], 1 = free space (robot never
-                                   occupies this voxel).  Complement of swept volume.
-                mob_unit:          float, voxel size in meters.
-                mob_llb:           (1, 3) float32, lower-left-back corner.
+                scene: dict with:
+                    occu_global:   bool ndarray [X, Y, Z], 1 = occupied (robot swept
+                                   through this voxel).  Strafe complement of swept volume.
+                    unit:          float, voxel size in meters.
+                    llb:           ndarray [3], float32, lower-left-back corner.
     """
     import mujoco
 
@@ -610,7 +611,7 @@ def compute_contact_and_mob(
 
     result: dict = {"contact_mask": contact}
 
-    # ── MOB: Pass 2 — create grid and mark voxels (replay cached poses + AABBs) ──
+    # ── MOB: build swept volume from cached AABBs ──
     if mob:
         llb = mob_mins.min(axis=0) - mob_margin
         rub = mob_maxs.max(axis=0) + mob_margin
@@ -627,10 +628,13 @@ def compute_contact_and_mob(
                 data.geom_xmat[gid] = xmat
                 _mark_geom(swept_occu, llb, mob_unit, model, data, gid, cached_aabb=(lo, hi))
 
-        # Store as free space: 1 = robot NEVER occupies this voxel
-        result["mob_occu_global"] = ~swept_occu
-        result["mob_unit"] = mob_unit
-        result["mob_llb"] = llb.reshape(1, 3).astype(np.float32)
+        # ~swept_occu → where the robot never went → assumed obstacle
+        # True = occupied (obstacle), False = free (robot passed through here)
+        result["scene"] = {
+            "occu_global": ~swept_occu,
+            "unit": mob_unit,
+            "llb": llb.astype(np.float32),
+        }
 
     return result
 
@@ -689,7 +693,7 @@ def resample_sequence(entry: dict, fps_source: int, fps_target: int) -> dict:
 
 def process_session_csvs(args_tuple):
     """Process all CSVs in a single session directory. Used by multiprocessing."""
-    session_dir, session_name, out_dir, fps, fps_source, mjcf_dir, mob_cfg, worker_pos = args_tuple
+    session_dir, session_name, out_dir, fps, fps_source, mjcf_dir, mob_cfg = args_tuple
     import time
     import warnings
 
@@ -702,18 +706,14 @@ def process_session_csvs(args_tuple):
 
     xml_path = os.path.join(mjcf_dir, "g1_29dof_with_collision.xml")
 
-    converted = 0
+    converted_num = 0
     failed = 0
     t_csv = t_convert = t_resample = t_fk = t_dump = 0.0
-    csv_iter = tqdm(
-        csv_files, desc=session_name[:20], unit="csv",
-        position=worker_pos, leave=False,
-    )
-    for csv_f in csv_iter:
+    for csv_f in csv_files:
         name = os.path.splitext(csv_f)[0]
         out_path = os.path.join(session_out, name + ".pkl")
         if os.path.exists(out_path):
-            converted += 1  # skip existing
+            converted_num += 1  # skip existing
             continue
         try:
             csv_path = os.path.join(session_dir, csv_f)
@@ -747,15 +747,13 @@ def process_session_csvs(args_tuple):
             )
             entry["contact_mask"] = fk_result["contact_mask"]
             if mob_cfg.get("enabled", False):
-                entry["mob_occu_global"] = fk_result["mob_occu_global"]
-                entry["mob_unit"] = fk_result["mob_unit"]
-                entry["mob_llb"] = fk_result["mob_llb"]
+                entry["scene"] = fk_result["scene"]
             t_fk += time.time() - t0
 
             t0 = time.time()
             joblib.dump({name: entry}, out_path, compress=True)
             t_dump += time.time() - t0
-            converted += 1
+            converted_num += 1
         except Exception:  # noqa: BLE001
             if failed == 0:  # print first error per session
                 import traceback
@@ -763,19 +761,19 @@ def process_session_csvs(args_tuple):
                       file=sys.stderr)
             failed += 1
 
-    if converted > 0:
-        elapsed_csv = t_csv / converted * 1000
-        elapsed_convert = t_convert / converted * 1000
-        elapsed_resample = t_resample / converted * 1000
-        elapsed_fk = t_fk / converted * 1000
-        elapsed_dump = t_dump / converted * 1000
+    if converted_num > 0:
+        elapsed_csv = t_csv / converted_num * 1000
+        elapsed_convert = t_convert / converted_num * 1000
+        elapsed_resample = t_resample / converted_num * 1000
+        elapsed_fk = t_fk / converted_num * 1000
+        elapsed_dump = t_dump / converted_num * 1000
         fk_label = "fk+mob" if mob_cfg.get("enabled") else "fk+contact"
-        print(f"  {session_name}: {converted}/{len(csv_files)} converted "
-              f"(csv {elapsed_csv:.0f}ms  convert {elapsed_convert:.0f}ms  "
+        print(f"  {session_name}: {converted_num}/{len(csv_files)} converted"
+              f" (per-csv avg: csv {elapsed_csv:.0f}ms  convert {elapsed_convert:.0f}ms  "
               f"resample {elapsed_resample:.0f}ms  {fk_label} {elapsed_fk:.0f}ms  "
               f"dump {elapsed_dump:.0f}ms)"
               + (f"  {failed} failed" if failed else ""))
-    return session_name, converted, failed, len(csv_files)
+    return session_name, converted_num, failed, len(csv_files)
 
 
 def main():
@@ -821,7 +819,7 @@ def main():
         "--mob",
         action="store_true",
         help="Also compute MOB swept occupancy grid for each motion "
-        "(1=free space complement of swept robot volume, requires MuJoCo)",
+        "(1=occupied/obstacle complement of swept robot volume, requires MuJoCo)",
     )
     parser.add_argument(
         "--mob_unit",
@@ -877,18 +875,18 @@ def main():
 
         session_dirs = []
         if has_session_subdirs:
-            for i, d in enumerate(subdirs):
+            for d in subdirs:
                 subdir = os.path.join(args.input, d)
                 if any(f.endswith(".csv") for f in os.listdir(subdir)):
                     session_dirs.append(
                         (subdir, d, args.output, args.fps, args.fps_source,
-                         args.mjcf_dir, mob_cfg, i)
+                         args.mjcf_dir, mob_cfg)
                     )
         elif has_csvs:
             session_name = os.path.basename(args.input.rstrip("/"))
             session_dirs.append(
                 (args.input, session_name, args.output, args.fps, args.fps_source,
-                 args.mjcf_dir, mob_cfg, 0)
+                 args.mjcf_dir, mob_cfg)
             )
 
         print(f"\nBatch converting {len(session_dirs)} sessions with {args.num_workers} workers")
@@ -897,7 +895,7 @@ def main():
 
         import multiprocessing
 
-        total_converted = 0
+        total_converted_num = 0
         total_failed = 0
         total_csvs = 0
         with multiprocessing.Pool(processes=args.num_workers) as pool:
@@ -908,16 +906,16 @@ def main():
                 unit="sess",
                 position=args.num_workers,
             )
-            for session_name, converted, failed, n_csvs in pbar:
-                total_converted += converted
+            for session_name, converted_num, failed, n_csvs in pbar:
+                total_converted_num += converted_num
                 total_failed += failed
                 total_csvs += n_csvs
                 pbar.set_postfix_str(
-                    f"{total_converted}/{total_csvs} ok" + (f" {total_failed} fail" if total_failed else "")
+                    f"{total_converted_num}/{total_csvs} ok" + (f" {total_failed} fail" if total_failed else "")
                 )
 
         print(
-            f"\nDone: {total_converted} motions converted, {total_failed} failed, {total_csvs} total CSVs"
+            f"\nDone: {total_converted_num} motions converted, {total_failed} failed, {total_csvs} total CSVs"
         )
         return
 
@@ -1036,9 +1034,7 @@ def main():
         )
         entry["contact_mask"] = fk_result["contact_mask"]
         if mob_cfg["enabled"]:
-            entry["mob_occu_global"] = fk_result["mob_occu_global"]
-            entry["mob_unit"] = fk_result["mob_unit"]
-            entry["mob_llb"] = fk_result["mob_llb"]
+            entry["scene"] = fk_result["scene"]
         motion_lib_dict[name] = entry
 
     # Save
