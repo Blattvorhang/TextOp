@@ -13,7 +13,7 @@
 #     VAL_RATIO          validation split ratio        (default: 0.05)
 #
 # Stages:
-#     1. convert_soma_csv_to_motion_lib.py    CSV -> motion_lib PKL
+#     1. convert_soma_csv_to_motion_lib.py    CSV -> motion_lib PKL (+ contact_mask + scene occu)
 #     2. filter_and_copy_bones_data.py        keyword filter
 #     3. pack_motion_lib_to_textop.py         motion_lib -> TextOp format
 #
@@ -23,6 +23,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Project root (TextOp/)
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+MJCF_DIR="${MJCF_DIR:-${PROJECT_ROOT}/TextOpRobotMDAR/description/robots/g1}"
 
 # ---- config ----
 BONES_SEED_DIR="${BONES_SEED_DIR:-/home/lenovo/data/bones-seed}"
@@ -30,8 +33,7 @@ BONES_SEED_DIR="${BONES_SEED_DIR:-/home/lenovo/data/bones-seed}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-data}"
 FPS_TARGET="${FPS_TARGET:-50}"
 FPS_SOURCE="${FPS_SOURCE:-120}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-MJCF_DIR="${MJCF_DIR:-TextOpRobotMDAR/description/robots/g1}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
 VAL_RATIO="${VAL_RATIO:-0.05}"
 SEED="${SEED:-42}"
 
@@ -60,7 +62,8 @@ else
         --fps_source "${FPS_SOURCE}" \
         --individual \
         --num_workers "${NUM_WORKERS}" \
-        --mjcf_dir "${MJCF_DIR}"
+        --mob \
+        --mob_frame_stride 2
     touch "${S1_DONE}"
     echo "  [DONE]"
 fi
@@ -109,8 +112,9 @@ fi
 # ============================================================================
 echo ""
 echo "Pipeline complete."
-echo "  train.pkl : ${S3_OUT}/train.pkl"
-echo "  val.pkl   : ${S3_OUT}/val.pkl"
-echo "  stats     : ${S3_OUT}/statistics.yaml"
+echo "  train.pkl  : ${S3_OUT}/train.pkl"
+echo "  val.pkl    : ${S3_OUT}/val.pkl"
+echo "  stats      : ${S3_OUT}/statistics.yaml"
+echo "  scene occu : inferred pseudo-obstacles (per-motion, in .pkl entries)"
 echo ""
 echo "Next: robotmdar --config-name=train_mvae data.datadir=${S3_OUT} ..."
