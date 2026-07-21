@@ -9,7 +9,7 @@ This is the second stage of the BONES-SEED → TextOp pipeline:
 
   Stage 2: pack_motion_lib_to_textop.py  ← this script
       motion_lib PKL
-      → TextOp train.pkl / val.pkl (23-DOF, list-of-dicts, with frame_ann)
+      → TextOp train.pkl / val.pkl (23-DOF, list-of-dicts)
 
 Usage:
     # Single motion_lib PKL
@@ -35,7 +35,6 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-import torch
 import yaml
 from tqdm import tqdm
 
@@ -108,10 +107,15 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
 
     motion_lib entry (from convert_soma_csv_to_motion_lib.py):
         {
-            "root_trans_offset": ndarray [T, 3],   # meters
-            "root_rot":          ndarray [T, 4],   # xyzw quaternion
-            "dof":               ndarray [T, 29],  # radians, 29-DOF MJCF order
-            "contact_mask":      ndarray [T, 2],   # left/right ∈ {0,1}
+            "root_trans_offset": ndarray [T, 3],    # meters
+            "root_rot":          ndarray [T, 4],    # xyzw quaternion
+            "dof":               ndarray [T, 29],   # radians, 29-DOF MJCF order
+            "contact_mask":      ndarray [T, 2],    # left/right ∈ {0,1}
+            "scene": {                              # optional, from --mob
+                "occu_global":    ndarray [X,Y,Z],
+                "unit":           float,
+                "llb":            ndarray [3],
+            },
             "fps":               int,
             "pose_aa":           ...,               # ignored
             "smpl_joints":       ...,               # ignored
@@ -120,15 +124,19 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
     TextOp format:
         {
             "length": int,
-            "motion": {
+            "motion": {                                        # ← from motion_lib entry
                 "root_trans_offset": ndarray [T, 3],
                 "root_rot":          ndarray [T, 4],
-                "dof":               ndarray [T, 23],  ← cropped
+                "dof":               ndarray [T, 23],         29-DOF → 23-DOF (wrists locked)
                 "contact_mask":      ndarray [T, 2],
                 "fps":               int,
                 "motion_len":        int,
             },
-            "frame_ann": [(0.0, duration_sec, "", [])],
+            "scene": {                                        # inferred pseudo-obstacles
+                "occu_global":       ndarray [X, Y, Z],  bool, 1=occupied (vacant space → obstacle)
+                "unit":              float,               voxel size (m)
+                "llb":               ndarray [3],         float32, world origin
+            },
         }
     """
     dof_29 = entry["dof"]
@@ -138,7 +146,6 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
     dof_23 = dof_29[:, DOF_29_TO_23]                     # (T, 23)
     T = dof_23.shape[0]
     fps_val = entry.get("fps", 50)
-    duration = T / fps_val
 
     return {
         "length": T,
@@ -150,7 +157,9 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
             "fps": fps_val,
             "motion_len": T,
         },
-        "frame_ann": [(0.0, duration, "", [])],
+        # inferred pseudo-obstacles: vacant space treated as occupied
+        # (computed by convert_soma_csv_to_motion_lib.py --mob)
+        "scene": entry.get("scene", {}),
     }
 
 
@@ -167,7 +176,7 @@ def main():
     )
     parser.add_argument(
         "--output", required=True,
-        help="Output directory for train.pkl, val.pkl, statistics.yaml, text_embed.pkl",
+        help="Output directory for train.pkl, val.pkl, statistics.yaml",
     )
     parser.add_argument("--val_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
@@ -239,13 +248,6 @@ def main():
     print(f"Statistics: {stats_path}")
     for k, v in stats.items():
         print(f"  {k}: {v}")
-
-    # ── Empty text embeddings (VAE-only, skip CLIP loading) ──
-    zero_emb = torch.zeros(512, dtype=torch.float32)
-    for split in ["train", "val"]:
-        embed_path = out / f"{split}_text_embed.pkl"
-        torch.save({"": zero_emb}, embed_path)
-        print(f"Empty text embeddings: {embed_path}")
 
     # ── Done ──
     print(f"\nDone. Ready for TextOp VAE training:")
