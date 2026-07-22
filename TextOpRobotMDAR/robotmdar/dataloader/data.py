@@ -21,9 +21,10 @@ import torch
 from torch import nn
 from torch.utils import data
 from tqdm import tqdm
-from robotmdar.model.clip import load_and_freeze_clip, encode_text
+# from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
-from robotmdar.dtype.motion import MotionDict, motion_dict_to_feature, AbsolutePose, motion_feature_to_dict, MotionKeys, FeatureVersion
+from robotmdar.dataloader.conditioning import quaternion_yaw
+from robotmdar.dtype.motion import MotionDict, motion_dict_to_feature, AbsolutePose, motion_feature_to_dict, MotionKeys
 import json
 
 
@@ -50,6 +51,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         num_primitive: int,
         datadir: str,
         action_statistics_path: str,
+        goal_offset: int = 0,
         weighted_sample: bool = False,
         frame_weight: bool = False,
         use_weighted_meanstd: bool = False,
@@ -58,6 +60,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         **kwargs: Any
     ):
         super().__init__()
+        if goal_offset < 0:
+            raise ValueError(f"goal_offset must be non-negative, got {goal_offset}")
 
         # Store parameters
         self.batch_size = batch_size
@@ -70,6 +74,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.segment_len = self.history_len + self.future_len * self.num_primitive + 1
         self.context_len = self.history_len + self.future_len
 
+        self.goal_offset = goal_offset
         self.weighted_sample = weighted_sample
         self.frame_weight = frame_weight
         self.action_statistics_path = action_statistics_path
@@ -111,9 +116,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         # Fix length labels and filter valid samples
         self.valid_indices = []
+        required_length = self.segment_len + self.goal_offset
         for i, item in enumerate(all_data):
             item['length'] = int(item['motion']['motion_len'])
-            if item['length'] >= self.segment_len:
+            # Preserve TextOp's exclusive randint upper bound: max_start > 0
+            if item['length'] > required_length:
                 self.valid_indices.append(i)
 
         self.raw_data = all_data
@@ -124,7 +131,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         logger.info(f" Found {len(self.valid_indices)} valid samples out of {len(self.raw_data)}")
 
         # Load text embeddings
-        self._load_text_embeddings()
+        # DEPRECATED: text embeddings no longer used (goal+scene conditioning).
+        # self._load_text_embeddings()
 
     def _cal_sample_weight(self):
 
@@ -222,47 +230,55 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self.statistics = yaml.safe_load(f)
         self.fps = self.statistics['fps']
 
-    def _load_text_embeddings(self) -> None:
-        """Load or compute text embeddings"""
-        text_embedding_path = self.datadir / f'{self.split}_text_embed.pkl'
-        if text_embedding_path.exists():
-            logger.info(" Loading cached text embeddings...")
-            self.text_embeddings_dict = torch.load(text_embedding_path, map_location="cpu")
-        else:
-            logger.info(" Computing text embeddings...")
-            clip_model = load_and_freeze_clip(
-                clip_version='ViT-B/32', device="cuda" if torch.cuda.is_available() else "cpu"
-            )
-            self.text_embeddings_dict = self._compute_text_embeddings(self.raw_data, clip_model)
-            torch.save(self.text_embeddings_dict, text_embedding_path)
-
-    @staticmethod
-    def _compute_text_embeddings(raw_data: List[Dict[str, Any]],
-                                 clip_model: nn.Module,
-                                 batch_size: int = 64) -> Dict[str, torch.Tensor]:
-        """Compute text embeddings efficiently"""
-        # Extract all unique texts
-        all_texts = set()
-        for item in raw_data:
-            for ann in item['frame_ann']:
-                all_texts.add(ann[2])
-
-        uni_texts = list(all_texts)
-
-        # Batch encode
-        embeddings_list = []
-        for i in range(0, len(uni_texts), batch_size):
-            batch_texts = uni_texts[i:i + batch_size]
-            batch_embeddings = encode_text(clip_model, batch_texts)
-            embeddings_list.append(batch_embeddings.detach().float())
-
-        text_embeddings = torch.cat(embeddings_list, dim=0)
-
-        # Create dictionary
-        text_embeddings_dict = dict(zip(uni_texts, text_embeddings))
-        text_embeddings_dict[''] = torch.zeros_like(text_embeddings[0])
-
-        return text_embeddings_dict
+    # =========================================================================
+    # DEPRECATED: Text embedding loading & computation.
+    # TextOp's original text-conditioned pipeline (CLIP → Denoiser) has been
+    # replaced by goal + scene conditioning per LDM_goal_scene_design.md.
+    # These methods are preserved for reference / future text-based ablation
+    # experiments — DO NOT DELETE. The active code path uses zero tensors
+    # for the embedding slot (see _extract_single_primitive).
+    # =========================================================================
+    # def _load_text_embeddings(self) -> None:
+    #     """Load or compute text embeddings"""
+    #     text_embedding_path = self.datadir / f'{self.split}_text_embed.pkl'
+    #     if text_embedding_path.exists():
+    #         logger.info(" Loading cached text embeddings...")
+    #         self.text_embeddings_dict = torch.load(text_embedding_path, map_location="cpu")
+    #     else:
+    #         logger.info(" Computing text embeddings...")
+    #         clip_model = load_and_freeze_clip(
+    #             clip_version='ViT-B/32', device="cuda" if torch.cuda.is_available() else "cpu"
+    #         )
+    #         self.text_embeddings_dict = self._compute_text_embeddings(self.raw_data, clip_model)
+    #         torch.save(self.text_embeddings_dict, text_embedding_path)
+    #
+    # @staticmethod
+    # def _compute_text_embeddings(raw_data: List[Dict[str, Any]],
+    #                              clip_model: nn.Module,
+    #                              batch_size: int = 64) -> Dict[str, torch.Tensor]:
+    #     """Compute text embeddings efficiently"""
+    #     # Extract all unique texts
+    #     all_texts = set()
+    #     for item in raw_data:
+    #         for ann in item['frame_ann']:
+    #             all_texts.add(ann[2])
+    #
+    #     uni_texts = list(all_texts)
+    #
+    #     # Batch encode
+    #     embeddings_list = []
+    #     for i in range(0, len(uni_texts), batch_size):
+    #         batch_texts = uni_texts[i:i + batch_size]
+    #         batch_embeddings = encode_text(clip_model, batch_texts)
+    #         embeddings_list.append(batch_embeddings.detach().float())
+    #
+    #     text_embeddings = torch.cat(embeddings_list, dim=0)
+    #
+    #     # Create dictionary
+    #     text_embeddings_dict = dict(zip(uni_texts, text_embeddings))
+    #     text_embeddings_dict[''] = torch.zeros_like(text_embeddings[0])
+    #
+    #     return text_embeddings_dict
 
     def _load_meanstd(self) -> None:
         """Load or compute mean/std for normalization"""
@@ -318,7 +334,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             batch_data = self._generate_batch_optimized(generator=torch.Generator().manual_seed(i))
 
             for primitive_idx in range(self.num_primitive):
-                motion_features, _ = batch_data[primitive_idx]
+                motion_features = batch_data[primitive_idx]['motion']
                 motion_sum += motion_features.sum(dim=(0, 1))
                 motion_square_sum += motion_features.square().sum(dim=(0, 1))
                 count += motion_features.shape[0] * motion_features.shape[1]
@@ -335,7 +351,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             primitive_data_list = []
             for start_frame in range(0, num_frames - self.context_len, self.future_len):
                 end_frame = start_frame + self.context_len
-                primitive_data_list.append(self._extract_single_primitive(seq_data, start_frame, end_frame)[0])
+                primitive_data_list.append(self._extract_single_primitive(seq_data, start_frame, end_frame,
+                                            goal_frame=start_frame + self.context_len)['motion'])
 
             primitive_dict = {}
             for key in MotionKeys:
@@ -402,35 +419,40 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             return True
 
     def _extract_single_primitive(self, sample: Dict[str, Any], prim_start: int,
-                                  prim_end: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Extract a single primitive from motion data"""
-        # Extract motion data
+                                  prim_end: int, goal_frame: int) -> Dict[str, Any]:
+        """Extract a single primitive from motion data, plus goal+scene fields.
+
+        Returns a dict with:
+          - motion: raw MotionDict for the primitive window
+          - world_goal_pos / world_goal_yaw: goal in world coordinates
+          - history_start_pos / history_start_rot: primitive start absolute pose
+          - gt_ref_pos / gt_ref_rot: last-history-frame absolute pose (egocentric reference)
+          - scene: per-sequence occupancy grid dict
+        """
         motion_data = {}
         for k in MotionKeys:
             if k in sample['motion']:
                 motion_data[k] = torch.tensor(sample['motion'][k][prim_start:prim_end], dtype=torch.float32)
 
-        # Find text label
-        prim_labels = []
+        reference_frame = prim_start + self.history_len - 1
+        raw_motion = sample['motion']
+        goal_rot = torch.as_tensor(raw_motion['root_rot'][goal_frame])
 
-        # zjk add
-        future_start = prim_start + self.history_len
-        future_end = prim_end - 1
-
-        for ann in sample['frame_ann']:
-            # breakpoint()
-            # if ann[0] * self.fps <= prim_start and ann[1] * self.fps >= prim_start:
-            if self.have_overlap([ann[0] * self.fps, ann[1] * self.fps], [future_start, future_end]):
-                prim_labels.append(ann[2])
-
-        text_label = random.choice(prim_labels) if prim_labels else ''
-        text_embedding = self.text_embeddings_dict.get(text_label, torch.zeros(512))
-
-        return motion_data, text_embedding
+        return {
+            'motion': motion_data,
+            'world_goal_pos': torch.as_tensor(raw_motion['root_trans_offset'][goal_frame], dtype=torch.float32),
+            'world_goal_yaw': quaternion_yaw(goal_rot.float()),
+            'history_start_pos': torch.as_tensor(raw_motion['root_trans_offset'][prim_start], dtype=torch.float32),
+            'history_start_rot': torch.as_tensor(raw_motion['root_rot'][prim_start], dtype=torch.float32),
+            'gt_ref_pos': torch.as_tensor(raw_motion['root_trans_offset'][reference_frame], dtype=torch.float32),
+            'gt_ref_rot': torch.as_tensor(raw_motion['root_rot'][reference_frame], dtype=torch.float32),
+            'scene': sample.get('scene', {}),
+        }
 
     def _generate_motion_primitives(self, sample: Dict[str, Any],
-                                    seg_start: int) -> List[Tuple[Dict[str, torch.Tensor], torch.Tensor]]:
+                                    seg_start: int) -> List[Dict[str, Any]]:
         """Generate all primitives from a single motion segment with proper overlapping"""
+        goal_frame = seg_start + self.segment_len - 1 + self.goal_offset
         primitives = []
 
         for primitive_idx in range(self.num_primitive):
@@ -440,14 +462,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             prim_start = seg_start + primitive_idx * self.future_len
             prim_end = prim_start + self.future_len + self.history_len + 1
 
-            motion_data, text_embedding = self._extract_single_primitive(sample, prim_start, prim_end)
-            primitives.append((motion_data, text_embedding))
+            primitives.append(self._extract_single_primitive(sample, prim_start, prim_end, goal_frame))
 
         return primitives
 
     def _sample_motion_batch(self,
                              generator: Optional[torch.Generator
-                                                ] = None) -> List[List[Tuple[Dict[str, torch.Tensor], torch.Tensor]]]:
+                                                ] = None) -> List[List[Dict[str, Any]]]:
         """Sample a batch of motions and generate all their primitives"""
 
         if not self.weighted_sample:
@@ -464,13 +485,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             sample = self.raw_data[sample_idx]
 
             # Sample segment start ONCE per motion using the generator for reproducibility
-            max_start = sample['length'] - self.segment_len
+            max_start = sample['length'] - self.segment_len - self.goal_offset
 
             # seg_start = int(
             #         torch.randint(0, max_start, (1, ), generator=generator).item())
 
             if self.weighted_sample and self.frame_weight:
-                seg_start = random.choices(range(max_start + 1), weights=sample['frame_weights'], k=1)[0]
+                seg_start = random.choices(range(max_start + 1), weights=sample['frame_weights'][:max_start + 1], k=1)[0]
             else:
                 seg_start = int(torch.randint(0, max_start, (1, ), generator=generator).item())
 
@@ -481,26 +502,44 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         return all_motion_primitives
 
     def _organize_primitives_by_index(
-        self, all_motion_primitives: List[List[Tuple[Dict[str, torch.Tensor], torch.Tensor]]]
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """Organize primitives by primitive index for batching"""
+        self, all_motion_primitives: List[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """Organize primitives by primitive index for batching.
+
+        Returns a list of dicts (one per primitive index), each containing:
+          - motion: normalized VAE features [B, T, nfeats]
+          - scene: list of per-sample occupancy dicts
+          - world_goal_pos, world_goal_yaw, history_start_pos, ...
+        """
+        tensor_keys = (
+            'world_goal_pos', 'world_goal_yaw',
+            'history_start_pos', 'history_start_rot',
+            'gt_ref_pos', 'gt_ref_rot',
+        )
         batch_primitives = []
 
         for primitive_idx in range(self.num_primitive):
-            # Collect motion and text data for this primitive across the batch
+            # Collect motion data for this primitive across the batch
             motion_batch = []
-            text_batch = []
+            primitives = []
 
             for batch_idx in range(self.batch_size):
-                motion_data, text_embedding = all_motion_primitives[batch_idx][primitive_idx]
-                motion_batch.append(motion_data)
-                text_batch.append(text_embedding)
+                primitive = all_motion_primitives[batch_idx][primitive_idx]
+                motion_batch.append(primitive['motion'])
+                primitives.append(primitive)
 
             # Convert to tensors and motion features
             motion_features = self._convert_to_motion_features(motion_batch)
-            text_features = torch.stack(text_batch)
 
-            batch_primitives.append((self.normalize(motion_features), text_features))
+            batch = {
+                'motion': self.normalize(motion_features),
+                'scene': [p['scene'] for p in primitives],
+            }
+            batch.update({
+                key: torch.stack([p[key] for p in primitives])
+                for key in tensor_keys
+            })
+            batch_primitives.append(batch)
 
         return batch_primitives
 
@@ -517,7 +556,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _generate_batch_optimized(self,
                                   generator: Optional[torch.Generator
-                                                     ] = None) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+                                                     ] = None) -> List[Dict[str, Any]]:
         """Generate a batch using motion-first approach"""
         # Step 1: Sample motions and generate all their primitives
         all_motion_primitives = self._sample_motion_batch(generator)

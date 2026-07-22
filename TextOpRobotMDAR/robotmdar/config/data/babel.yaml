@@ -3,12 +3,14 @@ skeleton: ${..skeleton}
 nfeats: 57 # 57 69 205 222 currently we hardcode here
 history_len: 2
 future_len: 8
-num_primitive: 8
+num_primitive: 4
 batch_size: 512
 
 weighted_sample: false
 frame_weight: false
 use_weighted_meanstd: false
+goal_offset: 0
+occupancy_unit: 0.08
 
 action_statistics_path: ./dataset/action_statistics_telemotion.json
 
@@ -46,6 +48,7 @@ common: &common
   weighted_sample: ${..weighted_sample}
   frame_weight: ${..frame_weight}
   use_weighted_meanstd: ${..use_weighted_meanstd}
+  goal_offset: ${..goal_offset}
 
 train:
   <<: *common

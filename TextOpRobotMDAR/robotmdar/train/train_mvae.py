@@ -107,8 +107,7 @@ def main(cfg: DictConfig):
         prev_motion = None
         for pidx in range(num_primitive):
             manager.pre_step()
-            motion, cond = batch[pidx]
-            motion, cond = motion.to(device), cond.to(device)
+            motion = batch[pidx]['motion'].to(cfg.device)
 
             future_motion_gt = motion[:, -future_len:, :]
             gt_history = motion[:, :history_len, :]
@@ -160,8 +159,7 @@ def main(cfg: DictConfig):
             batch = next(val_dataiter)
             for pidx in range(num_primitive):
                 manager.pre_step(is_eval=True)
-                motion, cond = batch[pidx]
-                motion, cond = motion.to(device), cond.to(device)
+                motion = batch[pidx]['motion'].to(cfg.device)
 
                 future_motion_gt = motion[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]

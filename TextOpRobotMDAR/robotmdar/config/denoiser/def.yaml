@@ -5,9 +5,11 @@ num_layers: 8
 num_heads: 4
 dropout: 0.1
 activation: gelu
-clip_dim: 512
-history_shape: 
+history_shape:
   - 2
-  - ${...nfeats} 
+  - ${...nfeats}
 noise_shape: [1, 128]
-cond_mask_prob: 0.1
+goal_dim: 5
+grid_size: 25
+cond_goal_mask_prob: 0.1
+cond_scene_mask_prob: 0.1

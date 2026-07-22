@@ -4,12 +4,61 @@ import torch.distributed as dist
 from omegaconf import DictConfig
 from hydra.utils import instantiate
 
+from robotmdar.dataloader.conditioning import (
+    build_ego_goal,
+    query_local_occupancy,
+)
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
 
 from robotmdar.train.manager import DARManager, is_main_process, get_ddp_model
 
-USE_VAE = True
+
+def _pose_dict(position: torch.Tensor, rotation: torch.Tensor):
+    return {"root_trans_offset": position, "root_rot": rotation}
+
+
+def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
+    goal = build_ego_goal(
+        primitive['world_goal_pos'].to(cfg.device),
+        primitive['world_goal_yaw'].to(cfg.device),
+        reference_pos,
+        reference_rot,
+    )
+    voxel = query_local_occupancy(
+        primitive['scene'],
+        reference_pos,
+        reference_rot,
+        grid_size=cfg.denoiser.grid_size,
+        grid_unit=cfg.data.occupancy_unit,
+    )
+    return {
+        'goal': goal,
+        'voxel': voxel,
+        'history_motion_normalized': history_motion,
+    }
+
+
+def _next_rollout_poses(dataset, motion, history_start_pos, history_start_rot, history_len):
+    with torch.no_grad():
+        reconstructed = dataset.reconstruct_motion(
+            motion,
+            abs_pose=_pose_dict(history_start_pos, history_start_rot),
+            ret_fk=False,
+        )
+    return (
+        reconstructed['root_trans_offset'][:, -history_len].detach(),
+        reconstructed['root_rot'][:, -history_len].detach(),
+        reconstructed['root_trans_offset'][:, -1].detach(),
+        reconstructed['root_rot'][:, -1].detach(),
+    )
+
+
+def _detach_mapping(values):
+    return {
+        key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in values.items()
+    }
 
 
 def ddp_setup():
@@ -39,6 +88,11 @@ def main(cfg: DictConfig):
 
     seed.set(cfg.seed + rank)
     logger.set(cfg)
+    if cfg.train.manager.use_static_pose:
+        raise ValueError(
+            "Static-pose replacement has no world reference pose and is not "
+            "supported by goal+scene training"
+        )
 
     # Override device in config for downstream components
     cfg.device = str(device)
@@ -90,60 +144,64 @@ def main(cfg: DictConfig):
         batch = next(train_dataiter)
 
         prev_motion = None
+        rollout_history_start_pos = None
+        rollout_history_start_rot = None
+        rollout_ref_pos = None
+        rollout_ref_rot = None
+
         for pidx in range(num_primitive):
             manager.pre_step()
-            motion, cond = batch[pidx]
-            motion, cond = motion.to(device), cond.to(device)
+            primitive = batch[pidx]
+            motion = primitive['motion'].to(cfg.device)
 
             future_motion_gt = motion[:, -future_len:, :]
             gt_history = motion[:, :history_len, :]
 
             # 使用统一的history选择函数
-            history_motion = manager.choose_history(gt_history, prev_motion,
-                                                    history_len)
+            history_motion, used_rollout = manager.choose_history(
+                gt_history, prev_motion, history_len, return_rollout=True)
+
+            if used_rollout:
+                history_start_pos = rollout_history_start_pos
+                history_start_rot = rollout_history_start_rot
+                reference_pos = rollout_ref_pos
+                reference_rot = rollout_ref_rot
+            else:
+                history_start_pos = primitive['history_start_pos'].to(cfg.device)
+                history_start_rot = primitive['history_start_rot'].to(cfg.device)
+                reference_pos = primitive['gt_ref_pos'].to(cfg.device)
+                reference_rot = primitive['gt_ref_rot'].to(cfg.device)
+
+            y = _conditions(primitive, reference_pos, reference_rot, history_motion, cfg)
 
             # Sample timesteps
             batch_size = motion.shape[0]
             t, weights = schedule_sampler.sample(batch_size, device=device)
 
-            if USE_VAE:
-                # Encode using VAE
-                latent_gt, _ = vae.encode(
-                    future_motion=future_motion_gt,
-                    history_motion=history_motion
-                )  # [T=1, B, D]   latent_gt: (1, 512, 128)
+            # Encode using VAE
+            latent_gt, _ = vae.encode(
+                future_motion=future_motion_gt,
+                history_motion=history_motion
+            )  # [T=1, B, D]   latent_gt: (1, 512, 128)
 
-                x_start = latent_gt.permute(1, 0, 2)  # [B, T=1, D]
-            else:
-                latent_gt = None
-                x_start = torch.cat((history_motion, future_motion_gt), dim=1)
+            x_start = latent_gt.permute(1, 0, 2)  # [B, T=1, D]
 
             # Forward diffusion
-
             x_t = diffusion.q_sample(x_start=x_start,
                                      t=t,
                                      noise=torch.randn_like(x_start))
 
             # Denoise
-            y = {
-                'text_embedding':
-                cond,  # cond is already the text_embedding tensor
-                'history_motion_normalized': history_motion,
-            }
             x_start_pred = denoiser(x_t=x_t,
                                     timesteps=diffusion._scale_timesteps(t),
                                     y=y)  # [B, T=1, D]
-            # breakpoint()
-            if USE_VAE:
-                latent_pred = x_start_pred.permute(1, 0, 2)  # [T=1, B, D]
 
-                # Decode
-                future_motion_pred = vae.decode(
-                    latent_pred, history_motion,
-                    nfuture=future_len)  # [B, F, D], normalized
-            else:
-                latent_pred = None
-                future_motion_pred = x_start_pred[:, -future_len:]
+            latent_pred = x_start_pred.permute(1, 0, 2)  # [T=1, B, D]
+
+            # Decode
+            future_motion_pred = vae.decode(
+                latent_pred, history_motion,
+                nfuture=future_len)  # [B, F, D], normalized
 
             # Calculate loss
             loss_dict, extras = manager.calc_loss(
@@ -173,48 +231,37 @@ def main(cfg: DictConfig):
                 optimizer.step()
 
             # 更新prev_motion，如果启用full sample则使用更高质量的采样
+            rollout_future = future_motion_pred
             if manager.should_use_full_sample():
                 with torch.no_grad():
                     # 使用完整的DDPM采样循环来生成更高质量的rollout history
-                    sample_fn = diffusion.p_sample_loop
-                    x_start_full = sample_fn(
+                    denoiser.eval()
+                    x_start_full = diffusion.p_sample_loop(
                         denoiser,
                         x_start.shape,
                         clip_denoised=False,
-                        model_kwargs={'y':
-                                      y},  # Wrap y in the expected structure
-                        skip_timesteps=0,
-                        init_image=None,
+                        model_kwargs={'y': y},
                         progress=False,
-                        dump_steps=None,
-                        noise=None,
-                        const_noise=False,
                     )
-                    # 确保x_start_full是tensor并转换维度
-                    if isinstance(x_start_full, torch.Tensor):
-                        latent_full = x_start_full.permute(1, 0,
-                                                           2)  # [T=1, B, D]
-                    else:
-                        # 如果返回的是其他格式，直接使用原始预测
-                        latent_full = latent_pred
-                    future_motion_full = vae.decode(latent_full,
-                                                    history_motion,
-                                                    nfuture=future_len)
-                    prev_motion = torch.cat(
-                        [history_motion, future_motion_full], dim=1).detach()
-            else:
-                prev_motion = torch.cat([history_motion, future_motion_pred],
-                                        dim=1).detach()
+                    denoiser.train()
+                    rollout_future = vae.decode(
+                        x_start_full.permute(1, 0, 2),
+                        history_motion,
+                        nfuture=future_len,
+                    )
+
+            prev_motion = torch.cat(
+                [history_motion, rollout_future], dim=1).detach()
+            (rollout_history_start_pos, rollout_history_start_rot,
+             rollout_ref_pos, rollout_ref_rot) = _next_rollout_poses(
+                train_data, prev_motion,
+                history_start_pos, history_start_rot, history_len)
+
             manager.post_step(
                 is_eval=False,
-                loss_dict={
-                    k: v.detach().cpu()
-                    for k, v in loss_dict.items()
-                },
-                extras={
-                    k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
-                    for k, v in extras.items()
-                })
+                loss_dict=_detach_mapping(loss_dict),
+                extras=_detach_mapping(extras),
+            )
 
         # Validation loop
         denoiser.eval()
@@ -222,49 +269,41 @@ def main(cfg: DictConfig):
             batch = next(val_dataiter)
             for pidx in range(num_primitive):
                 manager.pre_step(is_eval=True)
-                motion, cond = batch[pidx]
-                motion, cond = motion.to(device), cond.to(device)
+                primitive = batch[pidx]
+                motion = primitive['motion'].to(cfg.device)
 
                 future_motion_gt = motion[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]
+                y = _conditions(
+                    primitive,
+                    primitive['gt_ref_pos'].to(cfg.device),
+                    primitive['gt_ref_rot'].to(cfg.device),
+                    history_motion,
+                    cfg,
+                )
 
                 with torch.no_grad():
                     t, weights = schedule_sampler.sample(motion.shape[0],
                                                          device=device)
 
-                    if USE_VAE:
-                        latent_gt, _ = vae.encode(
-                            future_motion=future_motion_gt,
-                            history_motion=history_motion)
-                        # Forward diffusion
-                        x_start = latent_gt.permute(1, 0, 2)  # [B, T=1, D]
-                    else:
-                        latent_gt = None
-                        x_start = torch.cat((history_motion, future_motion_gt),
-                                            dim=1)
+                    latent_gt, _ = vae.encode(
+                        future_motion=future_motion_gt,
+                        history_motion=history_motion)
+                    # Forward diffusion
+                    x_start = latent_gt.permute(1, 0, 2)  # [B, T=1, D]
 
                     x_t = diffusion.q_sample(x_start=x_start,
                                              t=t,
                                              noise=torch.randn_like(x_start))
 
-                    y = {
-                        'text_embedding':
-                        cond,  # cond is already the text_embedding tensor
-                        'history_motion_normalized': history_motion,
-                    }
                     x_start_pred = denoiser(
                         x_t=x_t, timesteps=diffusion._scale_timesteps(t), y=y)
 
-                    if USE_VAE:
-                        latent_pred = x_start_pred.permute(1, 0, 2)
+                    latent_pred = x_start_pred.permute(1, 0, 2)
 
-                        future_motion_pred = vae.decode(latent_pred,
-                                                        history_motion,
-                                                        nfuture=future_len)
-
-                    else:
-                        latent_pred = None
-                        future_motion_pred = x_start_pred[:, -future_len:]
+                    future_motion_pred = vae.decode(latent_pred,
+                                                    history_motion,
+                                                    nfuture=future_len)
 
                     loss_dict, extras = manager.calc_loss(
                         future_motion_gt,
@@ -277,12 +316,6 @@ def main(cfg: DictConfig):
 
                 manager.post_step(
                     is_eval=True,
-                    loss_dict={
-                        k: v.detach().cpu()
-                        for k, v in loss_dict.items()
-                    },
-                    extras={
-                        k:
-                        v.detach().cpu() if isinstance(v, torch.Tensor) else v
-                        for k, v in extras.items()
-                    })
+                    loss_dict=_detach_mapping(loss_dict),
+                    extras=_detach_mapping(extras),
+                )

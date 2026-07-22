@@ -99,7 +99,12 @@ class BaseManager(ABC):
 
     def pre_step(self, is_eval: bool = False) -> None:
         """每步训练前调用"""
-        self.stage_idx = torch.searchsorted(self._stage_steps, self.step, out_int32=True).item()  # type:ignore
+        self.stage_idx = min(
+            torch.searchsorted(
+                self._stage_steps, self.step, right=True, out_int32=True
+            ).item(),
+            len(self.stages) - 1,
+        )  # type:ignore
         self.extra['stage'] = self.stage_idx
 
         if not self._tqdm and is_main_process():
@@ -287,17 +292,22 @@ class BaseManager(ABC):
         Returns:
             True if should use static pose, False otherwise
         """
-        if self.stage_idx < 2 and not self.use_static_pose:
+        if not self.use_static_pose or self.stage_idx < 2:
             return False
-        prob = min(1.0, (self.step - self.stages[1]) / max(float(self.stages[2]), 1e-6)) * self.static_prob
+        stage_start = self.stages[0] + self.stages[1]
+        prob = min(
+            1.0,
+            (self.step - stage_start) / max(float(self.stages[2]), 1e-6),
+        ) * self.static_prob
         return torch.rand(1).item() < prob
 
     def choose_history(
         self,
         gt_history: torch.Tensor,
         prev_motion: Optional[torch.Tensor] = None,
-        history_len: Optional[int] = None
-    ) -> torch.Tensor:
+        history_len: Optional[int] = None,
+        return_rollout: bool = False,
+    ):
         """
         统一的history选择函数
         Args:
@@ -311,7 +321,8 @@ class BaseManager(ABC):
             history_len = gt_history.shape[1]
 
         # 1. 检查是否使用rollout history
-        if prev_motion is not None and self.should_rollout():
+        used_rollout = prev_motion is not None and self.should_rollout()
+        if used_rollout:
             history_motion = prev_motion[:, -history_len:, :]
         else:
             # 使用ground truth history
@@ -327,6 +338,8 @@ class BaseManager(ABC):
                 zero_feature = perturb_feature_v3(zero_feature, perturbation_scale)
             history_motion = self.dataset.normalize(zero_feature)
 
+        if return_rollout:
+            return history_motion, used_rollout
         return history_motion
 
     @abstractmethod
