@@ -3,7 +3,7 @@ skeleton: ${..skeleton}
 nfeats: 57 # 57 69 205 222 currently we hardcode here
 history_len: 2
 future_len: 8
-num_primitive: 8
+num_primitive: 4
 batch_size: 512
 
 weighted_sample: false

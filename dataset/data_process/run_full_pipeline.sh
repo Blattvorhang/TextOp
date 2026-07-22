@@ -44,8 +44,8 @@ S2_OUT="${OUTPUT_ROOT}/motion_lib_filtered"
 S2_DONE="${S2_OUT}/.done"
 S3_OUT="${OUTPUT_ROOT}/g1_textop"
 S3_DONE="${S3_OUT}/.done"
-S4_OUT="${OUTPUT_ROOT}/RobotMDAR-statistics"
-S4_DONE="${S4_OUT}/.done"
+S4_OUT="${OUTPUT_ROOT}/g1_textop"
+S4_DONE="${S4_OUT}/.done_stats"
 
 # ============================================================================
 #  Stage 1: CSV -> motion_lib PKL
@@ -139,6 +139,11 @@ echo "  statistics.yaml         : ${S3_OUT}/statistics.yaml"
 echo "  action_statistics.json  : ${S4_OUT}/action_statistics.json"
 echo "  scene occu              : inferred pseudo-obstacles (per-motion, in .pkl entries)"
 echo "  frame_ann               : coarse action categories (per-sequence, in .pkl entries)"
+echo ""
+# symlink into robotmdar dataset dir
+ln -sfn "$(realpath "${S3_OUT}")" "${PROJECT_ROOT}/TextOpRobotMDAR/dataset/BONES-SEED-23dof-FULL-50fps"
+echo "  symlink: ${PROJECT_ROOT}/TextOpRobotMDAR/dataset/BONES-SEED-23dof-FULL-50fps -> ${S3_OUT}"
+
 echo ""
 echo "Next:"
 echo "  robotmdar --config-name=train_mvae \\"

@@ -8,16 +8,15 @@ manager:
     - 50000
     - 50000
     - 50000
-    - 150000
 
-  use_rollout: False     # True
-  use_static_pose: False   # True 
+  use_rollout: True
+  use_static_pose: False
 
   static_prob: 0.001
   static_perturbation_scale: 0.0
 
   # Full DDPM sampling settings
-  use_full_sample: False   # True
+  use_full_sample: True   # True
 
   save_every: 20000
   eval_every: 2000
@@ -64,4 +63,3 @@ manager:
   platform:
     _target_: robotmdar.train.train_platforms.TensorboardPlatform
     save_dir: ${..save_dir}
-

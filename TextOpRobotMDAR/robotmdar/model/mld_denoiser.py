@@ -7,15 +7,26 @@ import loralib as lora
 
 
 class DenoiserMLP(nn.Module):
+    # =========================================================================
+    # NOTE: DenoiserMLP is NOT currently used — the active config
+    # (config/denoiser/def.yaml) uses DenoiserTransformer.  The MLP is kept as
+    # a lighter alternative for ablations / memory-constrained runs.  It is
+    # fully wired for goal + scene conditioning and will work out of the box
+    # if you switch the config's _target_ to this class and add the matching
+    # keys (goal_dim, grid_size, cond_goal_mask_prob, cond_scene_mask_prob).
+    # =========================================================================
 
     def __init__(self,
                  h_dim=512,
                  n_blocks=2,
                  dropout: float = 0.1,
                  activation="gelu",
-                 # clip_dim=512,  # DEPRECATED: text→goal+scene, kept for checkpoint compat
                  history_shape=(2, 276),
                  noise_shape=(1, 128),
+                 goal_dim=5,
+                 grid_size=25,
+                 cond_goal_mask_prob=0.1,
+                 cond_scene_mask_prob=0.1,
                  **kargs):
         super().__init__()
         self.h_dim = h_dim
@@ -25,20 +36,24 @@ class DenoiserMLP(nn.Module):
 
         self.history_shape = history_shape
         self.noise_shape = noise_shape
-        # self.clip_dim = clip_dim  # DEPRECATED: text→goal+scene
-
-        # probability of masking the conditional text
-        self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
-        print('cond_mask_prob:', self.cond_mask_prob)
+        self.goal_dim = goal_dim
+        self.grid_size = grid_size
+        self.scene_dim = grid_size**3
+        self.cond_goal_mask_prob = cond_goal_mask_prob
+        self.cond_scene_mask_prob = cond_scene_mask_prob
 
         self.sequence_pos_encoder = PositionalEncoding(self.h_dim,
                                                        self.dropout)
         self.embed_timestep = TimestepEmbedder(self.h_dim,
                                                self.sequence_pos_encoder)
-        # DEPRECATED: clip_dim removed from input — text embedding no longer used.
-        # When goal+scene embeddings are added, expand input_dim accordingly.
-        input_dim = self.h_dim + np.prod(
-            history_shape) + np.prod(noise_shape)
+
+        self.embed_goal = nn.Linear(self.goal_dim, self.h_dim)
+        self.embed_scene = nn.Linear(self.scene_dim, self.h_dim)
+        self.embed_history = nn.Linear(self.history_shape[-1], self.h_dim)
+        self.embed_noise = nn.Linear(self.noise_shape[-1], self.h_dim)
+
+        # input: time + goal + scene + history + noise → all projected to h_dim
+        input_dim = self.h_dim * 5
         self.input_project = nn.Linear(input_dim, self.h_dim)
 
         self.mlp = MLPBlock(h_dim=h_dim,
@@ -46,54 +61,54 @@ class DenoiserMLP(nn.Module):
                             n_blocks=n_blocks,
                             actfun=activation)
 
-    # DEPRECATED: no CLIP model to exclude from parameter groups.
-    # def parameters_wo_clip(self):
-    #     return [
-    #         p for name, p in self.named_parameters()
-    #         if not name.startswith('clip_model.')
-    #     ]
-
-    def mask_cond(self, cond, force_mask=False):
-        bs, d = cond.shape
+    def mask_condition(self, cond, probability, force_mask=False):
+        """Independent Bernoulli dropout for goal / scene conditions."""
         if force_mask:
             return torch.zeros_like(cond)
-        elif self.training and self.cond_mask_prob > 0.:
+        if self.training and probability > 0.:
             mask = torch.bernoulli(
-                torch.ones(bs, device=cond.device) * self.cond_mask_prob).view(
-                    bs, 1)  # 1-> use null_cond, 0-> use real cond
+                torch.full((cond.shape[0], 1), probability, device=cond.device)
+            )
             return cond * (1. - mask)
-        else:
-            return cond
+        return cond
 
     def forward(self, x_t, timesteps, y=None):
         """
         x_t: [B, T=1, D]
         timesteps: [batch_size] (int)
+        y: dict with keys 'goal' [B, 5], 'voxel' [B, grid_size³],
+           'history_motion_normalized' [B, T_hist, nfeats]
         """
+        if y is None:
+            raise ValueError(
+                "Goal+scene denoiser requires a condition dictionary"
+            )
+
         batch_size = x_t.shape[0]
+
         emb_time = self.embed_timestep(timesteps).squeeze(0)  # [bs, h_dim]
-        emb_history = y['history_motion_normalized'].reshape(
-            batch_size, np.prod(self.history_shape))  # [bs, History * nfeats]
 
-        # DEPRECATED: text_embedding no longer used (goal+scene conditioning replaces it).
-        # mask_cond() is preserved for future goal/scene condition dropout.
-        # force_mask = y.get('uncond', False)
-        # emb_text = self.mask_cond(y['text_embedding'],
-        #                           force_mask=force_mask)  # [bs, clip_dim]
+        goal = self.mask_condition(
+            y['goal'], self.cond_goal_mask_prob,
+            force_mask=y.get('force_drop_goal', False))
+        voxel = self.mask_condition(
+            y['voxel'], self.cond_scene_mask_prob,
+            force_mask=y.get('force_drop_scene', False))
+        emb_goal = self.embed_goal(goal)     # [bs, h_dim]
+        emb_scene = self.embed_scene(voxel)  # [bs, h_dim]
 
-        emb_noise = x_t.reshape(batch_size,
-                                np.prod(self.noise_shape))  # [bs, noise_dim]
-        # print('emb_time shape:', emb_time.shape, 'emb_text shape:', emb_text.shape, 'emb_history shape:', emb_history.shape, 'emb_noise shape:', emb_noise.shape)
+        emb_history = self.embed_history(
+            y['history_motion_normalized'].reshape(
+                batch_size, self.history_shape[-1]))  # [bs, h_dim]
 
-        # DEPRECATED: emb_text removed from concat. When goal+scene tokens are added,
-        # insert emb_goal and emb_scene here.
-        input_embed = torch.cat((emb_time, emb_history, emb_noise),
-                                dim=1)  # [bs, input_dim]
+        emb_noise = self.embed_noise(
+            x_t.reshape(batch_size, self.noise_shape[-1]))  # [bs, h_dim]
+
+        input_embed = torch.cat(
+            (emb_time, emb_goal, emb_scene, emb_history, emb_noise), dim=1
+        )  # [bs, input_dim]
         output = self.mlp(self.input_project(input_embed))  # [bs, noise_dim]
-        output = output.reshape(
-            batch_size,
-            *self.noise_shape)  # [B, noise_shape[0], noise_shape[1]]
-        # print('output shape:', output.shape)
+        output = output.reshape(batch_size, *self.noise_shape)
 
         return output
 
@@ -107,10 +122,13 @@ class DenoiserTransformer(nn.Module):
                  num_heads=4,
                  dropout=0.1,
                  activation="gelu",
-                 # clip_dim=512,  # DEPRECATED: text→goal+scene, kept for checkpoint compat
                  history_shape=(2, 276),
                  noise_shape=(1, 128),
-                 use_vae = True,
+                 goal_dim=5,
+                 grid_size=25,
+                 cond_goal_mask_prob=0.1,
+                 cond_scene_mask_prob=0.1,
+                 use_vae=True,
                  **kargs):
         super().__init__()
         self.h_dim = h_dim
@@ -122,9 +140,11 @@ class DenoiserTransformer(nn.Module):
 
         self.history_shape = history_shape
         self.noise_shape = noise_shape
-        # self.clip_dim = clip_dim  # DEPRECATED: text→goal+scene
-
-        self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
+        self.goal_dim = goal_dim
+        self.grid_size = grid_size
+        self.scene_dim = grid_size**3
+        self.cond_goal_mask_prob = cond_goal_mask_prob
+        self.cond_scene_mask_prob = cond_scene_mask_prob
 
         # input embeddings
         self.sequence_pos_encoder = PositionalEncoding(self.h_dim,
@@ -132,13 +152,8 @@ class DenoiserTransformer(nn.Module):
         self.embed_timestep = TimestepEmbedder(self.h_dim,
                                                self.sequence_pos_encoder)
 
-        # DEPRECATED: text embedding replaced by goal+scene conditioning.
-        # When goal+scene embeddings are added per LDM_goal_scene_design.md §3.1:
-        #   self.embed_goal  = nn.Linear(goal_dim, self.h_dim)    # goal_dim = 5
-        #   self.embed_scene = nn.Linear(grid_dim, self.h_dim)    # grid_dim = 15625
-        # self.embed_text = nn.Linear(self.clip_dim, self.h_dim)
-        # self.embed_text = nn.Sequential(nn.ReLU(), nn.Linear(self.clip_dim, self.h_dim))
-
+        self.embed_goal = nn.Linear(self.goal_dim, self.h_dim)
+        self.embed_scene = nn.Linear(self.scene_dim, self.h_dim)
         self.embed_history = nn.Linear(self.history_shape[-1], self.h_dim)
         self.embed_noise = nn.Linear(self.noise_shape[-1], self.h_dim)
 
@@ -156,51 +171,42 @@ class DenoiserTransformer(nn.Module):
         # output projection
         self.output_process = nn.Linear(self.h_dim, self.noise_shape[-1])
 
-    # DEPRECATED: no CLIP model to exclude from parameter groups.
-    # def parameters_wo_clip(self):
-    #     return [
-    #         p for name, p in self.named_parameters()
-    #         if not name.startswith('clip_model.')
-    #     ]
-
-    def mask_cond(self, cond, force_mask=False):
-        bs, d = cond.shape
+    def mask_condition(self, cond, probability, force_mask=False):
         if force_mask:
             return torch.zeros_like(cond)
-        elif self.training and self.cond_mask_prob > 0.:
-            # print('masking cond')
+        if self.training and probability > 0.:
             mask = torch.bernoulli(
-                torch.ones(bs, device=cond.device) * self.cond_mask_prob).view(
-                    bs, 1)  # 1-> use null_cond, 0-> use real cond
+                torch.full((cond.shape[0], 1), probability,
+                           device=cond.device)
+            )
             return cond * (1. - mask)
-        else:
-            return cond
+        return cond
 
     def forward(self, x_t, timesteps, y=None):
         """
         x_t: [B, T=1, D]
         timesteps: [batch_size] (int)
         """
+        if y is None:
+            raise ValueError("Goal+scene denoiser requires a condition dictionary")
+
         emb_time = self.embed_timestep(timesteps)  # [1, bs, d]
+        goal = self.mask_condition(
+            y['goal'], self.cond_goal_mask_prob,
+            force_mask=y.get('force_drop_goal', False))
+        voxel = self.mask_condition(
+            y['voxel'], self.cond_scene_mask_prob,
+            force_mask=y.get('force_drop_scene', False))
+        emb_goal = self.embed_goal(goal).unsqueeze(0)
+        emb_scene = self.embed_scene(voxel).unsqueeze(0)
         emb_history = self.embed_history(
             y['history_motion_normalized']).permute(1, 0,
                                                     2)  # [History, bs, d]
-
-        # DEPRECATED: text_embedding no longer used (goal+scene conditioning replaces it).
-        # mask_cond() is preserved for future goal/scene condition dropout (§3.2).
-        # force_mask = y.get('uncond', False)
-        # emb_text = self.embed_text(
-        #     self.mask_cond(y['text_embedding'],
-        #                    force_mask=force_mask)).unsqueeze(0)  # [1, bs, d]
-
         emb_noise = self.embed_noise(x_t).permute(1, 0, 2)  # [1, bs, d]
-        # print('emb_time shape:', emb_time.shape, 'emb_text shape:', emb_text.shape, 'emb_history shape:', emb_history.shape, 'emb_noise shape:', emb_noise.shape)
 
-        # DEPRECATED: emb_text removed from xseq. When goal+scene tokens are added
-        # per LDM_goal_scene_design.md §3.1:
-        #   xseq = torch.cat((emb_time, emb_goal, emb_scene, emb_history, emb_noise), dim=0)
-        xseq = torch.cat((emb_time, emb_history, emb_noise), dim=0)
-        # print('xseq shape:', xseq.shape)
+        xseq = torch.cat(
+            (emb_time, emb_goal, emb_scene, emb_history, emb_noise), dim=0
+        )
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqTransEncoder(xseq)[
             -self.noise_shape[0]:]  # [1, bs, h_dim]
