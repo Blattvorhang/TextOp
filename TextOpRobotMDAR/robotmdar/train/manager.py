@@ -32,6 +32,37 @@ def get_ddp_model(model):
     return model
 
 
+def ddp_reduce_mean(tensor_dict: dict) -> dict:
+    """All-reduce mean across all DDP ranks for each tensor in the dict.
+
+    Returns a new dict where every tensor value is the average across all ranks.
+    Skips non-tensor values unchanged.
+    Handles both CPU and CUDA tensors (NCCL requires CUDA tensors).
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return tensor_dict
+
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return tensor_dict
+
+    reduced = {}
+    for k, v in tensor_dict.items():
+        if isinstance(v, torch.Tensor):
+            was_cpu = v.device.type == 'cpu'
+            if was_cpu:
+                v = v.cuda()
+            v_reduced = v.clone().detach()
+            dist.all_reduce(v_reduced, op=dist.ReduceOp.SUM)
+            v_reduced = v_reduced / world_size
+            if was_cpu:
+                v_reduced = v_reduced.cpu()
+            reduced[k] = v_reduced
+        else:
+            reduced[k] = v
+    return reduced
+
+
 class BaseManager(ABC):
     """
     Abstract base class for training managers.
@@ -135,29 +166,27 @@ class BaseManager(ABC):
                 self._total_eval_loss_dict[k] += v
             for k, v in extras.items():
                 self._total_eval_extras_dict[k] += v
-            if self._to_eval_steps == 0 and is_main_process():
-                # 报告 loss 到 "loss" group
-                for k, v in self._total_eval_loss_dict.items():
-                    self.platform.report_scalar(
-                        "eval_" + k, v.cpu().numpy() / self.eval_steps, self.step, group_name="loss"
+            if self._to_eval_steps == 0:
+                # All-reduce accumulated eval metrics across all DDP ranks
+                reduced_loss = ddp_reduce_mean(self._total_eval_loss_dict)
+                reduced_extras = ddp_reduce_mean(self._total_eval_extras_dict)
+                if is_main_process():
+                    for k, v in reduced_loss.items():
+                        self.platform.report_scalar(
+                            "eval_" + k, v.cpu().numpy() / self.eval_steps, self.step, group_name="loss"
+                        )
+                    for k, v in reduced_extras.items():
+                        self.platform.report_scalar(
+                            "eval_" + k, (v.cpu().numpy() / self.eval_steps) if isinstance(v, torch.Tensor) else
+                            (v / self.eval_steps),
+                            self.step,
+                            group_name="extras"
+                        )
+                    tqdm.write(
+                        f"Eval finished at step {self.step} with loss * {self.eval_steps}: {dict(reduced_loss)}"
                     )
-                # 报告 extras 到 "extras" group
-                for k, v in self._total_eval_extras_dict.items():
-                    self.platform.report_scalar(
-                        "eval_" + k, (v.cpu().numpy() / self.eval_steps) if isinstance(v, torch.Tensor) else
-                        (v / self.eval_steps),
-                        self.step,
-                        group_name="extras"
-                    )
-                tqdm.write(
-                    f"Eval finished at step {self.step} with loss * {self.eval_steps}: {dict(self._total_eval_loss_dict)}"
-                )
-                if self._total_eval_extras_dict:
-                    tqdm.write(f"Eval extras * {self.eval_steps}: {dict(self._total_eval_extras_dict)}")
-                self._total_eval_loss_dict = defaultdict(lambda: torch.tensor(0.0))
-                self._total_eval_extras_dict = defaultdict(lambda: torch.tensor(0.0))
-            elif self._to_eval_steps == 0:
-                # Non-rank-0: just reset the accumulators without logging
+                    if self._total_eval_extras_dict:
+                        tqdm.write(f"Eval extras * {self.eval_steps}: {dict(reduced_extras)}")
                 self._total_eval_loss_dict = defaultdict(lambda: torch.tensor(0.0))
                 self._total_eval_extras_dict = defaultdict(lambda: torch.tensor(0.0))
             return
@@ -171,6 +200,9 @@ class BaseManager(ABC):
         if self.step >= self.max_steps and self._tqdm is not None:
             self._tqdm.close()
 
+        # Train loss: log per-rank values directly (no all-reduce).
+        # Per-rank loss is close to the global average — the trend is what matters.
+        # all-reduce on every step would add ~50ms NCCL overhead per 10+ scalar keys.
         if is_main_process():
             for k, v in loss_dict.items():
                 self.platform.report_scalar("train_" + k, v.cpu().numpy(), self.step, group_name="loss")
@@ -774,17 +806,18 @@ class DARManager(BaseManager, GeometryLoss):
                 try:
                     # Hard Link, not soft link. It should be more safe
                     os.link(self.ckpt.vae, cache_vae_path)
+                    logger.info(f"VAE cached to {cache_vae_path}")
+                    if is_main_process():
+                        vae_src_path = self.save_dir / "vae_src.log"
+                        with open(vae_src_path, "w") as f:
+                            f.write(str(self.ckpt.vae))
                 except OSError as e:
-                    # If self.ckpt.vae and cache_vae_path lie in different filesystem,
-                    # it will raise error.
-                    if e.errno in (errno.EXDEV, errno.EPERM, errno.EACCES):
-                        shutil.copy2(self.ckpt.vae, cache_vae_path)
+                    # FileExistsError (EEXIST): another DDP rank already cached it — OK to skip
+                    # EXDEV/EPERM/EACCES: cross-filesystem link not allowed — fallback to copy
+                    if e.errno in (errno.EEXIST, errno.EXDEV, errno.EPERM, errno.EACCES):
+                        pass
                     else:
                         raise
-                logger.info(f"VAE cached to {cache_vae_path}")
-                vae_src_path = self.save_dir / "vae_src.log"
-                with open(vae_src_path, "w") as f:
-                    f.write(str(self.ckpt.vae))
             else:
                 logger.warning(f"Save dir {self.save_dir} not exists, skip caching VAE")
                 cache_vae_path = Path(self.ckpt.vae)

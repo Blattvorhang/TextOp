@@ -76,7 +76,9 @@ def main(cfg: DictConfig):
 
     if world_size > 1:
         vae = torch.nn.parallel.DistributedDataParallel(
-            vae, device_ids=[local_rank], output_device=local_rank
+            vae, device_ids=[local_rank], output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
         )
         if is_main_process():
             print(f"[DDP] Using DistributedDataParallel with {world_size} GPUs")

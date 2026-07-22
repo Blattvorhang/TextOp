@@ -52,19 +52,22 @@ echo "Master port: ${MASTER_PORT}"
 # Scale stages by NUM_GPUS: DDP sees NUM_GPUS × batch_size samples per step,
 # so each step is equivalent to NUM_GPUS single-GPU steps.
 # Original: [100000, 50000, 50000] → scaled: ÷ NUM_GPUS
-STAGE0=$((100000 / NUM_GPUS))
-STAGE1=$((50000 / NUM_GPUS))
-STAGE2=$((50000 / NUM_GPUS))
+SCALE_FACTOR=4
+STAGE0=$((100000 / NUM_GPUS * SCALE_FACTOR))
+STAGE1=$((50000 / NUM_GPUS * SCALE_FACTOR))
+STAGE2=$((50000 / NUM_GPUS * SCALE_FACTOR))
 TOTAL_STEPS=$((STAGE0 + STAGE1 + STAGE2))
 
 # Scale save/eval frequency proportionally
-SAVE_EVERY=$((20000 / NUM_GPUS))
-EVAL_EVERY=$((2000 / NUM_GPUS))
+SAVE_EVERY=$((20000 / NUM_GPUS * SCALE_FACTOR))
+EVAL_EVERY=$((2000 / NUM_GPUS * SCALE_FACTOR))
 
 echo "Scaled for ${NUM_GPUS} GPUs:"
 echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
 echo "  save_every:  ${SAVE_EVERY}"
 echo "  eval_every:  ${EVAL_EVERY}"
+
+DATADIR=BONES-SEED-23dof-FULL-50fps
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 torchrun \
@@ -72,13 +75,13 @@ torchrun \
     --master_port=${MASTER_PORT} \
     -m robotmdar.cli \
     --config-name=train_mvae \
-    expname=BONES-SEED-VAE \
+    expname=BONES-SEED-GOAL \
     timestamp=${TIMESTAMP} \
-    data.datadir=/home/hanyi/workspace/TextOp/g1_packed \
+    data.datadir=./dataset/${DATADIR} \
     data.num_primitive=4 \
     data.batch_size=512 \
     data.weighted_sample=false \
-    data.action_statistics_path=./dataset/dummy_action_stats.json \
+    data.action_statistics_path=./dataset/${DATADIR}/action_statistics.json \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \
     train.manager.save_every=${SAVE_EVERY} \
     train.manager.eval_every=${EVAL_EVERY} \

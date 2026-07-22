@@ -113,11 +113,16 @@ def main(cfg: DictConfig):
 
     if world_size > 1:
         denoiser = torch.nn.parallel.DistributedDataParallel(
-            denoiser, device_ids=[local_rank], output_device=local_rank
+            denoiser, device_ids=[local_rank], output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
         )
-        # Note: VAE is frozen during DAR training, so it doesn't need DDP wrapping
         if is_main_process():
             print(f"[DDP] Using DistributedDataParallel with {world_size} GPUs")
+
+    # Keep raw denoiser reference for inference-only paths (p_sample_loop)
+    # where DDP wrapper overhead is unnecessary and eval/train toggles are costly.
+    denoiser_raw = get_ddp_model(denoiser)
 
     schedule_sampler: SSampler = instantiate(cfg.diffusion.schedule_sampler)
     diffusion: Diffusion = schedule_sampler.diffusion
@@ -204,6 +209,9 @@ def main(cfg: DictConfig):
                 nfuture=future_len)  # [B, F, D], normalized
 
             # Calculate loss
+            # Note: y dict is mutated inside denoiser.forward() to add
+            # goal_condition_keep_mask, but DDP kwargs handling may prevent
+            # the mutation from propagating back. Use .get() as a safe fallback.
             loss_dict, extras = manager.calc_loss(
                 future_motion_gt,
                 future_motion_pred,
@@ -213,7 +221,7 @@ def main(cfg: DictConfig):
                 weights,
                 history_motion=history_motion,  # dist=None for DAR
                 ego_goal=y['goal'],
-                goal_condition_keep_mask=y['goal_condition_keep_mask'],
+                goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
             )
             loss = loss_dict['total']
 
@@ -236,21 +244,23 @@ def main(cfg: DictConfig):
             rollout_future = future_motion_pred
             if manager.should_use_full_sample():
                 with torch.no_grad():
-                    # 使用完整的DDPM采样循环来生成更高质量的rollout history
-                    denoiser.eval()
+                    # Use raw denoiser for p_sample_loop to avoid DDP wrapper
+                    # overhead. no_grad already skips gradient sync; eval mode is
+                    # only needed to disable dropout during sampling.
+                    denoiser_raw.eval()
                     x_start_full = diffusion.p_sample_loop(
-                        denoiser,
+                        denoiser_raw,
                         x_start.shape,
                         clip_denoised=False,
                         model_kwargs={'y': y},
                         progress=False,
                     )
-                    denoiser.train()
                     rollout_future = vae.decode(
                         x_start_full.permute(1, 0, 2),
                         history_motion,
                         nfuture=future_len,
                     )
+                denoiser_raw.train()  # restore train mode for next primitive
 
             prev_motion = torch.cat(
                 [history_motion, rollout_future], dim=1).detach()
@@ -316,7 +326,7 @@ def main(cfg: DictConfig):
                         weights,
                         history_motion=history_motion,
                         ego_goal=y['goal'],
-                        goal_condition_keep_mask=y['goal_condition_keep_mask'])
+                        goal_condition_keep_mask=y.get('goal_condition_keep_mask'))
 
                 manager.post_step(
                     is_eval=True,
