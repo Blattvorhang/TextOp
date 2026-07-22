@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import clip
+# import clip
 import loralib as lora
 
 
@@ -13,7 +13,7 @@ class DenoiserMLP(nn.Module):
                  n_blocks=2,
                  dropout: float = 0.1,
                  activation="gelu",
-                 clip_dim=512,
+                 # clip_dim=512,  # DEPRECATED: text→goal+scene, kept for checkpoint compat
                  history_shape=(2, 276),
                  noise_shape=(1, 128),
                  **kargs):
@@ -25,7 +25,7 @@ class DenoiserMLP(nn.Module):
 
         self.history_shape = history_shape
         self.noise_shape = noise_shape
-        self.clip_dim = clip_dim
+        # self.clip_dim = clip_dim  # DEPRECATED: text→goal+scene
 
         # probability of masking the conditional text
         self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
@@ -35,7 +35,9 @@ class DenoiserMLP(nn.Module):
                                                        self.dropout)
         self.embed_timestep = TimestepEmbedder(self.h_dim,
                                                self.sequence_pos_encoder)
-        input_dim = self.h_dim + self.clip_dim + np.prod(
+        # DEPRECATED: clip_dim removed from input — text embedding no longer used.
+        # When goal+scene embeddings are added, expand input_dim accordingly.
+        input_dim = self.h_dim + np.prod(
             history_shape) + np.prod(noise_shape)
         self.input_project = nn.Linear(input_dim, self.h_dim)
 
@@ -44,11 +46,12 @@ class DenoiserMLP(nn.Module):
                             n_blocks=n_blocks,
                             actfun=activation)
 
-    def parameters_wo_clip(self):
-        return [
-            p for name, p in self.named_parameters()
-            if not name.startswith('clip_model.')
-        ]
+    # DEPRECATED: no CLIP model to exclude from parameter groups.
+    # def parameters_wo_clip(self):
+    #     return [
+    #         p for name, p in self.named_parameters()
+    #         if not name.startswith('clip_model.')
+    #     ]
 
     def mask_cond(self, cond, force_mask=False):
         bs, d = cond.shape
@@ -71,14 +74,20 @@ class DenoiserMLP(nn.Module):
         emb_time = self.embed_timestep(timesteps).squeeze(0)  # [bs, h_dim]
         emb_history = y['history_motion_normalized'].reshape(
             batch_size, np.prod(self.history_shape))  # [bs, History * nfeats]
-        force_mask = y.get('uncond', False)
-        emb_text = self.mask_cond(y['text_embedding'],
-                                  force_mask=force_mask)  # [bs, clip_dim]
+
+        # DEPRECATED: text_embedding no longer used (goal+scene conditioning replaces it).
+        # mask_cond() is preserved for future goal/scene condition dropout.
+        # force_mask = y.get('uncond', False)
+        # emb_text = self.mask_cond(y['text_embedding'],
+        #                           force_mask=force_mask)  # [bs, clip_dim]
+
         emb_noise = x_t.reshape(batch_size,
                                 np.prod(self.noise_shape))  # [bs, noise_dim]
         # print('emb_time shape:', emb_time.shape, 'emb_text shape:', emb_text.shape, 'emb_history shape:', emb_history.shape, 'emb_noise shape:', emb_noise.shape)
 
-        input_embed = torch.cat((emb_time, emb_text, emb_history, emb_noise),
+        # DEPRECATED: emb_text removed from concat. When goal+scene tokens are added,
+        # insert emb_goal and emb_scene here.
+        input_embed = torch.cat((emb_time, emb_history, emb_noise),
                                 dim=1)  # [bs, input_dim]
         output = self.mlp(self.input_project(input_embed))  # [bs, noise_dim]
         output = output.reshape(
@@ -98,7 +107,7 @@ class DenoiserTransformer(nn.Module):
                  num_heads=4,
                  dropout=0.1,
                  activation="gelu",
-                 clip_dim=512,
+                 # clip_dim=512,  # DEPRECATED: text→goal+scene, kept for checkpoint compat
                  history_shape=(2, 276),
                  noise_shape=(1, 128),
                  use_vae = True,
@@ -113,7 +122,7 @@ class DenoiserTransformer(nn.Module):
 
         self.history_shape = history_shape
         self.noise_shape = noise_shape
-        self.clip_dim = clip_dim
+        # self.clip_dim = clip_dim  # DEPRECATED: text→goal+scene
 
         self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
 
@@ -122,8 +131,12 @@ class DenoiserTransformer(nn.Module):
                                                        self.dropout)
         self.embed_timestep = TimestepEmbedder(self.h_dim,
                                                self.sequence_pos_encoder)
-        
-        self.embed_text = nn.Linear(self.clip_dim, self.h_dim)
+
+        # DEPRECATED: text embedding replaced by goal+scene conditioning.
+        # When goal+scene embeddings are added per LDM_goal_scene_design.md §3.1:
+        #   self.embed_goal  = nn.Linear(goal_dim, self.h_dim)    # goal_dim = 5
+        #   self.embed_scene = nn.Linear(grid_dim, self.h_dim)    # grid_dim = 15625
+        # self.embed_text = nn.Linear(self.clip_dim, self.h_dim)
         # self.embed_text = nn.Sequential(nn.ReLU(), nn.Linear(self.clip_dim, self.h_dim))
 
         self.embed_history = nn.Linear(self.history_shape[-1], self.h_dim)
@@ -143,11 +156,12 @@ class DenoiserTransformer(nn.Module):
         # output projection
         self.output_process = nn.Linear(self.h_dim, self.noise_shape[-1])
 
-    def parameters_wo_clip(self):
-        return [
-            p for name, p in self.named_parameters()
-            if not name.startswith('clip_model.')
-        ]
+    # DEPRECATED: no CLIP model to exclude from parameter groups.
+    # def parameters_wo_clip(self):
+    #     return [
+    #         p for name, p in self.named_parameters()
+    #         if not name.startswith('clip_model.')
+    #     ]
 
     def mask_cond(self, cond, force_mask=False):
         bs, d = cond.shape
@@ -171,14 +185,21 @@ class DenoiserTransformer(nn.Module):
         emb_history = self.embed_history(
             y['history_motion_normalized']).permute(1, 0,
                                                     2)  # [History, bs, d]
-        force_mask = y.get('uncond', False)
-        emb_text = self.embed_text(
-            self.mask_cond(y['text_embedding'],
-                           force_mask=force_mask)).unsqueeze(0)  # [1, bs, d]
+
+        # DEPRECATED: text_embedding no longer used (goal+scene conditioning replaces it).
+        # mask_cond() is preserved for future goal/scene condition dropout (§3.2).
+        # force_mask = y.get('uncond', False)
+        # emb_text = self.embed_text(
+        #     self.mask_cond(y['text_embedding'],
+        #                    force_mask=force_mask)).unsqueeze(0)  # [1, bs, d]
+
         emb_noise = self.embed_noise(x_t).permute(1, 0, 2)  # [1, bs, d]
         # print('emb_time shape:', emb_time.shape, 'emb_text shape:', emb_text.shape, 'emb_history shape:', emb_history.shape, 'emb_noise shape:', emb_noise.shape)
 
-        xseq = torch.cat((emb_time, emb_text, emb_history, emb_noise), dim=0)
+        # DEPRECATED: emb_text removed from xseq. When goal+scene tokens are added
+        # per LDM_goal_scene_design.md §3.1:
+        #   xseq = torch.cat((emb_time, emb_goal, emb_scene, emb_history, emb_noise), dim=0)
+        xseq = torch.cat((emb_time, emb_history, emb_noise), dim=0)
         # print('xseq shape:', xseq.shape)
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqTransEncoder(xseq)[

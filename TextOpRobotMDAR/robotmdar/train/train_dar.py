@@ -78,9 +78,13 @@ def main(cfg: DictConfig):
                                      noise=torch.randn_like(x_start))
 
             # Denoise
+            # DEPRECATED: 'text_embedding' replaced by goal+scene conditioning.
+            # cond from dataloader is now torch.zeros(512) placeholder.
+            # When goal+scene embeddings are added per LDM_goal_scene_design.md,
+            # replace with: 'goal': ego_goal, 'voxel': occu_crop
             y = {
-                'text_embedding':
-                cond,  # cond is already the text_embedding tensor
+                # 'text_embedding':
+                # cond,  # cond is the text_embedding tensor (now zero placeholder)
                 'history_motion_normalized': history_motion,
             }
             x_start_pred = denoiser(x_t=x_t,
@@ -199,9 +203,10 @@ def main(cfg: DictConfig):
                                              t=t,
                                              noise=torch.randn_like(x_start))
 
+                    # DEPRECATED: 'text_embedding' replaced by goal+scene conditioning.
                     y = {
-                        'text_embedding':
-                        cond,  # cond is already the text_embedding tensor
+                        # 'text_embedding':
+                        # cond,  # cond is the text_embedding tensor (now zero placeholder)
                         'history_motion_normalized': history_motion,
                     }
                     x_start_pred = denoiser(

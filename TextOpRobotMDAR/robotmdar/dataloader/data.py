@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from torch.utils import data
 from tqdm import tqdm
-from robotmdar.model.clip import load_and_freeze_clip, encode_text
+# from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
 from robotmdar.dtype.motion import MotionDict, motion_dict_to_feature, AbsolutePose, motion_feature_to_dict, MotionKeys, FeatureVersion
 import json
@@ -120,7 +120,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         logger.info(f" Found {len(self.valid_indices)} valid samples out of {len(self.raw_data)}")
 
         # Load text embeddings
-        self._load_text_embeddings()
+        # DEPRECATED: text embeddings no longer used (goal+scene conditioning).
+        # self._load_text_embeddings()
 
     def _cal_sample_weight(self):
 
@@ -218,47 +219,55 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self.statistics = yaml.safe_load(f)
         self.fps = self.statistics['fps']
 
-    def _load_text_embeddings(self) -> None:
-        """Load or compute text embeddings"""
-        text_embedding_path = self.datadir / f'{self.split}_text_embed.pkl'
-        if text_embedding_path.exists():
-            logger.info(" Loading cached text embeddings...")
-            self.text_embeddings_dict = torch.load(text_embedding_path, map_location="cpu")
-        else:
-            logger.info(" Computing text embeddings...")
-            clip_model = load_and_freeze_clip(
-                clip_version='ViT-B/32', device="cuda" if torch.cuda.is_available() else "cpu"
-            )
-            self.text_embeddings_dict = self._compute_text_embeddings(self.raw_data, clip_model)
-            torch.save(self.text_embeddings_dict, text_embedding_path)
-
-    @staticmethod
-    def _compute_text_embeddings(raw_data: List[Dict[str, Any]],
-                                 clip_model: nn.Module,
-                                 batch_size: int = 64) -> Dict[str, torch.Tensor]:
-        """Compute text embeddings efficiently"""
-        # Extract all unique texts
-        all_texts = set()
-        for item in raw_data:
-            for ann in item['frame_ann']:
-                all_texts.add(ann[2])
-
-        uni_texts = list(all_texts)
-
-        # Batch encode
-        embeddings_list = []
-        for i in range(0, len(uni_texts), batch_size):
-            batch_texts = uni_texts[i:i + batch_size]
-            batch_embeddings = encode_text(clip_model, batch_texts)
-            embeddings_list.append(batch_embeddings.detach().float())
-
-        text_embeddings = torch.cat(embeddings_list, dim=0)
-
-        # Create dictionary
-        text_embeddings_dict = dict(zip(uni_texts, text_embeddings))
-        text_embeddings_dict[''] = torch.zeros_like(text_embeddings[0])
-
-        return text_embeddings_dict
+    # =========================================================================
+    # DEPRECATED: Text embedding loading & computation.
+    # TextOp's original text-conditioned pipeline (CLIP → Denoiser) has been
+    # replaced by goal + scene conditioning per LDM_goal_scene_design.md.
+    # These methods are preserved for reference / future text-based ablation
+    # experiments — DO NOT DELETE. The active code path uses zero tensors
+    # for the embedding slot (see _extract_single_primitive).
+    # =========================================================================
+    # def _load_text_embeddings(self) -> None:
+    #     """Load or compute text embeddings"""
+    #     text_embedding_path = self.datadir / f'{self.split}_text_embed.pkl'
+    #     if text_embedding_path.exists():
+    #         logger.info(" Loading cached text embeddings...")
+    #         self.text_embeddings_dict = torch.load(text_embedding_path, map_location="cpu")
+    #     else:
+    #         logger.info(" Computing text embeddings...")
+    #         clip_model = load_and_freeze_clip(
+    #             clip_version='ViT-B/32', device="cuda" if torch.cuda.is_available() else "cpu"
+    #         )
+    #         self.text_embeddings_dict = self._compute_text_embeddings(self.raw_data, clip_model)
+    #         torch.save(self.text_embeddings_dict, text_embedding_path)
+    #
+    # @staticmethod
+    # def _compute_text_embeddings(raw_data: List[Dict[str, Any]],
+    #                              clip_model: nn.Module,
+    #                              batch_size: int = 64) -> Dict[str, torch.Tensor]:
+    #     """Compute text embeddings efficiently"""
+    #     # Extract all unique texts
+    #     all_texts = set()
+    #     for item in raw_data:
+    #         for ann in item['frame_ann']:
+    #             all_texts.add(ann[2])
+    #
+    #     uni_texts = list(all_texts)
+    #
+    #     # Batch encode
+    #     embeddings_list = []
+    #     for i in range(0, len(uni_texts), batch_size):
+    #         batch_texts = uni_texts[i:i + batch_size]
+    #         batch_embeddings = encode_text(clip_model, batch_texts)
+    #         embeddings_list.append(batch_embeddings.detach().float())
+    #
+    #     text_embeddings = torch.cat(embeddings_list, dim=0)
+    #
+    #     # Create dictionary
+    #     text_embeddings_dict = dict(zip(uni_texts, text_embeddings))
+    #     text_embeddings_dict[''] = torch.zeros_like(text_embeddings[0])
+    #
+    #     return text_embeddings_dict
 
     def _load_meanstd(self) -> None:
         """Load or compute mean/std for normalization"""
@@ -406,21 +415,34 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             if k in sample['motion']:
                 motion_data[k] = torch.tensor(sample['motion'][k][prim_start:prim_end], dtype=torch.float32)
 
-        # Find text label
-        prim_labels = []
+        # =====================================================================
+        # DEPRECATED: Text label lookup + CLIP embedding → replaced by zero tensor.
+        # The original code looked up frame_ann[2] (text description) for the
+        # overlapping region, then fetched its CLIP embedding from
+        # self.text_embeddings_dict. Now replaced by a zero tensor placeholder.
+        #
+        # When goal+scene conditioning is fully implemented per
+        # LDM_goal_scene_design.md, the return signature should change to
+        # include ego_goal (5-dim) and occupancy voxel (15625-dim) instead of
+        # the 512-dim zero tensor.
+        # =====================================================================
+        # # Find text label
+        # prim_labels = []
+        #
+        # # zjk add
+        # future_start = prim_start + self.history_len
+        # future_end = prim_end - 1
+        #
+        # for ann in sample['frame_ann']:
+        #     # breakpoint()
+        #     # if ann[0] * self.fps <= prim_start and ann[1] * self.fps >= prim_start:
+        #     if self.have_overlap([ann[0] * self.fps, ann[1] * self.fps], [future_start, future_end]):
+        #         prim_labels.append(ann[2])
+        #
+        # text_label = random.choice(prim_labels) if prim_labels else ''
+        # text_embedding = self.text_embeddings_dict.get(text_label, torch.zeros(512))
 
-        # zjk add
-        future_start = prim_start + self.history_len
-        future_end = prim_end - 1
-
-        for ann in sample['frame_ann']:
-            # breakpoint()
-            # if ann[0] * self.fps <= prim_start and ann[1] * self.fps >= prim_start:
-            if self.have_overlap([ann[0] * self.fps, ann[1] * self.fps], [future_start, future_end]):
-                prim_labels.append(ann[2])
-
-        text_label = random.choice(prim_labels) if prim_labels else ''
-        text_embedding = self.text_embeddings_dict.get(text_label, torch.zeros(512))
+        text_embedding = torch.zeros(512)  # DEPRECATED: placeholder for text
 
         return motion_data, text_embedding
 

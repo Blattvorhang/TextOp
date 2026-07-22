@@ -3,9 +3,9 @@ h_dim: 512
 n_blocks: 2
 dropout: 0.1
 activation: gelu
-clip_dim: 512
-history_shape: 
+# clip_dim: 512
+history_shape:
   - 2
-  - ${...nfeats} 
+  - ${...nfeats}
 noise_shape: [1, 128]
 cond_mask_prob: 0.1
