@@ -103,19 +103,21 @@ TARGET_MASS = {
     # ---- Stage 4: Scene interaction (~7%) ----
     "sit":       1.5,
 
-    # ---- De-emphasized: hard to track or occupancy-invisible (~11%) ----
-    "jump":      0.5,
-    "climb":     0.5,
-    "push":      0.5,
-    "carry":     0.5,
-    "reach":     0.5,
-    "fall":      0.3,
+    # ---- De-emphasized: hard to track or occupancy-invisible (~6%) ----
+    # Masses are calibrated so that training share ≈ natural data share
+    # (no unintended boost for rare-but-deemphasized categories).
+    "jump":      0.5,    # 7.93% data — already suppressed
+    "climb":     0.02,   # 0.10% data — don't boost, keep near-natural share
+    "push":      0.5,    # 2.09% data — roughly neutral
+    "carry":     0.5,    # 6.56% data — already suppressed
+    "reach":     0.2,    # 0.90% data — mild suppression
+    "fall":      0.15,   # 0.73% data — mild suppression
 
     # ---- Suppressed: irrelevant to navigation (~15%) ----
     "gesture":   1.0,
     "dance":     0.5,
     "injured":   0.5,
-    "sport":     0.3,
+    "sport":     0.15,   # 0.75% data — mild suppression
     "crutch":    0.2,
     "other":     0.5,
 }

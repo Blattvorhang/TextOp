@@ -211,7 +211,9 @@ def main(cfg: DictConfig):
                 None,
                 latent_pred,
                 weights,
-                history_motion=history_motion  # dist=None for DAR
+                history_motion=history_motion,  # dist=None for DAR
+                ego_goal=y['goal'],
+                goal_condition_keep_mask=y['goal_condition_keep_mask'],
             )
             loss = loss_dict['total']
 
@@ -312,7 +314,9 @@ def main(cfg: DictConfig):
                         None,
                         latent_pred,
                         weights,
-                        history_motion=history_motion)
+                        history_motion=history_motion,
+                        ego_goal=y['goal'],
+                        goal_condition_keep_mask=y['goal_condition_keep_mask'])
 
                 manager.post_step(
                     is_eval=True,

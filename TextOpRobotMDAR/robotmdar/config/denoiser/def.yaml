@@ -12,4 +12,4 @@ noise_shape: [1, 128]
 goal_dim: 5
 grid_size: 25
 cond_goal_mask_prob: 0.1
-cond_scene_mask_prob: 0.1
+cond_scene_mask_prob: 0.8
