@@ -42,6 +42,7 @@ manager:
     dof_pos: 0.03
     dof_vel: 1e-5
     foot_contact: 0.01
+    goal_direction: 0.01
 
     fk_joints_rec: 1.0
     joints_consistency: 1.0

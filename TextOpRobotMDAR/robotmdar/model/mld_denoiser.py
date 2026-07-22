@@ -61,16 +61,24 @@ class DenoiserMLP(nn.Module):
                             n_blocks=n_blocks,
                             actfun=activation)
 
-    def mask_condition(self, cond, probability, force_mask=False):
+    def mask_condition(self, cond, probability, force_mask=False,
+                       return_keep_mask=False):
         """Independent Bernoulli dropout for goal / scene conditions."""
         if force_mask:
-            return torch.zeros_like(cond)
-        if self.training and probability > 0.:
-            mask = torch.bernoulli(
+            keep_mask = torch.zeros(cond.shape[0], dtype=torch.bool,
+                                    device=cond.device)
+        elif self.training and probability > 0.:
+            drop_mask = torch.bernoulli(
                 torch.full((cond.shape[0], 1), probability, device=cond.device)
-            )
-            return cond * (1. - mask)
-        return cond
+            ).bool()
+            keep_mask = ~drop_mask.squeeze(-1)
+        else:
+            keep_mask = torch.ones(cond.shape[0], dtype=torch.bool,
+                                   device=cond.device)
+        masked_cond = cond * keep_mask.unsqueeze(-1)
+        if return_keep_mask:
+            return masked_cond, keep_mask
+        return masked_cond
 
     def forward(self, x_t, timesteps, y=None):
         """
@@ -88,9 +96,11 @@ class DenoiserMLP(nn.Module):
 
         emb_time = self.embed_timestep(timesteps).squeeze(0)  # [bs, h_dim]
 
-        goal = self.mask_condition(
+        goal, goal_keep_mask = self.mask_condition(
             y['goal'], self.cond_goal_mask_prob,
-            force_mask=y.get('force_drop_goal', False))
+            force_mask=y.get('force_drop_goal', False),
+            return_keep_mask=True)
+        y['goal_condition_keep_mask'] = goal_keep_mask
         voxel = self.mask_condition(
             y['voxel'], self.cond_scene_mask_prob,
             force_mask=y.get('force_drop_scene', False))
@@ -171,16 +181,24 @@ class DenoiserTransformer(nn.Module):
         # output projection
         self.output_process = nn.Linear(self.h_dim, self.noise_shape[-1])
 
-    def mask_condition(self, cond, probability, force_mask=False):
+    def mask_condition(self, cond, probability, force_mask=False,
+                       return_keep_mask=False):
         if force_mask:
-            return torch.zeros_like(cond)
-        if self.training and probability > 0.:
-            mask = torch.bernoulli(
+            keep_mask = torch.zeros(cond.shape[0], dtype=torch.bool,
+                                    device=cond.device)
+        elif self.training and probability > 0.:
+            drop_mask = torch.bernoulli(
                 torch.full((cond.shape[0], 1), probability,
                            device=cond.device)
-            )
-            return cond * (1. - mask)
-        return cond
+            ).bool()
+            keep_mask = ~drop_mask.squeeze(-1)
+        else:
+            keep_mask = torch.ones(cond.shape[0], dtype=torch.bool,
+                                   device=cond.device)
+        masked_cond = cond * keep_mask.unsqueeze(-1)
+        if return_keep_mask:
+            return masked_cond, keep_mask
+        return masked_cond
 
     def forward(self, x_t, timesteps, y=None):
         """
@@ -191,9 +209,11 @@ class DenoiserTransformer(nn.Module):
             raise ValueError("Goal+scene denoiser requires a condition dictionary")
 
         emb_time = self.embed_timestep(timesteps)  # [1, bs, d]
-        goal = self.mask_condition(
+        goal, goal_keep_mask = self.mask_condition(
             y['goal'], self.cond_goal_mask_prob,
-            force_mask=y.get('force_drop_goal', False))
+            force_mask=y.get('force_drop_goal', False),
+            return_keep_mask=True)
+        y['goal_condition_keep_mask'] = goal_keep_mask
         voxel = self.mask_condition(
             y['voxel'], self.cond_scene_mask_prob,
             force_mask=y.get('force_drop_scene', False))

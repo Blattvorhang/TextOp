@@ -804,7 +804,9 @@ class DARManager(BaseManager, GeometryLoss):
         dist=None,
         latent_pred=None,
         weights=None,
-        history_motion=None
+        history_motion=None,
+        ego_goal=None,
+        goal_condition_keep_mask=None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         terms = {}
         extras = {}
@@ -863,6 +865,15 @@ class DARManager(BaseManager, GeometryLoss):
         terms.update(geometry_terms)
         extras.update(geometry_extras)
 
+        if self.loss_weight.get('goal_direction', 0.0) > 0.0:
+            if ego_goal is None:
+                raise ValueError(
+                    "ego_goal is required when goal_direction loss is enabled"
+                )
+            terms['goal_direction'] = self.calc_goal_direction_loss(
+                future_motion_pred, ego_goal, goal_condition_keep_mask
+            )
+
         total_loss = sum(self.loss_weight[k] * v for k, v in terms.items())
 
         # diffusion训练时可加权
@@ -871,6 +882,48 @@ class DARManager(BaseManager, GeometryLoss):
 
         terms['total'] = total_loss
         return terms, extras
+
+    def calc_goal_direction_loss(self, future_motion_pred, ego_goal,
+                                 goal_condition_keep_mask=None):
+        """Align predicted horizontal root displacement with the ego goal."""
+        if FeatureVersion != 3:
+            raise NotImplementedError(
+                "goal_direction loss currently supports FeatureVersion 3 only"
+            )
+
+        future_motion = self.dataset.denormalize(future_motion_pred)
+        delta_yaw = future_motion[..., 4]
+        relative_yaw = torch.cat(
+            (torch.zeros_like(delta_yaw[:, :1]), delta_yaw[:, :-1]), dim=1
+        ).cumsum(dim=1)
+        cos_yaw = torch.cos(relative_yaw)
+        sin_yaw = torch.sin(relative_yaw)
+        delta_xy = future_motion[..., 7:9]
+        delta_xy_start_frame = torch.stack(
+            (
+                delta_xy[..., 0] * cos_yaw - delta_xy[..., 1] * sin_yaw,
+                delta_xy[..., 0] * sin_yaw + delta_xy[..., 1] * cos_yaw,
+            ),
+            dim=-1,
+        )
+        root_displacement = delta_xy_start_frame.sum(dim=1)
+        goal_direction = ego_goal[..., :2]
+        goal_distance = goal_direction.norm(dim=-1)
+        valid = goal_distance > 0.1
+        if goal_condition_keep_mask is not None:
+            valid = valid & goal_condition_keep_mask.to(
+                device=valid.device, dtype=torch.bool
+            )
+        if not valid.any():
+            return future_motion_pred.sum() * 0.0
+
+        # A 5 cm denominator floor keeps useful gradients for near-zero motion
+        # without the instability of cosine similarity at zero displacement.
+        displacement_norm = root_displacement.norm(dim=-1).clamp_min(0.05)
+        goal_norm = goal_distance.clamp_min(0.05)
+        cosine = (root_displacement * goal_direction).sum(dim=-1)
+        cosine = (cosine / (displacement_norm * goal_norm)).clamp(-1.0, 1.0)
+        return (1.0 - cosine[valid]).mean()
 
     def save_model(self) -> None:
         save_path = self.save_dir / f"ckpt_{self.step}.pth"
