@@ -15,7 +15,8 @@
 # Stages:
 #     1. convert_soma_csv_to_motion_lib.py    CSV -> motion_lib PKL (+ contact_mask + scene occu)
 #     2. filter_and_copy_bones_data.py        keyword filter
-#     3. pack_motion_lib_to_textop.py         motion_lib -> TextOp format
+#     3. pack_motion_lib_to_textop.py         motion_lib -> TextOp format (+ coarse frame_ann)
+#     4. cal_weighted_statistics.py           generate action_statistics.json for weighted_sample
 #
 # Each stage writes a .done marker so the pipeline can be safely restarted
 # after a failure -- completed stages are skipped.
@@ -43,12 +44,14 @@ S2_OUT="${OUTPUT_ROOT}/motion_lib_filtered"
 S2_DONE="${S2_OUT}/.done"
 S3_OUT="${OUTPUT_ROOT}/g1_textop"
 S3_DONE="${S3_OUT}/.done"
+S4_OUT="${OUTPUT_ROOT}/RobotMDAR-statistics"
+S4_DONE="${S4_OUT}/.done"
 
 # ============================================================================
 #  Stage 1: CSV -> motion_lib PKL
 # ============================================================================
 echo ""
-echo "Stage 1/3: convert_soma_csv_to_motion_lib.py"
+echo "Stage 1/4: convert_soma_csv_to_motion_lib.py"
 echo "  Input : ${BONES_SEED_DIR}/g1/csv"
 echo "  Output: ${S1_OUT}"
 
@@ -72,7 +75,7 @@ fi
 #  Stage 2: keyword filter
 # ============================================================================
 echo ""
-echo "Stage 2/3: filter_and_copy_bones_data.py"
+echo "Stage 2/4: filter_and_copy_bones_data.py"
 echo "  Input : ${S1_OUT}"
 echo "  Output: ${S2_OUT}"
 
@@ -91,7 +94,7 @@ fi
 #  Stage 3: motion_lib -> TextOp format
 # ============================================================================
 echo ""
-echo "Stage 3/3: pack_motion_lib_to_textop.py"
+echo "Stage 3/4: pack_motion_lib_to_textop.py"
 echo "  Input : ${S2_OUT}"
 echo "  Output: ${S3_OUT}"
 
@@ -108,13 +111,38 @@ else
 fi
 
 # ============================================================================
+#  Stage 4: action_statistics.json for weighted_sample
+# ============================================================================
+echo ""
+echo "Stage 4/4: cal_weighted_statistics.py"
+echo "  Input : ${S3_OUT}/train.pkl"
+echo "  Output: ${S4_OUT}/action_statistics.json"
+
+if [ -f "${S4_DONE}" ]; then
+    echo "  [SKIP] already done"
+else
+    python3 "${SCRIPT_DIR}/cal_weighted_statistics.py" \
+        --data_folder "${S3_OUT}" \
+        --trg_filename "${S4_OUT}/action_statistics.json"
+    touch "${S4_DONE}"
+    echo "  [DONE]"
+fi
+
+# ============================================================================
 #  Summary
 # ============================================================================
 echo ""
 echo "Pipeline complete."
-echo "  train.pkl  : ${S3_OUT}/train.pkl"
-echo "  val.pkl    : ${S3_OUT}/val.pkl"
-echo "  stats      : ${S3_OUT}/statistics.yaml"
-echo "  scene occu : inferred pseudo-obstacles (per-motion, in .pkl entries)"
+echo "  train.pkl               : ${S3_OUT}/train.pkl"
+echo "  val.pkl                 : ${S3_OUT}/val.pkl"
+echo "  statistics.yaml         : ${S3_OUT}/statistics.yaml"
+echo "  action_statistics.json  : ${S4_OUT}/action_statistics.json"
+echo "  scene occu              : inferred pseudo-obstacles (per-motion, in .pkl entries)"
+echo "  frame_ann               : coarse action categories (per-sequence, in .pkl entries)"
 echo ""
-echo "Next: robotmdar --config-name=train_mvae data.datadir=${S3_OUT} ..."
+echo "Next:"
+echo "  robotmdar --config-name=train_mvae \\"
+echo "    data.datadir=${S3_OUT} \\"
+echo "    data.weighted_sample=true (optional) \\"
+echo "    data.action_statistics_path=${S4_OUT}/action_statistics.json \\"
+echo "    skeleton.asset.assetRoot=${MJCF_DIR}"

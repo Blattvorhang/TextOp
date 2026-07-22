@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -52,6 +53,146 @@ DOF_29_TO_23 = np.array([
 ])
 TARGET_DOF = 23
 assert DOF_29_TO_23.sum() == TARGET_DOF
+
+
+# ---------------------------------------------------------------------------
+# Coarse action classification (mirrors analyze_action_distribution.py)
+# ---------------------------------------------------------------------------
+def _extract_action_name(filename: str) -> str:
+    """Extract fine-grained action name from a BONES-SEED filename stem.
+
+    Handles both raw CSV names and prefixed motion_lib dict keys:
+      walk_ff_stop_180_R_003__A047           →  walk_ff_stop_180_R
+      210531__jump_and_land_heavy_001__A001  →  jump_and_land_heavy
+      idle_one_foot_left__003__A023          →  idle_one_foot_left
+      brush_of_dust__A029                    →  brush_of_dust
+    """
+    stem = filename.replace(".csv", "")
+
+    # 1. Strip trailing camera ID (last "__A" + digits)
+    stem = re.sub(r'__A\d+$', '', stem)
+
+    # 2. Strip leading date prefix (YYMMDD__) added by load_motion_lib_dicts
+    stem = re.sub(r'^\d{6}__', '', stem)
+
+    # 3. Strip trailing sequence number: action_001, action_001o, action_007_ns
+    m = re.match(r'^(.+)_(\d+(?:[a-z_]\w*)?)$', stem)
+    if m:
+        return m.group(1)
+
+    # 4. Double-underscore pattern: action__003
+    m = re.match(r'^(.+?)__(\d+)$', stem)
+    if m:
+        return m.group(1)
+
+    # 5. Sequence number directly appended (no underscore): nameR001
+    m = re.match(r'^(.+[a-zA-Z])(\d+[a-z_]*\w*)$', stem)
+    if m:
+        return m.group(1)
+
+    return stem
+
+
+# Keyword rules in priority order — first match wins.
+# See dataset/data_analyze/analyze_action_distribution.py for the full taxonomy.
+_COARSE_RULES = [
+    ("injured",       ["injured"]),
+    ("crutch",        ["crutch", "crutches"]),
+    ("jump",          ["jump", "hop", "leap", "flip", "vault_over",
+                       "jump_and_land", "jump_over", "jump_twice",
+                       "high_jump", "jump_ff", "jump_sideway",
+                       "jump_and_down", "turn_jump", "fire_in_the_hole"]),
+    ("jog",           ["jog", "jogging", "run_"]),
+    ("walk",          ["walk", "moonwalk", "step_forward", "step_backward"]),
+    ("dance",         ["dance", "dancing", "choreography", "macarena",
+                       "dancecard", "expressionism", "krakowiak"]),
+    ("climb",         ["climb", "ladder", "come_up_", "come_down_",
+                       "crouch_cupboard"]),
+    ("fall",          ["fall", "faint", "toxic_gas", "postmortem",
+                       "death", "lying", "lie_", "flying_",
+                       "stand_up_lying", "on_ground"]),
+    ("crouch",        ["crouch", "crawl", "on_all_fours",
+                       "crouch_idle", "crouch_walk", "stoop"]),
+    ("kneel",         ["kneel", "sit_on_heels"]),
+    ("sit",           ["sitting", "sit_cross", "sit_",
+                       "read_newspaper_sitting", "eat_hotdog_sitting",
+                       "play_guitar_sitting", "having_a_sit"]),
+    ("carry",         ["carry", "lift", "crate", "heavy_", "light_",
+                       "pick_up", "put_down", "hold_",
+                       "moving_object", "pass_",
+                       "item_give", "item_take", "item_pick", "item_put",
+                       "item_switch", "item_hold",
+                       "lasso_catch", "lasso_dance", "lasso_pull",
+                       "watering_plants", "walk_the_dog",
+                       "medium_big", "small_heavy", "small_light",
+                       "big_heavy", "big_light",
+                       "medium_heavy", "medium_light"]),
+    ("reach",         ["reach", "reaching"]),
+    ("push",          ["push", "pull", "crank", "valve", "handle", "lever",
+                       "_knob_", "door_", "shut", "slam",
+                       "open_walk", "close_",
+                       "horizontal_lever", "vertical_lever",
+                       "neutral_button", "operating"]),
+    ("step_over",     ["step_over", "step_in", "avoid_obstacle",
+                       "bump_into", "jump_over_obstacle", "neutral_avoid"]),
+    ("turn",          ["turn_handstand", "mohak", "step_rotate",
+                       "idle_turn", "spin_"]),
+    ("idle",          ["idle", "stand", "standing", "legs_relax",
+                       "looking_around", "looking_in_the_mirror",
+                       "look_around", "looking_R", "looking_",
+                       "neutral_sit", "neutral_stand",
+                       "neutral_idle", "neutral_laugh", "neutral_fear",
+                       "neutral_cry", "neutral_looking",
+                       "neutral_dancecard_idle", "neutral_dancecard_looking",
+                       "idle_hands", "idle_one_foot",
+                       "idle_to_", "one_leg_idle"]),
+    ("gesture",       ["wave", "salute", "clap", "cheer", "triumph",
+                       "thumbs", "point", "welcome", "greet", "bye",
+                       "raise_your_hand", "show_", "shhh", "rock_out",
+                       "mic_drop", "count_it", "i_got_this", "eureka",
+                       "fist_pump", "bicep", "body_check",
+                       "pray", "cross_your", "no_see", "no_hear",
+                       "lament", "scream", "confusion", "think",
+                       "don_t_know", "omg_", "yawn", "listen",
+                       "checking_time", "looking_at",
+                       "itching", "scratch", "brush_of_dust",
+                       "dusting", "wipe", "rub", "fixing",
+                       "body_stretch", "body_search", "pocket_search",
+                       "freezing_cold", "shiver", "cough", "sneeze",
+                       "puke", "boss_dust", "dust_brushing",
+                       "chefs_kiss", "shoulder_clap", "step_in_shit",
+                       "meditate", "horse_riding", "shuffle_cards",
+                       "drinking_bottle", "eat_burger",
+                       "zippo", "smoke", "drink_",
+                       "clear_ear", "rubbing_",
+                       "neutral_cry", "neutral_fear",
+                       "rage_", "proud_", "neutral_laugh",
+                       "looking_in_the_mirror",
+                       "wiping_shoes", "maybe", "just_realised",
+                       "tasty", "no_speak", "no_say",
+                       "on_the_edge", "eating", "painting",
+                       "stinky", "binoculars", "brush_off",
+                       "tarzan", "cry_", "laugh",
+                       "welcom", "clear", "alone",
+                       "playing", "grating", "peeling", "looting",
+                       "chainsaw", "cutting",
+                       ]),
+    ("sport",         ["swim", "throw_", "catch_", "kick_", "punch_",
+                       "dodge_", "play_tennis", "play_guitar",
+                       "petting_dog", "dribble", "shoot_",
+                       "ib_combat", "ib_dodge", "exercise",
+                       "cartwheel"]),
+]
+
+
+def classify_coarse(fine_name: str) -> str:
+    """Map a fine-grained action name to a coarse category (~20 classes)."""
+    name_lower = fine_name.lower()
+    for category, keywords in _COARSE_RULES:
+        for kw in keywords:
+            if kw in name_lower:
+                return category
+    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +288,11 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
     T = dof_23.shape[0]
     fps_val = entry.get("fps", 50)
 
+    # ── Coarse action label from filename ──
+    duration = T / fps_val
+    fine = _extract_action_name(name)
+    coarse = classify_coarse(fine)
+
     return {
         "length": T,
         "motion": {
@@ -160,6 +306,8 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
         # inferred pseudo-obstacles: vacant space treated as occupied
         # (computed by convert_soma_csv_to_motion_lib.py --mob)
         "scene": entry.get("scene", {}),
+        # Coarse category → weighted_sample via cal_weighted_statistics.py
+        "frame_ann": [(0.0, duration, coarse, [coarse])],
     }
 
 
