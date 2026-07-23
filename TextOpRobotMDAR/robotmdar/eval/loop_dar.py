@@ -209,11 +209,11 @@ def interactive_input_thread(loop_state: LoopState):
 
 
 def _update_goal_vis(viewer, world_goal: list, goal_received: bool):
-    """Draw goal heading as a capsule arrow (ref: occHIPC _draw_one_arrow_safe).
+    """Draw goal heading as an arrow + base sphere via ``mjv_initGeom``.
 
-    Uses mjGEOM_CAPSULE (extends along local +Z) with a mat that maps
-    local +Z → world horizontal heading.  mat is laid out column-major
-    for MuJoCo.
+    Uses ``mjGEOM_ARROW`` (cone+cylinder along local +Z) for the heading
+    arrow and ``mjGEOM_SPHERE`` for the base position marker.  Avoids
+    ``mjv_connector`` which segfaults in some MuJoCo builds.
     """
     viewer.user_scn.ngeom = 0
     if not goal_received:
@@ -223,26 +223,49 @@ def _update_goal_vis(viewer, world_goal: list, goal_received: bool):
     cos_h = math.cos(yaw)
     sin_h = math.sin(yaw)
 
-    direction = np.array([cos_h, sin_h, 0.0])
+    pos = np.array([x, y, z], dtype=np.float64)
 
-    shaft_radius = 0.025
-    length = 0.55
-    half_len = length / 2.0
-    center = np.array([x, y, z]) + direction * half_len
-
-    # column-major: local +Z → (cos_h, sin_h, 0); local +Y → (0, 0, 1)
-    mat = np.array([-sin_h, cos_h, 0.0,
-                    0.0,    0.0,   1.0,
-                    cos_h,  sin_h, 0.0], dtype=np.float64)
+    arrow_radius = 0.025
+    arrow_length = 0.5
+    sphere_radius = 0.05
 
     rgba = np.array([0.2, 1.0, 0.2, 0.9], dtype=np.float32)
 
+    # arrow
+    if viewer.user_scn.ngeom < viewer.user_scn.maxgeom:
+        g = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+
+        mat = np.array([
+            -sin_h, 0.0, cos_h,
+            cos_h, 0.0, sin_h,
+            0.0,   1.0, 0.0,
+        ], dtype=np.float64)
+
+        mujoco.mjv_initGeom(
+            g,
+            mujoco.mjtGeom.mjGEOM_ARROW,
+            np.array(
+                [arrow_radius, arrow_radius, arrow_length],
+                dtype=np.float32,
+            ),
+            pos,
+            mat,
+            rgba,
+        )
+
+        g.category = mujoco.mjtCatBit.mjCAT_DECOR
+        viewer.user_scn.ngeom += 1
+
+    # base sphere
     if viewer.user_scn.ngeom < viewer.user_scn.maxgeom:
         g = viewer.user_scn.geoms[viewer.user_scn.ngeom]
         mujoco.mjv_initGeom(
-            g, mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.array([shaft_radius, 0.0, half_len], dtype=np.float32),
-            center, mat, rgba,
+            g,
+            mujoco.mjtGeom.mjGEOM_SPHERE,
+            np.array([sphere_radius, sphere_radius, sphere_radius], dtype=np.float32),
+            pos,
+            np.eye(3).reshape(-1),
+            rgba,
         )
         g.category = mujoco.mjtCatBit.mjCAT_DECOR
         viewer.user_scn.ngeom += 1
