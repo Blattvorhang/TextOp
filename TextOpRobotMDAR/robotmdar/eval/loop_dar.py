@@ -2,40 +2,166 @@
 Loop DAR Script - Continuous Motion Generation
 
 Continuously generates motion using DAR model in an autoregressive manner.
-Starts from zero pose and generates infinite trajectory based on text prompts.
+Starts from zero pose and generates infinite trajectory based on goal+scene conditioning.
 
 Usage:
 - python eval/loop_dar.py --config-name=loop_dar
 - Interactive commands:
-  - Input text in terminal: Change text prompt
+  - Enter 'x y z yaw(deg)' in terminal: Set world-space goal (yaw degrees, 0°=+X)
   - Space or 'p': Pause/resume generation
   - Esc or 'q': Quit
+- Goal visualization: green arrow for heading
 """
 
+import atexit
+import math
+import os
 import threading
 import time
-import numpy as np
+from pathlib import Path
 import sys
 
-import clip
+import mujoco
 import numpy as np
 import torch
 from hydra.utils import instantiate
 from loguru import logger
 from omegaconf import DictConfig
 
+from robotmdar.dataloader.conditioning import build_ego_goal
 from robotmdar.dtype import seed, logger as dtype_logger
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
-from robotmdar.dtype.motion import (motion_dict_to_qpos, get_zero_abs_pose,
-                                    motion_dict_to_abs_pose, get_zero_feature,
-                                    FeatureVersion)
+from robotmdar.dtype.motion import (G1_ROOT_HEIGHT, motion_dict_to_qpos,
+                                    get_zero_abs_pose, motion_dict_to_abs_pose,
+                                    get_zero_feature, FeatureVersion)
 from robotmdar.dtype.vis_mjc import mjc_load_everything
-from robotmdar.eval.generate_dar import ClassifierFreeWrapper, generate_next_motion
+from robotmdar.eval.generate_dar import generate_next_motion
 from robotmdar.train.manager import DARManager
 
-# import torch_tensorrt
 from robotmdar.wrapper.vae_decode import DecoderWrapper
 from robotmdar.dtype.debug import pdb_decorator
+
+# ---------------------------------------------------------------------------
+# NPZ saving: accumulates FK results from every generated block.
+# Saved on graceful exit (Esc/q) or Ctrl+C via atexit.
+# Set env var NPZ_OUTPUT to change output path (default: ./loop_motion.npz)
+#
+# NPZ structure (matching Tracker expectations):
+#   joint_pos   [T, 29]   – joint angles (IsaacLab order, 29-DoF)
+#   joint_vel   [T, 29]   – joint velocities
+#   body_pos_w  [T, N, 3] – all N body world positions (FK result)
+#   body_quat_w [T, N, 4] – all N body world orientations (wxyz, FK result)
+#   fps         [1]       – frames per second (50)
+#
+# A companion file <output>.body_names.json lists body name → index for
+# the 14 bodies that the Tracker specifically needs.
+# ---------------------------------------------------------------------------
+_NPZ_BUFFER: list = []          # each entry: (dof_pos, dof_vel, body_trans, body_rot)
+_NPZ_FIRST_BLOCK = True
+_NPZ_OUTPUT = os.environ.get("NPZ_OUTPUT", "loop_motion.npz")
+_NPZ_FPS = None
+_NPZ_HISTORY_LEN = None
+_NPZ_SKELETON_BODY_NAMES: list = []
+
+# MuJoCo → IsaacLab joint reindex
+_NPZ_MJC2ISAAC = [
+    0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24,
+    18, 25, 19, 26, 20, 27, 21, 28
+]
+
+# The 14 body names the TextOp Tracker expects (motion_loader.cpp body_names)
+_NPZ_TRACKER_BODIES = [
+    "pelvis",
+    "left_hip_roll_link",
+    "left_knee_link",
+    "left_ankle_roll_link",
+    "right_hip_roll_link",
+    "right_knee_link",
+    "right_ankle_roll_link",
+    "torso_link",
+    "left_shoulder_roll_link",
+    "left_elbow_link",
+    "left_wrist_yaw_link",
+    "right_shoulder_roll_link",
+    "right_elbow_link",
+    "right_wrist_yaw_link",
+]
+
+
+def _npz_expand_23_to_29(v: np.ndarray) -> np.ndarray:
+    """Pad 23-DoF (wrists locked) → 29-DoF for IsaacLab."""
+    T = v.shape[0]
+    out = np.zeros((T, 29), dtype=v.dtype)
+    out[:, :19] = v[:, :19]
+    out[:, 22:26] = v[:, 19:23]
+    return out
+
+
+def _npz_save():
+    """Called on exit. Concatenates all accumulated blocks and writes NPZ."""
+    global _NPZ_BUFFER, _NPZ_SKELETON_BODY_NAMES
+    if not _NPZ_BUFFER:
+        return
+    fps = _NPZ_FPS or 30
+
+    all_dof_pos, all_dof_vel, all_body_trans, all_body_rot = [], [], [], []
+    for dof_pos, dof_vel, body_trans, body_rot in _NPZ_BUFFER:
+        all_dof_pos.append(dof_pos)
+        all_dof_vel.append(dof_vel)
+        all_body_trans.append(body_trans)
+        all_body_rot.append(body_rot)
+
+    dof_pos_all  = np.concatenate(all_dof_pos, axis=0)    # [T, 23]
+    dof_vel_all  = np.concatenate(all_dof_vel, axis=0)    # [T, 23]
+    body_trans_all = np.concatenate(all_body_trans, axis=0)  # [T, N, 3]
+    body_rot_all = np.concatenate(all_body_rot, axis=0)      # [T, N, 4] xyzw
+
+    dof_pos_29 = _npz_expand_23_to_29(dof_pos_all)
+    dof_vel_29 = _npz_expand_23_to_29(dof_vel_all)
+    dof_pos_isaaclab = dof_pos_29[:, _NPZ_MJC2ISAAC]
+    dof_vel_isaaclab = dof_vel_29[:, _NPZ_MJC2ISAAC]
+
+    # Convert body rotations: xyzw → wxyz (MuJoCo convention → IsaacLab convention)
+    body_rot_all_wxyz = body_rot_all[..., [3, 0, 1, 2]]
+
+    out = Path(_NPZ_OUTPUT)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        out,
+        joint_pos=dof_pos_isaaclab,          # [T, 29]
+        joint_vel=dof_vel_isaaclab,          # [T, 29]
+        body_pos_w=body_trans_all,           # [T, N, 3] — ALL FK bodies
+        body_quat_w=body_rot_all_wxyz,       # [T, N, 4] — ALL FK bodies (wxyz)
+        fps=np.array([fps]),
+    )
+
+    # Write body name → index mapping for Tracker's 14-body subset
+    name_to_idx = {name: i for i, name in enumerate(_NPZ_SKELETON_BODY_NAMES)}
+    tracker_map = {}
+    for name in _NPZ_TRACKER_BODIES:
+        idx = name_to_idx.get(name, -1)
+        tracker_map[name] = idx
+    missing = [k for k, v in tracker_map.items() if v < 0]
+    if missing:
+        print(f"\n[NPZ] WARNING: bodies not found in skeleton: {missing}")
+
+    body_map_path = out.with_suffix(out.suffix + ".body_names.json")
+    import json as _json
+    body_map_path.write_text(_json.dumps({
+        "all_body_names": _NPZ_SKELETON_BODY_NAMES,
+        "tracker_body_indices": tracker_map,
+        "note": "Tracker expects body_pos_w indexed as listed; use tracker_body_indices to subset",
+    }, indent=2))
+
+    file_mb = out.stat().st_size / 1024 / 1024
+    T_final = dof_pos_isaaclab.shape[0]
+    N_bodies = body_trans_all.shape[1]
+    print(f"\n[NPZ] Saved {T_final} frames × {N_bodies} bodies ({T_final/fps:.1f}s) → {out} ({file_mb:.2f} MB)")
+    print(f"[NPZ] Body index map → {body_map_path}")
+
+
+atexit.register(_npz_save)
+# ---------------------------------------------------------------------------
 
 # import torch_tensorrt
 
@@ -45,75 +171,81 @@ class LoopState:
 
     def __init__(self):
         self.paused = False
-        self.text_prompt = "stand"
-        self.text_changed = True  # Start with True to encode initial text
+        # World-space goal: (x, y, z, yaw_deg), yaw=0° → +X direction
+        # Default Z = G1_ROOT_HEIGHT (0.77m), the canonical standing root height
+        self.world_goal = [0.0, 0.0, G1_ROOT_HEIGHT, 0.0]
+        self.goal_received = False  # True after first valid user input
         self.quit_requested = False
 
 
-def get_text_embedding(text: str, clip_model, device: str) -> torch.Tensor:
-    """Encode text using CLIP model."""
-    try:
-        with torch.no_grad():
-            text_tokens = clip.tokenize([text]).to(device)
-            text_embedding = clip_model.encode_text(text_tokens)
-            # text_embedding = text_embedding / text_embedding.norm(dim=-1,
-            #                                                       keepdim=True)
-        return text_embedding.float()
-    except Exception as e:
-        logger.warning(f"Failed to encode text '{text}': {e}")
-        return torch.zeros(1, 512, device=device, dtype=torch.float32)
-
-
 def interactive_input_thread(loop_state: LoopState):
-    """Interactive input thread for user commands."""
+    """Interactive input thread for goal input.
+
+    Accepts world-space goal as: x y z yaw(deg)
+    - x, y, z: target position in world frame (meters)
+    - yaw: target heading in DEGREES, 0° = +X direction, 90° = +Y
+    Example: "1.0 0.5 0.0 90" (target 1m forward, 0.5m left, facing +Y)
+    """
+    print("Enter world goal: x y z yaw(deg)")
+    print("  yaw(deg): 0°=+X, 90°=+Y, 180°=-X, -90°=-Y")
     while not loop_state.quit_requested:
         try:
             user_input = input()
-            print(f"You entered new prompt: {user_input}")
-            loop_state.text_prompt = user_input
-            loop_state.text_changed = True
+            parts = user_input.strip().split()
+            if len(parts) == 4:
+                x, y, z, yaw_deg = map(float, parts)
+                yaw_rad = math.radians(yaw_deg)
+                loop_state.world_goal = [x, y, z, yaw_rad]
+                loop_state.goal_received = True
+                print(f"Goal updated: x={x:.3f} y={y:.3f} z={z:.3f} "
+                      f"yaw={yaw_deg:.1f}° ({yaw_rad:.3f} rad)")
+            else:
+                print(f"Invalid: expected 4 values (x y z yaw_deg), got {len(parts)}")
         except (EOFError, KeyboardInterrupt):
             break
+        except ValueError as e:
+            print(f"Parse error: {e}. Format: x y z yaw_deg "
+                  f"(e.g. '1.0 0.0 0.0 90')")
 
 
-def warmup(vae_trt, cfg_denoiser, diffusion, val_data, clip_model,
-           history_motion, abs_pose, future_len, history_len, cfg):
-    logger.info("Warming up...")
-    text_embedding = get_text_embedding("stand", clip_model, cfg.device)
-    future_motion, motion_dict, abs_pose = generate_next_motion(
-        vae=vae_trt,
-        denoiser=cfg_denoiser,
-        diffusion=diffusion,
-        val_data=val_data,
-        text_embedding=text_embedding,
-        history_motion=history_motion,
-        abs_pose=abs_pose,
-        future_len=future_len,
-        # cfg=cfg,
-        use_full_sample=cfg.use_full_sample,
-        guidance_scale=cfg.guidance_scale,
-    )
-    # 因为第一次和第二次, history_motion的stride内存布局不一样, 会重新触发编译
+def _update_goal_vis(viewer, world_goal: list, goal_received: bool):
+    """Draw goal heading as a capsule arrow (ref: occHIPC _draw_one_arrow_safe).
 
-    # print(f"First history_motion strides: {history_motion.stride()}")
-    # print(
-    #     f"Second history_motion strides: {future_motion[:, -history_len:, :].stride()}"
-    # )
-    history_motion = future_motion[:, -history_len:, :]
-    future_motion, motion_dict, abs_pose = generate_next_motion(
-        vae=vae_trt,
-        denoiser=cfg_denoiser,
-        diffusion=diffusion,
-        val_data=val_data,
-        text_embedding=text_embedding,
-        history_motion=history_motion,
-        abs_pose=abs_pose,
-        future_len=future_len,
-        # cfg=cfg,
-        use_full_sample=cfg.use_full_sample,
-        guidance_scale=cfg.guidance_scale,
-    )
-    logger.info("Warming up done")
+    Uses mjGEOM_CAPSULE (extends along local +Z) with a mat that maps
+    local +Z → world horizontal heading.  mat is laid out column-major
+    for MuJoCo.
+    """
+    viewer.user_scn.ngeom = 0
+    if not goal_received:
+        return
+
+    x, y, z, yaw = world_goal
+    cos_h = math.cos(yaw)
+    sin_h = math.sin(yaw)
+
+    direction = np.array([cos_h, sin_h, 0.0])
+
+    shaft_radius = 0.025
+    length = 0.55
+    half_len = length / 2.0
+    center = np.array([x, y, z]) + direction * half_len
+
+    # column-major: local +Z → (cos_h, sin_h, 0); local +Y → (0, 0, 1)
+    mat = np.array([-sin_h, cos_h, 0.0,
+                    0.0,    0.0,   1.0,
+                    cos_h,  sin_h, 0.0], dtype=np.float64)
+
+    rgba = np.array([0.2, 1.0, 0.2, 0.9], dtype=np.float32)
+
+    if viewer.user_scn.ngeom < viewer.user_scn.maxgeom:
+        g = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+        mujoco.mjv_initGeom(
+            g, mujoco.mjtGeom.mjGEOM_CAPSULE,
+            np.array([shaft_radius, 0.0, half_len], dtype=np.float32),
+            center, mat, rgba,
+        )
+        g.category = mujoco.mjtCatBit.mjCAT_DECOR
+        viewer.user_scn.ngeom += 1
 
 
 @pdb_decorator
@@ -123,9 +255,6 @@ def main(cfg: DictConfig):
     # torch.set_default_device(cfg.device)
 
     # Load models
-    clip_model, _ = clip.load("ViT-B/32", device=cfg.device)
-    clip_model.eval()
-
     val_data: Dataset = instantiate(cfg.data.val)
     vae: VAE = instantiate(cfg.vae)
     denoiser: Denoiser = instantiate(cfg.denoiser)
@@ -144,10 +273,16 @@ def main(cfg: DictConfig):
     # denoiser_trt = torch.compile(denoiser, backend='tensorrt')
     vae_trt = vae
     denoiser_trt = denoiser
-    cfg_denoiser = ClassifierFreeWrapper(denoiser_trt)
+    cfg_denoiser = denoiser_trt
 
     future_len = cfg.data.future_len
     history_len = cfg.data.history_len
+
+    # Store for NPZ saving
+    global _NPZ_FPS, _NPZ_HISTORY_LEN, _NPZ_SKELETON_BODY_NAMES
+    _NPZ_FPS = val_data.fps
+    _NPZ_HISTORY_LEN = history_len
+    _NPZ_SKELETON_BODY_NAMES = list(val_data.skeleton.body_names)
 
     # Initialize state
     loop_state = LoopState()
@@ -162,9 +297,6 @@ def main(cfg: DictConfig):
             get_zero_feature().unsqueeze(0).expand(1, history_len,
                                                    -1).to(cfg.device))
     abs_pose = get_zero_abs_pose((1, ), device=cfg.device)
-    text_embedding = None
-    # warmup(vae_trt, cfg_denoiser, diffusion, val_data, clip_model,
-    #        history_motion, abs_pose, future_len, history_len, cfg)
 
     # Setup visualization with keyboard callback
     dt = 1.0 / val_data.fps
@@ -191,36 +323,67 @@ def main(cfg: DictConfig):
 
     logger.info("Starting continuous motion generation...")
     logger.info(
-        "Commands: Input text in terminal (change prompt), Space/p(pause), Esc/q(quit)"
+        "Commands: Enter 'x y z yaw(deg)' in terminal, Space/p(pause), Esc/q(quit)"
     )
-    logger.info(f"Initial text: {loop_state.text_prompt}")
+    logger.info("  yaw(deg): 0°=+X, 90°=+Y, 180°=-X")
+    logger.info("  (goal defaults to zero until first input)")
+
+    # Pre-compute grid_size for zero voxel
+    grid_size = cfg.denoiser.grid_size
 
     # Main generation loop
     frame_idx = 0
     while not loop_state.quit_requested and viewer.is_running():
-        # Update text embedding if changed
-        if loop_state.text_changed:
-            text_embedding = get_text_embedding(loop_state.text_prompt,
-                                                clip_model, cfg.device)
-            loop_state.text_changed = False
-            logger.info(
-                f"Updated text embedding for: {loop_state.text_prompt}")
+        # Build ego_goal from world goal + current robot pose.
+        # Before first user input, use all-zero ego_goal (stand still).
+        if loop_state.goal_received:
+            world_goal_pos = torch.tensor(
+                loop_state.world_goal[:3], device=cfg.device
+            ).float().unsqueeze(0)  # [1, 3]
+            world_goal_yaw = torch.tensor(
+                [loop_state.world_goal[3]], device=cfg.device
+            ).float()  # [1]
+
+            reference_pos = abs_pose['root_trans_offset']  # [1, 3]
+            reference_rot = abs_pose['root_rot']  # [1, 4] xyzw
+
+            ego_goal = build_ego_goal(
+                world_goal_pos, world_goal_yaw,
+                reference_pos, reference_rot,
+            )  # [1, 5]
+        else:
+            ego_goal = torch.zeros(1, 5, device=cfg.device)
+
+        # Scene condition: all zeros
+        voxel = torch.zeros(1, grid_size**3, device=cfg.device)
 
         # Generate next motion if not paused
-        if not loop_state.paused and text_embedding is not None:
+        if not loop_state.paused:
             # breakpoint()
             future_motion, motion_dict, abs_pose = generate_next_motion(
                 vae=vae_trt,
                 denoiser=cfg_denoiser,
                 diffusion=diffusion,
                 val_data=val_data,
-                text_embedding=text_embedding,
+                goal=ego_goal,
+                voxel=voxel,
                 history_motion=history_motion,
                 abs_pose=abs_pose,
                 future_len=future_len,
-                # cfg=cfg,
                 use_full_sample=cfg.use_full_sample,
-                guidance_scale=cfg.guidance_scale)
+                guidance_scale=cfg.guidance_scale,
+                ret_fk=True)
+
+            # ── NPZ: accumulate FK results (new frames only, skip first-block history padding) ──
+            global _NPZ_BUFFER, _NPZ_FIRST_BLOCK
+            skip = history_len if _NPZ_FIRST_BLOCK else 0
+            _NPZ_FIRST_BLOCK = False
+            dof_pos = motion_dict['dof_pos'][0, skip:].detach().cpu().numpy()             # [T', 23]
+            dof_vel = motion_dict['dof_vel'][0, skip:].detach().cpu().numpy()             # [T', 23]
+            body_t  = motion_dict['global_translation'][0, skip:].detach().cpu().numpy()  # [T', N, 3]
+            body_r  = motion_dict['global_rotation'][0, skip:].detach().cpu().numpy()     # [T', N, 4] xyzw
+            _NPZ_BUFFER.append((dof_pos, dof_vel, body_t, body_r))
+            # ────────────────────────────────────────────────────────────────────
 
             # Update history for next generation (autoregressive)
             history_motion = future_motion[:, -history_len:, :]
@@ -236,12 +399,14 @@ def main(cfg: DictConfig):
             for t in range(qpos_np.shape[1]):
                 if loop_state.quit_requested or not viewer.is_running():
                     break
+                _update_goal_vis(viewer, loop_state.world_goal,
+                                 loop_state.goal_received)
                 show_fn(qpos_np[0, t], contact_np[0, t])
                 time.sleep(dt)
                 frame_idx += 1
                 # print("Frame ID: ", frame_idx)
         else:
-            time.sleep(0.1)  # Small sleep when paused or no text embedding
+            time.sleep(0.1)  # Small sleep when paused
 
     logger.info("Shutting down...")
     viewer.close()

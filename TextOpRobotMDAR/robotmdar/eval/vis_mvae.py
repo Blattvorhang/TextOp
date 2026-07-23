@@ -32,8 +32,7 @@ def add_batch_fn(motion_buff, val_dataiter, vae, val_data, num_primitive,
         pd_buff: List[Tuple[QPos, torch.Tensor]] = []
         gt_buff: List[Tuple[QPos, torch.Tensor]] = []
         for pidx in range(num_primitive):
-            motion, cond = batch[pidx]
-            motion, cond = motion.to(cfg.device), cond.to(cfg.device)
+            motion = batch[pidx]['motion'].to(cfg.device)
 
             future_motion_gt = motion[:, -future_len:, :]
             history_motion = motion[:, :history_len, :]

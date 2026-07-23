@@ -3,6 +3,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from robotmdar.dataloader.conditioning import build_ego_goal, query_local_occupancy
 from robotmdar.dtype import seed, logger as dtypelogger
 from robotmdar.dtype.motion import motion_dict_to_qpos, QPos, get_zero_abs_pose, motion_dict_to_abs_pose
 from robotmdar.dtype.device import tree_to_numpy
@@ -10,7 +11,7 @@ from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 from robotmdar.train.manager import DARManager
 from robotmdar.dtype.vis_mjc import VisState, get_keycb_fn, mjc_autoloop_mdar
 from robotmdar.dtype.motion import get_zero_feature_v3
-from robotmdar.eval.generate_dar import generate_next_motion, ClassifierFreeWrapper
+from robotmdar.eval.generate_dar import generate_next_motion
 
 
 def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
@@ -33,8 +34,8 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
         prev_predicted_motion = None
 
         for pidx in range(num_primitive):
-            motion, cond = batch[pidx]
-            motion, cond = motion.to(cfg.device), cond.to(cfg.device)
+            batch_item = batch[pidx]
+            motion = batch_item['motion'].to(cfg.device)
 
             future_motion_gt = motion[:, -future_len:, :]
             history_motion_gt = motion[:, :history_len, :]
@@ -52,17 +53,34 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 # Teacher forcing mode: use ground truth history
                 history_motion = history_motion_gt
 
+            # Build ego_goal and voxel from batch item
+            # For vis_dar (teacher forcing), we use gt_ref_pos/gt_ref_rot as the
+            # reference pose matching training logic
+            ego_goal = build_ego_goal(
+                batch_item['world_goal_pos'].to(cfg.device),
+                batch_item['world_goal_yaw'].to(cfg.device),
+                batch_item['gt_ref_pos'].to(cfg.device),
+                batch_item['gt_ref_rot'].to(cfg.device),
+            )  # [B, 5]
+            voxel = query_local_occupancy(
+                batch_item['scene'],
+                batch_item['gt_ref_pos'],
+                batch_item['gt_ref_rot'],
+                grid_size=cfg.denoiser.grid_size,
+                grid_unit=cfg.data.occupancy_unit,
+            )  # [B, grid_size^3]
+
             # Generate prediction using the common generate_next_motion function
             future_motion_pred, future_motion_pred_dict, pd_abs_pose = generate_next_motion(
                 vae=vae,
                 denoiser=denoiser,
                 diffusion=diffusion,
                 val_data=val_data,
-                text_embedding=cond,
+                goal=ego_goal,
+                voxel=voxel,
                 history_motion=history_motion,
                 abs_pose=pd_abs_pose,
                 future_len=future_len,
-                # cfg=cfg,
                 use_full_sample=use_full_sample,
                 guidance_scale=cfg.guidance_scale)
 
@@ -115,7 +133,7 @@ def main(cfg: DictConfig):
     # Load checkpoints using manager
     manager: DARManager = instantiate(cfg.train.manager)
     manager.hold_model(vae, denoiser, None, val_data)
-    cfg_denoiser = ClassifierFreeWrapper(denoiser)
+    cfg_denoiser = denoiser
 
     num_primitive = cfg.data.num_primitive
     future_len = cfg.data.future_len
