@@ -15,7 +15,7 @@ from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
 from robotmdar.dtype.motion import FeatureVersion
 from robotmdar.eval.generate_dar import generate_next_motion
-from robotmdar.planner.planner_utils import (
+from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
     generated_history_at_frame,
     motion_dict_to_g1data,

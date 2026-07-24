@@ -3,7 +3,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from robotmdar.dataloader.conditioning import build_ego_goal, query_local_occupancy
+from robotmdar.utils.ego_condition import build_ego_goal, query_local_occupancy
 from robotmdar.dtype import seed, logger as dtypelogger
 from robotmdar.dtype.motion import motion_dict_to_qpos, QPos, get_zero_abs_pose, motion_dict_to_abs_pose
 from robotmdar.dtype.device import tree_to_numpy

@@ -28,7 +28,7 @@ from hydra.utils import instantiate
 from loguru import logger
 from omegaconf import DictConfig
 
-from robotmdar.dataloader.conditioning import build_ego_goal
+from robotmdar.utils.ego_condition import build_ego_goal
 from robotmdar.dtype import seed, logger as dtype_logger
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 from robotmdar.dtype.motion import (G1_ROOT_HEIGHT, motion_dict_to_qpos,

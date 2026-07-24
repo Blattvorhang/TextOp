@@ -1,4 +1,4 @@
-"""Goal canonicalization and MOB-style local occupancy queries."""
+"""Ego-centric condition building: goal canonicalization and local scene-occupancy sampling."""
 
 from typing import Any, Dict, Sequence
 

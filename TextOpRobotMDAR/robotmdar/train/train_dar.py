@@ -2,7 +2,7 @@ import torch
 from omegaconf import DictConfig
 from hydra.utils import instantiate
 
-from robotmdar.dataloader.conditioning import (
+from robotmdar.utils.ego_condition import (
     build_ego_goal,
     query_local_occupancy,
 )
