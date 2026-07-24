@@ -1,0 +1,17 @@
+# Shared TextOp planner/controller PUB/SUB configuration.
+comm_mode: pubsub
+
+# Controller binds current_state_port; planner binds motion_port.
+current_state_port: 28703
+motion_port: 28701
+sync_port: 28710
+
+planner_host: "localhost"
+controller_host: "localhost"
+
+# Replanning is 20 Hz; generated motion samples are 50 Hz.
+replan_period: 0.05
+history_size: 5
+
+planner_request_timeout_ms: 300000
+planner_connect_timeout_s: 30.0

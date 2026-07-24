@@ -80,8 +80,8 @@ def generate_next_motion(
         #                 )  # [B, T=1, D] - latent_dim from config
         latent_shape = (batch_size, *denoiser.noise_shape)
 
-        # Sample random noise as starting point
-        # x_start_noise = torch.randn(latent_shape, device=device)
+        # Sample random noise as starting point for single-step denoising.
+        x_start_noise = torch.randn(latent_shape, device=device)
 
         # Sample a random timestep for demonstration (or use t=0 for no noise)
         t = torch.zeros(batch_size, dtype=torch.int32,

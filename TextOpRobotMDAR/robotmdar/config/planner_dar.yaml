@@ -1,0 +1,31 @@
+# @package _global_
+defaults:
+  - loop_dar
+  - _self_
+
+task: planner-dar
+
+# Planner deadlines are 20 Hz; generated/reference motion is sampled at 50 Hz.
+infer_period_ms: 50
+motion_fps: 50.0
+state_timeout_ms: 1
+log_every: 20
+pub_all_frames: false
+
+# Bootstrap from controller history once, then autoregress on generated history.
+# Before each replan, translate the generated history endpoint to the measured
+# G1 root position; local features and generated orientation remain unchanged.
+use_generated_history: true
+
+# Keep false while debugging pure autoregressive history. When enabled, the
+# selected generated-history endpoint is translated onto the measured G1 root.
+align_generated_history_to_g1: true
+
+# Single-step denoising is the real-time path. Full diffusion can be enabled
+# explicitly for offline experiments, but is not expected to meet 20 Hz.
+use_full_sample: false
+
+comm_config: ${hydra:runtime.cwd}/robotmdar/config/communication/pubsub.yaml
+
+# null means the current all-zero local occupancy condition.
+occ_grid: null

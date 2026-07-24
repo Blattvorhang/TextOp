@@ -418,12 +418,14 @@ def main(cfg: DictConfig):
             qpos_np = qpos_data.detach().cpu().numpy()  # [B, T, 30]
             contact_np = contact_data.detach().cpu().numpy()  # [B, T, 2]
 
+            # Update goal vis once per generated block (not every frame)
+            _update_goal_vis(viewer, loop_state.world_goal,
+                             loop_state.goal_received)
+
             # Show each frame of the generated motion
             for t in range(qpos_np.shape[1]):
                 if loop_state.quit_requested or not viewer.is_running():
                     break
-                _update_goal_vis(viewer, loop_state.world_goal,
-                                 loop_state.goal_received)
                 show_fn(qpos_np[0, t], contact_np[0, t])
                 time.sleep(dt)
                 frame_idx += 1
