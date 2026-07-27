@@ -417,19 +417,26 @@ for i in range(J):          # J = 27 bodies (24 base + 3 extend)
         rot_mat = parent_rotation @ self.local_rotation_matrices[i] @ joint_rotations[i-1]
 ```
 
-Standard kinematic tree traversal. At training time, compute the 5 goal-frame keypoints by feeding `dof[goal_frame]` (23-dim joint angles) + `root_pos` + `root_rot` in and extracting `global_translation[keypoint_indices]`.
+Standard kinematic tree traversal. At training time, compute the 5 goal-frame
+keypoints by feeding `dof[goal_frame]` (23-dim joint angles), `root_pos`, and
+`root_rot`, then indexing `global_translation_extend`.  The non-extended
+`global_translation` tensor contains only the 24 base bodies and cannot supply
+hand indices 24/25.
 
 ### 4.4 FK Cost Summary
 
 | Scenario | FK needed? | Frequency | Notes |
 |----------|-----------|-----------|-------|
-| **Training data loading** | Yes, repo FK | 1× per primitive | `SkeletonPrimitiveDataset` already owns `self.skeleton`; single-frame FK (27 bodies) on CPU |
+| **Training data loading** | Yes, repo FK | 1x per sampled segment | All primitives in a segment share one goal frame and reuse its `[5, 3]` FK result |
 | **Inference (Approach 1)** | No | — | Controller sends 5 keypoints directly |
 | **Inference (Approach 2)** | No | — | Load `.npz`, rotate/translate XY, preserve template Z |
 
 Training FK overhead is negligible:
-- The current training pipeline already runs multi-frame FK in `reconstruct_motion()` (`[B, T, 23]` → `global_translation [B, T, 27, 3]`)
-- The goal-frame FK is one extra single-frame call, dwarfed by the batch FK
+- The current training pipeline already runs multi-frame FK in
+  `reconstruct_motion()` (`[B, T, 23]` -> `global_translation_extend
+  [B, T, 27, 3]`)
+- The goal-frame FK is one single-frame call per sampled segment and is reused
+  across that segment's primitives
 - Pre-computing all snippet keypoints into `.pkl` files is an optional optimization, not needed now
 - See §4.3.6 for why repo FK is chosen over MuJoCo `mj_forward()`
 
