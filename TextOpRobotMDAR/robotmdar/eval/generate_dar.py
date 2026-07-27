@@ -63,7 +63,7 @@ def generate_next_motion(
         denoiser: Denoiser model for diffusion
         diffusion: Diffusion model
         val_data: Dataset for motion reconstruction
-        goal: Ego-centric goal tensor [B, 5] (ego_x, ego_y, dz, cos(dyaw), sin(dyaw))
+        goal: Ego-centric goal tensor [B, denoiser.goal_dim].
         voxel: Scene occupancy tensor [B, grid_size^3]
         history_motion: History motion tensor [B, T_hist, D]
         abs_pose: Current absolute pose

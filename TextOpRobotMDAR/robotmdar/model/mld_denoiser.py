@@ -84,7 +84,7 @@ class DenoiserMLP(nn.Module):
         """
         x_t: [B, T=1, D]
         timesteps: [batch_size] (int)
-        y: dict with keys 'goal' [B, 5], 'voxel' [B, grid_size³],
+        y: dict with keys 'goal' [B, goal_dim], 'voxel' [B, grid_size³],
            'history_motion_normalized' [B, T_hist, nfeats]
         """
         if y is None:

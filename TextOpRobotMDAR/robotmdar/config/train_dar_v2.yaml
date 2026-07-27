@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - train_dar
+  - _self_
+
+expname: DAR-BODY-GOAL
+
+data:
+  goal_type: body
+
+denoiser:
+  goal_dim: 15

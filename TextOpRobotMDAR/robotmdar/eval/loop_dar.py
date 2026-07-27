@@ -24,11 +24,16 @@ import sys
 import mujoco
 import numpy as np
 import torch
-from hydra.utils import instantiate
+from hydra.utils import instantiate, to_absolute_path
 from loguru import logger
 from omegaconf import DictConfig
 
-from robotmdar.utils.ego_condition import build_ego_goal
+from robotmdar.utils.ego_condition import (
+    GoalType,
+    build_ego_goal,
+    validate_goal_config,
+)
+from robotmdar.utils.planner_convert import load_goal_keypoints_from_reference
 from robotmdar.dtype import seed, logger as dtype_logger
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 from robotmdar.dtype.motion import (G1_ROOT_HEIGHT, motion_dict_to_qpos,
@@ -275,6 +280,13 @@ def _update_goal_vis(viewer, world_goal: list, goal_received: bool):
 def main(cfg: DictConfig):
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
+    goal_type = validate_goal_config(
+        cfg.data.goal_type, cfg.denoiser.goal_dim)
+    goal_reference_path = cfg.get("goal_reference_path")
+    if goal_reference_path is not None:
+        goal_reference_path = to_absolute_path(str(goal_reference_path))
+    if goal_type is GoalType.BODY and goal_reference_path is None:
+        raise ValueError("Body-goal loop requires goal_reference_path")
     # torch.set_default_device(cfg.device)
 
     # Load models
@@ -369,13 +381,26 @@ def main(cfg: DictConfig):
 
             reference_pos = abs_pose['root_trans_offset']  # [1, 3]
             reference_rot = abs_pose['root_rot']  # [1, 4] xyzw
+            goal_keypoints = None
+            if goal_type is GoalType.BODY:
+                goal_keypoints_np = load_goal_keypoints_from_reference(
+                    goal_reference_path,
+                    loop_state.world_goal[:3],
+                    float(loop_state.world_goal[3]),
+                )
+                goal_keypoints = torch.as_tensor(
+                    goal_keypoints_np, dtype=torch.float32,
+                    device=cfg.device).unsqueeze(0)
 
             ego_goal = build_ego_goal(
                 world_goal_pos, world_goal_yaw,
                 reference_pos, reference_rot,
-            )  # [1, 5]
+                goal_type=goal_type,
+                goal_keypoints=goal_keypoints,
+            )
         else:
-            ego_goal = torch.zeros(1, 5, device=cfg.device)
+            ego_goal = torch.zeros(
+                1, goal_type.dimension, device=cfg.device)
 
         # Scene condition: all zeros
         voxel = torch.zeros(1, grid_size**3, device=cfg.device)

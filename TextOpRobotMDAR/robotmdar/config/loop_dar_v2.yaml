@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - loop_dar
+  - _self_
+
+data:
+  goal_type: body
+
+denoiser:
+  goal_dim: 15
+
+goal_reference_path: ${hydra:runtime.cwd}/assets/ref_poses/stand.npz

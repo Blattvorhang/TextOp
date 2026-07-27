@@ -3,8 +3,10 @@ from omegaconf import DictConfig
 from hydra.utils import instantiate
 
 from robotmdar.utils.ego_condition import (
+    GoalType,
     build_ego_goal,
     query_local_occupancy,
+    validate_goal_config,
 )
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
@@ -21,6 +23,11 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
         primitive['world_goal_yaw'].to(cfg.device),
         reference_pos,
         reference_rot,
+        goal_type=cfg.data.goal_type,
+        goal_keypoints=(
+            primitive['world_goal_keypoints'].to(cfg.device)
+            if GoalType.parse(cfg.data.goal_type) is GoalType.BODY else None
+        ),
     )
     voxel = query_local_occupancy(
         primitive['scene'],
@@ -61,6 +68,7 @@ def _detach_mapping(values):
 def main(cfg: DictConfig):
     seed.set(cfg.seed)
     logger.set(cfg)
+    validate_goal_config(cfg.data.goal_type, cfg.denoiser.goal_dim)
     if cfg.train.manager.use_static_pose:
         raise ValueError(
             "Static-pose replacement has no world reference pose and is not "

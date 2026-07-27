@@ -15,6 +15,7 @@ from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
 from robotmdar.dtype.motion import FeatureVersion
 from robotmdar.eval.generate_dar import generate_next_motion
+from robotmdar.utils.ego_condition import GoalType, validate_goal_config
 from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
     generated_history_at_frame,
@@ -49,9 +50,19 @@ def _cuda_synchronize(device: str) -> None:
 def main(cfg: DictConfig) -> None:
     """Run the TextOp planner until interrupted."""
     from sonicmsg import PlannerNode
+    from sonicmsg.messages import unpack_occ
 
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
+    goal_type = validate_goal_config(
+        cfg.data.goal_type, cfg.denoiser.goal_dim)
+    goal_reference_path = cfg.get("goal_reference_path")
+    if goal_reference_path is not None:
+        goal_reference_path = to_absolute_path(str(goal_reference_path))
+    if goal_type is GoalType.BODY and goal_reference_path is None:
+        logger.info(
+            "Body-goal planner expects goal_keypoints from the controller; "
+            "no reference pose is configured")
     if FeatureVersion != 3:
         raise ValueError(
             f"planner_dar requires FeatureVersion 3, got {FeatureVersion}")
@@ -78,8 +89,7 @@ def main(cfg: DictConfig) -> None:
     node = PlannerNode(comm_config)
 
     grid_size = int(cfg.denoiser.grid_size)
-    voxel = torch.zeros(
-        (1, grid_size**3), dtype=torch.float32, device=cfg.device)
+    n_voxels = grid_size**3
     latest_state = None
     last_inferred_seq = None
     next_infer_time = time.perf_counter()
@@ -150,7 +160,9 @@ def main(cfg: DictConfig) -> None:
                                 latest_state, cfg.device))
                         ego_goal = state_goal_from_reference(
                             latest_state, goal_reference_pos,
-                            generated_reference_rot, cfg.device)
+                            generated_reference_rot, cfg.device,
+                            goal_type=goal_type,
+                            goal_reference_path=goal_reference_path)
                     else:
                         abs_pose = {
                             k: v.to(cfg.device)
@@ -159,7 +171,9 @@ def main(cfg: DictConfig) -> None:
                         history_translation = None
                         ego_goal = state_goal_from_reference(
                             latest_state, generated_reference_pos,
-                            generated_reference_rot, cfg.device)
+                            generated_reference_rot, cfg.device,
+                            goal_type=goal_type,
+                            goal_reference_path=goal_reference_path)
                 else:
                     tracked_frame = None
                     if latest_state.current_root_rot is None:
@@ -172,7 +186,9 @@ def main(cfg: DictConfig) -> None:
                             f"entries; need at least {history_len + 1}")
                     history_motion, abs_pose = state_to_model_input(
                         latest_state, history_len, val_data, cfg.device)
-                    ego_goal = state_to_ego_goal(latest_state, cfg.device)
+                    ego_goal = state_to_ego_goal(
+                        latest_state, cfg.device, goal_type=goal_type,
+                        goal_reference_path=goal_reference_path)
                     history_translation = None
 
                 # DEBUG: overwrite the ego_goal
@@ -183,11 +199,19 @@ def main(cfg: DictConfig) -> None:
                 _goal_ego_x = float(ego_goal[0, 0])
                 _goal_ego_y = float(ego_goal[0, 1])
                 _goal_delta_z = float(ego_goal[0, 2])
-                _goal_delta_yaw_rad = math.atan2(
-                    float(ego_goal[0, 4]), float(ego_goal[0, 3]))
-                _goal_delta_yaw_deg = math.degrees(_goal_delta_yaw_rad)
                 _cuda_synchronize(str(cfg.device))
                 infer_start = time.perf_counter()
+                if latest_state.ego_occ is None:
+                    raise ValueError(
+                        f"State {state_seq} does not contain ego occupancy")
+                ego_occ = unpack_occ(latest_state.ego_occ, n_voxels)
+                if ego_occ.size != n_voxels:
+                    raise ValueError(
+                        f"State {state_seq} occupancy has {ego_occ.size} "
+                        f"voxels; expected {n_voxels} for grid_size={grid_size}")
+                voxel = torch.as_tensor(
+                    ego_occ, dtype=torch.float32, device=cfg.device
+                ).unsqueeze(0)
                 future_motion, motion_dict, _new_abs_pose = generate_next_motion(
                     vae=vae,
                     denoiser=denoiser,
@@ -206,11 +230,21 @@ def main(cfg: DictConfig) -> None:
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
                 infer_times.append(infer_ms)
                 avg_ms = sum(infer_times[-20:]) / len(infer_times[-20:])
-                logger.info(
-                    "goal: ego_x={:.3f} ego_y={:.3f} delta_z={:.3f} "
-                    "delta_yaw={:.1f}° | infer={:.1f} ms (avg20={:.1f} ms)",
-                    _goal_ego_x, _goal_ego_y, _goal_delta_z, _goal_delta_yaw_deg,
-                    infer_ms, avg_ms)
+                if goal_type is GoalType.ROOT:
+                    _goal_delta_yaw_deg = math.degrees(math.atan2(
+                        float(ego_goal[0, 4]), float(ego_goal[0, 3])))
+                    logger.info(
+                        "goal[root]: ego_x={:.3f} ego_y={:.3f} "
+                        "delta_z={:.3f} delta_yaw={:.1f} deg | "
+                        "infer={:.1f} ms (avg20={:.1f} ms)",
+                        _goal_ego_x, _goal_ego_y, _goal_delta_z,
+                        _goal_delta_yaw_deg, infer_ms, avg_ms)
+                else:
+                    logger.info(
+                        "goal[body]: root_ego=({:.3f}, {:.3f}, {:.3f}) "
+                        "| infer={:.1f} ms (avg20={:.1f} ms)",
+                        _goal_ego_x, _goal_ego_y, _goal_delta_z,
+                        infer_ms, avg_ms)
 
                 skip_history = 0 if bool(cfg.pub_all_frames) else history_len
                 motion = motion_dict_to_g1data(

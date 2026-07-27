@@ -3,7 +3,12 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from robotmdar.utils.ego_condition import build_ego_goal, query_local_occupancy
+from robotmdar.utils.ego_condition import (
+    GoalType,
+    build_ego_goal,
+    query_local_occupancy,
+    validate_goal_config,
+)
 from robotmdar.dtype import seed, logger as dtypelogger
 from robotmdar.dtype.motion import motion_dict_to_qpos, QPos, get_zero_abs_pose, motion_dict_to_abs_pose
 from robotmdar.dtype.device import tree_to_numpy
@@ -61,7 +66,13 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 batch_item['world_goal_yaw'].to(cfg.device),
                 batch_item['gt_ref_pos'].to(cfg.device),
                 batch_item['gt_ref_rot'].to(cfg.device),
-            )  # [B, 5]
+                goal_type=cfg.data.goal_type,
+                goal_keypoints=(
+                    batch_item['world_goal_keypoints'].to(cfg.device)
+                    if GoalType.parse(cfg.data.goal_type) is GoalType.BODY
+                    else None
+                ),
+            )
             voxel = query_local_occupancy(
                 batch_item['scene'],
                 batch_item['gt_ref_pos'],
@@ -114,6 +125,7 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
 def main(cfg: DictConfig):
     dtypelogger.set(cfg)
     seed.set(cfg.seed)
+    validate_goal_config(cfg.data.goal_type, cfg.denoiser.goal_dim)
 
     val_data: Dataset = instantiate(cfg.data.val)
     val_dataiter = iter(val_data)

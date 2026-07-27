@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from robotmdar.utils.ego_condition import build_ego_goal
+from robotmdar.utils.ego_condition import GoalType, build_ego_goal
 from robotmdar.dtype.motion import motion_dict_to_feature_v3
 
 
@@ -129,7 +131,10 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
 
 
 def state_to_ego_goal(state_msg: Any,
-                      device: str | torch.device) -> torch.Tensor:
+                      device: str | torch.device,
+                      goal_type: GoalType | str = GoalType.ROOT,
+                      goal_reference_path: str | Path | None = None
+                      ) -> torch.Tensor:
     """Convert the root goal relative to the last history-feature pose."""
     reference_pos = torch.tensor(
         state_msg.raw["g1_pos"][-2], dtype=torch.float32,
@@ -139,22 +144,105 @@ def state_to_ego_goal(state_msg: Any,
     reference_rot = torch.as_tensor(
         reference_rot_np, dtype=torch.float32, device=device)
     return state_goal_from_reference(
-        state_msg, reference_pos, reference_rot, device)
+        state_msg, reference_pos, reference_rot, device,
+        goal_type=goal_type, goal_reference_path=goal_reference_path)
+
+
+@lru_cache(maxsize=8)
+def _load_goal_keypoint_template(ref_path: str) -> np.ndarray:
+    path = Path(ref_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Goal reference pose does not exist: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        if 'keypoints' not in data:
+            raise ValueError(f"Goal reference pose has no 'keypoints': {path}")
+        keypoints = np.array(data['keypoints'], dtype=np.float32, copy=True)
+    if keypoints.shape != (5, 3):
+        raise ValueError(
+            f"Goal reference keypoints must have shape (5, 3), got "
+            f"{keypoints.shape} in {path}")
+    if not np.isfinite(keypoints).all():
+        raise ValueError(f"Goal reference pose contains non-finite values: {path}")
+    if not np.allclose(keypoints[0, :2], 0.0, atol=1e-5):
+        raise ValueError(
+            f"Goal reference root XY must be at the origin, got "
+            f"{keypoints[0, :2]} in {path}")
+    return keypoints
+
+
+def load_goal_keypoints_from_reference(
+    ref_path: str | Path,
+    goal_root_pos: np.ndarray,
+    goal_heading: float,
+) -> np.ndarray:
+    """Place an XY-origin, absolute-Z reference pose in the world frame."""
+    goal_root_pos = np.asarray(goal_root_pos, dtype=np.float32)
+    if goal_root_pos.shape != (3,):
+        raise ValueError(
+            f"goal_root_pos must have shape (3,), got {goal_root_pos.shape}")
+    if not np.isfinite(goal_root_pos).all() or not np.isfinite(goal_heading):
+        raise ValueError("Goal root position and heading must be finite")
+
+    keypoints = _load_goal_keypoint_template(str(Path(ref_path).resolve())).copy()
+    if not np.isclose(goal_root_pos[2], keypoints[0, 2], atol=1e-4):
+        raise ValueError(
+            f"goal_root_pos.z ({goal_root_pos[2]:.4f}) does not match "
+            f"reference root z ({keypoints[0, 2]:.4f})")
+
+    c = np.cos(float(goal_heading))
+    s = np.sin(float(goal_heading))
+    rotation_xy = np.asarray([[c, -s], [s, c]], dtype=np.float32)
+    keypoints[:, :2] = keypoints[:, :2] @ rotation_xy.T
+    keypoints[:, :2] += goal_root_pos[:2]
+    return np.ascontiguousarray(keypoints)
 
 
 def state_goal_from_reference(state_msg: Any,
                               reference_pos: torch.Tensor,
                               reference_rot: torch.Tensor,
-                              device: str | torch.device) -> torch.Tensor:
+                              device: str | torch.device,
+                              goal_type: GoalType | str = GoalType.ROOT,
+                              goal_reference_path: str | Path | None = None
+                              ) -> torch.Tensor:
     """Convert the state goal relative to an explicit generated-history pose."""
-    if state_msg.goal_root_pos is None or state_msg.goal_heading is None:
-        raise ValueError("TextOp state is missing its root-heading goal")
-    goal_pos = torch.tensor(
-        state_msg.goal_root_pos, dtype=torch.float32, device=device).reshape(1, 3)
-    goal_yaw = torch.tensor(
-        state_msg.goal_heading, dtype=torch.float32, device=device).reshape(1)
+    goal_type = GoalType.parse(goal_type)
+    goal_keypoints = None
+
+    if goal_type is GoalType.BODY:
+        raw = getattr(state_msg, 'raw', {})
+        state_keypoints = getattr(state_msg, 'goal_keypoints', None)
+        if state_keypoints is None:
+            state_keypoints = raw.get('goal_keypoints')
+        if state_keypoints is None:
+            if goal_reference_path is None:
+                raise ValueError(
+                    "Body goal requires controller goal_keypoints or "
+                    "goal_reference_path")
+            if state_msg.goal_root_pos is None or state_msg.goal_heading is None:
+                raise ValueError("TextOp state is missing its root-heading goal")
+            state_keypoints = load_goal_keypoints_from_reference(
+                goal_reference_path,
+                np.asarray(state_msg.goal_root_pos, dtype=np.float32),
+                float(np.asarray(state_msg.goal_heading).reshape(-1)[0]),
+            )
+        goal_keypoints = torch.as_tensor(
+            np.array(state_keypoints, dtype=np.float32, copy=True),
+            dtype=torch.float32, device=device).reshape(1, 5, 3)
+        goal_pos = goal_keypoints[:, 0]
+        goal_yaw = torch.zeros(1, dtype=torch.float32, device=device)
+    else:
+        if state_msg.goal_root_pos is None or state_msg.goal_heading is None:
+            raise ValueError("TextOp state is missing its root-heading goal")
+        goal_pos = torch.tensor(
+            state_msg.goal_root_pos, dtype=torch.float32,
+            device=device).reshape(1, 3)
+        goal_yaw = torch.tensor(
+            state_msg.goal_heading, dtype=torch.float32,
+            device=device).reshape(1)
+
     return build_ego_goal(
-        goal_pos, goal_yaw, reference_pos.to(device), reference_rot.to(device))
+        goal_pos, goal_yaw, reference_pos.to(device), reference_rot.to(device),
+        goal_type=goal_type, goal_keypoints=goal_keypoints)
 
 
 def align_generated_history_pose(abs_pose: dict,
