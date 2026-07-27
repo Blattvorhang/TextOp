@@ -334,3 +334,7 @@ def main(cfg: DictConfig):
                     loss_dict=_detach_mapping(loss_dict),
                     extras=_detach_mapping(extras),
                 )
+
+    # Clean up DDP resources
+    if dist.is_initialized():
+        dist.destroy_process_group()

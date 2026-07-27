@@ -183,3 +183,7 @@ def main(cfg: DictConfig):
                                       lambda x: x.detach().cpu()
                                       if isinstance(x, torch.Tensor) else x,
                                       extras))
+
+    # Clean up DDP resources
+    if dist.is_initialized():
+        dist.destroy_process_group()
