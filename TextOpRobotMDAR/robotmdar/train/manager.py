@@ -13,6 +13,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 import copy
 
+from robotmdar.utils.ego_condition import GoalType
 from robotmdar.dtype.motion import get_zero_feature, perturb_feature_v3, FeatureVersion
 from robotmdar.dtype.rotation import rot6d_to_matrix, matrix_to_rot6d, quaternion_to_matrix, xyzw_to_wxyz
 from isaac_utils.rotations import get_euler_xyz
@@ -872,6 +873,7 @@ class DARManager(BaseManager, GeometryLoss):
         history_motion=None,
         ego_goal=None,
         goal_condition_keep_mask=None,
+        goal_type: GoalType | str = GoalType.ROOT,
         is_eval: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         terms = {}
@@ -931,6 +933,7 @@ class DARManager(BaseManager, GeometryLoss):
         terms.update(geometry_terms)
         extras.update(geometry_extras)
 
+        goal_type = GoalType.parse(goal_type)
         compute_goal_direction = (
             self.loss_weight.get('goal_direction', 0.0) > 0.0 or is_eval
         )
@@ -939,9 +942,16 @@ class DARManager(BaseManager, GeometryLoss):
                 raise ValueError(
                     "ego_goal is required when goal_direction loss is enabled or during eval"
                 )
-            terms['goal_direction'] = self.calc_goal_direction_loss(
-                future_motion_pred, ego_goal, goal_condition_keep_mask
-            )
+            if goal_type is GoalType.ROOT:
+                terms['goal_direction'] = self.calc_goal_direction_loss(
+                    future_motion_pred, ego_goal, goal_condition_keep_mask
+                )
+            else:
+                # goal_direction loss measures root displacement alignment;
+                # it is not defined for body keypoint goals. Report zero.
+                terms['goal_direction'] = torch.tensor(
+                    0.0, device=future_motion_gt.device
+                )
 
         total_loss = sum(self.loss_weight[k] * v for k, v in terms.items())
 

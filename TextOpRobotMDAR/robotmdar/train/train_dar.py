@@ -102,6 +102,16 @@ def main(cfg: DictConfig):
             "supported by goal+scene training"
         )
 
+    # Validate goal_direction loss compatibility
+    goal_type = GoalType.parse(cfg.data.goal_type)
+    goal_direction_weight = cfg.train.manager.loss_weight.get('goal_direction', 0.0)
+    if goal_direction_weight > 0.0 and goal_type is not GoalType.ROOT:
+        raise ValueError(
+            f"goal_direction loss (weight={goal_direction_weight}) is only "
+            f"supported for goal_type='root', got '{goal_type.value}'. "
+            "Set train.manager.loss_weight.goal_direction=0.0 for body goal."
+        )
+
     # Override device in config for downstream components
     cfg.device = str(device)
 
@@ -230,6 +240,7 @@ def main(cfg: DictConfig):
                 history_motion=history_motion,  # dist=None for DAR
                 ego_goal=y['goal'],
                 goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
+                goal_type=cfg.data.goal_type,
             )
             loss = loss_dict['total']
 
@@ -335,6 +346,7 @@ def main(cfg: DictConfig):
                         history_motion=history_motion,
                         ego_goal=y['goal'],
                         goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
+                        goal_type=cfg.data.goal_type,
                         is_eval=True)
 
                 manager.post_step(
