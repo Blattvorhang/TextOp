@@ -29,9 +29,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 MJCF_DIR="${MJCF_DIR:-${PROJECT_ROOT}/TextOpRobotMDAR/description/robots/g1}"
 
 # ---- config ----
-BONES_SEED_DIR="${BONES_SEED_DIR:-/home/lenovo/data/bones-seed}"
-# OUTPUT_ROOT="${OUTPUT_ROOT:-${BONES_SEED_DIR}}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-data}"
+BONES_SEED_DIR="${BONES_SEED_DIR:-/ALG/yukang/dataset/bones-seed}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${BONES_SEED_DIR}}"
+# OUTPUT_ROOT="${OUTPUT_ROOT:-data}"
 FPS_TARGET="${FPS_TARGET:-50}"
 FPS_SOURCE="${FPS_SOURCE:-120}"
 NUM_WORKERS="${NUM_WORKERS:-16}"

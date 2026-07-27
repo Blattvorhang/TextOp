@@ -606,8 +606,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         worker_info = data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         generator = torch.Generator()
-        # Use rank and world_size to ensure each DDP process gets different data
-        # Each rank's workers get seeds offset by rank to avoid data overlap
+        # Each DDP rank gets a distinct data stream via rank offset; each worker
+        # within a rank is further offset.  np.random.randint adds per-iterator-
+        # instance variation so that different runs (or resumed runs with a fresh
+        # iterator) naturally see different sample orderings without needing an
+        # explicit epoch counter — this training loop uses stages, not epochs.
         seed_offset = self.rank + worker_id * self.world_size + np.random.randint(0, 1000000)
         generator.manual_seed(seed_offset)
 

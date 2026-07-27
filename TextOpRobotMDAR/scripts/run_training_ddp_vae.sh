@@ -76,7 +76,7 @@ torchrun \
     -m robotmdar.cli \
     --config-name=train_mvae \
     expname=BONES-SEED-GOAL \
-    timestamp=${TIMESTAMP} \
+    timestamp="'${TIMESTAMP}'" \
     data.datadir=./dataset/${DATADIR} \
     data.num_primitive=4 \
     data.batch_size=512 \
