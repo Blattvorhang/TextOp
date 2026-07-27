@@ -2,7 +2,7 @@
 DAR Motion Generation Module
 
 Common motion generation functionality extracted from vis_dar.py and loop_dar.py.
-Supports both full_sample (complete DDMP sampling) and single_step_sample modes.
+Supports both full_sample (complete DDPM sampling) and single_step_sample modes.
 
 Functions:
 - generate_next_motion: Generate next motion segment using DAR model
@@ -44,7 +44,8 @@ def generate_next_motion(
         denoiser,
         diffusion,
         val_data,
-        text_embedding: torch.Tensor,
+        goal: torch.Tensor,
+        voxel: torch.Tensor,
         history_motion: torch.Tensor,
         abs_pose,  #  AbsolutePose
         future_len: int,
@@ -56,31 +57,31 @@ def generate_next_motion(
         use_ddim=False):
     """
     Generate next motion segment using DAR model.
-    
+
     Args:
         vae: VAE model for encoding/decoding
         denoiser: Denoiser model for diffusion
         diffusion: Diffusion model
         val_data: Dataset for motion reconstruction
-        text_embedding: Text embedding tensor [B, D]
+        goal: Ego-centric goal tensor [B, denoiser.goal_dim].
+        voxel: Scene occupancy tensor [B, grid_size^3]
         history_motion: History motion tensor [B, T_hist, D]
         abs_pose: Current absolute pose
         future_len: Length of future motion to generate
-        cfg: Configuration object
         use_full_sample: Whether to use full DDPM sampling loop
-        
+
     Returns:
         Tuple of (future_motion_pred, motion_dict, new_abs_pose)
     """
     device = history_motion.device
     with torch.no_grad():
-        batch_size = text_embedding.shape[0]
+        batch_size = goal.shape[0]
         # latent_shape = (batch_size, 1, 128
         #                 )  # [B, T=1, D] - latent_dim from config
         latent_shape = (batch_size, *denoiser.noise_shape)
 
-        # Sample random noise as starting point
-        # x_start_noise = torch.randn(latent_shape, device=device)
+        # Sample random noise as starting point for single-step denoising.
+        x_start_noise = torch.randn(latent_shape, device=device)
 
         # Sample a random timestep for demonstration (or use t=0 for no noise)
         t = torch.zeros(batch_size, dtype=torch.int32,
@@ -88,7 +89,8 @@ def generate_next_motion(
 
         # Prepare conditioning
         y: Dict[str, Any] = {
-            'text_embedding': text_embedding,
+            'goal': goal,
+            'voxel': voxel,
             'history_motion_normalized': history_motion,
         }
         if guidance_scale is not None:

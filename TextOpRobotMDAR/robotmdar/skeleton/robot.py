@@ -28,6 +28,14 @@ class RobotSkeleton:
     def foot_id(self):
         return self.fk.get_foot_id()
 
+    @cached_property
+    def hand_id(self):
+        return self.fk.get_hand_id()
+
+    @cached_property
+    def goal_keypoint_id(self):
+        return [0, *self.foot_id, *self.hand_id]
+
     @property
     def parent_indices(self):
         return self.fk.parent_indices

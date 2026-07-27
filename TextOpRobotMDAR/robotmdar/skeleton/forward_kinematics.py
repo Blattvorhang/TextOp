@@ -421,3 +421,8 @@ class ForwardKinematics:
         foot_names: list = self.cfg.foot_names
         return [body_names.index(foot_name) for foot_name in foot_names]
         # return bodyt_names.index('left_foot')
+
+    def get_hand_id(self) -> list:
+        """Return left/right hand IDs in the augmented body array."""
+        hand_names = ("left_hand_link", "right_hand_link")
+        return [self.body_names_augment.index(name) for name in hand_names]

@@ -8,6 +8,9 @@ task: loop-dar
 # Generation settings
 use_full_sample: true  # Use full DDPM sampling for better quality
 
+# Required in body-goal mode when the controller does not provide keypoints.
+goal_reference_path: null
+
 # Override data settings for loop generation
 data:
   val:

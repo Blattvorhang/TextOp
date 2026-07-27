@@ -23,7 +23,7 @@ from torch.utils import data
 from tqdm import tqdm
 # from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
-from robotmdar.dataloader.conditioning import quaternion_yaw
+from robotmdar.utils.ego_condition import GoalType, quaternion_yaw
 from robotmdar.dtype.motion import MotionDict, motion_dict_to_feature, AbsolutePose, motion_feature_to_dict, MotionKeys
 import json
 
@@ -52,6 +52,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         datadir: str,
         action_statistics_path: str,
         goal_offset: int = 0,
+        goal_type: GoalType | str = GoalType.ROOT,
         weighted_sample: bool = False,
         frame_weight: bool = False,
         use_weighted_meanstd: bool = False,
@@ -75,6 +76,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.context_len = self.history_len + self.future_len
 
         self.goal_offset = goal_offset
+        self.goal_type = GoalType.parse(goal_type)
         self.weighted_sample = weighted_sample
         self.frame_weight = frame_weight
         self.action_statistics_path = action_statistics_path
@@ -418,8 +420,27 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         else:
             return True
 
-    def _extract_single_primitive(self, sample: Dict[str, Any], prim_start: int,
-                                  prim_end: int, goal_frame: int) -> Dict[str, Any]:
+    def _world_goal_keypoints(self, raw_motion: Dict[str, Any],
+                              goal_frame: int) -> torch.Tensor:
+        goal_motion = {
+            'dof': torch.as_tensor(
+                raw_motion['dof'][goal_frame:goal_frame + 1],
+                dtype=torch.float32),
+            'root_trans_offset': torch.as_tensor(
+                raw_motion['root_trans_offset'][goal_frame:goal_frame + 1],
+                dtype=torch.float32),
+            'root_rot': torch.as_tensor(
+                raw_motion['root_rot'][goal_frame:goal_frame + 1],
+                dtype=torch.float32),
+        }
+        goal_fk = self.skeleton.forward_kinematics(goal_motion)
+        return goal_fk['global_translation_extend'][
+            0, 0, self.skeleton.goal_keypoint_id]
+
+    def _extract_single_primitive(
+        self, sample: Dict[str, Any], prim_start: int, prim_end: int,
+        goal_frame: int, world_goal_keypoints: torch.Tensor | None = None,
+    ) -> Dict[str, Any]:
         """Extract a single primitive from motion data, plus goal+scene fields.
 
         Returns a dict with:
@@ -438,7 +459,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         raw_motion = sample['motion']
         goal_rot = torch.as_tensor(raw_motion['root_rot'][goal_frame])
 
-        return {
+        primitive = {
             'motion': motion_data,
             'world_goal_pos': torch.as_tensor(raw_motion['root_trans_offset'][goal_frame], dtype=torch.float32),
             'world_goal_yaw': quaternion_yaw(goal_rot.float()),
@@ -448,11 +469,21 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'gt_ref_rot': torch.as_tensor(raw_motion['root_rot'][reference_frame], dtype=torch.float32),
             'scene': sample.get('scene', {}),
         }
+        if self.goal_type is GoalType.BODY:
+            if world_goal_keypoints is None:
+                world_goal_keypoints = self._world_goal_keypoints(
+                    raw_motion, goal_frame)
+            primitive['world_goal_keypoints'] = world_goal_keypoints
+        return primitive
 
     def _generate_motion_primitives(self, sample: Dict[str, Any],
                                     seg_start: int) -> List[Dict[str, Any]]:
         """Generate all primitives from a single motion segment with proper overlapping"""
         goal_frame = seg_start + self.segment_len - 1 + self.goal_offset
+        world_goal_keypoints = None
+        if self.goal_type is GoalType.BODY:
+            world_goal_keypoints = self._world_goal_keypoints(
+                sample['motion'], goal_frame)
         primitives = []
 
         for primitive_idx in range(self.num_primitive):
@@ -462,7 +493,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             prim_start = seg_start + primitive_idx * self.future_len
             prim_end = prim_start + self.future_len + self.history_len + 1
 
-            primitives.append(self._extract_single_primitive(sample, prim_start, prim_end, goal_frame))
+            primitives.append(self._extract_single_primitive(
+                sample, prim_start, prim_end, goal_frame,
+                world_goal_keypoints=world_goal_keypoints))
 
         return primitives
 
@@ -516,6 +549,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'history_start_pos', 'history_start_rot',
             'gt_ref_pos', 'gt_ref_rot',
         )
+        if self.goal_type is GoalType.BODY:
+            tensor_keys += ('world_goal_keypoints',)
         batch_primitives = []
 
         for primitive_idx in range(self.num_primitive):
