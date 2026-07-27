@@ -275,7 +275,8 @@ def main(cfg: DictConfig):
                         weights,
                         history_motion=history_motion,
                         ego_goal=y['goal'],
-                        goal_condition_keep_mask=y['goal_condition_keep_mask'])
+                        goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
+                        is_eval=True)
 
                 manager.post_step(
                     is_eval=True,
