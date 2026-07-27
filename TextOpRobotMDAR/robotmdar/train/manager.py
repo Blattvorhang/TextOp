@@ -872,6 +872,7 @@ class DARManager(BaseManager, GeometryLoss):
         history_motion=None,
         ego_goal=None,
         goal_condition_keep_mask=None,
+        is_eval: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         terms = {}
         extras = {}
@@ -930,10 +931,13 @@ class DARManager(BaseManager, GeometryLoss):
         terms.update(geometry_terms)
         extras.update(geometry_extras)
 
-        if self.loss_weight.get('goal_direction', 0.0) > 0.0:
+        compute_goal_direction = (
+            self.loss_weight.get('goal_direction', 0.0) > 0.0 or is_eval
+        )
+        if compute_goal_direction:
             if ego_goal is None:
                 raise ValueError(
-                    "ego_goal is required when goal_direction loss is enabled"
+                    "ego_goal is required when goal_direction loss is enabled or during eval"
                 )
             terms['goal_direction'] = self.calc_goal_direction_loss(
                 future_motion_pred, ego_goal, goal_condition_keep_mask
