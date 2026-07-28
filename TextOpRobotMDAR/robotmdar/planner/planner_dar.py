@@ -15,7 +15,7 @@ from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
 from robotmdar.dtype.motion import FeatureVersion
 from robotmdar.eval.generate_dar import generate_next_motion
-from robotmdar.utils.ego_condition import GoalType, validate_goal_config
+from robotmdar.utils.goal import GoalType, validate_goal_config
 from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
     generated_history_at_frame,
@@ -144,6 +144,11 @@ def main(cfg: DictConfig) -> None:
             scheduled_next = next_infer_time + period
 
             try:
+                state_goal_type = GoalType.parse(latest_state.goal_type)
+                if state_goal_type is not goal_type:
+                    raise ValueError(
+                        f"Planner is configured for goal_type={goal_type.value!r}, "
+                        f"but controller sent {state_goal_type.value!r}")
                 using_generated_history = (
                     use_generated_history and tracked_plan is not None)
                 if using_generated_history:

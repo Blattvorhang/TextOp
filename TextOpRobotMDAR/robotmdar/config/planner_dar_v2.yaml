@@ -9,4 +9,5 @@ data:
 denoiser:
   goal_dim: 15
 
-goal_reference_path: ${hydra:runtime.cwd}/assets/ref_poses/stand.npz
+# Online v2 requires protocol-v3 keypoints from the controller.
+goal_reference_path: null

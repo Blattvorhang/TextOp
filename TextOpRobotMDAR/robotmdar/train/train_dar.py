@@ -2,12 +2,12 @@ import torch
 from omegaconf import DictConfig
 from hydra.utils import instantiate
 
-from robotmdar.utils.ego_condition import (
+from robotmdar.utils.goal import (
     GoalType,
     build_ego_goal,
-    query_local_occupancy,
     validate_goal_config,
 )
+from robotmdar.utils.occupancy import query_local_occupancy
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
 from robotmdar.train.manager import DARManager

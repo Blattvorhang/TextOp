@@ -23,7 +23,7 @@ from torch.utils import data
 from tqdm import tqdm
 # from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
-from robotmdar.utils.ego_condition import GoalType, quaternion_yaw
+from robotmdar.utils.goal import GoalType, quaternion_yaw
 from robotmdar.dtype.motion import MotionDict, motion_dict_to_feature, AbsolutePose, motion_feature_to_dict, MotionKeys
 import json
 
