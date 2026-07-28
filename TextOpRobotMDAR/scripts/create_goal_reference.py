@@ -23,6 +23,7 @@ import torch
 from omegaconf import OmegaConf
 
 from robotmdar.dtype.motion import G1_ROOT_HEIGHT
+from robotmdar.dtype.rotation import euler_angles_to_quaternion
 from robotmdar.skeleton.robot import RobotSkeleton
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,10 @@ ACTIONS: dict[str, ActionSpec] = {
     "squat": {
         "keywords": ["squat"],  # exact content_name match (no _R suffix)
         "strategy": "deepest",
+    },
+    "crawl": {
+        "keywords": ["spider_crawl_R"],  # exact match — crawl on hands & knees
+        "strategy": "limbs_low",
     },
 }
 
@@ -175,10 +180,52 @@ def _select_squat_frame(csv_path: Path) -> tuple[int, dict[str, float]]:
     return best_frame, _read_frame(csv_path, best_frame)
 
 
+def _select_limbs_low_frame(
+    csv_path: Path,
+    skeleton: RobotSkeleton,
+) -> tuple[int, dict[str, float]]:
+    """Pick the frame where all four limbs are closest to the ground.
+
+    Samples frames, runs FK for each, and returns the one with the
+    smallest maximum Z among the four limb keypoints (feet + hands).
+    """
+    with csv_path.open("r", newline="") as fh:
+        all_rows = list(csv.DictReader(fh))
+
+    best_frame = 0
+    best_max_z = float("inf")
+    step = max(1, len(all_rows) // 100)  # sample ~100 frames
+
+    for i in range(0, len(all_rows), step):
+        row = all_rows[i]
+        dof_rad = _extract_dof(row)
+        root_z_m = float(row["root_translateZ"]) / 100.0
+        euler_rad = np.array([
+            np.deg2rad(float(row["root_rotateX"])),
+            np.deg2rad(float(row["root_rotateY"])),
+            0.0,  # yaw → 0
+        ], dtype=np.float32)
+        root_rot_np = euler_angles_to_quaternion(
+            torch.from_numpy(euler_rad)
+        ).numpy()
+
+        kp = _run_fk(skeleton, dof_rad, root_z_m, root_rot_np)
+        # kp order: pelvis, L-foot, R-foot, L-hand, R-hand
+        max_limb_z = max(kp[1, 2], kp[2, 2], kp[3, 2], kp[4, 2])
+        if max_limb_z < best_max_z:
+            best_max_z = max_limb_z
+            best_frame = i
+
+    return best_frame, _read_frame(csv_path, best_frame)
+
+
 FRAME_SELECTORS = {
-    "middle": lambda p: (lambda n: (n // 2, _read_frame(p, n // 2)))(_count_frames(p)),
-    "hand_raised": _select_hand_raised_frame,
-    "deepest": _select_squat_frame,
+    "middle": lambda p, sk=None: (
+        lambda n: (n // 2, _read_frame(p, n // 2))
+    )(_count_frames(p)),
+    "hand_raised": lambda p, sk=None: _select_hand_raised_frame(p),
+    "deepest": lambda p, sk=None: _select_squat_frame(p),
+    "limbs_low": _select_limbs_low_frame,
 }
 
 # ---------------------------------------------------------------------------
@@ -201,6 +248,7 @@ def _run_fk(
     skeleton: RobotSkeleton,
     dof: np.ndarray,
     root_z_m: float,
+    root_rot: np.ndarray | None = None,
 ) -> np.ndarray:
     """Run forward kinematics and return goal keypoints.
 
@@ -209,19 +257,23 @@ def _run_fk(
     skeleton : RobotSkeleton
     dof : np.ndarray  shape (23,), radians
     root_z_m : float   root Z in metres
+    root_rot : np.ndarray or None  shape (4,) quaternion xyzw; identity if None
 
     Returns
     -------
     np.ndarray  shape (N_keypoints, 3), metres
     """
-    root_rot = torch.zeros((1, 4), dtype=torch.float32)
-    root_rot[:, 3] = 1.0  # identity quaternion → yaw = 0
+    if root_rot is None:
+        root_rot_q = torch.zeros((1, 4), dtype=torch.float32)
+        root_rot_q[:, 3] = 1.0  # identity → yaw = 0
+    else:
+        root_rot_q = torch.from_numpy(root_rot).unsqueeze(0).to(torch.float32)
     motion = {
         "dof": torch.from_numpy(dof).unsqueeze(0),  # (23,) → (1, 23)
         "root_trans_offset": torch.tensor(
             [[0.0, 0.0, root_z_m]], dtype=torch.float32
         ),
-        "root_rot": root_rot,
+        "root_rot": root_rot_q,
     }
     result = skeleton.forward_kinematics(motion)
     # global_translation_extend: (batch=1, seq=1, N_bodies_ext, 3)
@@ -261,16 +313,17 @@ def _validate_pose(
     hand_z_l = l_hand[2]
     hand_z_r = r_hand[2]
 
-    # --- universal checks ---
-    # Feet should be near the ground
-    if abs(foot_z) > 0.15:
-        issues.append(f"Average foot Z = {foot_z:.3f} m (expected near 0)")
+    # --- universal checks (skip for poses that are inherently horizontal) ---
+    if action != "crawl":
+        # Feet should be near the ground
+        if abs(foot_z) > 0.15:
+            issues.append(f"Average foot Z = {foot_z:.3f} m (expected near 0)")
 
-    # Pelvis should be above feet
-    if pelvis_z < foot_z - 0.05:
-        issues.append(
-            f"Pelvis Z ({pelvis_z:.3f}) below foot Z ({foot_z:.3f})"
-        )
+        # Pelvis should be above feet
+        if pelvis_z < foot_z - 0.05:
+            issues.append(
+                f"Pelvis Z ({pelvis_z:.3f}) below foot Z ({foot_z:.3f})"
+            )
 
     # --- action-specific checks ---
     if action == "stand":
@@ -296,7 +349,6 @@ def _validate_pose(
             issues.append(
                 f"Raise-hand: hand Z diff = {diff:.3f} m (expected ≥0.20)"
             )
-        higher = "left" if hand_z_l > hand_z_r else "right"
         hh = max(hand_z_l, hand_z_r)
         if hh < 1.2:
             issues.append(
@@ -312,6 +364,19 @@ def _validate_pose(
         if knee_avg < 90.0:
             issues.append(
                 f"Squat knee avg = {knee_avg:.1f}° (expected ≥90°)"
+            )
+
+    elif action == "crawl":
+        # Hands-and-knees crawl: all four limbs should be near ground level,
+        # pelvis at intermediate height above the limbs.
+        max_limb_z = max(l_foot[2], r_foot[2], hand_z_l, hand_z_r)
+        if max_limb_z > 0.15:
+            issues.append(
+                f"Crawl: max limb Z = {max_limb_z:.3f} m (expected ≤0.15)"
+            )
+        if pelvis_z < max_limb_z - 0.02:
+            issues.append(
+                f"Crawl: pelvis Z ({pelvis_z:.3f}) below max limb Z ({max_limb_z:.3f})"
             )
 
     return issues
@@ -340,7 +405,7 @@ def main() -> None:
     parser.add_argument(
         "--actions",
         nargs="+",
-        default=["stand", "sit", "raise_hand", "squat"],
+        default=["stand", "sit", "raise_hand", "squat", "crawl"],
         help="Which actions to export (default: all four)",
     )
     parser.add_argument(
@@ -396,20 +461,31 @@ def main() -> None:
                 n = _count_frames(csv_path)
                 frame_idx, frame = n // 2, _read_frame(csv_path, n // 2)
             else:
-                frame_idx, frame = selector(csv_path)
+                frame_idx, frame = selector(csv_path, skeleton)
         except Exception as e:
             print(f"  ERROR selecting frame: {e}")
             continue
         print(f"  Frame: {frame_idx}")
 
-        # 3. extract DOF (radians) and root Z
+        # 3. extract DOF (radians), root Z, and root rotation
         dof_rad = _extract_dof(frame)
         root_z_cm = float(frame["root_translateZ"])
         root_z_m = root_z_cm / 100.0
         print(f"  Root Z: {root_z_m:.3f} m  ({root_z_cm:.1f} cm)")
 
+        # Build root quaternion from CSV euler angles (degrees → radians),
+        # keeping pitch & roll but zeroing yaw (heading = 0 convention).
+        rx = np.deg2rad(float(frame["root_rotateX"]))
+        ry = np.deg2rad(float(frame["root_rotateY"]))
+        rz = 0.0  # yaw → 0
+        euler_rad = np.array([rx, ry, rz], dtype=np.float32)
+        root_rot_np = euler_angles_to_quaternion(
+            torch.from_numpy(euler_rad)
+        ).numpy()
+        print(f"  Root rot (deg): X={np.rad2deg(rx):.1f} Y={np.rad2deg(ry):.1f} Z=0")
+
         # 4. FK
-        keypoints = _run_fk(skeleton, dof_rad, root_z_m)
+        keypoints = _run_fk(skeleton, dof_rad, root_z_m, root_rot_np)
         print(f"  Keypoints shape: {keypoints.shape}")
 
         # 5. validate
