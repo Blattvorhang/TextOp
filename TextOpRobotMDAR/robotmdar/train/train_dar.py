@@ -115,6 +115,8 @@ def main(cfg: DictConfig):
             motion = primitive['motion'].to(cfg.device)
 
             future_motion_gt = motion[:, -future_len:, :]
+            sliding_mask = batch[pidx]['sliding_mask'].to(
+                cfg.device)[:, -future_len:, :]
             gt_history = motion[:, :history_len, :]
 
             # 使用统一的history选择函数
@@ -172,6 +174,7 @@ def main(cfg: DictConfig):
                 latent_pred,
                 weights,
                 history_motion=history_motion,  # dist=None for DAR
+                sliding_mask=sliding_mask,
                 ego_goal=y['goal'],
                 goal_condition_keep_mask=y['goal_condition_keep_mask'],
             )
@@ -234,6 +237,8 @@ def main(cfg: DictConfig):
                 motion = primitive['motion'].to(cfg.device)
 
                 future_motion_gt = motion[:, -future_len:, :]
+                sliding_mask = batch[pidx]['sliding_mask'].to(
+                    cfg.device)[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]
                 y = _conditions(
                     primitive,
@@ -274,6 +279,7 @@ def main(cfg: DictConfig):
                         latent_pred,
                         weights,
                         history_motion=history_motion,
+                        sliding_mask=sliding_mask,
                         ego_goal=y['goal'],
                         goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                         is_eval=True)

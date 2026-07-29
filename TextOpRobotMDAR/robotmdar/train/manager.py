@@ -336,6 +336,30 @@ class GeometryLoss:
         jerk = torch.abs(jerk).mean()  # --> B x T-3 x 22, compute L1 norm of jerk
         return jerk
 
+    def calc_foot_sliding_loss(self, foot_positions, contact_mask, fps,
+                               sliding_mask=None):
+        """Penalize predicted world-foot velocity on ground-truth stance frames."""
+        if fps is None or fps <= 0:
+            raise ValueError(f"fps must be positive, got {fps}")
+        if foot_positions.shape[1] < 2:
+            return foot_positions.sum() * 0.0
+        foot_velocity = (
+            foot_positions[:, 1:] - foot_positions[:, :-1]
+        ) * fps
+        stance = contact_mask[:, 1:] > 0.5
+        if sliding_mask is not None:
+            stance = stance & ~(sliding_mask[:, 1:] > 0.5)
+        stance = stance.unsqueeze(-1).to(dtype=foot_velocity.dtype)
+        masked_velocity = foot_velocity * stance
+        return self.rec_criterion(masked_velocity, torch.zeros_like(masked_velocity))
+
+    @staticmethod
+    def calc_sliding_ratio(contact_mask, sliding_mask):
+        if sliding_mask is None:
+            return contact_mask.new_zeros(())
+        sliding = sliding_mask.sum()
+        return sliding / (contact_mask.sum() + sliding + 1e-8)
+
     @staticmethod
     def quantization(tensor, bits=8):
         if bits == 8:
@@ -372,7 +396,8 @@ class GeometryLoss:
         history_motion=None,
         smooth=False,
         quantize=False,
-        drift=False
+        drift=False,
+        sliding_mask=None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """计算几何损失"""
         terms = {}
@@ -395,7 +420,9 @@ class GeometryLoss:
         # Geometric loss
         future_motion_pred_fk = self.dataset.reconstruct_motion(future_motion_pred, need_denormalize=True, ret_fk=True)
         with torch.no_grad():
-            future_motion_gt_fk = self.dataset.reconstruct_motion(future_motion_gt, need_denormalize=True, ret_fk=True)
+            future_motion_gt_fk = self.dataset.reconstruct_motion(
+                future_motion_gt, need_denormalize=True, ret_fk=True,
+                sliding_mask=sliding_mask)
 
         body_trans_loss = self.rec_criterion(
             future_motion_pred_fk['global_translation_extend'], future_motion_gt_fk['global_translation_extend']
@@ -406,12 +433,16 @@ class GeometryLoss:
         dof_pos_loss = self.rec_criterion(future_motion_pred_fk['dof_pos'], future_motion_gt_fk['dof_pos'])
         dof_vel_loss = self.rec_criterion(future_motion_pred_fk['dof_vel'], future_motion_gt_fk['dof_vel'])
 
-        foot_should_contact = future_motion_gt_fk['contact_mask'].unsqueeze(-1)
         foot_trans_pred = future_motion_pred_fk['global_translation_extend'][:, :, self.dataset.skeleton.foot_id, :]
-        foot_trans_gt = future_motion_gt_fk['global_translation_extend'][:, :, self.dataset.skeleton.foot_id, :]
-        foot_contact_loss = self.rec_criterion(
-            foot_trans_pred * foot_should_contact, foot_trans_gt * foot_should_contact
+        foot_contact_loss = self.calc_foot_sliding_loss(
+            foot_trans_pred,
+            future_motion_gt_fk['contact_mask'],
+            fps=self.dataset.fps,
+            sliding_mask=future_motion_gt_fk.get('sliding_mask'),
         )
+        extras['sliding_ratio'] = self.calc_sliding_ratio(
+            future_motion_gt_fk['contact_mask'],
+            future_motion_gt_fk.get('sliding_mask'))
 
         if quantize:
             quantize_pred_rot = self.quantization(future_motion_pred_fk['global_rotation'][:, -1, 0])
@@ -512,7 +543,8 @@ class GeometryLoss:
     def calc_geometry_loss_v3(self,
                               future_motion_pred,
                               future_motion_gt,
-                              history_motion=None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+                              history_motion=None,
+                              sliding_mask=None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """计算几何损失"""
 
         terms = {}
@@ -530,7 +562,8 @@ class GeometryLoss:
                 future_motion_gt,
                 # torch.cat((history_motion, future_motion_gt), dim=1),
                 need_denormalize=True,
-                ret_fk=True
+                ret_fk=True,
+                sliding_mask=sliding_mask,
             )
 
         body_trans_loss = self.rec_criterion(
@@ -542,12 +575,16 @@ class GeometryLoss:
         dof_pos_loss = self.rec_criterion(future_motion_pred_fk['dof_pos'], future_motion_gt_fk['dof_pos'])
         dof_vel_loss = self.rec_criterion(future_motion_pred_fk['dof_vel'], future_motion_gt_fk['dof_vel'])
 
-        foot_should_contact = future_motion_gt_fk['contact_mask'].unsqueeze(-1)
         foot_trans_pred = future_motion_pred_fk['global_translation_extend'][:, :, self.dataset.skeleton.foot_id, :]
-        foot_trans_gt = future_motion_gt_fk['global_translation_extend'][:, :, self.dataset.skeleton.foot_id, :]
-        foot_contact_loss = self.rec_criterion(
-            foot_trans_pred * foot_should_contact, foot_trans_gt * foot_should_contact
+        foot_contact_loss = self.calc_foot_sliding_loss(
+            foot_trans_pred,
+            future_motion_gt_fk['contact_mask'],
+            fps=self.dataset.fps,
+            sliding_mask=future_motion_gt_fk.get('sliding_mask'),
         )
+        extras['sliding_ratio'] = self.calc_sliding_ratio(
+            future_motion_gt_fk['contact_mask'],
+            future_motion_gt_fk.get('sliding_mask'))
         '''temporal delta loss'''
         if history_motion is not None:
             pred_motion_tensor = torch.cat([history_motion[:, -1:, :], future_motion_pred], dim=1)
@@ -604,7 +641,8 @@ class MVAEManager(BaseManager, GeometryLoss):
                   future_motion_gt,
                   future_motion_pred,
                   dist,
-                  history_motion=None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+                  history_motion=None,
+                  sliding_mask=None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         terms = {}
         extras = {}
 
@@ -632,7 +670,8 @@ class MVAEManager(BaseManager, GeometryLoss):
             )
         elif FeatureVersion == 5:
             geometry_terms, geometry_extras = self.calc_geometry_loss_v3(
-                future_motion_pred, future_motion_gt, history_motion
+                future_motion_pred, future_motion_gt, history_motion,
+                sliding_mask=sliding_mask,
             )
         else:
             quantize = (self.loss_weight['quantize_rot'] > 0.0 or self.loss_weight['quantize_trans'] > 0.0)
@@ -643,7 +682,8 @@ class MVAEManager(BaseManager, GeometryLoss):
                 history_motion,
                 smooth=self.loss_weight['smooth'] > 0.0,
                 quantize=quantize,
-                drift=drift
+                drift=drift,
+                sliding_mask=sliding_mask,
             )
 
         # geometry_terms = self.calc_geometry_loss_v2(future_motion_pred, future_motion_gt, history_motion)
@@ -805,6 +845,7 @@ class DARManager(BaseManager, GeometryLoss):
         latent_pred=None,
         weights=None,
         history_motion=None,
+        sliding_mask=None,
         ego_goal=None,
         goal_condition_keep_mask=None,
         is_eval: bool = False,
@@ -843,7 +884,8 @@ class DARManager(BaseManager, GeometryLoss):
             )
         elif FeatureVersion == 5:
             geometry_terms, geometry_extras = self.calc_geometry_loss_v3(
-                future_motion_pred, future_motion_gt, history_motion
+                future_motion_pred, future_motion_gt, history_motion,
+                sliding_mask=sliding_mask,
             )
         else:
             quantize = (self.loss_weight['quantize_rot'] > 0.0 or self.loss_weight['quantize_trans'] > 0.0)
@@ -854,7 +896,8 @@ class DARManager(BaseManager, GeometryLoss):
                 history_motion,
                 smooth=self.loss_weight['smooth'] > 0.0,
                 quantize=quantize,
-                drift=drift
+                drift=drift,
+                sliding_mask=sliding_mask,
             )
 
         # geometry_terms, geometry_extras = calc_geometry_loss(

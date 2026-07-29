@@ -270,6 +270,7 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
                 "root_rot":          ndarray [T, 4],
                 "dof":               ndarray [T, 23],         29-DOF → 23-DOF (wrists locked)
                 "contact_mask":      ndarray [T, 2],
+                "sliding_mask":      ndarray [T, 2],         diagnostic/training side channel
                 "fps":               int,
                 "motion_len":        int,
             },
@@ -300,6 +301,9 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
             "root_rot": entry["root_rot"].astype(np.float32),
             "dof": dof_23.astype(np.float32),
             "contact_mask": entry["contact_mask"].astype(np.float32),
+            "sliding_mask": entry.get(
+                "sliding_mask", np.zeros_like(entry["contact_mask"])
+            ).astype(np.float32),
             "fps": fps_val,
             "motion_len": T,
         },

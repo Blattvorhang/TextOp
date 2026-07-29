@@ -503,6 +503,59 @@ def _mark_geom(occu, llb, unit, model, data, gid, cached_aabb=None):
     occu[vmin[0]:vmax[0], vmin[1]:vmax[1], vmin[2]:vmax[2]] |= mask
 
 
+def _contact_and_sliding_masks_from_foot_positions(
+    foot_pos: np.ndarray,
+    fps: float,
+    height_thresh: float = 0.05,
+    vel_thresh: float = 0.15,
+    pelvis_z: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Classify planted and sliding feet using Bones-SEED world kinematics.
+
+    When *pelvis_z* is provided, frames where the pelvis is below 0.35 m are
+    treated as crawl / prone locomotion.  In that regime foot movement is
+    intentional propulsion and is NOT flagged as sliding — only foot-ground
+    separation matters.
+
+    .. attention::
+       Crawl enforcement currently relies on ``body_trans_loss`` to keep feet
+       near the ground; there is **no** dedicated height-constraint loss for
+       crawl frames.  A future iteration should add a per-frame foot-height
+       penalty on ``sliding_mask`` frames whose ``pelvis_z < 0.35``, and
+       optionally extend contact detection to knees / hands.
+    """
+    if foot_pos.ndim != 3 or foot_pos.shape[1:] != (2, 3):
+        raise ValueError(f"Expected foot_pos shape (T, 2, 3), got {foot_pos.shape}")
+    if fps <= 0:
+        raise ValueError(f"Expected positive fps, got {fps}")
+
+    foot_speed = np.zeros((foot_pos.shape[0], 2), dtype=np.float64)
+    if foot_pos.shape[0] > 1:
+        foot_speed[1:] = np.linalg.norm(np.diff(foot_pos, axis=0), axis=-1) * fps
+
+    foot_is_low = foot_pos[:, :, 2] < height_thresh
+
+    # ── crawl / prone guard ──
+    # Foot motion during crawl is deliberate body propulsion, not a foot-slide
+    # artefact.  Suppress the sliding label so those frames are not penalised
+    # by the velocity→0 loss; they still receive body_trans_loss gravity.
+    if pelvis_z is not None:
+        is_crawl = np.asarray(pelvis_z, dtype=np.float64) < 0.35       # (T,)
+        # Broadcast to (T, 2) so the mask applies to both feet.
+        is_crawl = np.broadcast_to(is_crawl[:, np.newaxis], foot_pos.shape[:2])
+    else:
+        is_crawl = np.zeros(foot_pos.shape[:2], dtype=bool)
+
+    contact = (foot_is_low & (foot_speed < vel_thresh)).astype(np.float32)
+    # Crawl frames: low + fast = intentional, NOT sliding.
+    sliding = (
+        foot_is_low
+        & (foot_speed >= vel_thresh)
+        & ~is_crawl
+    ).astype(np.float32)
+    return contact, sliding
+
+
 def compute_contact_and_mob(
     root_trans_offset: np.ndarray,
     root_rot_xyzw: np.ndarray,
@@ -520,18 +573,17 @@ def compute_contact_and_mob(
     """Compute contact_mask and optionally MOB occupancy via MuJoCo mj_forward.
 
     Uses a single FK pass per frame for contact_mask, plus a second pass for
-    MOB voxel marking.  The body positions of left_ankle_roll_link and
-    right_ankle_roll_link are used for foot contact detection (same formula as
-    SONIC G1FootContactLoss).
+    MOB voxel marking.  Contact uses full 3D world velocity in m/s so the same
+    physical thresholds apply after Bones-SEED is resampled from 120 to 50 Hz.
 
     Args:
         root_trans_offset:  (T, 3) pelvis world translation, meters.
         root_rot_xyzw:      (T, 4) pelvis rotation, xyzw quaternion (scipy).
         dof_mj:             (T, 29) joint angles, radians, MuJoCo/MJCF order.
-        fps:                frame rate of the input data.
+        fps:                frame rate used to convert displacement to m/s.
         xml_path:           path to g1_29dof_with_collision.xml.
-        height_thresh:      contact height threshold in meters (default 0.05).
-        vel_thresh:         contact velocity threshold in m/s (default 0.15).
+        height_thresh:      ankle height threshold in meters (default 0.05).
+        vel_thresh:         full 3D ankle speed threshold in m/s (default 0.15).
         mob:                if True, also compute MOB swept occupancy.
         mob_unit:           voxel resolution for MOB (default 0.08 m).
         mob_margin:         padding around swept volume (default 0.16 m).
@@ -539,7 +591,14 @@ def compute_contact_and_mob(
 
     Returns:
         dict with:
-            contact_mask: (T, 2) float32, [:, 0]=left foot, [:, 1]=right foot.
+            contact_mask: (T, 2) float32. Low and stationary feet.
+            sliding_mask: (T, 2) float32. Low feet moving > *vel_thresh*
+                in world-frame m/s, **except** during crawl (pelvis < 0.35 m)
+                where foot motion is intentional propulsion rather than
+                a sliding artefact.  Crawl frames are excluded from the
+                sliding mask but currently receive no dedicated foot-height
+                constraint — see the ``.. attention`` note in
+                :func:`_contact_and_sliding_masks_from_foot_positions`.
             If mob=True, also:
                 scene: dict with:
                     occu_global:   bool ndarray [X, Y, Z], 1 = occupied (robot swept
@@ -557,7 +616,7 @@ def compute_contact_and_mob(
     # MuJoCo freejoint quaternion is wxyz; input is xyzw (scipy convention)
     root_rot_wxyz = root_rot_xyzw[:, [3, 0, 1, 2]].astype(np.float64)
 
-    foot_z = np.zeros((T, 2), dtype=np.float64)
+    foot_pos = np.zeros((T, 2, 3), dtype=np.float64)
 
     mob_geom_ids = _get_collision_geom_ids(model) if mob else []
     n_geoms = len(mob_geom_ids)
@@ -575,7 +634,7 @@ def compute_contact_and_mob(
 
     _frame_iter = tqdm(range(T), desc="FK+contact", unit="f", leave=False) if verbose else range(T)
 
-    # ── Pass 1: FK all frames → foot_z + MOB global AABB ──
+    # ── Pass 1: FK all frames → foot positions + MOB global AABB ──
     aabb_idx = 0
     for t in _frame_iter:
         data.qpos[0:3] = root_trans_offset[t]
@@ -583,8 +642,8 @@ def compute_contact_and_mob(
         data.qpos[7:MUJOCO_QPOS_END] = dof_mj[t]
         mujoco.mj_forward(model, data)
 
-        foot_z[t, 0] = data.xpos[left_body_id, 2]
-        foot_z[t, 1] = data.xpos[right_body_id, 2]
+        foot_pos[t, 0] = data.xpos[left_body_id]
+        foot_pos[t, 1] = data.xpos[right_body_id]
 
         if mob:
             frame_cache = []
@@ -602,14 +661,15 @@ def compute_contact_and_mob(
                 ))
             mob_geom_cache.append(frame_cache)
 
-    # ── Contact mask from foot_z ──
-    dt = 1.0 / fps
-    foot_vel = np.zeros((T, 2), dtype=np.float64)
-    foot_vel[1:] = np.abs(foot_z[1:] - foot_z[:-1]) / dt
+    contact, sliding = _contact_and_sliding_masks_from_foot_positions(
+        foot_pos,
+        fps=fps,
+        height_thresh=height_thresh,
+        vel_thresh=vel_thresh,
+        pelvis_z=root_trans_offset[:, 2],
+    )
 
-    contact = ((foot_z < height_thresh) & (foot_vel < vel_thresh)).astype(np.float32)
-
-    result: dict = {"contact_mask": contact}
+    result: dict = {"contact_mask": contact, "sliding_mask": sliding}
 
     # ── MOB: build swept volume from cached AABBs ──
     if mob:
@@ -746,6 +806,7 @@ def process_session_csvs(args_tuple):
                 mob_frame_stride=mob_cfg.get("frame_stride", 1),
             )
             entry["contact_mask"] = fk_result["contact_mask"]
+            entry["sliding_mask"] = fk_result["sliding_mask"]
             if mob_cfg.get("enabled", False):
                 entry["scene"] = fk_result["scene"]
             t_fk += time.time() - t0
@@ -1033,6 +1094,7 @@ def main():
             verbose=True,
         )
         entry["contact_mask"] = fk_result["contact_mask"]
+        entry["sliding_mask"] = fk_result["sliding_mask"]
         if mob_cfg["enabled"]:
             entry["scene"] = fk_result["scene"]
         motion_lib_dict[name] = entry
