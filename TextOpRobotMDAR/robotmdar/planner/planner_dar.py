@@ -235,21 +235,22 @@ def main(cfg: DictConfig) -> None:
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
                 infer_times.append(infer_ms)
                 avg_ms = sum(infer_times[-20:]) / len(infer_times[-20:])
+                occ_count = int(voxel.sum().item())
                 if goal_type is GoalType.ROOT:
                     _goal_delta_yaw_deg = math.degrees(math.atan2(
                         float(ego_goal[0, 4]), float(ego_goal[0, 3])))
                     logger.info(
                         "goal[root]: ego_x={:.3f} ego_y={:.3f} "
                         "delta_z={:.3f} delta_yaw={:.1f} deg | "
-                        "infer={:.1f} ms (avg20={:.1f} ms)",
+                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
-                        _goal_delta_yaw_deg, infer_ms, avg_ms)
+                        _goal_delta_yaw_deg, occ_count, infer_ms, avg_ms)
                 else:
                     logger.info(
                         "goal[body]: root_ego=({:.3f}, {:.3f}, {:.3f}) "
-                        "| infer={:.1f} ms (avg20={:.1f} ms)",
+                        "| occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
-                        infer_ms, avg_ms)
+                        occ_count, infer_ms, avg_ms)
 
                 skip_history = 0 if bool(cfg.pub_all_frames) else history_len
                 motion = motion_dict_to_g1data(
