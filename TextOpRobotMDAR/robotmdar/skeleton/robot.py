@@ -2,7 +2,9 @@ from functools import cached_property
 import torch
 from typing import Optional
 from omegaconf import DictConfig
-from robotmdar.dtype.motion import MotionDict, quaternion_to_euler_angles
+from isaac_utils.rotations import axis_angle_to_quaternion, quaternion_to_matrix
+from robotmdar.dtype.motion import MotionDict
+from robotmdar.dtype.rotation import xyzw_to_wxyz
 from robotmdar.skeleton.forward_kinematics import ForwardKinematics
 from scipy.spatial.transform import Rotation as sRot
 
@@ -63,30 +65,45 @@ class RobotSkeleton:
         dof = motion_dict['dof']
         root_trans = motion_dict['root_trans_offset']
         root_rot = motion_dict['root_rot']
-        root_rot_aa = quaternion_to_euler_angles(root_rot)
 
         # # 判断是否有batch维度
         if dof.ndim == 3:
             # (batch, seq, joints)
-            joint_angles = self.fk.dof_to_axis_angle(dof)
+            dof_batch = dof
+            joint_angles = self.fk.dof_to_axis_angle(dof_batch)
             root_translation = root_trans
         elif dof.ndim == 2:
             # (seq, joints)
-            joint_angles = self.fk.dof_to_axis_angle(dof.unsqueeze(0))
+            dof_batch = dof.unsqueeze(0)
+            joint_angles = self.fk.dof_to_axis_angle(dof_batch)
             root_translation = root_trans.unsqueeze(0)
-            root_rot_aa = root_rot_aa.unsqueeze(0)
+            root_rot = root_rot.unsqueeze(0)
         else:
             raise ValueError(f"dof shape not supported: {dof.shape}")
 
-        pose_aa = torch.cat(
-            (root_rot_aa.unsqueeze(-2), joint_angles,
-             torch.zeros((*joint_angles.shape[:-2],
-                          self.num_extend_dof - joint_angles.shape[-2], 3),
-                         device=joint_angles.device)),
-            dim=-2)
+        # fk_batch's axis-angle path treats every 3-vector as a rotation
+        # vector. A root Euler triple is not a rotation vector and corrupts
+        # combined roll/pitch/yaw. Construct matrices explicitly so the root
+        # quaternion is preserved exactly.
+        root_rot_mat = quaternion_to_matrix(
+            xyzw_to_wxyz(root_rot)).unsqueeze(-3)
+        joint_rot_mat = quaternion_to_matrix(
+            axis_angle_to_quaternion(joint_angles))
+        num_extended = self.num_extend_dof - joint_angles.shape[-2]
+        extended_rot_mat = torch.eye(
+            3, dtype=joint_angles.dtype, device=joint_angles.device
+        ).reshape(1, 1, 1, 3, 3).expand(
+            *joint_angles.shape[:-2], num_extended, 3, 3)
+        pose_mat = torch.cat(
+            (root_rot_mat, joint_rot_mat, extended_rot_mat), dim=-3)
 
-        fk_result = self.fk.fk_batch(pose_aa,
+        fk_result = self.fk.fk_batch(pose_mat,
                                      root_translation,
+                                     convert_to_mat=False,
                                      return_full=return_full)
+        # fk_batch normally recovers scalar joints by summing axis-angle
+        # vectors. Its matrix-input path cannot do that, so retain the exact
+        # source angles instead.
+        fk_result.dof_pos = dof_batch
         fk_result.update(motion_dict)
         return fk_result
