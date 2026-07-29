@@ -118,8 +118,8 @@ def main(cfg: DictConfig):
             history_motion = manager.choose_history(gt_history, prev_motion,
                                                     history_len)
 
-            latent, dist = vae_raw.encode(future_motion=future_motion_gt,
-                                          history_motion=history_motion)
+            latent, latent_dist = vae_raw.encode(future_motion=future_motion_gt,
+                                                  history_motion=history_motion)
             future_motion_pred = vae_raw.decode(latent,
                                                 history_motion,
                                                 nfuture=future_len)  # [B, F, D]
@@ -127,7 +127,7 @@ def main(cfg: DictConfig):
             loss_dict, extras = manager.calc_loss(
                 future_motion_gt,
                 future_motion_pred,
-                dist,
+                latent_dist,
                 history_motion=history_motion)
             loss = loss_dict['total']
 
@@ -166,15 +166,15 @@ def main(cfg: DictConfig):
                 future_motion_gt = motion[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]
 
-                latent, dist = vae_raw.encode(future_motion=future_motion_gt,
-                                              history_motion=history_motion)
+                latent, latent_dist = vae_raw.encode(future_motion=future_motion_gt,
+                                                      history_motion=history_motion)
                 future_motion_pred = vae_raw.decode(latent,
                                                     history_motion,
                                                     nfuture=future_len)
                 loss_dict, extras = manager.calc_loss(
                     future_motion_gt,
                     future_motion_pred,
-                    dist,
+                    latent_dist,
                     history_motion=history_motion)
                 manager.post_step(is_eval=True,
                                   loss_dict=toolz.valmap(
