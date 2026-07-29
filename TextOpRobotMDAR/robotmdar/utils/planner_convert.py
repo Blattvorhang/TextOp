@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from robotmdar.utils.ego_condition import GoalType, build_ego_goal
+from robotmdar.utils.goal import GoalType, build_ego_goal
 from robotmdar.dtype.motion import motion_dict_to_feature_v3
 
 

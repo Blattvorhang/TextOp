@@ -28,7 +28,7 @@ from hydra.utils import instantiate, to_absolute_path
 from loguru import logger
 from omegaconf import DictConfig
 
-from robotmdar.utils.ego_condition import (
+from robotmdar.utils.goal import (
     GoalType,
     build_ego_goal,
     validate_goal_config,

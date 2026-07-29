@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from TextOpRobotMDAR.robotmdar.utils.ego_condition import (
+from TextOpRobotMDAR.robotmdar.utils.goal import (
     GoalType,
     build_ego_goal,
     validate_goal_config,

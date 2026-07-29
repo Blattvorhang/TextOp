@@ -23,7 +23,7 @@ from torch.utils import data
 from tqdm import tqdm
 # from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
-from robotmdar.utils.ego_condition import GoalType, quaternion_yaw
+from robotmdar.utils.goal import GoalType, quaternion_yaw
 from robotmdar.dtype.motion import MotionDict, motion_dict_to_feature, AbsolutePose, motion_feature_to_dict, MotionKeys
 import json
 
@@ -391,7 +391,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         abs_pose: Optional[AbsolutePose] = None,
         need_denormalize: bool = True,
         ret_fk: bool = True,
-        ret_fk_full: bool = False
+        ret_fk_full: bool = False,
+        sliding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Reconstruct motion from features"""
         if need_denormalize:
@@ -401,6 +402,15 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             motion_dict = motion_feature_to_dict(motion_feature, abs_pose, self.skeleton)
         else:
             motion_dict = motion_feature_to_dict(motion_feature, abs_pose)
+
+        if sliding_mask is not None:
+            if sliding_mask.shape != motion_dict['contact_mask'].shape:
+                raise ValueError(
+                    "sliding_mask shape must match contact_mask: "
+                    f"{sliding_mask.shape} != {motion_dict['contact_mask'].shape}"
+                )
+            motion_dict['sliding_mask'] = sliding_mask.to(
+                device=motion_feature.device, dtype=torch.float32)
 
         if ret_fk:
             return self.skeleton.forward_kinematics(motion_dict, return_full=ret_fk_full)
@@ -455,12 +465,20 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             if k in sample['motion']:
                 motion_data[k] = torch.tensor(sample['motion'][k][prim_start:prim_end], dtype=torch.float32)
 
+        raw_sliding_mask = sample['motion'].get('sliding_mask')
+        if raw_sliding_mask is None:
+            sliding_mask = torch.zeros_like(motion_data['contact_mask'])
+        else:
+            sliding_mask = torch.as_tensor(
+                raw_sliding_mask[prim_start:prim_end], dtype=torch.float32)
+
         reference_frame = prim_start + self.history_len - 1
         raw_motion = sample['motion']
         goal_rot = torch.as_tensor(raw_motion['root_rot'][goal_frame])
 
         primitive = {
             'motion': motion_data,
+            'sliding_mask': sliding_mask,
             'world_goal_pos': torch.as_tensor(raw_motion['root_trans_offset'][goal_frame], dtype=torch.float32),
             'world_goal_yaw': quaternion_yaw(goal_rot.float()),
             'history_start_pos': torch.as_tensor(raw_motion['root_trans_offset'][prim_start], dtype=torch.float32),
@@ -565,9 +583,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
             # Convert to tensors and motion features
             motion_features = self._convert_to_motion_features(motion_batch)
+            feature_len = motion_features.shape[1]
 
             batch = {
                 'motion': self.normalize(motion_features),
+                'sliding_mask': torch.stack([
+                    p['sliding_mask'][:feature_len] for p in primitives
+                ]),
                 'scene': [p['scene'] for p in primitives],
             }
             batch.update({

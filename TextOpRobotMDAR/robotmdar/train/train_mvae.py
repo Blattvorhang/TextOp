@@ -112,6 +112,8 @@ def main(cfg: DictConfig):
             motion = batch[pidx]['motion'].to(cfg.device)
 
             future_motion_gt = motion[:, -future_len:, :]
+            sliding_mask = batch[pidx]['sliding_mask'].to(
+                cfg.device)[:, -future_len:, :]
             gt_history = motion[:, :history_len, :]
 
             # 使用统一的history选择函数
@@ -128,7 +130,8 @@ def main(cfg: DictConfig):
                 future_motion_gt,
                 future_motion_pred,
                 latent_dist,
-                history_motion=history_motion)
+                history_motion=history_motion,
+                sliding_mask=sliding_mask)
             loss = loss_dict['total']
 
             optimizer.zero_grad()
@@ -164,6 +167,8 @@ def main(cfg: DictConfig):
                 motion = batch[pidx]['motion'].to(cfg.device)
 
                 future_motion_gt = motion[:, -future_len:, :]
+                sliding_mask = batch[pidx]['sliding_mask'].to(
+                    cfg.device)[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]
 
                 latent, latent_dist = vae_raw.encode(future_motion=future_motion_gt,
@@ -175,7 +180,8 @@ def main(cfg: DictConfig):
                     future_motion_gt,
                     future_motion_pred,
                     latent_dist,
-                    history_motion=history_motion)
+                    history_motion=history_motion,
+                    sliding_mask=sliding_mask)
                 manager.post_step(is_eval=True,
                                   loss_dict=toolz.valmap(
                                       lambda x: x.detach().cpu(), loss_dict),

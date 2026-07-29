@@ -15,7 +15,7 @@ from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
 from robotmdar.dtype.motion import FeatureVersion
 from robotmdar.eval.generate_dar import generate_next_motion
-from robotmdar.utils.ego_condition import GoalType, validate_goal_config
+from robotmdar.utils.goal import GoalType, validate_goal_config
 from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
     generated_history_at_frame,
@@ -144,6 +144,11 @@ def main(cfg: DictConfig) -> None:
             scheduled_next = next_infer_time + period
 
             try:
+                state_goal_type = GoalType.parse(latest_state.goal_type)
+                if state_goal_type is not goal_type:
+                    raise ValueError(
+                        f"Planner is configured for goal_type={goal_type.value!r}, "
+                        f"but controller sent {state_goal_type.value!r}")
                 using_generated_history = (
                     use_generated_history and tracked_plan is not None)
                 if using_generated_history:
@@ -230,21 +235,22 @@ def main(cfg: DictConfig) -> None:
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
                 infer_times.append(infer_ms)
                 avg_ms = sum(infer_times[-20:]) / len(infer_times[-20:])
+                occ_count = int(voxel.sum().item())
                 if goal_type is GoalType.ROOT:
                     _goal_delta_yaw_deg = math.degrees(math.atan2(
                         float(ego_goal[0, 4]), float(ego_goal[0, 3])))
                     logger.info(
                         "goal[root]: ego_x={:.3f} ego_y={:.3f} "
                         "delta_z={:.3f} delta_yaw={:.1f} deg | "
-                        "infer={:.1f} ms (avg20={:.1f} ms)",
+                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
-                        _goal_delta_yaw_deg, infer_ms, avg_ms)
+                        _goal_delta_yaw_deg, occ_count, infer_ms, avg_ms)
                 else:
                     logger.info(
                         "goal[body]: root_ego=({:.3f}, {:.3f}, {:.3f}) "
-                        "| infer={:.1f} ms (avg20={:.1f} ms)",
+                        "| occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
-                        infer_ms, avg_ms)
+                        occ_count, infer_ms, avg_ms)
 
                 skip_history = 0 if bool(cfg.pub_all_frames) else history_len
                 motion = motion_dict_to_g1data(
