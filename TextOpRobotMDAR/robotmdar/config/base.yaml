@@ -1,8 +1,7 @@
-
 defaults:
   - _self_
   - base/hydra
-  - data/babel
+  - data/mob
   - vae/def
   - denoiser/def
   - diffusion/def
