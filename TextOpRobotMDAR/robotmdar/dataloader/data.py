@@ -53,6 +53,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         action_statistics_path: str,
         goal_offset: int = 0,
         goal_type: GoalType | str = GoalType.ROOT,
+        goal_per_primitive: bool = False,
         weighted_sample: bool = False,
         frame_weight: bool = False,
         use_weighted_meanstd: bool = False,
@@ -77,6 +78,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         self.goal_offset = goal_offset
         self.goal_type = GoalType.parse(goal_type)
+        self.goal_per_primitive = goal_per_primitive
         self.weighted_sample = weighted_sample
         self.frame_weight = frame_weight
         self.action_statistics_path = action_statistics_path
@@ -493,11 +495,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
     def _generate_motion_primitives(self, sample: Dict[str, Any],
                                     seg_start: int) -> List[Dict[str, Any]]:
         """Generate all primitives from a single motion segment with proper overlapping"""
-        goal_frame = seg_start + self.segment_len - 1 + self.goal_offset
+        # When goal_per_primitive is True, each primitive uses its own last frame
+        # as the goal; otherwise, the last frame of the entire snippet is shared.
+        snippet_goal_frame = seg_start + self.segment_len - 1 + self.goal_offset
         world_goal_keypoints = None
-        if self.goal_type is GoalType.BODY:
-            world_goal_keypoints = self._world_goal_keypoints(
-                sample['motion'], goal_frame)
         primitives = []
 
         for primitive_idx in range(self.num_primitive):
@@ -506,6 +507,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             # primitive i+1's first history_len frames
             prim_start = seg_start + primitive_idx * self.future_len
             prim_end = prim_start + self.future_len + self.history_len + 1
+
+            if self.goal_per_primitive:
+                # Goal is the last frame of this specific primitive's window
+                goal_frame = prim_start + self.future_len + self.history_len - 1 + self.goal_offset
+                world_goal_keypoints = None
+            else:
+                goal_frame = snippet_goal_frame
+
+            if self.goal_type is GoalType.BODY and world_goal_keypoints is None:
+                world_goal_keypoints = self._world_goal_keypoints(
+                    sample['motion'], goal_frame)
 
             primitives.append(self._extract_single_primitive(
                 sample, prim_start, prim_end, goal_frame,
