@@ -4,6 +4,14 @@ defaults:
   - train/dar
   - _self_
 
-expname: DAR
+expname: DAR-BODY-GOAL
 task: train-dar
 
+data:
+  history_len: 16
+  future_len: 64
+  num_primitive: 4
+  batch_size: 256
+
+denoiser:
+  goal_dim: 15
