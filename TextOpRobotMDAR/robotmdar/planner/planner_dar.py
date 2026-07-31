@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 import time
+from pathlib import Path
 
+import numpy as np
 import torch
 from hydra.utils import instantiate, to_absolute_path
 from loguru import logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from robotmdar.dtype import logger as dtype_logger
 from robotmdar.dtype import seed
@@ -72,10 +74,27 @@ def main(cfg: DictConfig) -> None:
     history_len = int(cfg.data.history_len)
     future_len = int(cfg.data.future_len)
     motion_fps = float(cfg.motion_fps)
-    if history_len != 2:
-        raise ValueError(f"TextOp checkpoint expects history_len=2, got {history_len}")
-    if future_len != 8:
-        raise ValueError(f"TextOp controller expects future_len=8, got {future_len}")
+    _model_cfg_path = cfg.ckpt.get("load_cfg")
+    if _model_cfg_path is None:
+        _ckpt_dar = cfg.ckpt.get("dar")
+        if _ckpt_dar is None:
+            raise ValueError(
+                "ckpt.dar must be set so the model config (cfg.yaml) can be located")
+        _model_cfg_path = Path(_ckpt_dar).parent / "cfg.yaml"
+    _model_cfg_path = to_absolute_path(str(_model_cfg_path))
+    _model_cfg = OmegaConf.load(_model_cfg_path)
+    _expected_history_len = int(_model_cfg.data.history_len)
+    _expected_future_len = int(_model_cfg.data.future_len)
+    if history_len != _expected_history_len:
+        raise ValueError(
+            f"Runtime history_len ({history_len}) does not match "
+            f"model checkpoint history_len ({_expected_history_len}) "
+            f"from {_model_cfg_path}")
+    if future_len != _expected_future_len:
+        raise ValueError(
+            f"Runtime future_len ({future_len}) does not match "
+            f"model checkpoint future_len ({_expected_future_len}) "
+            f"from {_model_cfg_path}")
     if abs(float(val_data.fps) - motion_fps) > 1e-6:
         raise ValueError(
             f"Dataset fps ({val_data.fps}) must match motion_fps ({motion_fps})")
@@ -99,11 +118,15 @@ def main(cfg: DictConfig) -> None:
     generated_plans = {}
     next_ack_log_time = 0.0
     infer_times: list[float] = []  # rolling window for running average
+    fixed_sampling_noise = None
+    if not bool(cfg.get("resample_noise_each_plan", False)):
+        fixed_sampling_noise = torch.randn(
+            (1, *denoiser.noise_shape), device=cfg.device)
 
     logger.info(
         "TextOp planner ready: replan={:.1f} Hz, motion={:.1f} Hz, "
         "history={} features/{} states, future={} frames, history_source={}",
-        1.0 / period, motion_fps, history_len, history_len + 1, future_len,
+        1.0 / period, motion_fps, history_len, history_len, future_len,
         ("generated+translated" if align_generated_history else "generated")
         if use_generated_history else "controller")
 
@@ -159,13 +182,18 @@ def main(cfg: DictConfig) -> None:
                         generated_history_at_frame(
                             tracked_plan, tracked_frame, history_len))
                     if align_generated_history:
-                        abs_pose, goal_reference_pos, history_translation = (
+                        (abs_pose, goal_reference_pos,
+                         goal_reference_rot, history_translation,
+                         history_motion) = (
                             align_generated_history_pose(
                                 generated_abs_pose, generated_reference_pos,
-                                latest_state, cfg.device))
+                                generated_reference_rot,
+                                latest_state, cfg.device,
+                                history_motion=history_motion,
+                                val_data=val_data))
                         ego_goal = state_goal_from_reference(
                             latest_state, goal_reference_pos,
-                            generated_reference_rot, cfg.device,
+                            goal_reference_rot, cfg.device,
                             goal_type=goal_type,
                             goal_reference_path=goal_reference_path)
                     else:
@@ -185,10 +213,10 @@ def main(cfg: DictConfig) -> None:
                         raise ValueError(
                             "Received a legacy history_state; TextOp requires "
                             "history_state_textop_v2")
-                    if latest_state.n_states < history_len + 1:
+                    if latest_state.n_states < history_len:
                         raise ValueError(
                             f"State {state_seq} has {latest_state.n_states} "
-                            f"entries; need at least {history_len + 1}")
+                            f"entries; need at least {history_len}")
                     history_motion, abs_pose = state_to_model_input(
                         latest_state, history_len, val_data, cfg.device)
                     ego_goal = state_to_ego_goal(
@@ -229,6 +257,7 @@ def main(cfg: DictConfig) -> None:
                     future_len=future_len,
                     use_full_sample=bool(cfg.use_full_sample),
                     guidance_scale=cfg.guidance_scale,
+                    initial_noise=fixed_sampling_noise,
                     ret_fk=True,
                 )
                 _cuda_synchronize(str(cfg.device))
@@ -252,9 +281,30 @@ def main(cfg: DictConfig) -> None:
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         occ_count, infer_ms, avg_ms)
 
-                skip_history = 0 if bool(cfg.pub_all_frames) else history_len
+                # SonicRunner resets each newly received G1 plan to frame 0.
+                # Keep the current measured history frame as that exact seam;
+                # dropping all history would jump directly to stochastic t+1.
+                skip_history = (
+                    0 if bool(cfg.pub_all_frames) else history_len - 1)
                 motion = motion_dict_to_g1data(
-                    motion_dict, skip_history=skip_history, fps=motion_fps)
+                    motion_dict, skip_history=skip_history, fps=motion_fps,
+                    locked_joint_pos=np.asarray(
+                        latest_state.raw["g1_joint_pos"][-1],
+                        dtype=np.float32))
+                measured_pos = np.asarray(
+                    latest_state.raw["g1_pos"][-1], dtype=np.float32)
+                measured_rot_xyzw = np.asarray(
+                    latest_state.raw["g1_root_rot"][-1], dtype=np.float32)
+                published_rot_xyzw = motion.body_ori[0, 0, [1, 2, 3, 0]]
+                quat_dot = float(np.clip(np.abs(np.dot(
+                    measured_rot_xyzw, published_rot_xyzw)), 0.0, 1.0))
+                seam_root_error = float(np.linalg.norm(
+                    motion.body_pos[0, 0] - measured_pos))
+                seam_root_angle_deg = math.degrees(2.0 * math.acos(quat_dot))
+                seam_joint_error = float(np.max(np.abs(
+                    motion.joint_pos[0]
+                    - np.asarray(latest_state.raw["g1_joint_pos"][-1],
+                                 dtype=np.float32))))
                 published_seq = node.publish_motion(motion)
 
                 if use_generated_history:
@@ -274,14 +324,16 @@ def main(cfg: DictConfig) -> None:
                     logger.info(
                         "plan={} state={} motion={} frames infer={:.1f} ms "
                         "(avg20={:.1f} ms) "
-                        "history={} tracked_plan={} frame={} shift={:.3f} m",
+                        "history={} tracked_plan={} frame={} shift={:.3f} m "
+                        "seam=({:.4f} m, {:.2f} deg, {:.4f} rad)",
                         published_seq, state_seq, motion.num_frames, infer_ms, avg_ms,
                         "generated" if using_generated_history else "controller",
                         (latest_state.tracked_plan_seq
                          if using_generated_history else -1),
                         tracked_frame if tracked_frame is not None else -1,
                         (float(torch.linalg.vector_norm(history_translation))
-                         if history_translation is not None else 0.0))
+                         if history_translation is not None else 0.0),
+                        seam_root_error, seam_root_angle_deg, seam_joint_error)
             except Exception:
                 logger.exception("Failed to process controller state {}", state_seq)
 
