@@ -46,17 +46,38 @@ def test_fk_preserves_non_upright_root_quaternion():
     motion = {
         "root_trans_offset": torch.zeros((1, 2, 3)),
         "root_rot": root_rot,
-        "dof": torch.zeros((1, 2, 23)),
+        "dof": torch.zeros((1, 2, 29)),
         "contact_mask": torch.ones((1, 2, 2)),
     }
 
     fk = skeleton.forward_kinematics(motion)
 
-    assert fk["dof_pos"].shape == (1, 2, 23)
+    assert fk["dof_pos"].shape == (1, 2, 29)
     torch.testing.assert_close(fk["dof_pos"], motion["dof"])
     dots = torch.abs(torch.sum(
         fk["global_rotation"][:, :, 0] * root_rot, dim=-1))
     torch.testing.assert_close(dots, torch.ones_like(dots), atol=1e-5, rtol=1e-5)
+
+
+def test_wrist_yaw_moves_palm_center_keypoint():
+    project_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(project_root / "robotmdar/config/skeleton/g1.yaml")
+    cfg.asset.assetRoot = str(project_root / "description/robots/g1")
+    skeleton = RobotSkeleton(device="cpu", cfg=cfg)
+    dof = torch.zeros((1, 2, 29))
+    dof[:, 1, 21] = torch.pi / 2  # left_wrist_yaw
+    motion = {
+        "root_trans_offset": torch.zeros((1, 2, 3)),
+        "root_rot": torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(1, 2, 4),
+        "dof": dof,
+        "contact_mask": torch.ones((1, 2, 2)),
+    }
+
+    palm = skeleton.forward_kinematics(motion)[
+        "global_translation_extend"
+    ][:, :, skeleton.hand_id[0]]
+
+    assert torch.linalg.vector_norm(palm[:, 1] - palm[:, 0]).item() > 0.05
 
 
 def test_joint_order_round_trip():
@@ -84,7 +105,7 @@ def test_controller_history_ends_at_current_non_upright_pose():
     feature, abs_pose = state_to_model_input(
         state, history_len=2, val_data=IdentityNormalization(), device="cpu")
 
-    assert feature.shape == (1, 2, 57)
+    assert feature.shape == (1, 2, 69)
     np.testing.assert_allclose(
         abs_pose["root_trans_offset"].numpy(), positions[-2:-1])
     np.testing.assert_allclose(feature[0, 1, 4].numpy(), 0.13, atol=1e-5)
@@ -178,7 +199,7 @@ def test_generated_history_alignment_corrects_absolute_height_channel():
     generated_rot = euler_angles_to_quaternion(torch.tensor([
         [[0.0, 0.0, 0.0], [0.1, -0.2, 0.0], [0.2, -0.3, 0.0]],
     ]))
-    generated_dof = torch.zeros((1, 3, 23))
+    generated_dof = torch.zeros((1, 3, 29))
     generated_contact = torch.ones((1, 3, 2))
     history, abs_pose = motion_dict_to_feature_v3({
         "root_trans_offset": generated_pos,
@@ -250,20 +271,21 @@ def test_generated_history_ends_at_tracked_future_frame():
 
 def test_g1_packet_keeps_seam_and_maps_sonic_tracking_bodies():
     frames = 10
-    dof_pos = torch.zeros((1, frames, 23), dtype=torch.float32)
+    dof_pos = torch.zeros((1, frames, 29), dtype=torch.float32)
     dof_pos[0, :, 0] = torch.arange(frames, dtype=torch.float32) * 0.02
-    body_pos = torch.zeros((1, frames, 27, 3), dtype=torch.float32)
+    dof_pos[0, :, 19:22] = torch.tensor([0.1, 0.2, 0.3])
+    dof_pos[0, :, 26:29] = torch.tensor([-0.1, -0.2, -0.3])
+    body_pos = torch.zeros((1, frames, 33, 3), dtype=torch.float32)
     body_pos[0, :, 15, 0] = 15.0
     body_pos[0, :, 24, 0] = 24.0
     body_pos[0, :, 25, 0] = 25.0
-    body_ori = torch.zeros((1, frames, 27, 4), dtype=torch.float32)
+    body_ori = torch.zeros((1, frames, 33, 4), dtype=torch.float32)
     body_ori[..., 3] = 1.0
-    locked_joint_pos = np.arange(29, dtype=np.float32)
     motion = motion_dict_to_g1data({
         "dof_pos": dof_pos,
         "global_translation_extend": body_pos,
         "global_rotation_extend": body_ori,
-    }, skip_history=1, fps=50.0, locked_joint_pos=locked_joint_pos)
+    }, skip_history=1, fps=50.0)
 
     assert motion.num_frames == 9
     assert motion.joint_pos.shape == (9, 29)
@@ -271,10 +293,8 @@ def test_g1_packet_keeps_seam_and_maps_sonic_tracking_bodies():
     assert motion.body_pos.shape == (9, 30, 3)
     np.testing.assert_array_equal(
         motion.body_pos, np.repeat(body_pos.numpy()[0, 1:, :1], 30, axis=1))
-    locked_isaaclab = np.asarray([23, 25, 27, 24, 26, 28])
     np.testing.assert_array_equal(
-        motion.joint_pos[:, locked_isaaclab],
-        np.repeat(locked_joint_pos[None, locked_isaaclab], 9, axis=0))
+        motion.joint_pos, mujoco_to_isaaclab_dof(dof_pos.numpy()[0, 1:]))
     np.testing.assert_allclose(motion.joint_vel[:, 0], 1.0, atol=1e-6)
     np.testing.assert_array_equal(
         motion.body_ori[0, 0], np.asarray([1.0, 0.0, 0.0, 0.0]))

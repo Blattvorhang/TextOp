@@ -1,10 +1,10 @@
 skeleton: ${..skeleton}
 
-nfeats: 57 # 57 69 205 222 currently we hardcode here
-history_len: 2
-future_len: 8
+nfeats: 69
+history_len: 16
+future_len: 64
 num_primitive: 4
-batch_size: 512
+batch_size: 64
 
 weighted_sample: false
 frame_weight: false
@@ -14,28 +14,12 @@ goal_type: body
 goal_per_primitive: false
 occupancy_unit: 0.08
 
-action_statistics_path: ./dataset/action_statistics_telemotion.json
+action_statistics_path: ${.datadir}/action_statistics.json
 
-# datadir: ./dataset/BABEL-AMASS-ROBOT
-# datadir: ./dataset/BABEL-AMASS-ROBOT-23dof-FULL
-# datadir: ./dataset/BABEL-AMASS-ROBOT-23dof-FULL-Modifier
-# datadir: ./dataset/BABEL-TeleMotion-ROBOT-23dof-9770-Merged
-# datadir: ./dataset/BABEL-AMASS-ROBOT-23dof-9770
-# datadir: ./dataset/BABEL-TeleMotion-ROBOT-23dof-9770-100-Merged
-# datadir: ./dataset/BABEL-TeleMotion-ROBOT-23dof-Full-300-Merged
-# datadir: ./dataset/BABEL-TeleMotion-ROBOT-23dof-Full-1ANN-1000-Merged
-# datadir: ./dataset/BABEL-AMASS-ROBOT-23dof-FULL-50fps
-datadir: dataset/BABEL-TeleMotion-ROBOT-23dof-Full-1ANN-1000-Merged-Interp
+datadir: dataset/BONES-SEED-29dof-FULL-50fps
 
 common: &common
   _target_: robotmdar.dataloader.data.SkeletonPrimitiveDataset
-  # datadir: ./dataset/BABEL-AMASS-ROBOT
-  # datadir: ./dataset/BABEL-AMASS-ROBOT-23dof-FULL
-  # datadir: ./dataset/BABEL-AMASS-ROBOT-23dof-FULL-Modifier
-  # datadir: ./dataset/BABEL-TeleMotion-ROBOT-23dof-9770-Merged
-  # datadir: ./dataset/BABEL-AMASS-ROBOT-23dof-9770
-  # datadir: ./dataset/BABEL-TeleMotion-ROBOT-23dof-9770-100-Merged
-  # datadir: ./dataset/BABEL-TeleMotion-ROBOT-23dof-Full-300-Merged
   datadir: ${..datadir}
 
   action_statistics_path: ${..action_statistics_path}
