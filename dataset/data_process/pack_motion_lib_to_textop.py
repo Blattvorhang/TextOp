@@ -9,7 +9,7 @@ This is the second stage of the BONES-SEED → TextOp pipeline:
 
   Stage 2: pack_motion_lib_to_textop.py  ← this script
       motion_lib PKL
-      → TextOp train.pkl / val.pkl (23-DOF, list-of-dicts)
+      → TextOp train.pkl / val.pkl manifests + samples/ (29-DOF)
 
 Usage:
     # Single motion_lib PKL
@@ -29,6 +29,9 @@ Usage:
 """
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import os
 import random
 import re
 import sys
@@ -39,20 +42,8 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
-# 29-DOF → 23-DOF crop mask (same as convert_soma_csv_to_motion_lib.py)
-# ---------------------------------------------------------------------------
-DOF_29_TO_23 = np.array([
-    True,  True,  True,  True,  True,  True,    # left leg  0-5
-    True,  True,  True,  True,  True,  True,    # right leg 6-11
-    True,  True,  True,                          # waist     12-14
-    True,  True,  True,  True,                   # left arm  15-18
-    False, False, False,                         # left wrist 19-21
-    True,  True,  True,  True,                   # right arm 22-25
-    False, False, False,                         # right wrist 26-28
-])
-TARGET_DOF = 23
-assert DOF_29_TO_23.sum() == TARGET_DOF
+TARGET_DOF = 29
+FEATURE_DIM_V3 = 11 + 2 * TARGET_DOF
 
 
 # ---------------------------------------------------------------------------
@@ -198,49 +189,166 @@ def classify_coarse(fine_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def load_motion_lib_dicts(input_paths: list[str]) -> dict[str, dict]:
-    """Load and merge motion_lib entries from PKL files and/or directories.
+def discover_motion_lib_pkls(input_paths: list[str]) -> list[tuple[Path, Path | None]]:
+    """Return input PKLs and their optional directory roots.
 
     Supported inputs:
       - Single combined PKL:  {name: entry, ...}
       - Directory of individual PKLs (e.g. --individual output or filtered dir):
-        walks the tree, loads every .pkl, merges all {name: entry} dicts.
+        walks the tree without loading their contents.
     """
-    merged: dict[str, dict] = {}
+    discovered: list[tuple[Path, Path | None]] = []
     for raw_path in input_paths:
         p = Path(raw_path)
         if not p.exists():
             print(f"ERROR: {raw_path} not found")
             sys.exit(1)
 
-        pkl_paths: list[Path] = []
         if p.is_dir():
-            pkl_paths = sorted(p.rglob("*.pkl"))
+            discovered.extend((pkl_path, p) for pkl_path in sorted(p.rglob("*.pkl")))
         elif p.suffix == ".pkl":
-            pkl_paths = [p]
+            discovered.append((p, None))
         else:
             print(f"WARNING: {raw_path} is neither .pkl nor directory, skipping")
+    return discovered
+
+
+def iter_motion_lib_dicts(
+    input_paths: list[str],
+):
+    """Yield entries while retaining at most one source PKL in memory."""
+    seen_names: set[str] = set()
+    pkl_paths = discover_motion_lib_pkls(input_paths)
+    for pkl_f, root in tqdm(pkl_paths, desc="Reading source PKLs"):
+        try:
+            data = joblib.load(pkl_f)
+        except Exception as exc:
+            print(f"  WARNING: failed to load {pkl_f}: {exc}")
+            continue
+        if not isinstance(data, dict):
+            print(f"  WARNING: {pkl_f} does not contain a dict, skipping")
             continue
 
-        for pkl_f in pkl_paths:
-            try:
-                data = joblib.load(pkl_f)
-            except Exception:
-                print(f"  WARNING: failed to load {pkl_f}, skipping")
-                continue
-            if not isinstance(data, dict):
-                continue
-            # Use relative path prefix to avoid name collisions across sessions
-            prefix = ""
-            if p.is_dir():
-                prefix = str(pkl_f.relative_to(p).with_suffix("")).replace("/", "__") + "__"
-            for name, entry in data.items():
-                unique_name = prefix + name if prefix else name
-                if unique_name in merged:
-                    unique_name = f"{pkl_f.stem}__{name}"
-                merged[unique_name] = entry
+        prefix = ""
+        if root is not None:
+            prefix = str(pkl_f.relative_to(root).with_suffix("")).replace("/", "__") + "__"
+        for raw_name, entry in data.items():
+            name = str(raw_name)
+            unique_name = prefix + name if prefix else name
+            if unique_name in seen_names:
+                base_name = f"{pkl_f.stem}__{name}"
+                unique_name = base_name
+                suffix = 2
+                while unique_name in seen_names:
+                    unique_name = f"{base_name}__{suffix}"
+                    suffix += 1
+            seen_names.add(unique_name)
+            yield unique_name, entry
 
-    return merged
+
+def load_motion_lib_dicts(input_paths: list[str]) -> dict[str, dict]:
+    """Compatibility helper; prefer iter_motion_lib_dicts for large datasets."""
+    return dict(iter_motion_lib_dicts(input_paths))
+
+
+def _pack_source_file(task: tuple) -> tuple[list[dict], int, set[int], str | None]:
+    """Load, convert, and save one source PKL.
+
+    This function is thread-safe: every source index owns a disjoint output
+    filename prefix. Returning metadata only keeps executor memory bounded.
+    """
+    source_idx, pkl_f, root, out, min_frames, sample_compress = task
+    try:
+        data = joblib.load(pkl_f)
+    except Exception as exc:
+        return [], 0, set(), f"failed to load {pkl_f}: {exc}"
+    if not isinstance(data, dict):
+        return [], 0, set(), f"{pkl_f} does not contain a dict"
+
+    prefix = ""
+    if root is not None:
+        prefix = str(pkl_f.relative_to(root).with_suffix("")).replace("/", "__") + "__"
+
+    records: list[dict] = []
+    skipped = 0
+    fps_values: set[int] = set()
+    warning = None
+    for entry_idx, (raw_name, entry) in enumerate(data.items()):
+        name = prefix + str(raw_name) if prefix else str(raw_name)
+        try:
+            item = motion_lib_entry_to_textop(name, entry)
+        except (TypeError, ValueError) as exc:
+            warning = f"invalid motion {name}: {exc}"
+            item = None
+        if item is None or (min_frames and item["length"] < min_frames):
+            skipped += 1
+            continue
+
+        item["_source"] = name
+        sample_relpath = (
+            Path("samples") / f"{source_idx:08d}_{entry_idx:04d}.pkl"
+        )
+        joblib.dump(item, out / sample_relpath, compress=sample_compress)
+        fps = int(item["motion"]["fps"])
+        fps_values.add(fps)
+        records.append({
+            "length": item["length"],
+            "frame_ann": item["frame_ann"],
+            "_source": name,
+            "_data_path": sample_relpath.as_posix(),
+            "_fps": fps,
+        })
+    return records, skipped, fps_values, warning
+
+
+def pack_source_files(
+    source_pkls: list[tuple[Path, Path | None]],
+    out: Path,
+    min_frames: int,
+    sample_compress: int,
+    workers: int,
+) -> tuple[list[dict], int, set[int]]:
+    """Pack source files with a bounded number of in-flight tasks."""
+    tasks = (
+        (idx, pkl_f, root, out, min_frames, sample_compress)
+        for idx, (pkl_f, root) in enumerate(source_pkls)
+    )
+    manifest: list[dict] = []
+    skipped = 0
+    fps_values: set[int] = set()
+
+    if workers == 1:
+        results = map(_pack_source_file, tasks)
+        for records, task_skipped, task_fps, warning in tqdm(
+            results, total=len(source_pkls), desc="Packing source PKLs"
+        ):
+            manifest.extend(records)
+            skipped += task_skipped
+            fps_values.update(task_fps)
+            if warning:
+                tqdm.write(f"  WARNING: {warning}")
+        return manifest, skipped, fps_values
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = deque()
+        task_iter = iter(tasks)
+        for _ in range(min(len(source_pkls), workers * 2)):
+            pending.append(executor.submit(_pack_source_file, next(task_iter)))
+
+        with tqdm(total=len(source_pkls), desc="Packing source PKLs") as progress:
+            while pending:
+                records, task_skipped, task_fps, warning = pending.popleft().result()
+                manifest.extend(records)
+                skipped += task_skipped
+                fps_values.update(task_fps)
+                if warning:
+                    tqdm.write(f"  WARNING: {warning}")
+                progress.update()
+                try:
+                    pending.append(executor.submit(_pack_source_file, next(task_iter)))
+                except StopIteration:
+                    pass
+    return manifest, skipped, fps_values
 
 
 def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
@@ -268,7 +376,7 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
             "motion": {                                        # ← from motion_lib entry
                 "root_trans_offset": ndarray [T, 3],
                 "root_rot":          ndarray [T, 4],
-                "dof":               ndarray [T, 23],         29-DOF → 23-DOF (wrists locked)
+                "dof":               ndarray [T, 29],         native G1 order, wrists retained
                 "contact_mask":      ndarray [T, 2],
                 "sliding_mask":      ndarray [T, 2],         diagnostic/training side channel
                 "fps":               int,
@@ -281,29 +389,48 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
             },
         }
     """
-    dof_29 = entry["dof"]
-    if dof_29.shape[1] != 29:
+    required_keys = ("dof", "root_trans_offset", "root_rot", "contact_mask")
+    if not isinstance(entry, dict) or any(key not in entry for key in required_keys):
+        return None
+
+    dof = np.asarray(entry["dof"])
+    if dof.ndim != 2 or dof.shape[1] != TARGET_DOF:
         return None  # unexpected DOF count, skip
 
-    dof_23 = dof_29[:, DOF_29_TO_23]                     # (T, 23)
-    T = dof_23.shape[0]
-    fps_val = entry.get("fps", 50)
+    T = dof.shape[0]
+    root_trans = np.asarray(entry["root_trans_offset"])
+    root_rot = np.asarray(entry["root_rot"])
+    contact_mask = np.asarray(entry["contact_mask"])
+    sliding_mask = np.asarray(entry.get("sliding_mask", np.zeros_like(contact_mask)))
+    if (
+        root_trans.shape != (T, 3)
+        or root_rot.shape != (T, 4)
+        or contact_mask.shape != (T, 2)
+        or sliding_mask.shape != (T, 2)
+    ):
+        return None
+    if not all(np.isfinite(array).all() for array in (
+        dof, root_trans, root_rot, contact_mask, sliding_mask
+    )):
+        return None
+
+    fps_val = int(entry.get("fps", 50))
+    if fps_val <= 0:
+        return None
 
     # ── Coarse action label from filename ──
     duration = T / fps_val
-    fine = _extract_action_name(name)
+    fine = _extract_action_name(str(name))
     coarse = classify_coarse(fine)
 
     return {
         "length": T,
         "motion": {
-            "root_trans_offset": entry["root_trans_offset"].astype(np.float32),
-            "root_rot": entry["root_rot"].astype(np.float32),
-            "dof": dof_23.astype(np.float32),
-            "contact_mask": entry["contact_mask"].astype(np.float32),
-            "sliding_mask": entry.get(
-                "sliding_mask", np.zeros_like(entry["contact_mask"])
-            ).astype(np.float32),
+            "root_trans_offset": root_trans.astype(np.float32, copy=False),
+            "root_rot": root_rot.astype(np.float32, copy=False),
+            "dof": dof.astype(np.float32, copy=False),
+            "contact_mask": contact_mask.astype(np.float32, copy=False),
+            "sliding_mask": sliding_mask.astype(np.float32, copy=False),
             "fps": fps_val,
             "motion_len": T,
         },
@@ -333,46 +460,70 @@ def main():
     parser.add_argument("--val_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--min_frames", type=int, default=35,
-        help="Minimum sequence length in frames (segment_len with default config)",
+        "--sample_compress", type=int, default=3, choices=range(0, 10),
+        metavar="0-9",
+        help="Joblib compression for individual sample files (default: 3).",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=min(8, os.cpu_count() or 1),
+        help="Parallel source-file workers (default: min(8, CPU count)).",
+    )
+    parser.add_argument(
+        "--min_frames", type=int, default=0,
+        help="Optional model-independent data-quality filter. Disabled by "
+        "default; training-window validity is evaluated from the active config.",
     )
     args = parser.parse_args()
+    if args.min_frames < 0:
+        parser.error("--min_frames must be non-negative")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if not 0.0 <= args.val_ratio < 1.0:
+        parser.error("--val_ratio must be in [0, 1)")
 
-    # ── Load all motion_lib entries (supports files + directories) ──
-    all_entries = load_motion_lib_dicts(args.input)
-    print(f"Loaded {len(all_entries)} total sequences from {len(args.input)} input(s)")
+    source_pkls = discover_motion_lib_pkls(args.input)
+    if not source_pkls:
+        print("ERROR: No input PKL files found")
+        sys.exit(1)
+    print(f"Found {len(source_pkls):,} PKL files from {len(args.input)} input(s)")
+    effective_workers = min(args.workers, len(source_pkls))
+    print(
+        f"Packing with {effective_workers} worker(s), "
+        f"joblib compression={args.sample_compress}"
+    )
 
-    # ── Convert ──
-    converted: list[dict] = []
-    skipped = 0
-    for name, entry in tqdm(all_entries.items(), desc="Converting"):
-        item = motion_lib_entry_to_textop(name, entry)
-        if item is None:
-            skipped += 1
-            continue
-        if item["length"] < args.min_frames:
-            skipped += 1
-            continue
-        item["_source"] = name
-        converted.append(item)
+    out = Path(args.output)
+    samples_dir = out / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Converted {len(converted)} (skipped {skipped} — too short or wrong DOF count)")
+    # Each worker persists samples directly and returns metadata only. The
+    # bounded task queue limits peak memory to roughly 2 * workers source files.
+    manifest, skipped, fps_values = pack_source_files(
+        source_pkls=source_pkls,
+        out=out,
+        min_frames=args.min_frames,
+        sample_compress=args.sample_compress,
+        workers=effective_workers,
+    )
 
-    if not converted:
+    print(f"Converted {len(manifest)} (skipped {skipped} - too short or invalid)")
+
+    if not manifest:
         print("ERROR: No valid sequences!")
+        sys.exit(1)
+    if len(fps_values) != 1:
+        print(f"ERROR: Mixed source frame rates are unsupported: {sorted(fps_values)}")
         sys.exit(1)
 
     # ── Shuffle & split ──
-    random.seed(args.seed)
-    random.shuffle(converted)
-    n_val = max(1, int(len(converted) * args.val_ratio))
-    train_data = converted[n_val:]
-    val_data = converted[:n_val]
+    random.Random(args.seed).shuffle(manifest)
+    n_val = int(len(manifest) * args.val_ratio)
+    if args.val_ratio > 0 and len(manifest) > 1:
+        n_val = max(1, min(n_val, len(manifest) - 1))
+    train_data = manifest[n_val:]
+    val_data = manifest[:n_val]
 
     # ── Save ──
-    out = Path(args.output)
-    out.mkdir(parents=True, exist_ok=True)
-
     train_path = out / "train.pkl"
     val_path = out / "val.pkl"
     print(f"\nSaving train: {len(train_data)} sequences → {train_path}")
@@ -381,14 +532,16 @@ def main():
     joblib.dump(val_data, val_path)
 
     # ── Statistics ──
-    fps_val = int(train_data[0]["motion"]["fps"])
-    train_hours = sum(d["motion"]["motion_len"] for d in train_data) / fps_val / 3600
-    val_hours = sum(d["motion"]["motion_len"] for d in val_data) / fps_val / 3600
+    fps_val = next(iter(fps_values))
+    train_hours = sum(d["length"] for d in train_data) / fps_val / 3600
+    val_hours = sum(d["length"] for d in val_data) / fps_val / 3600
 
     stats = {
-        "dataset name": "BONES-SEED → TextOp (G1 23-DOF, 50fps)",
+        "dataset name": "BONES-SEED → TextOp (G1 29-DOF, 50fps)",
         "fps": fps_val,
-        "nfeats": 57,
+        "dof_dim": TARGET_DOF,
+        "nfeats": FEATURE_DIM_V3,
+        "storage": "lazy-sample-manifest-v1",
         "train count": len(train_data),
         "val count": len(val_data),
         "train hours": round(train_hours, 1),
@@ -402,10 +555,10 @@ def main():
         print(f"  {k}: {v}")
 
     # ── Done ──
-    print(f"\nDone. Ready for TextOp VAE training:")
+    print("\nDone. Ready for TextOp VAE training:")
     print(f"  data.datadir={out.resolve()}")
-    print(f"  data.weighted_sample=false")
-    print(f"  skeleton.asset.assetRoot=<path/to/description/robots/g1/>")
+    print("  data.weighted_sample=false")
+    print("  skeleton.asset.assetRoot=<path/to/description/robots/g1/>")
 
 
 if __name__ == "__main__":

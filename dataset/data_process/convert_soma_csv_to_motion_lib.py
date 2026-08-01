@@ -51,7 +51,8 @@ import joblib
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.spatial import transform
-from scipy.spatial.transform import Slerp, Rotation as R
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 from tqdm import tqdm
 
 # IsaacLab ↔ MuJoCo joint reordering (29 DOFs for G1).
@@ -97,6 +98,7 @@ MJ_TO_IL = np.array(
 # ---------------------------------------------------------------------------
 _MJ_MODEL = None       # MjModel singleton (fork-safe via multiprocessing)
 _MJ_MODEL_PATH = None  # cached path for lazy init
+_TORCH_FK_MODELS = {}
 
 # Default MOB parameters (same as occHIPC/utils/g1_mob.py)
 DEFAULT_MOB_UNIT = 0.08     # voxel resolution in meters
@@ -223,8 +225,18 @@ def load_bones_csv(csv_path: str) -> dict:
     root_quat_wxyz = root_quat_xyzw[:, [3, 0, 1, 2]]
 
     # Joint DOFs: degrees → radians, already in MuJoCo/MJCF actuator order
-    joint_cols = [c for c in data.columns if c.endswith("_dof")]
-    joint_pos_mj = np.deg2rad(data[joint_cols].values).astype(np.float32)  # (T, 29)
+    missing_joint_cols = [c for c in BONES_CSV_JOINT_NAMES if c not in data.columns]
+    if missing_joint_cols:
+        raise ValueError(
+            f"Bones-SEED CSV is missing {len(missing_joint_cols)} G1 joint columns: "
+            f"{missing_joint_cols}"
+        )
+    # Select by semantic name rather than relying on incidental CSV column order.
+    joint_pos_mj = np.deg2rad(
+        data[BONES_CSV_JOINT_NAMES].to_numpy(dtype=np.float32)
+    ).astype(np.float32)  # (T, 29)
+    if not np.isfinite(joint_pos_mj).all():
+        raise ValueError("Bones-SEED CSV contains non-finite joint angles")
 
     # Create dummy body_pos_w and body_quat_w (only root body populated, rest zeros)
     # The converter only uses body_pos_w[:,0] for root_trans and body_quat_w[:,0] for root_rot
@@ -409,6 +421,149 @@ def _get_collision_geom_ids(model) -> list:
     return ids
 
 
+def _quat_wxyz_to_matrix_torch(quat):
+    """Convert normalized wxyz quaternions to rotation matrices."""
+    import torch
+
+    quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1e-12)
+    w, x, y, z = quat.unbind(dim=-1)
+    two = 2.0
+    return torch.stack(
+        (
+            1 - two * (y * y + z * z), two * (x * y - z * w),
+            two * (x * z + y * w), two * (x * y + z * w),
+            1 - two * (x * x + z * z), two * (y * z - x * w),
+            two * (x * z - y * w), two * (y * z + x * w),
+            1 - two * (x * x + y * y),
+        ),
+        dim=-1,
+    ).reshape(quat.shape[:-1] + (3, 3))
+
+
+def _axis_angle_to_matrix_torch(axis, angle):
+    """Convert fixed rotation axes and batched scalar angles to matrices."""
+    import torch
+
+    axis = axis / torch.linalg.vector_norm(axis, dim=-1, keepdim=True).clamp_min(1e-12)
+    half = angle * 0.5
+    xyz = axis.unsqueeze(0) * torch.sin(half).unsqueeze(-1)
+    quat = torch.cat((torch.cos(half).unsqueeze(-1), xyz), dim=-1)
+    return _quat_wxyz_to_matrix_torch(quat)
+
+
+class _TorchBatchKinematics:
+    """Batched G1 FK initialized from MuJoCo's compiled model constants."""
+
+    def __init__(self, model, device: str):
+        import mujoco
+        import torch
+
+        if model.nbody - 1 != NUM_BODIES:
+            raise ValueError(
+                f"Expected {NUM_BODIES} G1 bodies, compiled model has {model.nbody - 1}"
+            )
+        self.device = torch.device(device)
+        self.parents = torch.as_tensor(
+            np.asarray(model.body_parentid[1:], dtype=np.int64) - 1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.body_pos = torch.as_tensor(
+            np.asarray(model.body_pos[1:], dtype=np.float32), device=self.device
+        )
+        self.body_rot = _quat_wxyz_to_matrix_torch(torch.as_tensor(
+            np.asarray(model.body_quat[1:], dtype=np.float32), device=self.device
+        ))
+
+        joint_ids = np.asarray(model.body_jntadr[2:], dtype=np.int64)
+        if np.any(np.asarray(model.body_jntnum[2:]) != 1):
+            raise ValueError("Torch FK requires exactly one hinge joint per actuated body")
+        joint_pos = np.asarray(model.jnt_pos[joint_ids])
+        if not np.allclose(joint_pos, 0.0, atol=1e-8):
+            raise ValueError("Torch FK currently requires zero hinge-joint offsets")
+        self.joint_axis = torch.as_tensor(
+            np.asarray(model.jnt_axis[joint_ids], dtype=np.float32), device=self.device
+        )
+
+        self.geom_ids = _get_collision_geom_ids(model)
+        geom_body = np.asarray(model.geom_bodyid[self.geom_ids], dtype=np.int64) - 1
+        if np.any(geom_body < 0):
+            raise ValueError("World geoms cannot be used for robot swept-volume FK")
+        self.geom_body = torch.as_tensor(geom_body, dtype=torch.long, device=self.device)
+        self.geom_pos = torch.as_tensor(
+            np.asarray(model.geom_pos[self.geom_ids], dtype=np.float32), device=self.device
+        )
+        self.geom_rot = _quat_wxyz_to_matrix_torch(torch.as_tensor(
+            np.asarray(model.geom_quat[self.geom_ids], dtype=np.float32), device=self.device
+        ))
+        self.geom_types = np.asarray(model.geom_type[self.geom_ids], dtype=np.int32)
+        self.geom_sizes = np.asarray(model.geom_size[self.geom_ids], dtype=np.float64)
+        self.geom_half_extents = np.stack([
+            _geom_local_half_extents(model, gid) for gid in self.geom_ids
+        ])
+        self.left_foot = (
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                              "left_ankle_roll_link") - 1
+        )
+        self.right_foot = (
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                              "right_ankle_roll_link") - 1
+        )
+
+    def forward(self, root_trans, root_rot_xyzw, dof, mob_frame_ids):
+        import torch
+
+        if self.device.type == "cpu":
+            # The outer data pipeline already parallelizes by process.
+            torch.set_num_threads(1)
+        root_trans_t = torch.as_tensor(root_trans, dtype=torch.float32, device=self.device)
+        root_quat_t = torch.as_tensor(
+            root_rot_xyzw[:, [3, 0, 1, 2]], dtype=torch.float32, device=self.device
+        )
+        dof_t = torch.as_tensor(dof, dtype=torch.float32, device=self.device)
+        if dof_t.ndim != 2 or dof_t.shape[-1] != NUM_DOF:
+            raise ValueError(f"Expected batched {NUM_DOF}-DoF input, got {tuple(dof_t.shape)}")
+
+        joint_rot = _axis_angle_to_matrix_torch(self.joint_axis, dof_t)
+        world_pos = [root_trans_t]
+        world_rot = [_quat_wxyz_to_matrix_torch(root_quat_t)]
+        for body_idx in range(1, NUM_BODIES):
+            parent_idx = int(self.parents[body_idx])
+            parent_pos = world_pos[parent_idx]
+            parent_rot = world_rot[parent_idx]
+            offset = torch.matmul(
+                parent_rot, self.body_pos[body_idx].reshape(1, 3, 1)
+            ).squeeze(-1)
+            local_rot = torch.matmul(self.body_rot[body_idx], joint_rot[:, body_idx - 1])
+            world_pos.append(parent_pos + offset)
+            world_rot.append(torch.matmul(parent_rot, local_rot))
+
+        body_pos = torch.stack(world_pos, dim=1)
+        body_rot = torch.stack(world_rot, dim=1)
+        foot_pos = body_pos[:, [self.left_foot, self.right_foot]]
+
+        frame_ids_t = torch.as_tensor(mob_frame_ids, dtype=torch.long, device=self.device)
+        selected_pos = body_pos.index_select(0, frame_ids_t)[:, self.geom_body]
+        selected_rot = body_rot.index_select(0, frame_ids_t)[:, self.geom_body]
+        geom_pos = selected_pos + torch.matmul(
+            selected_rot, self.geom_pos.reshape(1, -1, 3, 1)
+        ).squeeze(-1)
+        geom_rot = torch.matmul(selected_rot, self.geom_rot.unsqueeze(0))
+        return (
+            foot_pos.cpu().numpy().astype(np.float64),
+            geom_pos.cpu().numpy().astype(np.float64),
+            geom_rot.cpu().numpy().astype(np.float64),
+        )
+
+
+def _get_torch_fk_model(xml_path: str, device: str):
+    key = (str(Path(xml_path).resolve()), device)
+    if key not in _TORCH_FK_MODELS:
+        model, _ = _get_mj_model(xml_path)
+        _TORCH_FK_MODELS[key] = _TorchBatchKinematics(model, device)
+    return _TORCH_FK_MODELS[key]
+
+
 def _geom_local_half_extents(model, gid: int) -> np.ndarray:
     """Local AABB half-extents for a collision geom (sphere/capsule/cylinder/box).
 
@@ -449,19 +604,10 @@ def _world_to_index_bounds(lo, hi, llb, unit, shape):
     return vmin, vmax
 
 
-def _mark_geom(occu, llb, unit, model, data, gid, cached_aabb=None):
-    """Rasterize one MuJoCo geom into the voxel grid occu (mutated in-place).
-
-    Args:
-        cached_aabb: optional (lo, hi) tuple from a previous _geom_world_aabb
-                     call, to skip redundant AABB recomputation.
-    """
+def _mark_geom_pose(occu, llb, unit, gtype, size, center, rot, lo, hi):
+    """Rasterize one positioned primitive geom into ``occu`` in-place."""
     import mujoco
 
-    if cached_aabb is not None:
-        lo, hi = cached_aabb
-    else:
-        lo, hi = _geom_world_aabb(model, data, gid)
     vmin, vmax = _world_to_index_bounds(lo, hi, llb, unit, np.asarray(occu.shape))
     if np.any(vmax <= vmin):
         return
@@ -474,12 +620,8 @@ def _mark_geom(occu, llb, unit, model, data, gid, cached_aabb=None):
     wz = llb[2] + (zs + 0.5) * unit
     grid = np.stack(np.meshgrid(wx, wy, wz, indexing="ij"), axis=-1)
 
-    center = np.asarray(data.geom_xpos[gid], dtype=np.float64)
-    rot = np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
     local = (grid - center) @ rot
 
-    gtype = int(model.geom_type[gid])
-    size = model.geom_size[gid]
     if gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
         mask = np.sum(local * local, axis=-1) <= float(size[0]) ** 2
     elif gtype == mujoco.mjtGeom.mjGEOM_CAPSULE:
@@ -501,6 +643,121 @@ def _mark_geom(occu, llb, unit, model, data, gid, cached_aabb=None):
         return
 
     occu[vmin[0]:vmax[0], vmin[1]:vmax[1], vmin[2]:vmax[2]] |= mask
+
+
+def _mark_geom(occu, llb, unit, model, data, gid, cached_aabb=None):
+    """Rasterize one MuJoCo geom into the voxel grid occu (mutated in-place)."""
+    lo, hi = cached_aabb if cached_aabb is not None else _geom_world_aabb(model, data, gid)
+    _mark_geom_pose(
+        occu,
+        llb,
+        unit,
+        int(model.geom_type[gid]),
+        model.geom_size[gid],
+        np.asarray(data.geom_xpos[gid], dtype=np.float64),
+        np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3),
+        lo,
+        hi,
+    )
+
+
+def _rasterize_geoms_exact_vectorized(
+    occu: np.ndarray,
+    llb: np.ndarray,
+    unit: float,
+    model,
+    geom_ids: list[int],
+    geom_pos: np.ndarray,
+    geom_rot: np.ndarray,
+    geom_mins: np.ndarray,
+    geom_maxs: np.ndarray,
+) -> None:
+    """Rasterize sampled primitive poses using the scalar algorithm in batches.
+
+    Poses with the same primitive type and candidate AABB dimensions share one
+    voxel-offset grid. The containment equations and voxel-center convention
+    are identical to :func:`_mark_geom_pose`.
+    """
+    import mujoco
+
+    grid_shape = np.asarray(occu.shape, dtype=np.int64)
+    vmin = np.floor((geom_mins - llb) / unit).astype(np.int64)
+    vmax = np.ceil((geom_maxs - llb) / unit).astype(np.int64)
+    vmin = np.clip(vmin, 0, grid_shape)
+    vmax = np.clip(vmax, 0, grid_shape)
+
+    n_frames, n_geoms = geom_pos.shape[:2]
+    starts = vmin.reshape(-1, 3)
+    dims = (vmax - vmin).reshape(-1, 3)
+    centers = geom_pos.reshape(-1, 3)
+    rotations = geom_rot.reshape(-1, 3, 3)
+    geom_types = np.broadcast_to(
+        np.asarray(model.geom_type[geom_ids], dtype=np.int32),
+        (n_frames, n_geoms),
+    ).reshape(-1)
+    geom_sizes = np.broadcast_to(
+        np.asarray(model.geom_size[geom_ids], dtype=np.float64),
+        (n_frames, n_geoms, 3),
+    ).reshape(-1, 3)
+
+    valid = np.all(dims > 0, axis=1)
+    if not np.any(valid):
+        return
+
+    # Grouping by AABB dimensions keeps temporary [pose, candidate, xyz]
+    # arrays compact and reuses the same integer offset grid for every pose.
+    keys = np.column_stack((geom_types, dims))
+    for key in np.unique(keys[valid], axis=0):
+        gtype = int(key[0])
+        shape = key[1:].astype(np.int64)
+        group = valid & np.all(keys == key, axis=1)
+        group_ids = np.flatnonzero(group)
+
+        offsets = np.stack(
+            np.meshgrid(
+                np.arange(shape[0]),
+                np.arange(shape[1]),
+                np.arange(shape[2]),
+                indexing="ij",
+            ),
+            axis=-1,
+        ).reshape(-1, 3)
+        # Cap temporary arrays for unusually long clips or large rotated AABBs.
+        chunk_size = max(1, 250_000 // len(offsets))
+        for chunk_start in range(0, len(group_ids), chunk_size):
+            pose_ids = group_ids[chunk_start:chunk_start + chunk_size]
+            indices = starts[pose_ids, None, :] + offsets[None, :, :]
+            world = llb + (indices.astype(np.float64) + 0.5) * unit
+            local = np.matmul(
+                world - centers[pose_ids, None, :], rotations[pose_ids]
+            )
+            size = geom_sizes[pose_ids]
+
+            if gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+                mask = np.sum(local * local, axis=-1) <= size[:, None, 0] ** 2
+            elif gtype == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                radius = size[:, None, 0]
+                half_length = size[:, None, 1]
+                clipped_z = np.clip(local[..., 2], -half_length, half_length)
+                mask = (
+                    local[..., 0] ** 2
+                    + local[..., 1] ** 2
+                    + (local[..., 2] - clipped_z) ** 2
+                    <= radius ** 2
+                )
+            elif gtype == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                mask = (
+                    local[..., 0] ** 2 + local[..., 1] ** 2
+                    <= size[:, None, 0] ** 2
+                ) & (np.abs(local[..., 2]) <= size[:, None, 1])
+            elif gtype == mujoco.mjtGeom.mjGEOM_BOX:
+                mask = np.all(np.abs(local) <= size[:, None, :], axis=-1)
+            else:
+                continue
+
+            occupied = indices[mask]
+            if occupied.size:
+                occu[occupied[:, 0], occupied[:, 1], occupied[:, 2]] = True
 
 
 def _contact_and_sliding_masks_from_foot_positions(
@@ -568,13 +825,16 @@ def compute_contact_and_mob(
     mob_unit: float = DEFAULT_MOB_UNIT,
     mob_margin: float = DEFAULT_MOB_MARGIN,
     mob_frame_stride: int = 1,
+    fk_backend: str = "torch",
+    torch_device: str = "cpu",
+    mob_raster_backend: str = "vectorized",
     verbose: bool = False,
 ) -> dict:
-    """Compute contact_mask and optionally MOB occupancy via MuJoCo mj_forward.
+    """Compute contact masks and optional MOB occupancy from G1 kinematics.
 
-    Uses a single FK pass per frame for contact_mask, plus a second pass for
-    MOB voxel marking.  Contact uses full 3D world velocity in m/s so the same
-    physical thresholds apply after Bones-SEED is resampled from 120 to 50 Hz.
+    The default PyTorch backend batches FK across the full sequence and only
+    materializes collision geometry at MOB-sampled frames. The MuJoCo backend
+    is retained as a parity/reference implementation.
 
     Args:
         root_trans_offset:  (T, 3) pelvis world translation, meters.
@@ -588,6 +848,11 @@ def compute_contact_and_mob(
         mob_unit:           voxel resolution for MOB (default 0.08 m).
         mob_margin:         padding around swept volume (default 0.16 m).
         mob_frame_stride:   subsample frames for MOB (default 1 = all frames).
+        fk_backend:         ``torch`` (batched) or ``mujoco`` (reference).
+        torch_device:       device used by batched FK, normally ``cpu`` when
+                            the outer pipeline uses multiple worker processes.
+        mob_raster_backend: ``vectorized`` exact batched rasterizer or
+                            ``scalar`` reference implementation.
 
     Returns:
         dict with:
@@ -608,58 +873,55 @@ def compute_contact_and_mob(
     """
     import mujoco
 
-    model, data = _get_mj_model(xml_path)
-    left_body_id, right_body_id = _find_foot_body_ids(model)
-
     T = root_trans_offset.shape[0]
+    if mob_frame_stride < 1:
+        raise ValueError(f"mob_frame_stride must be >= 1, got {mob_frame_stride}")
+    if fk_backend not in {"torch", "mujoco"}:
+        raise ValueError(f"Unsupported FK backend {fk_backend!r}")
+    if mob_raster_backend not in {"vectorized", "scalar"}:
+        raise ValueError(f"Unsupported MOB raster backend {mob_raster_backend!r}")
 
-    # MuJoCo freejoint quaternion is wxyz; input is xyzw (scipy convention)
-    root_rot_wxyz = root_rot_xyzw[:, [3, 0, 1, 2]].astype(np.float64)
-
-    foot_pos = np.zeros((T, 2, 3), dtype=np.float64)
-
+    model, data = _get_mj_model(xml_path)
     mob_geom_ids = _get_collision_geom_ids(model) if mob else []
-    n_geoms = len(mob_geom_ids)
+    frame_ids = np.arange(0, T, mob_frame_stride, dtype=np.int64) if mob else np.empty(0, dtype=np.int64)
 
-    # Pre-allocate AABB arrays (Pass 1 writes directly into these)
-    if mob:
-        n_aabbs = T * n_geoms
-        mob_mins = np.empty((n_aabbs, 3), dtype=np.float64)
-        mob_maxs = np.empty((n_aabbs, 3), dtype=np.float64)
-        # Cache: [t][gid] = (xpos, xmat, lo, hi)
-        mob_geom_cache: list = []
-    else:
-        mob_mins = mob_maxs = None  # type: ignore[assignment]
-        mob_geom_cache = []  # unused, keeps linter happy
-
-    _frame_iter = tqdm(range(T), desc="FK+contact", unit="f", leave=False) if verbose else range(T)
-
-    # ── Pass 1: FK all frames → foot positions + MOB global AABB ──
-    aabb_idx = 0
-    for t in _frame_iter:
-        data.qpos[0:3] = root_trans_offset[t]
-        data.qpos[3:7] = root_rot_wxyz[t]
-        data.qpos[7:MUJOCO_QPOS_END] = dof_mj[t]
-        mujoco.mj_forward(model, data)
-
-        foot_pos[t, 0] = data.xpos[left_body_id]
-        foot_pos[t, 1] = data.xpos[right_body_id]
-
+    if fk_backend == "torch":
+        torch_fk = _get_torch_fk_model(xml_path, torch_device)
+        foot_pos, geom_pos, geom_rot = torch_fk.forward(
+            root_trans_offset, root_rot_xyzw, dof_mj, frame_ids
+        )
         if mob:
-            frame_cache = []
-            for i, gid in enumerate(mob_geom_ids):
-                lo, hi = _geom_world_aabb(model, data, gid)
-                mob_mins[aabb_idx] = lo
-                mob_maxs[aabb_idx] = hi
-                aabb_idx += 1
-                # Cache geom poses + AABB so Pass 2 skips FK & AABB entirely
-                frame_cache.append((
-                    np.asarray(data.geom_xpos[gid], dtype=np.float64).copy(),
-                    np.asarray(data.geom_xmat[gid], dtype=np.float64).copy(),
-                    lo.copy(),
-                    hi.copy(),
-                ))
-            mob_geom_cache.append(frame_cache)
+            half_world = np.einsum(
+                "tgij,gj->tgi", np.abs(geom_rot), torch_fk.geom_half_extents
+            )
+            mob_mins = geom_pos - half_world
+            mob_maxs = geom_pos + half_world
+    else:
+        left_body_id, right_body_id = _find_foot_body_ids(model)
+
+        # MuJoCo freejoint quaternion is wxyz; input is xyzw.
+        root_rot_wxyz = root_rot_xyzw[:, [3, 0, 1, 2]].astype(np.float64)
+        foot_pos = np.zeros((T, 2, 3), dtype=np.float64)
+        geom_pos = np.empty((len(frame_ids), len(mob_geom_ids), 3), dtype=np.float64)
+        geom_rot = np.empty((len(frame_ids), len(mob_geom_ids), 3, 3), dtype=np.float64)
+        sampled_lookup = {int(frame): idx for idx, frame in enumerate(frame_ids)}
+        frame_iter = tqdm(range(T), desc="FK+contact", unit="f", leave=False) if verbose else range(T)
+        for t in frame_iter:
+            data.qpos[0:3] = root_trans_offset[t]
+            data.qpos[3:7] = root_rot_wxyz[t]
+            data.qpos[7:MUJOCO_QPOS_END] = dof_mj[t]
+            mujoco.mj_forward(model, data)
+            foot_pos[t, 0] = data.xpos[left_body_id]
+            foot_pos[t, 1] = data.xpos[right_body_id]
+            sampled_idx = sampled_lookup.get(t)
+            if sampled_idx is not None:
+                geom_pos[sampled_idx] = data.geom_xpos[mob_geom_ids]
+                geom_rot[sampled_idx] = data.geom_xmat[mob_geom_ids].reshape(-1, 3, 3)
+        if mob:
+            local_half = np.stack([_geom_local_half_extents(model, gid) for gid in mob_geom_ids])
+            half_world = np.einsum("tgij,gj->tgi", np.abs(geom_rot), local_half)
+            mob_mins = geom_pos - half_world
+            mob_maxs = geom_pos + half_world
 
     contact, sliding = _contact_and_sliding_masks_from_foot_positions(
         foot_pos,
@@ -673,20 +935,42 @@ def compute_contact_and_mob(
 
     # ── MOB: build swept volume from cached AABBs ──
     if mob:
-        llb = mob_mins.min(axis=0) - mob_margin
-        rub = mob_maxs.max(axis=0) + mob_margin
+        llb = mob_mins.min(axis=(0, 1)) - mob_margin
+        rub = mob_maxs.max(axis=(0, 1)) + mob_margin
         shape = np.ceil((rub - llb) / mob_unit).astype(np.int64) + 1
         swept_occu = np.zeros(tuple(shape.tolist()), dtype=bool)
 
-        frame_ids = list(range(0, T, mob_frame_stride))
-        voxel_iter = tqdm(frame_ids, desc="MOB rasterize", unit="f", leave=False) if verbose else frame_ids
-        for t in voxel_iter:
-            frame_cache = mob_geom_cache[t]
-            for i, gid in enumerate(mob_geom_ids):
-                xpos, xmat, lo, hi = frame_cache[i]
-                data.geom_xpos[gid] = xpos
-                data.geom_xmat[gid] = xmat
-                _mark_geom(swept_occu, llb, mob_unit, model, data, gid, cached_aabb=(lo, hi))
+        if mob_raster_backend == "vectorized":
+            _rasterize_geoms_exact_vectorized(
+                swept_occu,
+                llb,
+                mob_unit,
+                model,
+                mob_geom_ids,
+                geom_pos,
+                geom_rot,
+                mob_mins,
+                mob_maxs,
+            )
+        else:
+            voxel_indices = range(len(frame_ids))
+            voxel_iter = (
+                tqdm(voxel_indices, desc="MOB rasterize", unit="f", leave=False)
+                if verbose else voxel_indices
+            )
+            for sampled_idx in voxel_iter:
+                for geom_idx, gid in enumerate(mob_geom_ids):
+                    _mark_geom_pose(
+                        swept_occu,
+                        llb,
+                        mob_unit,
+                        int(model.geom_type[gid]),
+                        model.geom_size[gid],
+                        geom_pos[sampled_idx, geom_idx],
+                        geom_rot[sampled_idx, geom_idx],
+                        mob_mins[sampled_idx, geom_idx],
+                        mob_maxs[sampled_idx, geom_idx],
+                    )
 
         # ~swept_occu → where the robot never went → assumed obstacle
         # True = occupied (obstacle), False = free (robot passed through here)
@@ -804,6 +1088,9 @@ def process_session_csvs(args_tuple):
                 mob_unit=mob_cfg.get("unit", DEFAULT_MOB_UNIT),
                 mob_margin=mob_cfg.get("margin", DEFAULT_MOB_MARGIN),
                 mob_frame_stride=mob_cfg.get("frame_stride", 1),
+                fk_backend=mob_cfg.get("fk_backend", "torch"),
+                torch_device=mob_cfg.get("torch_device", "cpu"),
+                mob_raster_backend=mob_cfg.get("raster_backend", "vectorized"),
             )
             entry["contact_mask"] = fk_result["contact_mask"]
             entry["sliding_mask"] = fk_result["sliding_mask"]
@@ -818,8 +1105,13 @@ def process_session_csvs(args_tuple):
         except Exception:  # noqa: BLE001
             if failed == 0:  # print first error per session
                 import traceback
-                print(f"\n  [{session_name}] ERROR on {csv_f}:\n  {traceback.format_exc().strip().replace(chr(10), chr(10) + '  ')}",
-                      file=sys.stderr)
+                traceback_text = traceback.format_exc().strip().replace(
+                    chr(10), chr(10) + "  "
+                )
+                print(
+                    f"\n  [{session_name}] ERROR on {csv_f}:\n  {traceback_text}",
+                    file=sys.stderr,
+                )
             failed += 1
 
     if converted_num > 0:
@@ -901,16 +1193,41 @@ def main():
         help="MOB frame subsampling factor (default: 1 = all frames). "
         "Set to 2 for 2x speedup with negligible quality loss at 50fps.",
     )
+    parser.add_argument(
+        "--fk_backend",
+        choices=("torch", "mujoco"),
+        default="torch",
+        help="FK implementation for feet and collision geoms (default: torch).",
+    )
+    parser.add_argument(
+        "--torch_device",
+        default="cpu",
+        help="PyTorch FK device. Use cpu with multi-process conversion; cuda is "
+        "intended for a single worker (default: cpu).",
+    )
+    parser.add_argument(
+        "--mob_raster_backend",
+        choices=("vectorized", "scalar"),
+        default="vectorized",
+        help="Exact MOB rasterizer implementation. Vectorized preserves scalar "
+        "voxel semantics while batching primitive tests (default: vectorized).",
+    )
     args = parser.parse_args()
+
+    if args.torch_device.startswith("cuda") and args.num_workers != 1:
+        parser.error("--torch_device=cuda requires --num_workers=1")
 
     mob_cfg = {
         "enabled": args.mob,
         "unit": args.mob_unit,
         "margin": args.mob_margin,
         "frame_stride": args.mob_frame_stride,
+        "fk_backend": args.fk_backend,
+        "torch_device": args.torch_device,
+        "raster_backend": args.mob_raster_backend,
     }
 
-    print(f"G1 {NUM_DOF} DOFs, {NUM_BODIES} bodies (hardcoded axes)")
+    print(f"G1 {NUM_DOF} DOFs, {NUM_BODIES} bodies; FK backend={args.fk_backend} ({args.torch_device})")
     if args.mob:
         print(f"MOB enabled: unit={args.mob_unit}m, margin={args.mob_margin}m, stride={args.mob_frame_stride}")
 
@@ -1074,7 +1391,6 @@ def main():
     seq_iter = tqdm(sequences.items(), desc="Converting", unit="seq")
     for name, seq_data in seq_iter:
         seq_iter.set_postfix_str(name[:40])
-        T = seq_data["joint_pos"].shape[0]
         fps_for_convert = args.fps_source if args.fps_source else args.fps
         entry = convert_sequence(seq_data, fps_for_convert)
         if args.fps_source and args.fps_source != args.fps:
@@ -1091,6 +1407,9 @@ def main():
             mob_unit=mob_cfg["unit"],
             mob_margin=mob_cfg["margin"],
             mob_frame_stride=mob_cfg["frame_stride"],
+            fk_backend=mob_cfg["fk_backend"],
+            torch_device=mob_cfg["torch_device"],
+            mob_raster_backend=mob_cfg["raster_backend"],
             verbose=True,
         )
         entry["contact_mask"] = fk_result["contact_mask"]

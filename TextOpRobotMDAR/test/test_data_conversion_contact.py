@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pytest
 import torch
@@ -15,6 +16,99 @@ from dataset.data_process.pack_motion_lib_to_textop import (
 )
 from TextOpRobotMDAR.robotmdar.dataloader.data import SkeletonPrimitiveDataset
 from TextOpRobotMDAR.robotmdar.train.manager import GeometryLoss
+
+
+def _motion_item(length: int, marker: str = "motion"):
+    return {
+        "length": length,
+        "motion": {"motion_len": length},
+        "marker": marker,
+    }
+
+
+def _length_only_dataset(datadir: Path, *, weighted_sample: bool = False):
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.datadir = datadir
+    dataset.split = "train"
+    dataset.segment_len = 10
+    dataset.context_len = 10
+    dataset.goal_offset = 0
+    dataset.history_len = 3
+    dataset.future_len = 7
+    dataset.num_primitive = 1
+    dataset.batch_size = 1
+    dataset.weighted_sample = weighted_sample
+    dataset._load_statistics = lambda: None
+    return dataset
+
+
+def test_dataset_filters_lengths_at_training_time_and_accepts_exact_window(tmp_path):
+    joblib.dump(
+        [_motion_item(9, "short"), _motion_item(10, "exact")],
+        tmp_path / "train.pkl",
+    )
+    dataset = _length_only_dataset(tmp_path)
+    dataset._load_data()
+    dataset._generate_motion_primitives = lambda sample, start: [
+        (sample["marker"], start)
+    ]
+
+    sampled = dataset._sample_motion_batch(
+        generator=torch.Generator().manual_seed(0)
+    )
+
+    assert dataset.valid_indices == [1]
+    assert sampled == [[("exact", 0)]]
+
+
+def test_dataset_lazily_loads_manifest_sample(tmp_path):
+    sample_dir = tmp_path / "samples"
+    sample_dir.mkdir()
+    joblib.dump(_motion_item(10, "lazy"), sample_dir / "00000000.pkl")
+    joblib.dump(
+        [{
+            "length": 10,
+            "frame_ann": [],
+            "_data_path": "samples/00000000.pkl",
+        }],
+        tmp_path / "train.pkl",
+    )
+    dataset = _length_only_dataset(tmp_path)
+    dataset._load_data()
+    dataset._generate_motion_primitives = lambda sample, start: [
+        (sample["marker"], start)
+    ]
+
+    sampled = dataset._sample_motion_batch(
+        generator=torch.Generator().manual_seed(0)
+    )
+
+    assert sampled == [[("lazy", 0)]]
+    assert "motion" not in dataset.raw_data[0]
+
+
+def test_dataset_reports_active_window_when_every_clip_is_too_short(tmp_path):
+    joblib.dump([_motion_item(9)], tmp_path / "train.pkl")
+    dataset = _length_only_dataset(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match=r"required_length=10 .*history_len=3, future_len=7.*longest=9",
+    ):
+        dataset._load_data()
+
+
+def test_weighted_sampling_indexes_only_valid_sequences():
+    dataset = _length_only_dataset(Path("."), weighted_sample=True)
+    dataset.raw_data = [_motion_item(5, "short"), _motion_item(10, "valid")]
+    dataset.valid_indices = [1]
+    dataset.seq_weights = np.array([1.0])
+    dataset.frame_weight = False
+    dataset._generate_motion_primitives = lambda sample, start: [sample["marker"]]
+
+    sampled = dataset._sample_motion_batch()
+
+    assert sampled == [["valid"]]
 
 
 def test_bonesseed_contact_mask_rejects_low_sliding_feet():
