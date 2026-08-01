@@ -252,7 +252,7 @@ def test_motion_packer_and_reconstruction_surface_sliding_mask():
     dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
     dataset.skeleton = EchoSkeleton()
     reconstructed = dataset.reconstruct_motion(
-        torch.zeros((1, 2, 57)),
+        torch.zeros((1, 2, 69)),
         need_denormalize=False,
         ret_fk=True,
         sliding_mask=torch.as_tensor(sliding_mask).unsqueeze(0),
@@ -265,7 +265,7 @@ def test_motion_packer_and_reconstruction_surface_sliding_mask():
     dataset.batch_size = 1
     dataset.goal_type = "root"
     dataset.normalize = lambda feature: feature
-    dataset._convert_to_motion_features = lambda motion: torch.zeros((1, 3, 57))
+    dataset._convert_to_motion_features = lambda motion: torch.zeros((1, 3, 69))
     primitive = {
         "motion": {},
         "sliding_mask": torch.arange(8, dtype=torch.float32).reshape(4, 2),

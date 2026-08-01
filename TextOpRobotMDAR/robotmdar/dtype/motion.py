@@ -13,10 +13,21 @@ import joblib
 # Define the dimensions of each component (change if needed)
 ROOT_TRANS_OFFSET_DIM = 3  # xyz (m)
 ROOT_ROT_DIM = 4  # Quat, xyzw
-DOF_DIM = 23  # 29 - 2 hand * 3 wrist
+DOF_DIM = 29  # Full G1 skeleton, including both 3-DoF wrists.
 CONTACT_MASK_DIM = 2  # 2 feet
 
 G1_ROOT_HEIGHT = 0.77  # meters
+
+G1_DEFAULT_DOF = (
+    -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,       # left leg
+    -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,       # right leg
+    0.0, 0.0, 0.0,                          # waist
+    0.2, 0.2, 0.0, 0.9,                    # left arm
+    0.0, 0.0, 0.0,                          # left wrist
+    0.2, -0.2, 0.0, 0.9,                   # right arm
+    0.0, 0.0, 0.0,                          # right wrist
+)
+assert len(G1_DEFAULT_DOF) == DOF_DIM
 
 
 # Define MotionDict with explicit component shapes
@@ -27,7 +38,7 @@ MotionKeys: List[str] = ['root_trans_offset', 'dof', 'root_rot', 'contact_mask']
 class MotionDict_(TypedDict):
     root_trans_offset: torch.Tensor  # shape (..., 3)
     root_rot: torch.Tensor  # shape (..., 4) xyzw
-    dof: torch.Tensor  # shape (..., 23)
+    dof: torch.Tensor  # shape (..., 29)
     contact_mask: torch.Tensor  # shape (..., 2)
 
 
@@ -43,10 +54,10 @@ AbsolutePose = Union[AbsolutePose_, Dict[str, torch.Tensor]]
 
 FeatureVersion: int = 3
 
-QPos = torch.Tensor  # shape (..., 30), Mujoco Format qpos
-n_qpos = 30
+QPos = torch.Tensor  # shape (..., 7 + DOF_DIM), MuJoCo qpos format
+n_qpos = 7 + DOF_DIM
 
-# MotionFeatureV0 is just a NumPy ndarray with last dim = 32 (3+4+23+2)
+# MotionFeatureV0 is a tensor with last dim = 38 (3+4+29+2).
 MotionFeatureV0 = torch.Tensor
 
 MotionFeatureV1 = torch.Tensor
@@ -55,7 +66,7 @@ MotionFeatureV1 = torch.Tensor
 # contact_mask: 2
 # root invariant - delta root trans: 3
 # height: 1
-# dof: 23
+# dof: 29
 
 MotionFeatureV2 = torch.Tensor
 # (root_roll, root_pitch) x (sin, cos) : 4
@@ -63,8 +74,8 @@ MotionFeatureV2 = torch.Tensor
 # contact_mask: 2
 # root invariant - delta root trans (t+1 - t): 3
 # height: 1
-# dof: 23
-# delta dof (t+1 - t): 23
+# dof: 29
+# delta dof (t+1 - t): 29
 
 MotionFeatureV3 = torch.Tensor
 
@@ -139,7 +150,7 @@ def motion_dict_to_feature_v1(motion_dict: MotionDict) -> Tuple[MotionFeatureV1,
     # 保持不变
     trans = motion_dict['root_trans_offset']  # (T, 3)
     rot = motion_dict['root_rot']  # (T, 4)
-    dof = motion_dict['dof']  # (T, 23)
+    dof = motion_dict['dof']  # (T, 29)
     contact = motion_dict['contact_mask']  # (T, 2)
 
     T, _ = trans.shape
@@ -195,7 +206,7 @@ def motion_feature_to_dict_v1(motion_feature: MotionFeatureV1, abs_pose: Optiona
     contact = motion_feature[:, 5:7]
     delta_trans_local = motion_feature[:, 7:10]
     height = motion_feature[:, 10]  # 高度
-    dof = motion_feature[:, 11:]  # (T, 23)
+    dof = motion_feature[:, 11:]  # (T, 29)
 
     # 计算roll和pitch
     roll = torch.atan2(sin_roll, cos_roll)
@@ -268,7 +279,7 @@ def __jitable_motion_dict_to_feature_v2__(
     )  # (B, T, 3)
 
     # 计算delta dof: (t+1) - t，使用前T帧
-    delta_dof = dof[:, 1:T + 1] - dof[:, :T]  # (B, T, 23)
+    delta_dof = dof[:, 1:T + 1] - dof[:, :T]  # (B, T, 29)
 
     # 只使用前T帧的contact
     contact_T = contact[:, :T]
@@ -297,7 +308,7 @@ def motion_dict_to_feature_v2(motion_dict: MotionDict) -> Tuple[MotionFeatureV2,
     # 输入N+1帧，返回N帧的feature
     trans = motion_dict['root_trans_offset']  # ([B,] T+1, 3)
     rot = motion_dict['root_rot']  # ([B], T+1, 4)
-    dof = motion_dict['dof']  # ([B], T+1, 23)
+    dof = motion_dict['dof']  # ([B], T+1, 29)
     contact = motion_dict['contact_mask']  # ([B], T+1, 2)
     if len(trans.shape) == 2:
         expanded = True
@@ -348,8 +359,8 @@ def motion_feature_to_dict_v2(motion_feature: MotionFeatureV2, abs_pose: Optiona
     contact = motion_feature[..., 5:7]
     delta_trans_local = motion_feature[..., 7:10]  # (t+1) - t
     height = motion_feature[..., 10]  #+ 0.8  # 高度
-    dof = motion_feature[..., 11:34]  # (B, T, 23)
-    delta_dof = motion_feature[..., 34:]  # (B,T, 23) (t+1) - t
+    dof = motion_feature[..., 11:11 + DOF_DIM]
+    delta_dof = motion_feature[..., 11 + DOF_DIM:11 + 2 * DOF_DIM]
 
     # 计算roll和pitch
     roll = torch.atan2(sin_roll, cos_roll)
@@ -428,7 +439,7 @@ def __jitable_motion_dict_to_feature_v3__(
     # print(f"DEBUG: {delta_trans_local=}")
 
     # 计算delta dof: (t+1) - t，使用前T帧
-    delta_dof = dof[:, 1:T + 1] - dof[:, :T]  # (B, T, 23)
+    delta_dof = dof[:, 1:T + 1] - dof[:, :T]  # (B, T, 29)
 
     # 只使用前T帧的contact
     contact_T = contact[:, :T]
@@ -457,8 +468,12 @@ def motion_dict_to_feature_v3(motion_dict: MotionDict, skeleton: None = None) ->
     # 输入N+1帧，返回N帧的feature
     trans = motion_dict['root_trans_offset']  # ([B,] T+1, 3)
     rot = motion_dict['root_rot']  # ([B], T+1, 4)
-    dof = motion_dict['dof']  # ([B], T+1, 23)
+    dof = motion_dict['dof']  # ([B], T+1, 29)
     contact = motion_dict['contact_mask']  # ([B], T+1, 2)
+    if dof.shape[-1] != DOF_DIM:
+        raise ValueError(
+            f"FeatureVersion 3 expects {DOF_DIM} DoFs, got {dof.shape[-1]}"
+        )
     if len(trans.shape) == 2:
         expanded = True
         trans = trans.unsqueeze(0)
@@ -509,8 +524,14 @@ def motion_feature_to_dict_v3(motion_feature: MotionFeatureV3, abs_pose: Optiona
     contact = motion_feature[..., 5:7]
     delta_trans_local = motion_feature[..., 7:10]  # (t+1) - t
     height = motion_feature[..., 10]  #+ 0.8  # 高度
-    dof = motion_feature[..., 11:34]  # (B, T, 23)
-    delta_dof = motion_feature[..., 34:]  # (B,T, 23) (t+1) - t
+    expected_dim = 11 + 2 * DOF_DIM
+    if motion_feature.shape[-1] != expected_dim:
+        raise ValueError(
+            f"FeatureVersion 3 expects {expected_dim} features for "
+            f"{DOF_DIM} DoFs, got {motion_feature.shape[-1]}"
+        )
+    dof = motion_feature[..., 11:11 + DOF_DIM]
+    delta_dof = motion_feature[..., 11 + DOF_DIM:expected_dim]
 
     # 计算roll和pitch
     roll = torch.atan2(sin_roll, cos_roll)
@@ -632,8 +653,8 @@ def __jitable_motion_dict_to_feature_v4__(trans, rot, dof, contact, skeleton, re
     rot_delta_rotmat = torch.matmul(root_rot_new[:, 1:], root_rot_new[:, :-1].permute(0, 1, 3, 2))
     rot_delta_6d = matrix_to_rot6d(rot_delta_rotmat)  # [B, t-1, 6]
 
-    # dof : [B, T, 23]
-    dof = dof[:, :-1, :]  # [B, T-1, 23]
+    # dof: [B, T, 29]
+    dof = dof[:, :-1, :]  # [B, T-1, 29]
     transl_feature = transl[:, :-1, :]  # [B, T-1, 3]
     rot_6d_feature = rot_6d[:, :-1, :]  # [B, T-1, 6]
     joints_feature = joints[:, :-1, :]  # [B, T-1, J*3]
@@ -643,7 +664,7 @@ def __jitable_motion_dict_to_feature_v4__(trans, rot, dof, contact, skeleton, re
         [
             transl_feature,  # 3
             rot_6d_feature,  # 6
-            dof,  # 23
+            dof,  # 29
             transl_delta,  # 3
             rot_delta_6d,  # 6
             joints_feature,  # J*3
@@ -659,7 +680,7 @@ def __jitable_motion_dict_to_feature_v4__(trans, rot, dof, contact, skeleton, re
 def motion_dict_to_feature_v4(motion_dict, skeleton):
     trans = motion_dict['root_trans_offset']  # ([B,] T+1, 3)
     rot = motion_dict['root_rot']  # ([B], T+1, 4)
-    dof = motion_dict['dof']  # ([B], T+1, 23)
+    dof = motion_dict['dof']  # ([B], T+1, 29)
     contact = motion_dict['contact_mask']  # ([B], T+1, 2)
     if len(trans.shape) == 2:
         expanded = True
@@ -730,11 +751,15 @@ def motion_feature_to_dict_v4(motion_feature, abs_pose):
 
     transl_feature = motion_feature[..., :3]  # [B, T, 3]
     rot_6d_feature = motion_feature[..., 3:9]  # [B, T, 6]
-    dof = motion_feature[..., 9:32]  # [B, T, 23]
-    transl_delta = motion_feature[..., 32:35]  # [B, T, 3]
-    rot_delta_6d = motion_feature[..., 35:41]  # [B, T, 6]
-    joints_feature = motion_feature[..., 41:41 + (DOF_DIM + 4) * 3]  # [B, T, J*3]
-    joints_delta = motion_feature[..., 41 + (DOF_DIM + 4) * 3:-2]  # [B, T, J*3]
+    dof_end = 9 + DOF_DIM
+    transl_delta_end = dof_end + 3
+    rot_delta_end = transl_delta_end + 6
+    joints_end = rot_delta_end + (DOF_DIM + 4) * 3
+    dof = motion_feature[..., 9:dof_end]
+    transl_delta = motion_feature[..., dof_end:transl_delta_end]
+    rot_delta_6d = motion_feature[..., transl_delta_end:rot_delta_end]
+    joints_feature = motion_feature[..., rot_delta_end:joints_end]
+    joints_delta = motion_feature[..., joints_end:-2]
     contact = motion_feature[..., -2:]  # [B, T, 2]
 
     assert joints_feature.shape[
@@ -956,8 +981,8 @@ def __jitable_motion_dict_to_feature_v5__(trans, rot, dof, contact, joints):
     sincos: (B, T, 1)
     delta_yaw: (B, T, 1)
     contact_T: (B, T, 2)
-    dof_T: (B, T, 23)
-    delta_dof: (B, T, 23)
+    dof_T: (B, T, 29)
+    delta_dof: (B, T, 29)
     joints_local: (B, T, (DoF_DIM+4)*3)
     delta_joints_local: (B, T, (DoF_DIM+4)*3)
     '''
@@ -1006,7 +1031,7 @@ def __jitable_motion_dict_to_feature_v5__(trans, rot, dof, contact, joints):
                                     True).reshape(B, T, -1)  # (B, T, (DoF_DIM+4)*3)
 
     # 计算delta dof: (t+1) - t，使用前T帧
-    delta_dof = dof[:, 1:T + 1] - dof[:, :T]  # (B, T, 23)
+    delta_dof = dof[:, 1:T + 1] - dof[:, :T]  # (B, T, 29)
 
     # breakpoint()
 
@@ -1043,7 +1068,7 @@ def motion_dict_to_feature_v5(motion_dict, skeleton):
     # 输入N+1帧，返回N帧的feature
     trans = motion_dict['root_trans_offset']  # ([B,] T+1, 3)
     rot = motion_dict['root_rot']  # ([B], T+1, 4)
-    dof = motion_dict['dof']  # ([B], T+1, 23)
+    dof = motion_dict['dof']  # ([B], T+1, 29)
     contact = motion_dict['contact_mask']  # ([B], T+1, 2)
     if len(trans.shape) == 2:
         expanded = True
@@ -1104,8 +1129,8 @@ def motion_feature_to_dict_v5(motion_feature, abs_pose):
     joints_local = motion_feature[..., 13:13 + joints_feature_dim]  # (B, T, (DoF_DIM+4)*3)
     delta_joints_local = motion_feature[..., 13 + joints_feature_dim:13 + 2 * joints_feature_dim]
     height = motion_feature[..., 13 + 2 * joints_feature_dim]  #+ 0.8  # 高度
-    dof = motion_feature[..., -46:-23]  # (B, T, 23)
-    delta_dof = motion_feature[..., -23:]  # (B,T, 23) (t+1) - t
+    dof = motion_feature[..., -2 * DOF_DIM:-DOF_DIM]
+    delta_dof = motion_feature[..., -DOF_DIM:]
 
     # 计算roll和pitch
     roll = torch.atan2(sin_roll, cos_roll)
@@ -1174,8 +1199,8 @@ def motion_feature_to_dict_v5(motion_feature, abs_pose):
 motion_feature_dim_v1 = (4 + 1 + 2 + 3 + 1 + DOF_DIM)
 motion_feature_dim_v2 = (4 + 1 + 2 + 3 + 1 + DOF_DIM + DOF_DIM)
 motion_feature_dim_v3 = (4 + 1 + 2 + 3 + 1 + DOF_DIM + DOF_DIM)
-motion_feature_dim_v4 = (3 + 6 + DOF_DIM + 3 + 6 + (DOF_DIM + 4) * 3 + (DOF_DIM + 4) * 3 + 2)  # 181
-motion_feature_dim_v5 = (4 + 1 + 2 + 3 + 3 + (DOF_DIM + 4) * 3 + (DOF_DIM + 4) * 3 + 1 + DOF_DIM + DOF_DIM)  #  222
+motion_feature_dim_v4 = (3 + 6 + DOF_DIM + 3 + 6 + (DOF_DIM + 4) * 3 + (DOF_DIM + 4) * 3 + 2)  # 247
+motion_feature_dim_v5 = (4 + 1 + 2 + 3 + 3 + (DOF_DIM + 4) * 3 + (DOF_DIM + 4) * 3 + 1 + DOF_DIM + DOF_DIM)  # 270
 
 
 def get_zero_abs_pose(batch_shape: Tuple[int, ...], device: str = 'cuda') -> AbsolutePose:
@@ -1195,12 +1220,7 @@ def get_zero_feature_v1() -> MotionFeatureV1:
     feat = torch.zeros((1, motion_feature_dim_v1), dtype=torch.float32)
     feat[0, 3] = 1.0  # Set the w component of the quaternion to 1
     feat[0, 10] = 0.8  # Set height
-    feat[0, 11:] = torch.tensor(
-        [
-            -0.1, 0.0, 0.0, 0.3, -0.2, 0.0, -0.1, 0.0, 0.0, 0.3, -0.2, 0.0, 0.0, 0.0, 0.0, 0.2, 0.2, 0.0, 0.9, 0.2,
-            -0.2, 0.0, 0.9
-        ]
-    )
+    feat[0, 11:] = torch.tensor(G1_DEFAULT_DOF)
     return feat
 
 
@@ -1211,12 +1231,7 @@ def get_zero_feature_v2() -> MotionFeatureV2:
     feat = torch.zeros((1, motion_feature_dim_v2), dtype=torch.float32)
     feat[0, 5:7] = 1.0  # contact mask
     feat[0, 10] = 0.75  # Set height
-    feat[0, 11:34] = torch.tensor(
-        [
-            -0.1, 0.0, 0.0, 0.3, -0.2, 0.0, -0.1, 0.0, 0.0, 0.3, -0.2, 0.0, 0.0, 0.0, 0.0, 0.2, 0.2, 0.0, 0.9, 0.2,
-            -0.2, 0.0, 0.9
-        ]
-    )
+    feat[0, 11:11 + DOF_DIM] = torch.tensor(G1_DEFAULT_DOF)
     # delta dof部分保持为0
     return feat
 
@@ -1227,12 +1242,7 @@ get_zero_feature_v3 = get_zero_feature_v2
 def get_zero_feature_v4(skeleton):
     root_rot = torch.zeros((1, 4))
     root_rot[..., 3] = 1.0
-    dof = torch.tensor(
-        [
-            -0.1, 0.0, 0.0, 0.3, -0.2, 0.0, -0.1, 0.0, 0.0, 0.3, -0.2, 0.0, 0.0, 0.0, 0.0, 0.2, 0.2, 0.0, 0.9, 0.2,
-            -0.2, 0.0, 0.9
-        ]
-    )
+    dof = torch.tensor(G1_DEFAULT_DOF)
 
     motion_dict = {
         'root_trans_offset': torch.tensor([0.0, 0.0, G1_ROOT_HEIGHT]).unsqueeze(0),

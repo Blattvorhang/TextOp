@@ -38,33 +38,11 @@ def isaaclab_to_mujoco_dof(values: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(values[..., _ISAACLAB_TO_MUJOCO])
 
 
-def _reduce_mujoco_29_to_23(values: np.ndarray) -> np.ndarray:
-    """Drop the six locked wrist DoFs from MuJoCo-ordered values."""
+def mujoco_to_isaaclab_dof(values: np.ndarray) -> np.ndarray:
+    """Convert 29-DoF MuJoCo values to IsaacLab order."""
     values = np.asarray(values)
     if values.shape[-1] != 29:
         raise ValueError(f"Expected 29 MuJoCo DoFs, got {values.shape}")
-    return np.ascontiguousarray(
-        np.concatenate((values[..., :19], values[..., 22:26]), axis=-1))
-
-
-def _expand_mujoco_23_to_29(values: np.ndarray) -> np.ndarray:
-    """Insert zero-valued wrist DoFs into MuJoCo-ordered values."""
-    values = np.asarray(values)
-    if values.shape[-1] != 23:
-        raise ValueError(f"Expected 23 MuJoCo DoFs, got {values.shape}")
-    expanded = np.zeros(values.shape[:-1] + (29,), dtype=values.dtype)
-    expanded[..., :19] = values[..., :19]
-    expanded[..., 22:26] = values[..., 19:23]
-    return expanded
-
-
-def mujoco_to_isaaclab_dof(values: np.ndarray) -> np.ndarray:
-    """Convert 23- or 29-DoF MuJoCo values to IsaacLab 29-DoF order."""
-    values = np.asarray(values)
-    if values.shape[-1] == 23:
-        values = _expand_mujoco_23_to_29(values)
-    elif values.shape[-1] != 29:
-        raise ValueError(f"Expected 23 or 29 MuJoCo DoFs, got {values.shape}")
     return np.ascontiguousarray(values[..., _MUJOCO_TO_ISAACLAB])
 
 
@@ -119,10 +97,10 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
     positions = positions[-history_len:]
     rotations = rotations[-history_len:]
     joints_mujoco = isaaclab_to_mujoco_dof(joints[-history_len:])
-    joints_23 = _reduce_mujoco_29_to_23(joints_mujoco)
     positions_with_terminal = np.concatenate((positions, positions[-1:]), axis=0)
     rotations_with_terminal = np.concatenate((rotations, rotations[-1:]), axis=0)
-    joints_with_terminal = np.concatenate((joints_23, joints_23[-1:]), axis=0)
+    joints_with_terminal = np.concatenate(
+        (joints_mujoco, joints_mujoco[-1:]), axis=0)
 
     motion_dict = {
         "root_trans_offset": torch.as_tensor(
@@ -135,10 +113,10 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
             (1, history_len + 1, 2), dtype=torch.float32, device=device),
     }
     feature, abs_pose = motion_dict_to_feature_v3(motion_dict)
-    if feature.shape != (1, history_len, 57):
+    if feature.shape != (1, history_len, 69):
         raise ValueError(
             f"Unexpected FeatureVersion 3 shape {tuple(feature.shape)}; "
-            f"expected (1, {history_len}, 57)")
+            f"expected (1, {history_len}, 69)")
 
     # Estimate the unavailable current->next deltas from the most recent
     # physical interval. Roll/pitch and the pose fields already come directly
@@ -158,7 +136,7 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
         - motion_dict["root_trans_offset"][:, -3],
         w_last=True,
     )
-    feature[:, -1, 34:57] = (
+    feature[:, -1, 40:69] = (
         motion_dict["dof"][:, -2] - motion_dict["dof"][:, -3])
 
     # motion_dict_to_feature_v3 subtracts Euler yaw directly. Wrap all yaw
@@ -345,7 +323,7 @@ def align_generated_history_pose(abs_pose: dict,
     aligned_history_motion = history_motion
     if history_motion is not None and val_data is not None:
         raw = val_data.denormalize(
-            history_motion.to(device))          # (B, T, 57)
+            history_motion.to(device))          # (B, T, 69)
         B, T = raw.shape[:2]
 
         # -- original per-frame Euler angles (matching motion_feature_to_dict_v3) --
@@ -523,8 +501,7 @@ def _textop_bodies_to_sonic(values: np.ndarray) -> np.ndarray:
 
 
 def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
-                          fps: float = 50.0,
-                          locked_joint_pos: np.ndarray | None = None):
+                          fps: float = 50.0):
     """Convert one reconstructed MuJoCo batch to ``G1MotionData``."""
     from sonicmsg.messages import G1MotionData
 
@@ -550,17 +527,6 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
     dof_vel = _forward_velocity(dof_pos, fps)
     joint_pos = mujoco_to_isaaclab_dof(dof_pos)[skip_history:]
     joint_vel = mujoco_to_isaaclab_dof(dof_vel)[skip_history:]
-    if locked_joint_pos is not None:
-        locked_joint_pos = np.asarray(locked_joint_pos, dtype=np.float32)
-        if locked_joint_pos.shape != (29,):
-            raise ValueError(
-                f"locked_joint_pos must have shape (29,), got "
-                f"{locked_joint_pos.shape}")
-        # TextOp omits both 3-DoF wrists. Hold SONIC's unmodeled references
-        # at their measured values instead of discontinuously setting zero.
-        locked_isaaclab = _ISAACLAB_TO_MUJOCO[[19, 20, 21, 26, 27, 28]]
-        joint_pos[:, locked_isaaclab] = locked_joint_pos[locked_isaaclab]
-        joint_vel[:, locked_isaaclab] = 0.0
     body_pos = _textop_bodies_to_sonic(body_pos[skip_history:])
     body_ori = np.ascontiguousarray(
         _textop_bodies_to_sonic(body_ori_xyzw[skip_history:])[
