@@ -51,6 +51,7 @@ def generate_next_motion(
         future_len: int,
         use_full_sample: bool = False,
         guidance_scale: Optional[float] = None,
+        initial_noise: Optional[torch.Tensor] = None,
         ret_fk: bool = False,
         ret_fk_full: bool = False,
         use_vae=True,
@@ -80,8 +81,17 @@ def generate_next_motion(
         #                 )  # [B, T=1, D] - latent_dim from config
         latent_shape = (batch_size, *denoiser.noise_shape)
 
-        # Sample random noise as starting point for single-step denoising.
-        x_start_noise = torch.randn(latent_shape, device=device)
+        # Online replanning should reuse one noise realization. Resampling at
+        # every MPC update makes otherwise-nearby conditions decode to visibly
+        # different motions at the plan seam.
+        if initial_noise is None:
+            x_start_noise = torch.randn(latent_shape, device=device)
+        else:
+            if tuple(initial_noise.shape) != tuple(latent_shape):
+                raise ValueError(
+                    f"initial_noise has shape {tuple(initial_noise.shape)}, "
+                    f"expected {tuple(latent_shape)}")
+            x_start_noise = initial_noise.to(device=device)
 
         # Sample a random timestep for demonstration (or use t=0 for no noise)
         t = torch.zeros(batch_size, dtype=torch.int32,

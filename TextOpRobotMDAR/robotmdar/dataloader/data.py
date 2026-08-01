@@ -7,6 +7,7 @@ This is a clean, well-structured implementation with:
 3. 100% interface compatibility with original
 """
 
+from collections import OrderedDict
 from pathlib import Path
 import numpy as np
 import joblib
@@ -87,6 +88,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.datadir = Path(datadir)
         self.split = split
         self.device = "cpu"  # Keep embeddings on CPU initially
+        self.sample_cache_size = max(0, int(kwargs.get('sample_cache_size', 8)))
+        self._sample_cache = OrderedDict()
 
         # DDP rank and world_size, set externally by training script
         self.rank = 0
@@ -118,16 +121,34 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             assert datapkl.exists(), f"Data file {datapkl} does not exist"
             all_data.extend(joblib.load(datapkl))
 
-        # Fix length labels and filter valid samples
+        # Fix length labels and filter against the active training window. New
+        # datasets use lightweight manifest records; old monolithic files remain
+        # supported for compatibility.
         self.valid_indices = []
         required_length = self.segment_len + self.goal_offset
         for i, item in enumerate(all_data):
-            item['length'] = int(item['motion']['motion_len'])
-            # Preserve TextOp's exclusive randint upper bound: max_start > 0
-            if item['length'] > required_length:
+            if 'motion' in item:
+                item['length'] = int(item['motion']['motion_len'])
+            elif '_data_path' in item:
+                item['length'] = int(item['length'])
+            else:
+                raise ValueError(
+                    f"Dataset item {i} has neither 'motion' nor '_data_path'"
+                )
+            if item['length'] >= required_length:
                 self.valid_indices.append(i)
 
         self.raw_data = all_data
+
+        if not self.valid_indices:
+            longest = max((item['length'] for item in all_data), default=0)
+            raise ValueError(
+                "No motion sequences satisfy the active training window: "
+                f"required_length={required_length} "
+                f"(history_len={self.history_len}, future_len={self.future_len}, "
+                f"num_primitive={self.num_primitive}, goal_offset={self.goal_offset}), "
+                f"loaded={len(all_data)}, longest={longest}, split={self.split!r}"
+            )
 
         if self.weighted_sample:
             self._cal_sample_weight()
@@ -137,6 +158,40 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # Load text embeddings
         # DEPRECATED: text embeddings no longer used (goal+scene conditioning).
         # self._load_text_embeddings()
+
+    def _hydrate_sample(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Load a manifest-backed sample, with a small per-worker LRU cache."""
+        relpath = record.get('_data_path')
+        if relpath is None:
+            return record
+
+        sample_path = self.datadir / relpath
+        cache = getattr(self, '_sample_cache', None)
+        if cache is None:
+            cache = self._sample_cache = OrderedDict()
+
+        cache_key = str(sample_path)
+        if cache_key in cache:
+            stored = cache.pop(cache_key)
+            cache[cache_key] = stored
+        else:
+            if not sample_path.exists():
+                raise FileNotFoundError(
+                    f"Manifest sample does not exist: {sample_path}"
+                )
+            stored = joblib.load(sample_path)
+            if not isinstance(stored, dict) or 'motion' not in stored:
+                raise ValueError(f"Invalid manifest sample: {sample_path}")
+            cache[cache_key] = stored
+            cache_size = getattr(self, 'sample_cache_size', 8)
+            while len(cache) > cache_size:
+                cache.popitem(last=False)
+
+        # Sampling weights are computed on manifest records after packing.
+        sample = dict(stored)
+        sample.update({key: value for key, value in record.items()
+                       if key != '_data_path'})
+        return sample
 
     def _cal_sample_weight(self):
 
@@ -179,16 +234,24 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 frame_weights.append(frame_weight)
             data['frame_weights'] = frame_weights
 
-        babel_sum = sum([data['weight'] for data in self.raw_data])
+        valid_data = [self.raw_data[i] for i in self.valid_indices]
+        babel_sum = sum(data['weight'] for data in valid_data)
         print('babel sum: ', babel_sum)
         samp_percent = 0.0
         print('samp percent: ', samp_percent)
         if babel_sum > 0:
-            for data in self.raw_data:
+            for data in valid_data:
                 data['weight'] = data['weight'] / babel_sum * (1 - samp_percent)
 
-        seq_weights = np.array([data['weight'] for data in self.raw_data])
-        seq_weights = seq_weights / seq_weights.sum()
+        seq_weights = np.asarray([data['weight'] for data in valid_data], dtype=np.float64)
+        weight_sum = seq_weights.sum()
+        if not np.isfinite(weight_sum) or weight_sum <= 0:
+            logger.warning(
+                "Valid motion weights are empty or non-positive; using uniform sampling"
+            )
+            seq_weights = np.full(len(valid_data), 1.0 / len(valid_data))
+        else:
+            seq_weights = seq_weights / weight_sum
         self.seq_weights = seq_weights
 
         # self._statistic_sample_weight()
@@ -349,7 +412,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _compute_meanstd_V2(self) -> Tuple[torch.Tensor, torch.Tensor]:
         all_mp_data = []
-        for seq_data in self.raw_data:
+        for record in self.raw_data:
+            seq_data = self._hydrate_sample(record)
             motion_data = seq_data['motion']
             num_frames = motion_data['root_trans_offset'].shape[0]
             primitive_data_list = []
@@ -538,14 +602,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             rand_idx = torch.randint(0, len(self.valid_indices), (self.batch_size, ), generator=generator)
         else:
             rand_idx = torch.from_numpy(
-                np.random.choice(len(self.raw_data), size=self.batch_size, replace=True, p=self.seq_weights)
+                np.random.choice(len(self.valid_indices), size=self.batch_size, replace=True, p=self.seq_weights)
             )
 
         all_motion_primitives = []
         for batch_idx in range(self.batch_size):
             # Get sample
             sample_idx = self.valid_indices[rand_idx[batch_idx].item()]  # type:ignore
-            sample = self.raw_data[sample_idx]
+            sample = self._hydrate_sample(self.raw_data[sample_idx])
 
             # Sample segment start ONCE per motion using the generator for reproducibility
             max_start = sample['length'] - self.segment_len - self.goal_offset
@@ -556,7 +620,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             if self.weighted_sample and self.frame_weight:
                 seg_start = random.choices(range(max_start + 1), weights=sample['frame_weights'][:max_start + 1], k=1)[0]
             else:
-                seg_start = int(torch.randint(0, max_start, (1, ), generator=generator).item())
+                seg_start = int(torch.randint(0, max_start + 1, (1, ), generator=generator).item())
 
             # Generate ALL primitives for this motion using the SAME seg_start
             motion_primitives = self._generate_motion_primitives(sample, seg_start)

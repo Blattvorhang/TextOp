@@ -10,7 +10,11 @@ import numpy as np
 import torch
 
 from robotmdar.utils.goal import GoalType, build_ego_goal
-from robotmdar.dtype.motion import motion_dict_to_feature_v3
+from robotmdar.dtype.motion import (
+    motion_dict_to_feature_v3,
+    quaternion_to_euler_angles,
+)
+from robotmdar.dtype.rotation import quat_apply
 
 
 # Indexing an IsaacLab-ordered vector with this array produces MuJoCo order.
@@ -82,10 +86,17 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
                          device: str | torch.device):
     """Build normalized DAR history from the latest physical controller states.
 
-    FeatureVersion 3 stores forward deltas. Consequently ``history_len`` model
-    features require ``history_len + 1`` physical poses.
+    FeatureVersion 3 stores the absolute roll/pitch and joint pose at feature
+    frame ``t``, plus forward deltas from ``t`` to ``t + 1``.  The controller
+    cannot provide the future pose needed by the last history feature, so its
+    latest measured velocity is used as a constant-velocity estimate.  This
+    keeps the latest physical pose itself in history; otherwise its root
+    roll/pitch would be dropped at every replan.
     """
-    required_states = history_len + 1
+    if history_len < 2:
+        raise ValueError(
+            f"Controller history requires at least 2 features, got {history_len}")
+    required_states = history_len
     raw = state_msg.raw
     positions = np.array(raw["g1_pos"], dtype=np.float32, copy=True)
     rotations = _normalized_quaternions_xyzw(raw["g1_root_rot"])
@@ -102,20 +113,26 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
             f"Need {required_states} physical states for {history_len} features, "
             f"got {len(positions)}")
 
-    positions = positions[-required_states:]
-    rotations = rotations[-required_states:]
-    joints_mujoco = isaaclab_to_mujoco_dof(joints[-required_states:])
+    # The model history must end at the current physical state. Append a copy
+    # only to satisfy the feature converter's N+1 input contract; terminal
+    # forward deltas are replaced below with a constant-velocity estimate.
+    positions = positions[-history_len:]
+    rotations = rotations[-history_len:]
+    joints_mujoco = isaaclab_to_mujoco_dof(joints[-history_len:])
     joints_23 = _reduce_mujoco_29_to_23(joints_mujoco)
+    positions_with_terminal = np.concatenate((positions, positions[-1:]), axis=0)
+    rotations_with_terminal = np.concatenate((rotations, rotations[-1:]), axis=0)
+    joints_with_terminal = np.concatenate((joints_23, joints_23[-1:]), axis=0)
 
     motion_dict = {
         "root_trans_offset": torch.as_tensor(
-            positions, dtype=torch.float32, device=device).unsqueeze(0),
+            positions_with_terminal, dtype=torch.float32, device=device).unsqueeze(0),
         "root_rot": torch.as_tensor(
-            rotations, dtype=torch.float32, device=device).unsqueeze(0),
+            rotations_with_terminal, dtype=torch.float32, device=device).unsqueeze(0),
         "dof": torch.as_tensor(
-            joints_23, dtype=torch.float32, device=device).unsqueeze(0),
+            joints_with_terminal, dtype=torch.float32, device=device).unsqueeze(0),
         "contact_mask": torch.ones(
-            (1, required_states, 2), dtype=torch.float32, device=device),
+            (1, history_len + 1, 2), dtype=torch.float32, device=device),
     }
     feature, abs_pose = motion_dict_to_feature_v3(motion_dict)
     if feature.shape != (1, history_len, 57):
@@ -123,8 +140,29 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
             f"Unexpected FeatureVersion 3 shape {tuple(feature.shape)}; "
             f"expected (1, {history_len}, 57)")
 
-    # motion_dict_to_feature_v3 subtracts Euler yaw directly. Wrap the result
-    # at the branch cut before applying the training-set normalization.
+    # Estimate the unavailable current->next deltas from the most recent
+    # physical interval. Roll/pitch and the pose fields already come directly
+    # from the current state and must not be extrapolated.
+    feature[:, -1, 4] = feature[:, -2, 4]
+    current_yaw = quaternion_to_euler_angles(
+        motion_dict["root_rot"][:, -2])[:, 2]
+    current_yaw_quat = torch.stack((
+        torch.zeros_like(current_yaw),
+        torch.zeros_like(current_yaw),
+        -torch.sin(current_yaw / 2),
+        torch.cos(current_yaw / 2),
+    ), dim=-1)
+    feature[:, -1, 7:10] = quat_apply(
+        current_yaw_quat,
+        motion_dict["root_trans_offset"][:, -2]
+        - motion_dict["root_trans_offset"][:, -3],
+        w_last=True,
+    )
+    feature[:, -1, 34:57] = (
+        motion_dict["dof"][:, -2] - motion_dict["dof"][:, -3])
+
+    # motion_dict_to_feature_v3 subtracts Euler yaw directly. Wrap all yaw
+    # deltas at the branch cut before applying training-set normalization.
     feature[..., 4] = torch.atan2(
         torch.sin(feature[..., 4]), torch.cos(feature[..., 4]))
     return val_data.normalize(feature), abs_pose
@@ -135,12 +173,12 @@ def state_to_ego_goal(state_msg: Any,
                       goal_type: GoalType | str = GoalType.ROOT,
                       goal_reference_path: str | Path | None = None
                       ) -> torch.Tensor:
-    """Convert the root goal relative to the last history-feature pose."""
+    """Convert the root goal relative to the current history-feature pose."""
     reference_pos = torch.tensor(
-        state_msg.raw["g1_pos"][-2], dtype=torch.float32,
+        state_msg.raw["g1_pos"][-1], dtype=torch.float32,
         device=device).reshape(1, 3)
     reference_rot_np = _normalized_quaternions_xyzw(
-        np.asarray(state_msg.raw["g1_root_rot"][-2:], dtype=np.float32))[:1]
+        np.asarray(state_msg.raw["g1_root_rot"][-1:], dtype=np.float32))
     reference_rot = torch.as_tensor(
         reference_rot_np, dtype=torch.float32, device=device)
     return state_goal_from_reference(
@@ -247,19 +285,170 @@ def state_goal_from_reference(state_msg: Any,
 
 def align_generated_history_pose(abs_pose: dict,
                                  generated_reference_pos: torch.Tensor,
+                                 generated_reference_rot: torch.Tensor,
                                  state_msg: Any,
-                                 device: str | torch.device):
-    """Translate generated history so its last pose matches the real G1 root."""
+                                 device: str | torch.device,
+                                 history_motion: torch.Tensor | None = None,
+                                 val_data: Any = None):
+    """Translate and rotate generated history so its reference pose matches the real G1 root.
+
+    When *history_motion* and *val_data* are provided the per-frame roll, pitch
+    and delta_yaw features are also rotated so that **every** reconstructed
+    frame (not just the starting abs_pose) carries the correction.
+    """
+    from robotmdar.dtype.rotation import (
+        euler_angles_to_quaternion,
+        get_euler_xyz,
+        quat_apply,
+        quat_inverse,
+        quat_mul,
+    )
+
     real_current_pos = torch.tensor(
         state_msg.raw["g1_pos"][-1], dtype=torch.float32,
         device=device).reshape(1, 3)
+    # Normalise the real quaternion defensively (ZMQ decoding may produce
+    # views with non-unit norm).
+    real_current_rot_q = _normalized_quaternions_xyzw(
+        np.asarray(state_msg.raw["g1_root_rot"][-1:], dtype=np.float32))
+    real_current_rot = torch.as_tensor(
+        real_current_rot_q, dtype=torch.float32, device=device).reshape(1, 4)
+
     generated_reference_pos = generated_reference_pos.to(device).reshape(1, 3)
-    translation = real_current_pos - generated_reference_pos
+    generated_reference_rot = generated_reference_rot.to(device).reshape(1, 4)
+
+    # Rotation delta: q_delta = q_real * q_gen^{-1}
+    q_gen_inv = quat_inverse(generated_reference_rot, w_last=True)
+    q_delta = quat_mul(real_current_rot, q_gen_inv, w_last=True)
+
+    # Rotate the generated position *around* the reference pivot, then add
+    # the real translation.
+    rel_pos = (abs_pose["root_trans_offset"].to(device)
+               - generated_reference_pos)
+    rotated_rel_pos = quat_apply(q_delta, rel_pos, w_last=True)
+
     aligned_abs_pose = {
-        "root_trans_offset": abs_pose["root_trans_offset"].to(device) + translation,
-        "root_rot": abs_pose["root_rot"].to(device),
+        "root_trans_offset": real_current_pos + rotated_rel_pos,
+        "root_rot": quat_mul(
+            q_delta, abs_pose["root_rot"].to(device), w_last=True),
     }
-    return aligned_abs_pose, generated_reference_pos + translation, translation
+
+    # ------------------------------------------------------------------
+    # Also rotate every history-frame feature so the full reconstructed
+    # trajectory carries the correction (not just frame 0 via abs_pose).
+    #
+    # The roll / pitch sincos are **absolute** per frame and delta_yaw is
+    # a forward difference — all three must be updated.  Likewise
+    # delta_trans_local lives in the per-frame yaw-aligned basis and
+    # needs to be re-expressed after the rotation correction.
+    # ------------------------------------------------------------------
+    aligned_history_motion = history_motion
+    if history_motion is not None and val_data is not None:
+        raw = val_data.denormalize(
+            history_motion.to(device))          # (B, T, 57)
+        B, T = raw.shape[:2]
+
+        # -- original per-frame Euler angles (matching motion_feature_to_dict_v3) --
+        sin_roll = raw[..., 0]
+        cos_roll = raw[..., 1] + 1              # stored as cos(roll) - 1
+        sin_pitch = raw[..., 2]
+        cos_pitch = raw[..., 3] + 1
+        delta_yaw = raw[..., 4]                 # (B, T) — only [:, :T-1] is used by decoder
+
+        roll = torch.atan2(sin_roll, cos_roll)  # (B, T)
+        pitch = torch.atan2(sin_pitch, cos_pitch)
+
+        init_euler = get_euler_xyz(abs_pose["root_rot"].to(device), w_last=True)
+        ref_yaw = init_euler[2]                 # scalar per batch
+        yaw_old = torch.zeros(B, T, device=device)
+        yaw_old[:, 0] = ref_yaw
+        if T > 1:
+            yaw_old[:, 1:] = (torch.cumsum(delta_yaw[:, :T - 1], dim=1)
+                              + ref_yaw.reshape(-1, 1))
+
+        # -- apply q_delta to every frame's rotation --
+        euler = torch.stack([roll, pitch, yaw_old], dim=-1)     # (B, T, 3)
+        rot_orig = euler_angles_to_quaternion(euler)            # (B, T, 4) xyzw
+        rot_corrected = quat_mul(
+            q_delta.expand(B * T, 4), rot_orig.reshape(-1, 4), w_last=True,
+        ).reshape(B, T, 4)
+
+        # Extract new per-frame Euler angles.
+        roll_new, pitch_new, yaw_new = get_euler_xyz(
+            rot_corrected.reshape(-1, 4), w_last=True)
+        roll_new = roll_new.reshape(B, T)
+        pitch_new = pitch_new.reshape(B, T)
+        yaw_new = yaw_new.reshape(B, T)
+
+        # -- write corrected sincos --
+        raw[..., 0] = torch.sin(roll_new)
+        raw[..., 1] = torch.cos(roll_new) - 1
+        raw[..., 2] = torch.sin(pitch_new)
+        raw[..., 3] = torch.cos(pitch_new) - 1
+
+        # -- write corrected delta_yaw (only indices used by the decoder) --
+        if T > 1:
+            raw[..., :T - 1, 4] = yaw_new[:, 1:] - yaw_new[:, :-1]
+
+        # -- re-express delta_trans_local in the corrected yaw frame --
+        # delta_trans_local[t] lives in the yaw[t]-aligned local basis.
+        # After the rotation correction the same world-space displacement
+        # must be rotated into the new yaw_new[t] basis.
+        delta_trans_local = raw[..., 7:10].clone()               # (B, T, 3)
+        yaw_quat_old = euler_angles_to_quaternion(
+            torch.stack([torch.zeros_like(yaw_old),
+                         torch.zeros_like(yaw_old), yaw_old], dim=-1),
+        )                                                        # (B, T, 4)
+        world_disp = quat_apply(
+            yaw_quat_old[:, :-1].reshape(-1, 4),
+            delta_trans_local[:, :-1].reshape(-1, 3), w_last=True,
+        ).reshape(B, T - 1, 3)
+        # Apply the same q_delta rotation in world space.
+        world_disp_corr = quat_apply(
+            q_delta.expand(B * (T - 1), 4),
+            world_disp.reshape(-1, 3), w_last=True,
+        ).reshape(B, T - 1, 3)
+        # Project back into the *new* yaw frame.
+        yaw_quat_new = euler_angles_to_quaternion(
+            torch.stack([torch.zeros_like(yaw_new),
+                         torch.zeros_like(yaw_new), yaw_new], dim=-1),
+        )
+        inv_yaw_new = quat_inverse(yaw_quat_new[:, :-1], w_last=True)
+        delta_trans_new = quat_apply(
+            inv_yaw_new.reshape(-1, 4),
+            world_disp_corr.reshape(-1, 3), w_last=True,
+        ).reshape(B, T - 1, 3)
+        raw[..., :T - 1, 7:10] = delta_trans_new
+
+        # Feature V3 stores height as an absolute world-space value rather
+        # than deriving it from delta_trans_local. Its decoder overwrites the
+        # reconstructed z coordinate with this channel, so transform every
+        # history position explicitly. Without this, x/y and orientation
+        # align at the seam while z remains at the generated height.
+        root_pos_old = torch.zeros(B, T, 3, device=device, dtype=raw.dtype)
+        root_pos_old[:, 0] = abs_pose["root_trans_offset"].to(device)
+        if T > 1:
+            root_pos_old[:, 1:] = (
+                torch.cumsum(world_disp, dim=1)
+                + root_pos_old[:, :1]
+            )
+        root_pos_old[..., 2] = raw[..., 10]
+        root_pos_corrected = real_current_pos.unsqueeze(1) + quat_apply(
+            q_delta.unsqueeze(1).expand(B, T, 4),
+            root_pos_old - generated_reference_pos.unsqueeze(1),
+            w_last=True,
+        )
+        raw[..., 10] = root_pos_corrected[..., 2]
+
+        aligned_history_motion = val_data.normalize(raw)
+
+    # goal reference pose is the *real* G1 pose so ego-goal is computed
+    # relative to where the robot actually is.
+    return (aligned_abs_pose,
+            real_current_pos,       # goal_reference_pos
+            real_current_rot,       # goal_reference_rot
+            real_current_pos - generated_reference_pos,  # translation
+            aligned_history_motion)
 
 
 def tracked_frame_from_timestamps(state_msg: Any, fps: float,
@@ -319,8 +508,23 @@ def _forward_velocity(values: np.ndarray, fps: float) -> np.ndarray:
     return velocity
 
 
+def _textop_bodies_to_sonic(values: np.ndarray) -> np.ndarray:
+    """Build SONIC's documented root-only 30-body representation.
+
+    TextOp's hands are synthetic extensions of its locked-wrist skeleton and
+    are not valid SONIC VR targets. Replicating the pelvis disables VR guidance
+    while retaining the root and 29-joint tracking inputs used by the policy.
+    """
+    values = np.asarray(values)
+    if values.ndim < 3 or values.shape[-2] < 1:
+        raise ValueError(
+            f"Expected at least one TextOp FK body, got {values.shape}")
+    return np.ascontiguousarray(np.repeat(values[..., :1, :], 30, axis=-2))
+
+
 def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
-                          fps: float = 50.0):
+                          fps: float = 50.0,
+                          locked_joint_pos: np.ndarray | None = None):
     """Convert one reconstructed MuJoCo batch to ``G1MotionData``."""
     from sonicmsg.messages import G1MotionData
 
@@ -331,8 +535,10 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
         return value[0].detach().cpu().numpy()
 
     dof_pos = np.asarray(batch_numpy("dof_pos"), dtype=np.float32)
-    body_pos = np.asarray(batch_numpy("global_translation"), dtype=np.float32)
-    body_ori_xyzw = np.asarray(batch_numpy("global_rotation"), dtype=np.float32)
+    body_pos = np.asarray(
+        batch_numpy("global_translation_extend"), dtype=np.float32)
+    body_ori_xyzw = np.asarray(
+        batch_numpy("global_rotation_extend"), dtype=np.float32)
     if not (len(dof_pos) == len(body_pos) == len(body_ori_xyzw)):
         raise ValueError("Reconstructed motion arrays have different frame counts")
     if skip_history < 0 or skip_history >= len(dof_pos):
@@ -344,9 +550,21 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
     dof_vel = _forward_velocity(dof_pos, fps)
     joint_pos = mujoco_to_isaaclab_dof(dof_pos)[skip_history:]
     joint_vel = mujoco_to_isaaclab_dof(dof_vel)[skip_history:]
-    body_pos = np.ascontiguousarray(body_pos[skip_history:])
+    if locked_joint_pos is not None:
+        locked_joint_pos = np.asarray(locked_joint_pos, dtype=np.float32)
+        if locked_joint_pos.shape != (29,):
+            raise ValueError(
+                f"locked_joint_pos must have shape (29,), got "
+                f"{locked_joint_pos.shape}")
+        # TextOp omits both 3-DoF wrists. Hold SONIC's unmodeled references
+        # at their measured values instead of discontinuously setting zero.
+        locked_isaaclab = _ISAACLAB_TO_MUJOCO[[19, 20, 21, 26, 27, 28]]
+        joint_pos[:, locked_isaaclab] = locked_joint_pos[locked_isaaclab]
+        joint_vel[:, locked_isaaclab] = 0.0
+    body_pos = _textop_bodies_to_sonic(body_pos[skip_history:])
     body_ori = np.ascontiguousarray(
-        body_ori_xyzw[skip_history:, ..., [3, 0, 1, 2]])
+        _textop_bodies_to_sonic(body_ori_xyzw[skip_history:])[
+            ..., [3, 0, 1, 2]])
 
     return G1MotionData(
         joint_pos=joint_pos,
