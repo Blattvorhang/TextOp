@@ -80,6 +80,37 @@ def test_wrist_yaw_moves_palm_center_keypoint():
     assert torch.linalg.vector_norm(palm[:, 1] - palm[:, 0]).item() > 0.05
 
 
+def test_palm_center_offset_is_in_wrist_yaw_frame():
+    project_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(project_root / "robotmdar/config/skeleton/g1.yaml")
+    cfg.asset.assetRoot = str(project_root / "description/robots/g1")
+    skeleton = RobotSkeleton(device="cpu", cfg=cfg)
+    dof = torch.zeros((1, 1, 29))
+    dof[..., 19:22] = torch.tensor([0.4, -0.3, 0.8])
+    dof[..., 26:29] = torch.tensor([-0.2, 0.5, -0.7])
+    motion = {
+        "root_trans_offset": torch.tensor([[[0.3, -0.2, 0.9]]]),
+        "root_rot": euler_angles_to_quaternion(
+            torch.tensor([[[0.2, -0.1, 0.6]]])
+        ),
+        "dof": dof,
+        "contact_mask": torch.ones((1, 1, 2)),
+    }
+
+    fk = skeleton.forward_kinematics(motion)
+    offset = torch.tensor([0.075, 0.0, 0.0])
+    wrist_names = ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    for hand_id, wrist_name in zip(skeleton.hand_id, wrist_names):
+        wrist_id = skeleton.fk.body_names_augment.index(wrist_name)
+        wrist_pos = fk["global_translation_extend"][..., wrist_id, :]
+        wrist_rot = fk["global_rotation_mat_extend"][..., wrist_id, :, :]
+        expected_palm = wrist_pos + torch.matmul(
+            wrist_rot, offset[:, None]
+        ).squeeze(-1)
+        actual_palm = fk["global_translation_extend"][..., hand_id, :]
+        torch.testing.assert_close(actual_palm, expected_palm)
+
+
 def test_joint_order_round_trip():
     isaaclab = np.arange(29, dtype=np.float32).reshape(1, 29)
     mujoco = isaaclab_to_mujoco_dof(isaaclab)

@@ -287,10 +287,7 @@ def main(cfg: DictConfig) -> None:
                 skip_history = (
                     0 if bool(cfg.pub_all_frames) else history_len - 1)
                 motion = motion_dict_to_g1data(
-                    motion_dict, skip_history=skip_history, fps=motion_fps,
-                    locked_joint_pos=np.asarray(
-                        latest_state.raw["g1_joint_pos"][-1],
-                        dtype=np.float32))
+                    motion_dict, skip_history=skip_history, fps=motion_fps)
                 measured_pos = np.asarray(
                     latest_state.raw["g1_pos"][-1], dtype=np.float32)
                 measured_rot_xyzw = np.asarray(

@@ -6,7 +6,7 @@ num_heads: 4
 dropout: 0.1
 activation: gelu
 history_shape:
-  - 2
+  - ${...data.history_len}
   - ${...nfeats}
 noise_shape: [1, 128]
 goal_dim: 5
