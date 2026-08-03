@@ -10,6 +10,7 @@ from robotmdar.utils.goal import (
 from robotmdar.utils.occupancy import query_local_occupancy
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
+from robotmdar.dtype.motion import DOF_DIM, motion_feature_dim
 from robotmdar.train.manager import DARManager
 
 
@@ -65,6 +66,94 @@ def _detach_mapping(values):
     }
 
 
+def _validate_29dof_contract(cfg, datasets, vae, denoiser) -> None:
+    """Fail before DAR training if data, FK, VAE, and denoiser disagree."""
+    if DOF_DIM != 29 or motion_feature_dim != 69:
+        raise RuntimeError(
+            "DAR 29-DoF training requires DOF_DIM=29 and FeatureVersion 3 "
+            f"dimension 69, got DOF_DIM={DOF_DIM}, nfeats={motion_feature_dim}"
+        )
+    if int(cfg.data.nfeats) != motion_feature_dim:
+        raise ValueError(
+            f"data.nfeats={cfg.data.nfeats}, expected {motion_feature_dim}"
+        )
+
+    for split, dataset in datasets:
+        stats = dataset.statistics
+        stats_dof = int(stats.get('dof_dim', DOF_DIM))
+        stats_nfeats = int(stats.get('nfeats', motion_feature_dim))
+        skeleton_dof = int(dataset.skeleton.fk.num_dof)
+        if stats_dof != DOF_DIM or stats_nfeats != motion_feature_dim:
+            raise ValueError(
+                f"{split} dataset is not native 29-DoF/69-D: "
+                f"statistics dof_dim={stats_dof}, nfeats={stats_nfeats}"
+            )
+        if skeleton_dof != DOF_DIM:
+            raise ValueError(
+                f"{split} skeleton has {skeleton_dof} DoFs, expected {DOF_DIM}"
+            )
+        if (
+            dataset.mean.shape[-1] != motion_feature_dim
+            or dataset.std.shape[-1] != motion_feature_dim
+        ):
+            raise ValueError(
+                f"{split} normalization has shape mean={tuple(dataset.mean.shape)}, "
+                f"std={tuple(dataset.std.shape)}; expected {motion_feature_dim}"
+            )
+        hand_names = tuple(
+            dataset.skeleton.fk.body_names_augment[idx]
+            for idx in dataset.skeleton.hand_id
+        )
+        if hand_names != ('left_hand_link', 'right_hand_link'):
+            raise ValueError(
+                "Body goals must use the left/right palm-center extensions, got "
+                f"{hand_names}"
+            )
+
+    if vae.skel_embedding.in_features != motion_feature_dim:
+        raise ValueError(
+            f"VAE encoder expects {vae.skel_embedding.in_features} features, "
+            f"expected {motion_feature_dim}"
+        )
+    if vae.final_layer.out_features != motion_feature_dim:
+        raise ValueError(
+            f"VAE decoder emits {vae.final_layer.out_features} features, "
+            f"expected {motion_feature_dim}"
+        )
+
+    expected_history_shape = (int(cfg.data.history_len), motion_feature_dim)
+    actual_history_shape = tuple(int(dim) for dim in denoiser.history_shape)
+    if actual_history_shape != expected_history_shape:
+        raise ValueError(
+            f"Denoiser history_shape={actual_history_shape}, expected "
+            f"{expected_history_shape}"
+        )
+
+
+def _validate_batch(batch, cfg) -> None:
+    num_primitive = int(cfg.data.num_primitive)
+    context_len = int(cfg.data.history_len) + int(cfg.data.future_len)
+    if len(batch) != num_primitive:
+        raise ValueError(
+            f"Dataset returned {len(batch)} primitives, expected {num_primitive}"
+        )
+    for primitive_idx, primitive in enumerate(batch):
+        motion = primitive['motion']
+        if motion.shape[1:] != (context_len, motion_feature_dim):
+            raise ValueError(
+                f"Primitive {primitive_idx} motion shape is {tuple(motion.shape)}, "
+                f"expected [batch, {context_len}, {motion_feature_dim}]"
+            )
+        if GoalType.parse(cfg.data.goal_type) is GoalType.BODY:
+            keypoints = primitive.get('world_goal_keypoints')
+            if keypoints is None or keypoints.shape[-2:] != (5, 3):
+                shape = None if keypoints is None else tuple(keypoints.shape)
+                raise ValueError(
+                    f"Primitive {primitive_idx} body goal keypoints have shape "
+                    f"{shape}, expected [batch, 5, 3]"
+                )
+
+
 def main(cfg: DictConfig):
     seed.set(cfg.seed)
     logger.set(cfg)
@@ -80,6 +169,10 @@ def main(cfg: DictConfig):
 
     vae: VAE = instantiate(cfg.vae)
     denoiser: Denoiser = instantiate(cfg.denoiser)
+
+    _validate_29dof_contract(
+        cfg, [('train', train_data), ('val', val_data)], vae, denoiser
+    )
 
     schedule_sampler: SSampler = instantiate(cfg.diffusion.schedule_sampler)
     diffusion: Diffusion = schedule_sampler.diffusion
@@ -97,11 +190,16 @@ def main(cfg: DictConfig):
 
     train_dataiter = iter(train_data)
     val_dataiter = iter(val_data)
+    train_batch_validated = False
+    val_batch_validated = False
 
     # Training loop following train_mvae.py approach
     while manager:
         denoiser.train()
         batch = next(train_dataiter)
+        if not train_batch_validated:
+            _validate_batch(batch, cfg)
+            train_batch_validated = True
 
         prev_motion = None
         rollout_history_start_pos = None
@@ -231,6 +329,9 @@ def main(cfg: DictConfig):
         denoiser.eval()
         while manager.should_eval():
             batch = next(val_dataiter)
+            if not val_batch_validated:
+                _validate_batch(batch, cfg)
+                val_batch_validated = True
             for pidx in range(num_primitive):
                 manager.pre_step(is_eval=True)
                 primitive = batch[pidx]
