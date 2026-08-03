@@ -53,6 +53,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         datadir: str,
         action_statistics_path: str,
         goal_offset: int = 0,
+        goal_offset_range: Optional[Tuple[int, int]] = None,
         goal_type: GoalType | str = GoalType.ROOT,
         goal_per_primitive: bool = False,
         weighted_sample: bool = False,
@@ -63,9 +64,6 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         **kwargs: Any
     ):
         super().__init__()
-        if goal_offset < 0:
-            raise ValueError(f"goal_offset must be non-negative, got {goal_offset}")
-
         # Store parameters
         self.batch_size = batch_size
         self.history_len = history_len
@@ -77,9 +75,37 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.segment_len = self.history_len + self.future_len * self.num_primitive + 1
         self.context_len = self.history_len + self.future_len
 
-        self.goal_offset = goal_offset
         self.goal_type = GoalType.parse(goal_type)
         self.goal_per_primitive = goal_per_primitive
+        self.goal_offset = int(goal_offset)
+        if goal_offset_range is None:
+            self.goal_offset_range = (self.goal_offset, self.goal_offset)
+        else:
+            if len(goal_offset_range) != 2:
+                raise ValueError(
+                    "goal_offset_range must contain inclusive [min, max] bounds"
+                )
+            self.goal_offset_range = tuple(int(value) for value in goal_offset_range)
+        self.min_goal_offset, self.max_goal_offset = self.goal_offset_range
+        if self.min_goal_offset > self.max_goal_offset:
+            raise ValueError(
+                f"Invalid goal_offset_range={self.goal_offset_range}: min > max"
+            )
+        min_valid_offset = 1 - self.future_len
+        if self.min_goal_offset < min_valid_offset:
+            raise ValueError(
+                f"goal offsets must be >= {min_valid_offset} so the goal is "
+                f"after the reference frame, got {self.goal_offset_range}"
+            )
+
+        # BODY_EXT uses a forward difference at the goal. A shared snippet goal
+        # sits on the final raw frame, so it needs one additional source frame.
+        forward_diff_extra = int(
+            self.goal_type is GoalType.BODY_EXT and not self.goal_per_primitive
+        )
+        self.required_length = self.segment_len + max(
+            0, self.max_goal_offset + forward_diff_extra
+        )
         self.weighted_sample = weighted_sample
         self.frame_weight = frame_weight
         self.action_statistics_path = action_statistics_path
@@ -125,7 +151,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # datasets use lightweight manifest records; old monolithic files remain
         # supported for compatibility.
         self.valid_indices = []
-        required_length = self.segment_len + self.goal_offset
+        required_length = self.required_length
         for i, item in enumerate(all_data):
             if 'motion' in item:
                 item['length'] = int(item['motion']['motion_len'])
@@ -146,7 +172,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 "No motion sequences satisfy the active training window: "
                 f"required_length={required_length} "
                 f"(history_len={self.history_len}, future_len={self.future_len}, "
-                f"num_primitive={self.num_primitive}, goal_offset={self.goal_offset}), "
+                f"num_primitive={self.num_primitive}, "
+                f"goal_offset_range={self.goal_offset_range}), "
                 f"loaded={len(all_data)}, longest={longest}, split={self.split!r}"
             )
 
@@ -510,8 +537,25 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 dtype=torch.float32),
         }
         goal_fk = self.skeleton.forward_kinematics(goal_motion)
-        return goal_fk['global_translation_extend'][
-            0, 0, self.skeleton.goal_keypoint_id]
+        keypoint_ids = (
+            self.skeleton.goal_limb_keypoint_id
+            if self.goal_type is GoalType.BODY_EXT
+            else self.skeleton.goal_keypoint_id
+        )
+        return goal_fk['global_translation_extend'][0, 0, keypoint_ids]
+
+    def _world_goal_velocity(self, raw_motion: Dict[str, Any],
+                             goal_frame: int) -> torch.Tensor:
+        root_position = raw_motion['root_trans_offset']
+        if goal_frame < 0 or goal_frame + 1 >= len(root_position):
+            raise IndexError(
+                f"Goal frame {goal_frame} has no forward-difference frame in "
+                f"motion of length {len(root_position)}"
+            )
+        return (
+            torch.as_tensor(root_position[goal_frame + 1], dtype=torch.float32)
+            - torch.as_tensor(root_position[goal_frame], dtype=torch.float32)
+        ) * float(self.fps)
 
     def _extract_single_primitive(
         self, sample: Dict[str, Any], prim_start: int, prim_end: int,
@@ -553,19 +597,31 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'gt_ref_rot': torch.as_tensor(raw_motion['root_rot'][reference_frame], dtype=torch.float32),
             'scene': sample.get('scene', {}),
         }
-        if self.goal_type is GoalType.BODY:
+        if self.goal_type.uses_keypoints:
             if world_goal_keypoints is None:
                 world_goal_keypoints = self._world_goal_keypoints(
                     raw_motion, goal_frame)
             primitive['world_goal_keypoints'] = world_goal_keypoints
+        if self.goal_type is GoalType.BODY_EXT:
+            primitive['world_goal_vel'] = self._world_goal_velocity(
+                raw_motion, goal_frame)
+            primitive['goal_timestep'] = torch.tensor(
+                [(goal_frame - reference_frame) / float(self.fps)],
+                dtype=torch.float32,
+            )
         return primitive
 
     def _generate_motion_primitives(self, sample: Dict[str, Any],
-                                    seg_start: int) -> List[Dict[str, Any]]:
+                                    seg_start: int,
+                                    goal_offset: Optional[int] = None
+                                    ) -> List[Dict[str, Any]]:
         """Generate all primitives from a single motion segment with proper overlapping"""
+        if goal_offset is None:
+            goal_offset = self.goal_offset
+        goal_type = GoalType.parse(self.goal_type)
         # When goal_per_primitive is True, each primitive uses its own last frame
         # as the goal; otherwise, the last frame of the entire snippet is shared.
-        snippet_goal_frame = seg_start + self.segment_len - 1 + self.goal_offset
+        snippet_goal_frame = seg_start + self.segment_len - 1 + goal_offset
         world_goal_keypoints = None
         primitives = []
 
@@ -578,12 +634,30 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
             if self.goal_per_primitive:
                 # Goal is the last frame of this specific primitive's window
-                goal_frame = prim_start + self.future_len + self.history_len - 1 + self.goal_offset
+                goal_frame = (
+                    prim_start + self.future_len + self.history_len - 1
+                    + goal_offset
+                )
                 world_goal_keypoints = None
             else:
                 goal_frame = snippet_goal_frame
 
-            if self.goal_type is GoalType.BODY and world_goal_keypoints is None:
+            clip_len = len(sample['motion']['root_trans_offset'])
+            if goal_frame <= prim_start + self.history_len - 1:
+                raise IndexError(
+                    f"Goal frame {goal_frame} must follow primitive reference "
+                    f"frame {prim_start + self.history_len - 1}"
+                )
+            required_last_frame = goal_frame + int(
+                goal_type is GoalType.BODY_EXT
+            )
+            if required_last_frame >= clip_len:
+                raise IndexError(
+                    f"Goal frame {goal_frame} exceeds motion bounds for "
+                    f"goal_type={goal_type.value!r}, length={clip_len}"
+                )
+
+            if goal_type.uses_keypoints and world_goal_keypoints is None:
                 world_goal_keypoints = self._world_goal_keypoints(
                     sample['motion'], goal_frame)
 
@@ -612,7 +686,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             sample = self._hydrate_sample(self.raw_data[sample_idx])
 
             # Sample segment start ONCE per motion using the generator for reproducibility
-            max_start = sample['length'] - self.segment_len - self.goal_offset
+            max_start = sample['length'] - self.required_length
 
             # seg_start = int(
             #         torch.randint(0, max_start, (1, ), generator=generator).item())
@@ -623,7 +697,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 seg_start = int(torch.randint(0, max_start + 1, (1, ), generator=generator).item())
 
             # Generate ALL primitives for this motion using the SAME seg_start
-            motion_primitives = self._generate_motion_primitives(sample, seg_start)
+            if self.min_goal_offset == self.max_goal_offset:
+                goal_offset = self.min_goal_offset
+            else:
+                goal_offset = int(torch.randint(
+                    self.min_goal_offset,
+                    self.max_goal_offset + 1,
+                    (1, ),
+                    generator=generator,
+                ).item())
+            motion_primitives = self._generate_motion_primitives(
+                sample, seg_start, goal_offset)
             all_motion_primitives.append(motion_primitives)
 
         return all_motion_primitives
@@ -638,13 +722,16 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
           - scene: list of per-sample occupancy dicts
           - world_goal_pos, world_goal_yaw, history_start_pos, ...
         """
+        goal_type = GoalType.parse(self.goal_type)
         tensor_keys = (
             'world_goal_pos', 'world_goal_yaw',
             'history_start_pos', 'history_start_rot',
             'gt_ref_pos', 'gt_ref_rot',
         )
-        if self.goal_type is GoalType.BODY:
+        if goal_type.uses_keypoints:
             tensor_keys += ('world_goal_keypoints',)
+        if goal_type is GoalType.BODY_EXT:
+            tensor_keys += ('world_goal_vel', 'goal_timestep')
         batch_primitives = []
 
         for primitive_idx in range(self.num_primitive):

@@ -61,16 +61,24 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
             # Build ego_goal and voxel from batch item
             # For vis_dar (teacher forcing), we use gt_ref_pos/gt_ref_rot as the
             # reference pose matching training logic
+            goal_type = GoalType.parse(cfg.data.goal_type)
             ego_goal = build_ego_goal(
                 batch_item['world_goal_pos'].to(cfg.device),
                 batch_item['world_goal_yaw'].to(cfg.device),
                 batch_item['gt_ref_pos'].to(cfg.device),
                 batch_item['gt_ref_rot'].to(cfg.device),
-                goal_type=cfg.data.goal_type,
+                goal_type=goal_type,
                 goal_keypoints=(
                     batch_item['world_goal_keypoints'].to(cfg.device)
-                    if GoalType.parse(cfg.data.goal_type) is GoalType.BODY
-                    else None
+                    if goal_type.uses_keypoints else None
+                ),
+                root_velocity=(
+                    batch_item['world_goal_vel'].to(cfg.device)
+                    if goal_type is GoalType.BODY_EXT else None
+                ),
+                timestep=(
+                    batch_item['goal_timestep'].to(cfg.device)
+                    if goal_type is GoalType.BODY_EXT else None
                 ),
             )
             voxel = query_local_occupancy(

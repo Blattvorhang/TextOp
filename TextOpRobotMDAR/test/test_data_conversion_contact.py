@@ -15,6 +15,7 @@ from dataset.data_process.pack_motion_lib_to_textop import (
     motion_lib_entry_to_textop,
 )
 from TextOpRobotMDAR.robotmdar.dataloader.data import SkeletonPrimitiveDataset
+from TextOpRobotMDAR.robotmdar.utils.goal import GoalType
 from TextOpRobotMDAR.robotmdar.train.manager import GeometryLoss
 
 
@@ -33,6 +34,12 @@ def _length_only_dataset(datadir: Path, *, weighted_sample: bool = False):
     dataset.segment_len = 10
     dataset.context_len = 10
     dataset.goal_offset = 0
+    dataset.goal_offset_range = (0, 0)
+    dataset.min_goal_offset = 0
+    dataset.max_goal_offset = 0
+    dataset.required_length = 10
+    dataset.goal_type = GoalType.ROOT
+    dataset.goal_per_primitive = False
     dataset.history_len = 3
     dataset.future_len = 7
     dataset.num_primitive = 1
@@ -49,7 +56,7 @@ def test_dataset_filters_lengths_at_training_time_and_accepts_exact_window(tmp_p
     )
     dataset = _length_only_dataset(tmp_path)
     dataset._load_data()
-    dataset._generate_motion_primitives = lambda sample, start: [
+    dataset._generate_motion_primitives = lambda sample, start, goal_offset: [
         (sample["marker"], start)
     ]
 
@@ -75,7 +82,7 @@ def test_dataset_lazily_loads_manifest_sample(tmp_path):
     )
     dataset = _length_only_dataset(tmp_path)
     dataset._load_data()
-    dataset._generate_motion_primitives = lambda sample, start: [
+    dataset._generate_motion_primitives = lambda sample, start, goal_offset: [
         (sample["marker"], start)
     ]
 
@@ -104,11 +111,72 @@ def test_weighted_sampling_indexes_only_valid_sequences():
     dataset.valid_indices = [1]
     dataset.seq_weights = np.array([1.0])
     dataset.frame_weight = False
-    dataset._generate_motion_primitives = lambda sample, start: [sample["marker"]]
+    dataset._generate_motion_primitives = (
+        lambda sample, start, goal_offset: [sample["marker"]]
+    )
 
     sampled = dataset._sample_motion_batch()
 
     assert sampled == [["valid"]]
+
+
+@pytest.mark.parametrize(
+    ("goal_per_primitive", "expected_goal_frames"),
+    [
+        (True, [2, 6]),
+        (False, [7, 7]),
+    ],
+)
+def test_negative_goal_offset_is_bounded_for_both_goal_modes(
+    goal_per_primitive, expected_goal_frames
+):
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.history_len = 2
+    dataset.future_len = 4
+    dataset.num_primitive = 2
+    dataset.segment_len = 11
+    dataset.goal_offset = -3
+    dataset.goal_type = GoalType.BODY_EXT
+    dataset.goal_per_primitive = goal_per_primitive
+    dataset._world_goal_keypoints = lambda motion, frame: torch.zeros((4, 3))
+    observed = []
+
+    def extract(sample, prim_start, prim_end, goal_frame,
+                world_goal_keypoints=None):
+        observed.append((prim_start, prim_end, goal_frame))
+        return {"goal_frame": goal_frame}
+
+    dataset._extract_single_primitive = extract
+    sample = {
+        "motion": {
+            "root_trans_offset": np.zeros((12, 3), dtype=np.float32),
+        }
+    }
+
+    result = dataset._generate_motion_primitives(sample, 0)
+
+    assert [item["goal_frame"] for item in result] == expected_goal_frames
+    assert [item[2] for item in observed] == expected_goal_frames
+
+
+def test_shared_extended_goal_rejects_missing_forward_difference_frame():
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.history_len = 2
+    dataset.future_len = 4
+    dataset.num_primitive = 2
+    dataset.segment_len = 11
+    dataset.goal_offset = 0
+    dataset.goal_type = GoalType.BODY_EXT
+    dataset.goal_per_primitive = False
+    dataset._world_goal_keypoints = lambda motion, frame: torch.zeros((4, 3))
+    sample = {
+        "motion": {
+            "root_trans_offset": np.zeros((11, 3), dtype=np.float32),
+        }
+    }
+
+    with pytest.raises(IndexError, match="exceeds motion bounds"):
+        dataset._generate_motion_primitives(sample, 0)
 
 
 def test_bonesseed_contact_mask_rejects_low_sliding_feet():
