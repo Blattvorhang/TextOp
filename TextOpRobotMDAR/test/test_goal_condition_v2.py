@@ -6,6 +6,7 @@ import torch
 
 from TextOpRobotMDAR.robotmdar.utils.goal import (
     GoalType,
+    _world_to_ego,
     build_ego_goal,
     validate_goal_config,
 )
@@ -20,6 +21,49 @@ def _yaw_quaternion(yaw: torch.Tensor) -> torch.Tensor:
     result[..., 2] = torch.sin(yaw / 2)
     result[..., 3] = torch.cos(yaw / 2)
     return result
+
+
+def test_world_to_ego_accepts_column_yaw_without_cross_batch_broadcast():
+    world_delta = torch.tensor([
+        [1.0, 0.0, 0.5],
+        [0.0, 2.0, -0.5],
+    ])
+    yaw = torch.tensor([[np.pi / 2], [0.0]])
+
+    result = _world_to_ego(world_delta, yaw)
+
+    assert result.shape == world_delta.shape
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0.0, -1.0, 0.5], [0.0, 2.0, -0.5]]),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+def test_world_to_ego_broadcasts_batch_yaw_over_keypoints():
+    world_delta = torch.tensor([
+        [[1.0, 0.0, 0.0], [0.0, 2.0, 1.0]],
+        [[1.0, 0.0, 2.0], [0.0, 2.0, 3.0]],
+    ])
+    yaw = torch.tensor([np.pi / 2, 0.0])
+
+    result = _world_to_ego(world_delta, yaw)
+
+    torch.testing.assert_close(
+        result[0],
+        torch.tensor([[0.0, -1.0, 0.0], [2.0, 0.0, 1.0]]),
+        atol=1e-6,
+        rtol=0,
+    )
+    torch.testing.assert_close(result[1], world_delta[1])
+
+
+def test_world_to_ego_rejects_invalid_shapes():
+    with pytest.raises(ValueError, match=r"shape \[\.\.\., 3\]"):
+        _world_to_ego(torch.zeros((2, 4)), torch.zeros(2))
+    with pytest.raises(ValueError, match="incompatible"):
+        _world_to_ego(torch.zeros((2, 3, 3)), torch.zeros((4, 1)))
 
 
 def test_body_goal_is_batched_relative_xyz():
@@ -53,8 +97,65 @@ def test_body_goal_is_batched_relative_xyz():
 def test_goal_configuration_requires_matching_dimension():
     assert validate_goal_config("root", 5) is GoalType.ROOT
     assert validate_goal_config("body", 15) is GoalType.BODY
+    assert validate_goal_config("body_ext", 21) is GoalType.BODY_EXT
     with pytest.raises(ValueError, match="requires goal_dim=15"):
         validate_goal_config("body", 5)
+
+
+def test_extended_body_goal_layout_and_ego_transform():
+    reference_pos = torch.tensor([[1.0, 2.0, 0.7]])
+    reference_rot = _yaw_quaternion(torch.tensor([np.pi / 2]))
+    world_goal_pos = torch.tensor([[3.0, 3.0, 1.0]])
+    world_goal_yaw = torch.tensor([np.pi])
+    world_velocity = torch.tensor([[2.0, 1.0, -0.5]])
+    timestep = torch.tensor([[1.25]])
+    limb_offsets = torch.tensor([
+        [1.0, 0.5, -0.6],
+        [1.0, -0.5, -0.6],
+        [0.5, 1.0, 0.1],
+        [0.5, -1.0, 0.1],
+    ])
+    keypoints = reference_pos[:, None, :] + limb_offsets[None]
+
+    goal = build_ego_goal(
+        world_goal_pos,
+        world_goal_yaw,
+        reference_pos,
+        reference_rot,
+        goal_type=GoalType.BODY_EXT,
+        goal_keypoints=keypoints,
+        root_velocity=world_velocity,
+        timestep=timestep,
+    )
+
+    assert goal.shape == (1, 21)
+    torch.testing.assert_close(goal[0, 0:3], torch.tensor([1.0, -2.0, 0.3]))
+    torch.testing.assert_close(goal[0, 3:5], torch.tensor([0.0, 1.0]), atol=1e-6, rtol=0)
+    torch.testing.assert_close(goal[0, 5:8], torch.tensor([1.0, -2.0, -0.5]))
+    torch.testing.assert_close(goal[0, 8:9], timestep[0])
+    expected_limbs = torch.stack(
+        (limb_offsets[:, 1], -limb_offsets[:, 0], limb_offsets[:, 2]),
+        dim=-1,
+    ).flatten()
+    torch.testing.assert_close(goal[0, 9:21], expected_limbs, atol=1e-6, rtol=0)
+
+
+def test_extended_body_goal_requires_velocity_and_column_timestep():
+    root = torch.zeros((2, 3))
+    rotation = torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(2, 4)
+    limbs = torch.zeros((2, 4, 3))
+    with pytest.raises(ValueError, match="root_velocity is required"):
+        build_ego_goal(
+            root, torch.zeros(2), root, rotation,
+            goal_type="body_ext", goal_keypoints=limbs,
+            timestep=torch.ones((2, 1)),
+        )
+    with pytest.raises(ValueError, match="timestep must have shape"):
+        build_ego_goal(
+            root, torch.zeros(2), root, rotation,
+            goal_type="body_ext", goal_keypoints=limbs,
+            root_velocity=torch.zeros((2, 3)), timestep=torch.ones(2),
+        )
 
 
 def test_reference_pose_transforms_xy_and_preserves_z(tmp_path):

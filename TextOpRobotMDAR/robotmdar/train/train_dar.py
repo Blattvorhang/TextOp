@@ -19,15 +19,24 @@ def _pose_dict(position: torch.Tensor, rotation: torch.Tensor):
 
 
 def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
+    goal_type = GoalType.parse(cfg.data.goal_type)
     goal = build_ego_goal(
         primitive['world_goal_pos'].to(cfg.device),
         primitive['world_goal_yaw'].to(cfg.device),
         reference_pos,
         reference_rot,
-        goal_type=cfg.data.goal_type,
+        goal_type=goal_type,
         goal_keypoints=(
             primitive['world_goal_keypoints'].to(cfg.device)
-            if GoalType.parse(cfg.data.goal_type) is GoalType.BODY else None
+            if goal_type.uses_keypoints else None
+        ),
+        root_velocity=(
+            primitive['world_goal_vel'].to(cfg.device)
+            if goal_type is GoalType.BODY_EXT else None
+        ),
+        timestep=(
+            primitive['goal_timestep'].to(cfg.device)
+            if goal_type is GoalType.BODY_EXT else None
         ),
     )
     voxel = query_local_occupancy(
@@ -144,13 +153,30 @@ def _validate_batch(batch, cfg) -> None:
                 f"Primitive {primitive_idx} motion shape is {tuple(motion.shape)}, "
                 f"expected [batch, {context_len}, {motion_feature_dim}]"
             )
-        if GoalType.parse(cfg.data.goal_type) is GoalType.BODY:
+        goal_type = GoalType.parse(cfg.data.goal_type)
+        if goal_type.uses_keypoints:
             keypoints = primitive.get('world_goal_keypoints')
-            if keypoints is None or keypoints.shape[-2:] != (5, 3):
+            num_keypoints = 4 if goal_type is GoalType.BODY_EXT else 5
+            if keypoints is None or keypoints.shape[-2:] != (num_keypoints, 3):
                 shape = None if keypoints is None else tuple(keypoints.shape)
                 raise ValueError(
                     f"Primitive {primitive_idx} body goal keypoints have shape "
-                    f"{shape}, expected [batch, 5, 3]"
+                    f"{shape}, expected [batch, {num_keypoints}, 3]"
+                )
+        if goal_type is GoalType.BODY_EXT:
+            velocity = primitive.get('world_goal_vel')
+            timestep = primitive.get('goal_timestep')
+            if velocity is None or velocity.shape[-1:] != (3,):
+                shape = None if velocity is None else tuple(velocity.shape)
+                raise ValueError(
+                    f"Primitive {primitive_idx} goal velocity has shape {shape}, "
+                    "expected [batch, 3]"
+                )
+            if timestep is None or timestep.shape[-1:] != (1,):
+                shape = None if timestep is None else tuple(timestep.shape)
+                raise ValueError(
+                    f"Primitive {primitive_idx} goal timestep has shape {shape}, "
+                    "expected [batch, 1]"
                 )
 
 

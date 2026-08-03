@@ -10,6 +10,7 @@ weighted_sample: false
 frame_weight: false
 use_weighted_meanstd: false
 goal_offset: 0
+goal_offset_range: null
 goal_type: body
 goal_per_primitive: false
 occupancy_unit: 0.08
@@ -35,6 +36,7 @@ common: &common
   frame_weight: ${..frame_weight}
   use_weighted_meanstd: ${..use_weighted_meanstd}
   goal_offset: ${..goal_offset}
+  goal_offset_range: ${..goal_offset_range}
   goal_type: ${..goal_type}
   goal_per_primitive: ${..goal_per_primitive}
 

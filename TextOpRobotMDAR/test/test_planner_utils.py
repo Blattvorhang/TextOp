@@ -98,9 +98,14 @@ def test_palm_center_offset_is_in_wrist_yaw_frame():
     }
 
     fk = skeleton.forward_kinematics(motion)
-    offset = torch.tensor([0.075, 0.0, 0.0])
+    offsets = (
+        torch.tensor([0.0415, 0.003, 0.0]),
+        torch.tensor([0.0415, -0.003, 0.0]),
+    )
     wrist_names = ("left_wrist_yaw_link", "right_wrist_yaw_link")
-    for hand_id, wrist_name in zip(skeleton.hand_id, wrist_names):
+    for hand_id, wrist_name, offset in zip(
+        skeleton.hand_id, wrist_names, offsets
+    ):
         wrist_id = skeleton.fk.body_names_augment.index(wrist_name)
         wrist_pos = fk["global_translation_extend"][..., wrist_id, :]
         wrist_rot = fk["global_rotation_mat_extend"][..., wrist_id, :, :]

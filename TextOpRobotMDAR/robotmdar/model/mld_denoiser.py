@@ -6,6 +6,64 @@ import torch.nn.functional as F
 import loralib as lora
 
 
+EXTENDED_BODY_GOAL_DIM = 21
+
+
+def _resolve_root_mask_prob(value, kwargs):
+    """Accept the pre-V4 config key while exposing only the precise V4 name."""
+    legacy_value = kwargs.pop('cond_goal_mask_prob', None)
+    if value is None:
+        return 0.1 if legacy_value is None else float(legacy_value)
+    if legacy_value is not None and float(legacy_value) != float(value):
+        raise ValueError(
+            "cond_goal_root_mask_prob and legacy cond_goal_mask_prob disagree"
+        )
+    return float(value)
+
+
+def _mask_goal(model, goal, y):
+    """Mask V4 components independently while preserving legacy goal behavior."""
+    if model.goal_dim != EXTENDED_BODY_GOAL_DIM:
+        return model.mask_condition(
+            goal,
+            model.cond_goal_root_mask_prob,
+            force_mask=y.get(
+                'force_drop_goal_root', y.get('force_drop_goal', False)
+            ),
+            return_keep_mask=True,
+        )
+
+    root, root_keep = model.mask_condition(
+        goal[:, 0:3],
+        model.cond_goal_root_mask_prob,
+        force_mask=y.get('force_drop_goal_root', False),
+        return_keep_mask=True,
+    )
+    yaw, yaw_keep = model.mask_condition(
+        goal[:, 3:5],
+        model.cond_goal_yaw_mask_prob,
+        force_mask=y.get('force_drop_goal_yaw', False),
+        return_keep_mask=True,
+    )
+    velocity = goal[:, 5:8]
+    goal_time, time_keep = model.mask_condition(
+        goal[:, 8:9],
+        model.cond_goal_time_mask_prob,
+        force_mask=y.get('force_drop_goal_time', False),
+        return_keep_mask=True,
+    )
+    limbs, body_keep = model.mask_condition(
+        goal[:, 9:21],
+        model.cond_goal_body_mask_prob,
+        force_mask=y.get('force_drop_goal_body', False),
+        return_keep_mask=True,
+    )
+    y['goal_yaw_condition_keep_mask'] = yaw_keep
+    y['goal_time_condition_keep_mask'] = time_keep
+    y['goal_body_condition_keep_mask'] = body_keep
+    return torch.cat((root, yaw, velocity, goal_time, limbs), dim=-1), root_keep
+
+
 class DenoiserMLP(nn.Module):
     # =========================================================================
     # NOTE: DenoiserMLP is NOT currently used — the active config
@@ -13,7 +71,8 @@ class DenoiserMLP(nn.Module):
     # a lighter alternative for ablations / memory-constrained runs.  It is
     # fully wired for goal + scene conditioning and will work out of the box
     # if you switch the config's _target_ to this class and add the matching
-    # keys (goal_dim, grid_size, cond_goal_mask_prob, cond_scene_mask_prob).
+    # keys (goal_dim, grid_size, cond_goal_root_mask_prob,
+    # cond_scene_mask_prob).
     # =========================================================================
 
     def __init__(self,
@@ -25,7 +84,10 @@ class DenoiserMLP(nn.Module):
                  noise_shape=(1, 128),
                  goal_dim=5,
                  grid_size=25,
-                 cond_goal_mask_prob=0.1,
+                 cond_goal_root_mask_prob=None,
+                 cond_goal_yaw_mask_prob=0.0,
+                 cond_goal_time_mask_prob=0.0,
+                 cond_goal_body_mask_prob=0.0,
                  cond_scene_mask_prob=0.1,
                  **kargs):
         super().__init__()
@@ -39,7 +101,12 @@ class DenoiserMLP(nn.Module):
         self.goal_dim = goal_dim
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
-        self.cond_goal_mask_prob = cond_goal_mask_prob
+        self.cond_goal_root_mask_prob = _resolve_root_mask_prob(
+            cond_goal_root_mask_prob, kargs
+        )
+        self.cond_goal_yaw_mask_prob = cond_goal_yaw_mask_prob
+        self.cond_goal_time_mask_prob = cond_goal_time_mask_prob
+        self.cond_goal_body_mask_prob = cond_goal_body_mask_prob
         self.cond_scene_mask_prob = cond_scene_mask_prob
 
         self.sequence_pos_encoder = PositionalEncoding(self.h_dim,
@@ -96,10 +163,7 @@ class DenoiserMLP(nn.Module):
 
         emb_time = self.embed_timestep(timesteps).squeeze(0)  # [bs, h_dim]
 
-        goal, goal_keep_mask = self.mask_condition(
-            y['goal'], self.cond_goal_mask_prob,
-            force_mask=y.get('force_drop_goal', False),
-            return_keep_mask=True)
+        goal, goal_keep_mask = _mask_goal(self, y['goal'], y)
         y['goal_condition_keep_mask'] = goal_keep_mask
         voxel = self.mask_condition(
             y['voxel'], self.cond_scene_mask_prob,
@@ -136,7 +200,10 @@ class DenoiserTransformer(nn.Module):
                  noise_shape=(1, 128),
                  goal_dim=5,
                  grid_size=25,
-                 cond_goal_mask_prob=0.1,
+                 cond_goal_root_mask_prob=None,
+                 cond_goal_yaw_mask_prob=0.0,
+                 cond_goal_time_mask_prob=0.0,
+                 cond_goal_body_mask_prob=0.0,
                  cond_scene_mask_prob=0.1,
                  use_vae=True,
                  **kargs):
@@ -153,7 +220,12 @@ class DenoiserTransformer(nn.Module):
         self.goal_dim = goal_dim
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
-        self.cond_goal_mask_prob = cond_goal_mask_prob
+        self.cond_goal_root_mask_prob = _resolve_root_mask_prob(
+            cond_goal_root_mask_prob, kargs
+        )
+        self.cond_goal_yaw_mask_prob = cond_goal_yaw_mask_prob
+        self.cond_goal_time_mask_prob = cond_goal_time_mask_prob
+        self.cond_goal_body_mask_prob = cond_goal_body_mask_prob
         self.cond_scene_mask_prob = cond_scene_mask_prob
 
         # input embeddings
@@ -209,10 +281,7 @@ class DenoiserTransformer(nn.Module):
             raise ValueError("Goal+scene denoiser requires a condition dictionary")
 
         emb_time = self.embed_timestep(timesteps)  # [1, bs, d]
-        goal, goal_keep_mask = self.mask_condition(
-            y['goal'], self.cond_goal_mask_prob,
-            force_mask=y.get('force_drop_goal', False),
-            return_keep_mask=True)
+        goal, goal_keep_mask = _mask_goal(self, y['goal'], y)
         y['goal_condition_keep_mask'] = goal_keep_mask
         voxel = self.mask_condition(
             y['voxel'], self.cond_scene_mask_prob,
