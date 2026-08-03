@@ -160,7 +160,7 @@ def main(cfg: DictConfig):
     manager: MVAEManager = instantiate(cfg.train.manager)
 
     _validate_29dof_contract(
-        cfg, [('train', train_data), ('val', val_data)], vae
+        cfg, [('train', train_data), ('val', val_data)], vae_raw
     )
 
     manager.hold_model(vae, optimizer, train_data)

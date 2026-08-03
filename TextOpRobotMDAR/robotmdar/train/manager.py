@@ -13,7 +13,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 import copy
 
-from robotmdar.utils.ego_condition import GoalType
+from robotmdar.utils.goal import GoalType
 from robotmdar.dtype.motion import get_zero_feature, perturb_feature_v3, FeatureVersion
 from robotmdar.dtype.rotation import rot6d_to_matrix, matrix_to_rot6d, quaternion_to_matrix, xyzw_to_wxyz
 from isaac_utils.rotations import get_euler_xyz
