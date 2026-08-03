@@ -16,7 +16,7 @@ The v1 planner uses a **5-dimensional ego-centric goal** as the target condition
 [ego_x, ego_y, delta_z, cos(delta_yaw), sin(delta_yaw)]
 ```
 
-Implemented in `build_ego_goal()` at [robotmdar/utils/ego_condition.py](../robotmdar/utils/ego_condition.py).
+Implemented in `build_ego_goal()` at [robotmdar/utils/goalo.py](../robotmdar/utils/goal.py).
 
 These 5 dimensions are built from a world-space target but encode only the
 **root position xyz relative to the current root + relative yaw**.  This includes
@@ -466,7 +466,7 @@ The `guidance_scale` hyperparameter may need re-tuning — a 15-dim goal carries
 
 | File | Change |
 |------|--------|
-| `robotmdar/utils/ego_condition.py` | Add `GoalType` enum; extend `build_ego_goal()` with `goal_type` + `goal_keypoints` |
+| `robotmdar/utils/goal.py` | Add `GoalType` enum; extend `build_ego_goal()` with `goal_type` + `goal_keypoints` |
 | `robotmdar/utils/planner_convert.py` | Thread `goal_type` through `state_to_ego_goal()`; add `load_goal_keypoints_from_reference()` (Approach 2, load NPZ + rotate/translate XY, preserve Z) |
 | `robotmdar/model/mld_denoiser.py` | Read `goal_dim` from config, support 5/15 |
 | `robotmdar/config/denoiser/def.yaml` | Add `goal_dim: 5` (default v1; override to 15 for v2 training) |
