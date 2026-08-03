@@ -231,7 +231,7 @@ def main(cfg: DictConfig):
     denoiser_raw = get_ddp_model(denoiser)
 
     _validate_29dof_contract(
-        cfg, [('train', train_data), ('val', val_data)], vae, denoiser
+        cfg, [('train', train_data), ('val', val_data)], vae, denoiser_raw
     )
 
     schedule_sampler: SSampler = instantiate(cfg.diffusion.schedule_sampler)
