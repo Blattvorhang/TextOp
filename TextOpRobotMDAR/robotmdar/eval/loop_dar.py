@@ -396,7 +396,7 @@ def main(cfg: DictConfig):
                 world_goal_pos, world_goal_yaw,
                 reference_pos, reference_rot,
                 goal_type=goal_type,
-                goal_keypoints=goal_keypoints,
+                world_goal_keypoints=goal_keypoints,
             )
         else:
             ego_goal = torch.zeros(

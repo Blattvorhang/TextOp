@@ -156,8 +156,8 @@ def test_controller_history_ends_at_current_non_upright_pose():
 
 def test_goal_uses_current_history_feature_reference():
     state = SimpleNamespace(
-        goal_root_pos=np.asarray([2.0, 1.0, 0.77], dtype=np.float32),
-        goal_heading=np.asarray([0.5], dtype=np.float32),
+        goal_root_pos_world=np.asarray([2.0, 1.0, 0.77], dtype=np.float32),
+        goal_yaw_world=np.asarray([0.5], dtype=np.float32),
         raw={
             "g1_pos": np.asarray([
                 [0.0, 1.0, 0.77],
@@ -179,8 +179,8 @@ def test_goal_uses_current_history_feature_reference():
 
 def test_generated_goal_uses_translated_history_endpoint():
     state = SimpleNamespace(
-        goal_root_pos=np.asarray([12.0, 20.0, 0.9], dtype=np.float32),
-        goal_heading=np.asarray([0.5], dtype=np.float32),
+        goal_root_pos_world=np.asarray([12.0, 20.0, 0.9], dtype=np.float32),
+        goal_yaw_world=np.asarray([0.5], dtype=np.float32),
     )
     goal = state_goal_from_reference(
         state,

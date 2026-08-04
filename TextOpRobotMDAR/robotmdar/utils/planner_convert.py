@@ -188,28 +188,31 @@ def _load_goal_keypoint_template(ref_path: str) -> np.ndarray:
 
 def load_goal_keypoints_from_reference(
     ref_path: str | Path,
-    goal_root_pos: np.ndarray,
-    goal_heading: float,
+    goal_root_pos_world: np.ndarray,
+    goal_yaw_world: float,
 ) -> np.ndarray:
     """Place an XY-origin, absolute-Z reference pose in the world frame."""
-    goal_root_pos = np.asarray(goal_root_pos, dtype=np.float32)
-    if goal_root_pos.shape != (3,):
+    goal_root_pos_world = np.asarray(goal_root_pos_world, dtype=np.float32)
+    if goal_root_pos_world.shape != (3,):
         raise ValueError(
-            f"goal_root_pos must have shape (3,), got {goal_root_pos.shape}")
-    if not np.isfinite(goal_root_pos).all() or not np.isfinite(goal_heading):
+            "goal_root_pos_world must have shape (3,), got "
+            f"{goal_root_pos_world.shape}")
+    if (not np.isfinite(goal_root_pos_world).all()
+            or not np.isfinite(goal_yaw_world)):
         raise ValueError("Goal root position and heading must be finite")
 
     keypoints = _load_goal_keypoint_template(str(Path(ref_path).resolve())).copy()
-    if not np.isclose(goal_root_pos[2], keypoints[0, 2], atol=1e-4):
+    if not np.isclose(goal_root_pos_world[2], keypoints[0, 2], atol=1e-4):
         raise ValueError(
-            f"goal_root_pos.z ({goal_root_pos[2]:.4f}) does not match "
+            f"goal_root_pos_world.z ({goal_root_pos_world[2]:.4f}) "
+            "does not match "
             f"reference root z ({keypoints[0, 2]:.4f})")
 
-    c = np.cos(float(goal_heading))
-    s = np.sin(float(goal_heading))
+    c = np.cos(float(goal_yaw_world))
+    s = np.sin(float(goal_yaw_world))
     rotation_xy = np.asarray([[c, -s], [s, c]], dtype=np.float32)
     keypoints[:, :2] = keypoints[:, :2] @ rotation_xy.T
-    keypoints[:, :2] += goal_root_pos[:2]
+    keypoints[:, :2] += goal_root_pos_world[:2]
     return np.ascontiguousarray(keypoints)
 
 
@@ -222,43 +225,90 @@ def state_goal_from_reference(state_msg: Any,
                               ) -> torch.Tensor:
     """Convert the state goal relative to an explicit generated-history pose."""
     goal_type = GoalType.parse(goal_type)
-    goal_keypoints = None
+    goal_keypoints_world = None
 
-    if goal_type is GoalType.BODY:
+    if (goal_type is not GoalType.BODY
+            and (state_msg.goal_root_pos_world is None
+                 or state_msg.goal_yaw_world is None)):
+        raise ValueError("TextOp state is missing its root-heading goal")
+
+    if goal_type.uses_keypoints:
         raw = getattr(state_msg, 'raw', {})
-        state_keypoints = getattr(state_msg, 'goal_keypoints', None)
-        if state_keypoints is None:
-            state_keypoints = raw.get('goal_keypoints')
-        if state_keypoints is None:
+        state_keypoints_world = getattr(
+            state_msg, 'goal_keypoints_world', None)
+        if state_keypoints_world is None:
+            state_keypoints_world = raw.get('goal_keypoints_world')
+        if state_keypoints_world is None:
             if goal_reference_path is None:
                 raise ValueError(
-                    "Body goal requires controller goal_keypoints or "
+                    f"{goal_type.value} goal requires controller "
+                    "goal_keypoints_world or "
                     "goal_reference_path")
-            if state_msg.goal_root_pos is None or state_msg.goal_heading is None:
-                raise ValueError("TextOp state is missing its root-heading goal")
-            state_keypoints = load_goal_keypoints_from_reference(
+            state_keypoints_world = load_goal_keypoints_from_reference(
                 goal_reference_path,
-                np.asarray(state_msg.goal_root_pos, dtype=np.float32),
-                float(np.asarray(state_msg.goal_heading).reshape(-1)[0]),
+                np.asarray(state_msg.goal_root_pos_world, dtype=np.float32),
+                float(np.asarray(state_msg.goal_yaw_world).reshape(-1)[0]),
             )
-        goal_keypoints = torch.as_tensor(
-            np.array(state_keypoints, dtype=np.float32, copy=True),
-            dtype=torch.float32, device=device).reshape(1, 5, 3)
-        goal_pos = goal_keypoints[:, 0]
-        goal_yaw = torch.zeros(1, dtype=torch.float32, device=device)
+        state_keypoints_world = np.array(
+            state_keypoints_world, dtype=np.float32, copy=True)
+        if (goal_type is GoalType.BODY_EXT
+                and state_keypoints_world.shape == (5, 3)):
+            # Reference-pose files retain the legacy pelvis point; V4 does not.
+            state_keypoints_world = state_keypoints_world[1:]
+        num_keypoints = 4 if goal_type is GoalType.BODY_EXT else 5
+        if state_keypoints_world.shape != (num_keypoints, 3):
+            raise ValueError(
+                f"{goal_type.value} goal_keypoints_world must have shape "
+                f"({num_keypoints}, 3), got {state_keypoints_world.shape}")
+        goal_keypoints_world = torch.as_tensor(
+            state_keypoints_world, dtype=torch.float32,
+            device=device).reshape(1, num_keypoints, 3)
+
+    if goal_type is GoalType.BODY:
+        goal_pos_world = goal_keypoints_world[:, 0]
+        goal_yaw_world = torch.zeros(1, dtype=torch.float32, device=device)
     else:
-        if state_msg.goal_root_pos is None or state_msg.goal_heading is None:
-            raise ValueError("TextOp state is missing its root-heading goal")
-        goal_pos = torch.tensor(
-            state_msg.goal_root_pos, dtype=torch.float32,
+        goal_pos_world = torch.tensor(
+            state_msg.goal_root_pos_world, dtype=torch.float32,
             device=device).reshape(1, 3)
-        goal_yaw = torch.tensor(
-            state_msg.goal_heading, dtype=torch.float32,
+        goal_yaw_world = torch.tensor(
+            state_msg.goal_yaw_world, dtype=torch.float32,
             device=device).reshape(1)
 
+    world_root_velocity = None
+    timestep = None
+    if goal_type is GoalType.BODY_EXT:
+        state_velocity = getattr(
+            state_msg, 'goal_root_velocity_world', None)
+        goal_timestamp_ns = getattr(state_msg, 'goal_timestamp_ns', None)
+        timestamps_ns = getattr(state_msg, 'timestamps_ns', None)
+        if state_velocity is None:
+            raise ValueError(
+                "body_ext goal requires goal_root_velocity_world [3]")
+        if goal_timestamp_ns is None:
+            raise ValueError("body_ext goal requires goal_timestamp_ns")
+        if not timestamps_ns:
+            raise ValueError("body_ext goal requires controller timestamps_ns")
+        state_velocity = np.asarray(state_velocity, dtype=np.float32)
+        if state_velocity.shape != (3,):
+            raise ValueError(
+                "body_ext goal_root_velocity_world must have shape (3,), got "
+                f"{state_velocity.shape}")
+        if not np.isfinite(state_velocity).all():
+            raise ValueError(
+                "body_ext goal_root_velocity_world must be finite")
+        world_root_velocity = torch.as_tensor(
+            state_velocity, dtype=torch.float32, device=device).reshape(1, 3)
+        remaining_seconds = (
+            int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9
+        timestep = torch.tensor(
+            [[remaining_seconds]], dtype=torch.float32, device=device)
+
     return build_ego_goal(
-        goal_pos, goal_yaw, reference_pos.to(device), reference_rot.to(device),
-        goal_type=goal_type, goal_keypoints=goal_keypoints)
+        goal_pos_world, goal_yaw_world, reference_pos.to(device),
+        reference_rot.to(device), goal_type=goal_type,
+        world_goal_keypoints=goal_keypoints_world,
+        world_root_velocity=world_root_velocity, timestep=timestep)
 
 
 def align_generated_history_pose(abs_pose: dict,

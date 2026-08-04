@@ -100,8 +100,8 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
                    reference_pos: torch.Tensor,
                    reference_rot: torch.Tensor,
                    goal_type: GoalType | str = GoalType.ROOT,
-                   goal_keypoints: Optional[torch.Tensor] = None,
-                   root_velocity: Optional[torch.Tensor] = None,
+                   world_goal_keypoints: Optional[torch.Tensor] = None,
+                   world_root_velocity: Optional[torch.Tensor] = None,
                    timestep: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Express a world-space root or body goal in the local X-forward frame."""
     goal_type = GoalType.parse(goal_type)
@@ -116,33 +116,37 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
             dim=-1,
         )
 
-    if goal_keypoints is None:
-        raise ValueError("goal_keypoints is required for goal_type='body'")
+    if world_goal_keypoints is None:
+        raise ValueError(
+            "world_goal_keypoints is required for body goal types")
     num_keypoints = 4 if goal_type is GoalType.BODY_EXT else 5
-    if goal_keypoints.shape[-2:] != (num_keypoints, 3):
+    if world_goal_keypoints.shape[-2:] != (num_keypoints, 3):
         raise ValueError(
             f"{goal_type.value} goal keypoints must have shape "
             f"[..., {num_keypoints}, 3], got "
-            f"{tuple(goal_keypoints.shape)}"
+            f"{tuple(world_goal_keypoints.shape)}"
         )
     expected_prefix = reference_pos.shape[:-1]
-    if goal_keypoints.shape[:-2] != expected_prefix:
+    if world_goal_keypoints.shape[:-2] != expected_prefix:
         raise ValueError(
             "Body goal batch dimensions must match reference_pos: "
-            f"{tuple(goal_keypoints.shape[:-2])} != {tuple(expected_prefix)}"
+            f"{tuple(world_goal_keypoints.shape[:-2])} != "
+            f"{tuple(expected_prefix)}"
         )
 
-    keypoint_delta = goal_keypoints - reference_pos.unsqueeze(-2)
+    keypoint_delta = world_goal_keypoints - reference_pos.unsqueeze(-2)
     ego_keypoints = _world_to_ego(keypoint_delta, current_yaw).flatten(-2)
     if goal_type is GoalType.BODY:
         return ego_keypoints
 
-    if root_velocity is None:
-        raise ValueError("root_velocity is required for goal_type='body_ext'")
-    if root_velocity.shape != world_goal_pos.shape:
+    if world_root_velocity is None:
         raise ValueError(
-            "root_velocity must match world_goal_pos shape, got "
-            f"{tuple(root_velocity.shape)} != {tuple(world_goal_pos.shape)}"
+            "world_root_velocity is required for goal_type='body_ext'")
+    if world_root_velocity.shape != world_goal_pos.shape:
+        raise ValueError(
+            "world_root_velocity must match world_goal_pos shape, got "
+            f"{tuple(world_root_velocity.shape)} != "
+            f"{tuple(world_goal_pos.shape)}"
         )
     if timestep is None:
         raise ValueError("timestep is required for goal_type='body_ext'")
@@ -156,7 +160,7 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
     ego_root = _world_to_ego(world_goal_pos - reference_pos, current_yaw)
     delta_yaw = world_goal_yaw - current_yaw
     ego_yaw = torch.stack((torch.cos(delta_yaw), torch.sin(delta_yaw)), dim=-1)
-    ego_velocity = _world_to_ego(root_velocity, current_yaw)
+    ego_velocity = _world_to_ego(world_root_velocity, current_yaw)
     return torch.cat(
         (ego_root, ego_yaw, ego_velocity, timestep, ego_keypoints), dim=-1
     )

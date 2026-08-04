@@ -55,7 +55,11 @@ def generate_next_motion(
         ret_fk: bool = False,
         ret_fk_full: bool = False,
         use_vae=True,
-        use_ddim=False):
+        use_ddim=False,
+        force_drop_goal_root: bool = False,
+        force_drop_goal_yaw: bool = False,
+        force_drop_goal_time: bool = False,
+        force_drop_goal_body: bool = False):
     """
     Generate next motion segment using DAR model.
 
@@ -70,6 +74,10 @@ def generate_next_motion(
         abs_pose: Current absolute pose
         future_len: Length of future motion to generate
         use_full_sample: Whether to use full DDPM sampling loop
+        force_drop_goal_root: Mask the root-position component at inference.
+        force_drop_goal_yaw: Mask the root-yaw component at inference.
+        force_drop_goal_time: Mask the remaining-time component at inference.
+        force_drop_goal_body: Mask the limb-keypoint component at inference.
 
     Returns:
         Tuple of (future_motion_pred, motion_dict, new_abs_pose)
@@ -102,6 +110,10 @@ def generate_next_motion(
             'goal': goal,
             'voxel': voxel,
             'history_motion_normalized': history_motion,
+            'force_drop_goal_root': force_drop_goal_root,
+            'force_drop_goal_yaw': force_drop_goal_yaw,
+            'force_drop_goal_time': force_drop_goal_time,
+            'force_drop_goal_body': force_drop_goal_body,
         }
         if guidance_scale is not None:
             y['scale'] = guidance_scale

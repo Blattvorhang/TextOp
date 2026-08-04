@@ -179,6 +179,23 @@ def test_shared_extended_goal_rejects_missing_forward_difference_frame():
         dataset._generate_motion_primitives(sample, 0)
 
 
+def test_goal_timestep_mode_supports_zero_ablation_and_relative_time():
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.fps = 50
+
+    dataset.goal_timestep_mode = "zero"
+    torch.testing.assert_close(
+        dataset._goal_timestep(reference_frame=10, goal_frame=60),
+        torch.zeros(1),
+    )
+
+    dataset.goal_timestep_mode = "relative"
+    torch.testing.assert_close(
+        dataset._goal_timestep(reference_frame=10, goal_frame=60),
+        torch.ones(1),
+    )
+
+
 def test_bonesseed_contact_mask_rejects_low_sliding_feet():
     foot_pos = np.array(
         [
