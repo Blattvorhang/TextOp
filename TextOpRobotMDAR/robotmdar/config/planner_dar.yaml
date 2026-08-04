@@ -8,7 +8,7 @@ task: planner-dar
 # Let SONIC consume the complete generated segment before replacing it.
 # Resetting its frame-index cursor faster than the 8-frame / 50 Hz horizon
 # repeatedly discards most of every reference and destabilizes tracking.
-infer_period_ms: 400
+infer_period_ms: 500
 motion_fps: 50.0
 state_timeout_ms: 1
 log_every: 20
@@ -38,12 +38,21 @@ comm_config: ${hydra:runtime.cwd}/robotmdar/config/communication/pubsub.yaml
 occ_grid: null
 
 data:
-  goal_type: body
+  goal_type: body_ext
   history_len: 16
   future_len: 64
 
 denoiser:
-  goal_dim: 15
+  goal_dim: 21
 
-# Online v2 requires protocol-v3 keypoints from the controller.
+# Root yaw is present on the wire for compatibility but is intentionally not
+# used by the deployed V4 planner.
+force_drop_goal_yaw: true
+
+# The recommended V4 ablation keeps the 21-D layout but trains and deploys the
+# remaining-time channel as zero. Relative timestamps remain on the wire for
+# future checkpoints trained with goal_timestep_mode=relative.
+force_drop_goal_time: true
+
+# body_ext requires protocol-v5 world velocity, goal timestamp, and keypoints.
 goal_reference_path: null

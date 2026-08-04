@@ -56,6 +56,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         goal_offset_range: Optional[Tuple[int, int]] = None,
         goal_type: GoalType | str = GoalType.ROOT,
         goal_per_primitive: bool = False,
+        goal_timestep_mode: str = "relative",
         weighted_sample: bool = False,
         frame_weight: bool = False,
         use_weighted_meanstd: bool = False,
@@ -77,6 +78,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         self.goal_type = GoalType.parse(goal_type)
         self.goal_per_primitive = goal_per_primitive
+        self.goal_timestep_mode = str(goal_timestep_mode).lower()
+        if self.goal_timestep_mode not in ("relative", "zero"):
+            raise ValueError(
+                "goal_timestep_mode must be 'relative' or 'zero', got "
+                f"{goal_timestep_mode!r}"
+            )
         self.goal_offset = int(goal_offset)
         if goal_offset_range is None:
             self.goal_offset_range = (self.goal_offset, self.goal_offset)
@@ -553,6 +560,15 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             - torch.as_tensor(root_position[goal_frame], dtype=torch.float32)
         ) * float(self.fps)
 
+    def _goal_timestep(self, reference_frame: int,
+                       goal_frame: int) -> torch.Tensor:
+        if self.goal_timestep_mode == "zero":
+            return torch.zeros(1, dtype=torch.float32)
+        return torch.tensor(
+            [(goal_frame - reference_frame) / float(self.fps)],
+            dtype=torch.float32,
+        )
+
     def _extract_single_primitive(
         self, sample: Dict[str, Any], prim_start: int, prim_end: int,
         goal_frame: int, world_goal_keypoints: torch.Tensor | None = None,
@@ -601,10 +617,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if self.goal_type is GoalType.BODY_EXT:
             primitive['world_goal_vel'] = self._world_goal_velocity(
                 raw_motion, goal_frame)
-            primitive['goal_timestep'] = torch.tensor(
-                [(goal_frame - reference_frame) / float(self.fps)],
-                dtype=torch.float32,
-            )
+            primitive['goal_timestep'] = self._goal_timestep(
+                reference_frame, goal_frame)
         return primitive
 
     def _generate_motion_primitives(self, sample: Dict[str, Any],

@@ -68,11 +68,11 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 batch_item['gt_ref_pos'].to(cfg.device),
                 batch_item['gt_ref_rot'].to(cfg.device),
                 goal_type=goal_type,
-                goal_keypoints=(
+                world_goal_keypoints=(
                     batch_item['world_goal_keypoints'].to(cfg.device)
                     if goal_type.uses_keypoints else None
                 ),
-                root_velocity=(
+                world_root_velocity=(
                     batch_item['world_goal_vel'].to(cfg.device)
                     if goal_type is GoalType.BODY_EXT else None
                 ),

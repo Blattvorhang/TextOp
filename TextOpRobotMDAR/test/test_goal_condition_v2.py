@@ -84,7 +84,7 @@ def test_body_goal_is_batched_relative_xyz():
 
     goal = build_ego_goal(
         keypoints[:, 0], torch.zeros(2), reference_pos, reference_rot,
-        goal_type=GoalType.BODY, goal_keypoints=keypoints)
+        goal_type=GoalType.BODY, world_goal_keypoints=keypoints)
 
     assert goal.shape == (2, 15)
     torch.testing.assert_close(goal[0].reshape(5, 3), offsets)
@@ -123,8 +123,8 @@ def test_extended_body_goal_layout_and_ego_transform():
         reference_pos,
         reference_rot,
         goal_type=GoalType.BODY_EXT,
-        goal_keypoints=keypoints,
-        root_velocity=world_velocity,
+        world_goal_keypoints=keypoints,
+        world_root_velocity=world_velocity,
         timestep=timestep,
     )
 
@@ -144,17 +144,17 @@ def test_extended_body_goal_requires_velocity_and_column_timestep():
     root = torch.zeros((2, 3))
     rotation = torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(2, 4)
     limbs = torch.zeros((2, 4, 3))
-    with pytest.raises(ValueError, match="root_velocity is required"):
+    with pytest.raises(ValueError, match="world_root_velocity is required"):
         build_ego_goal(
             root, torch.zeros(2), root, rotation,
-            goal_type="body_ext", goal_keypoints=limbs,
+            goal_type="body_ext", world_goal_keypoints=limbs,
             timestep=torch.ones((2, 1)),
         )
     with pytest.raises(ValueError, match="timestep must have shape"):
         build_ego_goal(
             root, torch.zeros(2), root, rotation,
-            goal_type="body_ext", goal_keypoints=limbs,
-            root_velocity=torch.zeros((2, 3)), timestep=torch.ones(2),
+            goal_type="body_ext", world_goal_keypoints=limbs,
+            world_root_velocity=torch.zeros((2, 3)), timestep=torch.ones(2),
         )
 
 
@@ -188,9 +188,9 @@ def test_state_body_goal_prefers_controller_keypoints():
         [2.2, 2.7, 0.6],
     ], dtype=np.float32)
     state = SimpleNamespace(
-        raw={"goal_keypoints": keypoints},
-        goal_root_pos=None,
-        goal_heading=None,
+        raw={"goal_keypoints_world": keypoints},
+        goal_root_pos_world=None,
+        goal_yaw_world=None,
     )
     goal = state_goal_from_reference(
         state,
@@ -203,3 +203,37 @@ def test_state_body_goal_prefers_controller_keypoints():
     torch.testing.assert_close(
         goal.reshape(5, 3),
         torch.from_numpy(keypoints) - torch.tensor([1.0, 2.0, 0.7]))
+
+
+def test_state_extended_body_goal_uses_velocity_and_absolute_timestamp():
+    keypoints = np.asarray([
+        [2.1, 3.2, 0.1],
+        [2.1, 2.8, 0.1],
+        [2.2, 3.3, 0.6],
+        [2.2, 2.7, 0.6],
+    ], dtype=np.float32)
+    state = SimpleNamespace(
+        raw={"goal_keypoints_world": keypoints},
+        goal_root_pos_world=np.asarray([2.0, 3.0, 0.8], dtype=np.float32),
+        goal_yaw_world=np.asarray([0.0], dtype=np.float32),
+        goal_root_velocity_world=np.asarray(
+            [0.5, -0.25, 0.0], dtype=np.float32),
+        goal_timestamp_ns=4_500_000_000,
+        timestamps_ns=[2_000_000_000, 2_500_000_000],
+    )
+
+    goal = state_goal_from_reference(
+        state,
+        reference_pos=torch.tensor([[1.0, 2.0, 0.7]]),
+        reference_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+        device="cpu",
+        goal_type="body_ext",
+    )
+
+    assert goal.shape == (1, 21)
+    torch.testing.assert_close(goal[0, 0:3], torch.tensor([1.0, 1.0, 0.1]))
+    torch.testing.assert_close(goal[0, 5:8], torch.tensor([0.5, -0.25, 0.0]))
+    torch.testing.assert_close(goal[0, 8:9], torch.tensor([2.0]))
+    torch.testing.assert_close(
+        goal[0, 9:21],
+        (torch.from_numpy(keypoints) - torch.tensor([1.0, 2.0, 0.7])).flatten())

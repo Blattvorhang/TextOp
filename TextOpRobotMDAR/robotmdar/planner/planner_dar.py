@@ -49,6 +49,50 @@ def _cuda_synchronize(device: str) -> None:
         torch.cuda.synchronize(device)
 
 
+def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
+    """Load and validate the config associated with the DAR checkpoint."""
+    model_cfg_path = cfg.ckpt.get("load_cfg")
+    if model_cfg_path is None:
+        ckpt_dar = cfg.ckpt.get("dar")
+        if ckpt_dar is None:
+            raise ValueError(
+                "ckpt.dar must be set so the model config (cfg.yaml) can be located")
+        model_cfg_path = Path(str(ckpt_dar)).parent / "cfg.yaml"
+    model_cfg_path = Path(to_absolute_path(str(model_cfg_path)))
+    model_cfg = OmegaConf.load(model_cfg_path)
+
+    expected = {
+        "nfeats": (int(cfg.data.nfeats), int(model_cfg.data.nfeats)),
+        "history_len": (
+            int(cfg.data.history_len), int(model_cfg.data.history_len)),
+        "future_len": (
+            int(cfg.data.future_len), int(model_cfg.data.future_len)),
+        "goal_dim": (
+            int(cfg.denoiser.goal_dim), int(model_cfg.denoiser.goal_dim)),
+    }
+    mismatches = [
+        f"{name}: runtime={runtime}, checkpoint={checkpoint}"
+        for name, (runtime, checkpoint) in expected.items()
+        if runtime != checkpoint
+    ]
+    runtime_goal_type = GoalType.parse(cfg.data.goal_type)
+    checkpoint_goal_type = GoalType.parse(model_cfg.data.goal_type)
+    if runtime_goal_type is not checkpoint_goal_type:
+        mismatches.append(
+            f"goal_type: runtime={runtime_goal_type.value}, "
+            f"checkpoint={checkpoint_goal_type.value}")
+    humanoid_type = str(model_cfg.data.skeleton.humanoid_type)
+    if int(model_cfg.data.nfeats) != 69 or humanoid_type != "g1_29dof":
+        mismatches.append(
+            "checkpoint is not a 29-DoF G1 model "
+            f"(nfeats={model_cfg.data.nfeats}, humanoid_type={humanoid_type})")
+    if mismatches:
+        raise ValueError(
+            f"Incompatible DAR checkpoint config {model_cfg_path}: "
+            + "; ".join(mismatches))
+    return model_cfg_path, model_cfg
+
+
 def main(cfg: DictConfig) -> None:
     """Run the TextOp planner until interrupted."""
     from sonicmsg import PlannerNode
@@ -61,28 +105,21 @@ def main(cfg: DictConfig) -> None:
     goal_reference_path = cfg.get("goal_reference_path")
     if goal_reference_path is not None:
         goal_reference_path = to_absolute_path(str(goal_reference_path))
-    if goal_type is GoalType.BODY and goal_reference_path is None:
+    if goal_type.uses_keypoints and goal_reference_path is None:
         logger.info(
-            "Body-goal planner expects goal_keypoints from the controller; "
-            "no reference pose is configured")
+            "{} planner expects goal_keypoints_world from the controller; "
+            "no reference pose is configured", goal_type.value)
+
     if FeatureVersion != 3:
         raise ValueError(
             f"planner_dar requires FeatureVersion 3, got {FeatureVersion}")
 
-    logger.info("Loading DAR model and dataset statistics")
+    _model_cfg_path, _model_cfg = _checkpoint_config(cfg)
+    logger.info("Loading 29-DoF DAR model and dataset statistics")
     vae, denoiser, diffusion, val_data = _load_models(cfg)
     history_len = int(cfg.data.history_len)
     future_len = int(cfg.data.future_len)
     motion_fps = float(cfg.motion_fps)
-    _model_cfg_path = cfg.ckpt.get("load_cfg")
-    if _model_cfg_path is None:
-        _ckpt_dar = cfg.ckpt.get("dar")
-        if _ckpt_dar is None:
-            raise ValueError(
-                "ckpt.dar must be set so the model config (cfg.yaml) can be located")
-        _model_cfg_path = Path(_ckpt_dar).parent / "cfg.yaml"
-    _model_cfg_path = to_absolute_path(str(_model_cfg_path))
-    _model_cfg = OmegaConf.load(_model_cfg_path)
     _expected_history_len = int(_model_cfg.data.history_len)
     _expected_future_len = int(_model_cfg.data.future_len)
     if history_len != _expected_history_len:
@@ -232,6 +269,45 @@ def main(cfg: DictConfig) -> None:
                 _goal_ego_x = float(ego_goal[0, 0])
                 _goal_ego_y = float(ego_goal[0, 1])
                 _goal_delta_z = float(ego_goal[0, 2])
+
+                _world_goal = getattr(latest_state, 'goal_root_pos_world', None)
+                if _world_goal is not None:
+                    _world_goal = np.asarray(_world_goal, dtype=np.float64).reshape(-1)
+                    _goal_world_x = float(_world_goal[0])
+                    _goal_world_y = float(_world_goal[1])
+                    _goal_world_z = float(_world_goal[2])
+                else:
+                    _goal_world_x = _goal_world_y = _goal_world_z = float('nan')
+
+                _world_vel = getattr(latest_state, 'goal_root_velocity_world', None)
+                if _world_vel is not None:
+                    _world_vel = np.asarray(_world_vel, dtype=np.float64).reshape(-1)
+                    _vel_world_x = float(_world_vel[0])
+                    _vel_world_y = float(_world_vel[1])
+                    _vel_world_z = float(_world_vel[2])
+                else:
+                    _vel_world_x = _vel_world_y = _vel_world_z = float('nan')
+
+                # ── world (from controller) ──
+                _world_yaw = getattr(latest_state, 'goal_yaw_world', None)
+                if _world_yaw is not None:
+                    _goal_yaw_world_deg = math.degrees(
+                        float(np.asarray(_world_yaw, dtype=np.float64).reshape(-1)[0]))
+                else:
+                    _goal_yaw_world_deg = float('nan')
+
+                # ── ego (as seen by planner, after dropout) ──
+                _force_drop_yaw = bool(cfg.get("force_drop_goal_yaw", False))
+                _force_drop_time = bool(cfg.get("force_drop_goal_time", False))
+                if goal_type in (GoalType.ROOT, GoalType.BODY_EXT):
+                    if _force_drop_yaw:
+                        _goal_ego_yaw_deg = 0.0  # mask_condition zeros the yaw channels
+                    else:
+                        _goal_ego_yaw_deg = math.degrees(math.atan2(
+                            float(ego_goal[0, 4]), float(ego_goal[0, 3])))
+                else:
+                    _goal_ego_yaw_deg = float('nan')
+
                 _cuda_synchronize(str(cfg.device))
                 infer_start = time.perf_counter()
                 if latest_state.ego_occ is None:
@@ -259,6 +335,14 @@ def main(cfg: DictConfig) -> None:
                     guidance_scale=cfg.guidance_scale,
                     initial_noise=fixed_sampling_noise,
                     ret_fk=True,
+                    force_drop_goal_root=bool(
+                        cfg.get("force_drop_goal_root", False)),
+                    force_drop_goal_yaw=bool(
+                        cfg.get("force_drop_goal_yaw", False)),
+                    force_drop_goal_time=bool(
+                        cfg.get("force_drop_goal_time", False)),
+                    force_drop_goal_body=bool(
+                        cfg.get("force_drop_goal_body", False)),
                 )
                 _cuda_synchronize(str(cfg.device))
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
@@ -266,19 +350,45 @@ def main(cfg: DictConfig) -> None:
                 avg_ms = sum(infer_times[-20:]) / len(infer_times[-20:])
                 occ_count = int(voxel.sum().item())
                 if goal_type is GoalType.ROOT:
-                    _goal_delta_yaw_deg = math.degrees(math.atan2(
-                        float(ego_goal[0, 4]), float(ego_goal[0, 3])))
                     logger.info(
-                        "goal[root]: ego_x={:.3f} ego_y={:.3f} "
-                        "delta_z={:.3f} delta_yaw={:.1f} deg | "
+                        "goal[root]: world(pos=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f} deg) "
+                        "ego(pos=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f} deg) | "
                         "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        _goal_world_x, _goal_world_y, _goal_world_z,
+                        _goal_yaw_world_deg,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
-                        _goal_delta_yaw_deg, occ_count, infer_ms, avg_ms)
+                        _goal_ego_yaw_deg,
+                        occ_count, infer_ms, avg_ms)
+                elif goal_type is GoalType.BODY:
+                    logger.info(
+                        "goal[body]: world(pos=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f} deg) "
+                        "ego(pos=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f} deg) | "
+                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        _goal_world_x, _goal_world_y, _goal_world_z,
+                        _goal_yaw_world_deg,
+                        _goal_ego_x, _goal_ego_y, _goal_delta_z,
+                        _goal_ego_yaw_deg,
+                        occ_count, infer_ms, avg_ms)
                 else:
                     logger.info(
-                        "goal[body]: root_ego=({:.3f}, {:.3f}, {:.3f}) "
-                        "| occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        "goal[body_ext]: world(pos=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f} deg vel=({:.3f},{:.3f},{:.3f})) "
+                        "ego(pos=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f} deg "
+                        "vel=({:.3f},{:.3f},{:.3f}) dt={:.3f}s) | "
+                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        _goal_world_x, _goal_world_y, _goal_world_z,
+                        _goal_yaw_world_deg,
+                        _vel_world_x, _vel_world_y, _vel_world_z,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
+                        _goal_ego_yaw_deg,
+                        float(ego_goal[0, 5]), float(ego_goal[0, 6]),
+                        float(ego_goal[0, 7]),
+                        0.0 if _force_drop_time else float(ego_goal[0, 8]),
                         occ_count, infer_ms, avg_ms)
 
                 # SonicRunner resets each newly received G1 plan to frame 0.

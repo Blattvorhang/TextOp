@@ -13,6 +13,7 @@ goal_offset: 0
 goal_offset_range: null
 goal_type: body
 goal_per_primitive: false
+goal_timestep_mode: relative
 occupancy_unit: 0.08
 
 action_statistics_path: ${.datadir}/action_statistics.json
@@ -39,6 +40,7 @@ common: &common
   goal_offset_range: ${..goal_offset_range}
   goal_type: ${..goal_type}
   goal_per_primitive: ${..goal_per_primitive}
+  goal_timestep_mode: ${..goal_timestep_mode}
 
 train:
   <<: *common

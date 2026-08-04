@@ -26,11 +26,11 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
         reference_pos,
         reference_rot,
         goal_type=goal_type,
-        goal_keypoints=(
+        world_goal_keypoints=(
             primitive['world_goal_keypoints'].to(cfg.device)
             if goal_type.uses_keypoints else None
         ),
-        root_velocity=(
+        world_root_velocity=(
             primitive['world_goal_vel'].to(cfg.device)
             if goal_type is GoalType.BODY_EXT else None
         ),
