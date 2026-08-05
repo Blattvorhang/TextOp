@@ -11,22 +11,39 @@ import torch
 
 from robotmdar.utils.goal import GoalType, build_ego_goal
 from robotmdar.dtype.motion import (
+    G1_MUJOCO_DOF_JOINT_NAMES,
     motion_dict_to_feature_v3,
     quaternion_to_euler_angles,
 )
 from robotmdar.dtype.rotation import quat_apply
 
 
-# Indexing an IsaacLab-ordered vector with this array produces MuJoCo order.
-_ISAACLAB_TO_MUJOCO = np.asarray([
-    0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11, 15, 19,
-    21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28,
-], dtype=np.int64)
+G1_ISAACLAB_DOF_JOINT_NAMES = (
+    "left_hip_pitch_joint", "right_hip_pitch_joint", "waist_yaw_joint",
+    "left_hip_roll_joint", "right_hip_roll_joint", "waist_roll_joint",
+    "left_hip_yaw_joint", "right_hip_yaw_joint", "waist_pitch_joint",
+    "left_knee_joint", "right_knee_joint", "left_shoulder_pitch_joint",
+    "right_shoulder_pitch_joint", "left_ankle_pitch_joint",
+    "right_ankle_pitch_joint", "left_shoulder_roll_joint",
+    "right_shoulder_roll_joint", "left_ankle_roll_joint",
+    "right_ankle_roll_joint", "left_shoulder_yaw_joint",
+    "right_shoulder_yaw_joint", "left_elbow_joint", "right_elbow_joint",
+    "left_wrist_roll_joint", "right_wrist_roll_joint",
+    "left_wrist_pitch_joint", "right_wrist_pitch_joint",
+    "left_wrist_yaw_joint", "right_wrist_yaw_joint",
+)
 
-# Indexing a MuJoCo-ordered vector with this array produces IsaacLab order.
+# Derive boundary permutations by semantic name so an order change cannot
+# silently pair the wrong joints.
+if set(G1_ISAACLAB_DOF_JOINT_NAMES) != set(G1_MUJOCO_DOF_JOINT_NAMES):
+    raise RuntimeError("IsaacLab and MuJoCo G1 joint-name sets differ")
+_ISAACLAB_TO_MUJOCO = np.asarray([
+    G1_ISAACLAB_DOF_JOINT_NAMES.index(name)
+    for name in G1_MUJOCO_DOF_JOINT_NAMES
+], dtype=np.int64)
 _MUJOCO_TO_ISAACLAB = np.asarray([
-    0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23,
-    5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28,
+    G1_MUJOCO_DOF_JOINT_NAMES.index(name)
+    for name in G1_ISAACLAB_DOF_JOINT_NAMES
 ], dtype=np.int64)
 
 

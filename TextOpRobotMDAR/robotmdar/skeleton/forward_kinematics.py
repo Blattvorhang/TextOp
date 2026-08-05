@@ -41,6 +41,7 @@ class ForwardKinematics:
 
         # Extract skeleton information
         self.body_names = skeleton_data['node_names']
+        self.dof_joint_names = skeleton_data['dof_joint_names']
         self.parent_indices = skeleton_data['parent_indices'].to(device)
         # Add batch dimension to match original implementation
         self.local_translations = skeleton_data['local_translations'][
@@ -49,6 +50,15 @@ class ForwardKinematics:
         self.local_rotations = skeleton_data['local_rotations'][
             None,
         ].to(device)  # [1, num_bodies, 4]
+
+        configured_dof_names = tuple(cfg.dof_names) if hasattr(
+            cfg, 'dof_names') else ()
+        parsed_dof_bodies = tuple(self.body_names[1:])
+        if configured_dof_names and configured_dof_names != parsed_dof_bodies:
+            raise ValueError(
+                "Configured DOF order does not match MJCF body traversal: "
+                f"configured={configured_dof_names}, parsed={parsed_dof_bodies}"
+            )
 
         # Initialize extended configuration
         self.body_names_augment = self.body_names.copy()
@@ -105,6 +115,7 @@ class ForwardKinematics:
         parent_indices = []
         local_translations = []
         local_rotations = []
+        body_joint_names = []
 
         def _parse_node(xml_node, parent_idx, node_idx):
             """Recursively parse XML node"""
@@ -122,6 +133,11 @@ class ForwardKinematics:
             parent_indices.append(parent_idx)
             local_translations.append(pos)
             local_rotations.append(quat)
+            direct_joints = xml_node.findall("joint")
+            body_joint_names.append(
+                direct_joints[0].attrib.get("name") if len(direct_joints) == 1
+                else None
+            )
 
             current_idx = node_idx
             node_idx += 1
@@ -140,11 +156,14 @@ class ForwardKinematics:
         actuator = tree.getroot().find("actuator")
         if actuator is None:
             raise ValueError("Invalid MJCF file: no actuator found")
-        motors = sorted(
-            [m.attrib['name'] for m in list(actuator) if 'name' in m.attrib])
-        assert len(motors) > 0, "No motors found in the mjcf file"
+        actuator_joint_names = [
+            node.attrib.get('joint') for node in list(actuator)
+            if node.attrib.get('joint') is not None
+        ]
+        if not actuator_joint_names:
+            raise ValueError("No joint actuators found in the mjcf file")
 
-        self.num_dof = len(motors)
+        self.num_dof = len(actuator_joint_names)
         self.num_extend_dof = self.num_dof
 
         joint_nodes = xml_world_body.findall('.//joint')
@@ -162,17 +181,37 @@ class ForwardKinematics:
             return [int(i) for i in axis_str.split(" ")]
 
         if "type" in joints[0].attrib and joints[0].attrib['type'] == "free":
-            for j in joints[1:]:
+            dof_joints = joints[1:]
+            for j in dof_joints:
                 dof_axis_list.append(get_axis(j))
             self.has_freejoint = True
         elif "type" not in joints[0].attrib:
-            for j in joints:
+            dof_joints = joints
+            for j in dof_joints:
                 dof_axis_list.append(get_axis(j))
             self.has_freejoint = True
         else:
-            for j in joints[6:]:
+            dof_joints = joints[6:]
+            for j in dof_joints:
                 dof_axis_list.append(get_axis(j))
             self.has_freejoint = False
+
+        dof_joint_names = [joint.attrib.get('name') for joint in dof_joints]
+        if len(dof_joint_names) != self.num_dof:
+            raise ValueError(
+                f"MJCF has {len(dof_joint_names)} scalar DOFs but "
+                f"{self.num_dof} joint actuators"
+            )
+        if dof_joint_names != actuator_joint_names:
+            raise ValueError(
+                "MJCF joint traversal and actuator order differ: "
+                f"joints={dof_joint_names}, actuators={actuator_joint_names}"
+            )
+        if body_joint_names[1:] != dof_joint_names:
+            raise ValueError(
+                "MJCF actuated-body traversal and joint order differ: "
+                f"bodies={body_joint_names[1:]}, joints={dof_joint_names}"
+            )
 
         self.dof_axis = torch.tensor(dof_axis_list)
 
@@ -184,7 +223,9 @@ class ForwardKinematics:
             'local_translations':
             torch.from_numpy(np.array(local_translations, dtype=np.float32)),
             'local_rotations':
-            torch.from_numpy(np.array(local_rotations, dtype=np.float32))
+            torch.from_numpy(np.array(local_rotations, dtype=np.float32)),
+            'dof_joint_names':
+            dof_joint_names,
         }
 
     def dof_to_axis_angle(self, dof: torch.Tensor) -> torch.Tensor:

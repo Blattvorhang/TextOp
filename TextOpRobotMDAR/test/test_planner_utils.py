@@ -6,6 +6,7 @@ import torch
 from omegaconf import OmegaConf
 
 from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
+    G1_ISAACLAB_DOF_JOINT_NAMES,
     align_generated_history_pose,
     generated_history_at_frame,
     isaaclab_to_mujoco_dof,
@@ -17,6 +18,8 @@ from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
     tracked_frame_from_timestamps,
 )
 from TextOpRobotMDAR.robotmdar.dtype.motion import (
+    G1_MUJOCO_DOF_JOINT_NAMES,
+    G1_MUJOCO_DOF_LINK_NAMES,
     motion_dict_to_feature_v3,
     motion_feature_to_dict_v3,
 )
@@ -119,7 +122,38 @@ def test_palm_center_offset_is_in_wrist_yaw_frame():
 def test_joint_order_round_trip():
     isaaclab = np.arange(29, dtype=np.float32).reshape(1, 29)
     mujoco = isaaclab_to_mujoco_dof(isaaclab)
+    expected = np.asarray([
+        G1_ISAACLAB_DOF_JOINT_NAMES.index(name)
+        for name in G1_MUJOCO_DOF_JOINT_NAMES
+    ], dtype=np.float32).reshape(1, 29)
+    np.testing.assert_array_equal(mujoco, expected)
     np.testing.assert_array_equal(mujoco_to_isaaclab_dof(mujoco), isaaclab)
+
+
+def test_training_fk_uses_canonical_mujoco_joint_and_body_order():
+    project_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(project_root / "robotmdar/config/skeleton/g1.yaml")
+    cfg.asset.assetRoot = str(project_root / "description/robots/g1")
+    skeleton = RobotSkeleton(device="cpu", cfg=cfg)
+
+    assert tuple(skeleton.fk.dof_joint_names) == G1_MUJOCO_DOF_JOINT_NAMES
+    assert tuple(skeleton.fk.body_names[1:]) == G1_MUJOCO_DOF_LINK_NAMES
+
+
+def test_feature_v3_preserves_canonical_joint_indices():
+    current = torch.arange(29, dtype=torch.float32)
+    following = current + 100.0
+    motion = {
+        "root_trans_offset": torch.zeros((1, 2, 3)),
+        "root_rot": torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(1, 2, 4),
+        "dof": torch.stack((current, following)).unsqueeze(0),
+        "contact_mask": torch.ones((1, 2, 2)),
+    }
+
+    feature, _ = motion_dict_to_feature_v3(motion)
+
+    torch.testing.assert_close(feature[0, 0, 11:40], current)
+    torch.testing.assert_close(feature[0, 0, 40:69], following - current)
 
 
 def test_controller_history_ends_at_current_non_upright_pose():

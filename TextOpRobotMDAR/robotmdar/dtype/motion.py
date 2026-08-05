@@ -16,6 +16,34 @@ ROOT_ROT_DIM = 4  # Quat, xyzw
 DOF_DIM = 29  # Full G1 skeleton, including both 3-DoF wrists.
 CONTACT_MASK_DIM = 2  # 2 feet
 
+G1_MUJOCO_DOF_JOINT_NAMES = (
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+)
+
+G1_MUJOCO_DOF_LINK_NAMES = (
+    "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link",
+    "left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link",
+    "right_hip_pitch_link", "right_hip_roll_link", "right_hip_yaw_link",
+    "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link",
+    "waist_yaw_link", "waist_roll_link", "torso_link",
+    "left_shoulder_pitch_link", "left_shoulder_roll_link",
+    "left_shoulder_yaw_link", "left_elbow_link",
+    "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+    "right_shoulder_pitch_link", "right_shoulder_roll_link",
+    "right_shoulder_yaw_link", "right_elbow_link",
+    "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
+)
+
 G1_ROOT_HEIGHT = 0.77  # meters
 
 G1_DEFAULT_DOF = (
@@ -28,6 +56,8 @@ G1_DEFAULT_DOF = (
     0.0, 0.0, 0.0,                          # right wrist
 )
 assert len(G1_DEFAULT_DOF) == DOF_DIM
+assert len(G1_MUJOCO_DOF_JOINT_NAMES) == DOF_DIM
+assert len(G1_MUJOCO_DOF_LINK_NAMES) == DOF_DIM
 
 
 # Define MotionDict with explicit component shapes
