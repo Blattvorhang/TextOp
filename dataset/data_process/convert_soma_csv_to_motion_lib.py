@@ -182,6 +182,9 @@ BONES_CSV_JOINT_NAMES = [
     "right_wrist_pitch_joint_dof",
     "right_wrist_yaw_joint_dof",
 ]
+MUJOCO_DOF_JOINT_NAMES = tuple(
+    name.removesuffix("_dof") for name in BONES_CSV_JOINT_NAMES
+)
 
 
 def load_bones_csv(csv_path: str) -> dict:
@@ -329,6 +332,8 @@ def convert_sequence(seq_data: dict, fps: int, humanoid_fk=None) -> dict:  # noq
         "root_trans_offset": root_trans_offset.astype(np.float32),
         "pose_aa": pose_aa.astype(np.float32),
         "dof": dof.astype(np.float32),
+        "dof_order": "mujoco",
+        "dof_names": list(MUJOCO_DOF_JOINT_NAMES),
         "root_rot": root_quat_xyzw.astype(np.float32),  # xyzw (scipy convention)
         "smpl_joints": np.zeros((T, 24, 3), dtype=np.float32),  # placeholder
         "fps": fps,
@@ -1029,6 +1034,10 @@ def resample_sequence(entry: dict, fps_source: int, fps_target: int) -> dict:
         "root_trans_offset": trans_tgt,
         "pose_aa": pose_aa_tgt,
         "dof": dof_tgt,
+        "dof_order": entry.get("dof_order", "mujoco"),
+        "dof_names": entry.get(
+            "dof_names", list(MUJOCO_DOF_JOINT_NAMES)
+        ),
         "root_rot": quat_tgt,
         "smpl_joints": smpl_tgt,
         "fps": fps_target,

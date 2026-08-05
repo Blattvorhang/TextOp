@@ -44,6 +44,20 @@ from tqdm import tqdm
 
 TARGET_DOF = 29
 FEATURE_DIM_V3 = 11 + 2 * TARGET_DOF
+TARGET_DOF_NAMES = (
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+)
+assert len(TARGET_DOF_NAMES) == TARGET_DOF
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +410,15 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
     dof = np.asarray(entry["dof"])
     if dof.ndim != 2 or dof.shape[1] != TARGET_DOF:
         return None  # unexpected DOF count, skip
+    dof_order = entry.get("dof_order")
+    if dof_order is not None and str(dof_order).lower() not in ("mj", "mujoco"):
+        raise ValueError(f"Expected MuJoCo DOF order, got {dof_order!r}")
+    dof_names = entry.get("dof_names")
+    if dof_names is not None and tuple(dof_names) != TARGET_DOF_NAMES:
+        raise ValueError(
+            "Motion joint order differs from the TextOp 29-DOF contract: "
+            f"got {tuple(dof_names)}"
+        )
 
     T = dof.shape[0]
     root_trans = np.asarray(entry["root_trans_offset"])
@@ -429,6 +452,8 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
             "root_trans_offset": root_trans.astype(np.float32, copy=False),
             "root_rot": root_rot.astype(np.float32, copy=False),
             "dof": dof.astype(np.float32, copy=False),
+            "dof_order": "mujoco",
+            "dof_names": list(TARGET_DOF_NAMES),
             "contact_mask": contact_mask.astype(np.float32, copy=False),
             "sliding_mask": sliding_mask.astype(np.float32, copy=False),
             "fps": fps_val,
@@ -540,6 +565,8 @@ def main():
         "dataset name": "BONES-SEED → TextOp (G1 29-DOF, 50fps)",
         "fps": fps_val,
         "dof_dim": TARGET_DOF,
+        "dof_order": "mujoco",
+        "dof_names": list(TARGET_DOF_NAMES),
         "nfeats": FEATURE_DIM_V3,
         "storage": "lazy-sample-manifest-v1",
         "train count": len(train_data),
