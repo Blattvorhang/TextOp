@@ -171,6 +171,13 @@ class BaseManager(ABC):
         """是否需要评估"""
         return self._to_eval_steps > 0
 
+    def should_report_eval_visualization(self) -> bool:
+        """Report one visualization batch per eval cycle, from DDP rank zero."""
+        return (
+            self._to_eval_steps == self.eval_steps
+            and os.environ.get('RANK', '0') == '0'
+        )
+
     def grad_clip(self, model):
         """
         Apply gradient clipping to model parameters.
@@ -918,10 +925,27 @@ class DARManager(BaseManager, GeometryLoss):
                     "ego_goal is required when goal_direction loss is enabled or during eval"
                 )
             terms['goal_direction'] = self.calc_goal_direction_loss(
-                future_motion_pred, ego_goal, goal_condition_keep_mask
+                future_motion_pred, ego_goal, goal_condition_keep_mask,
+                history_motion=history_motion,
             )
 
-        total_loss = sum(self.loss_weight[k] * v for k, v in terms.items())
+        compute_goal_position = (
+            self.loss_weight.get('goal_position', 0.0) > 0.0 or is_eval
+        )
+        if compute_goal_position:
+            if ego_goal is None:
+                raise ValueError(
+                    "ego_goal is required when goal_position loss is enabled "
+                    "or during eval"
+                )
+            terms['goal_position'] = self.calc_goal_position_loss(
+                future_motion_pred, ego_goal, goal_condition_keep_mask,
+                history_motion=history_motion,
+            )
+
+        total_loss = sum(
+            self.loss_weight.get(k, 0.0) * v for k, v in terms.items()
+        )
 
         # diffusion训练时可加权
         if weights is not None:
@@ -931,29 +955,11 @@ class DARManager(BaseManager, GeometryLoss):
         return terms, extras
 
     def calc_goal_direction_loss(self, future_motion_pred, ego_goal,
-                                 goal_condition_keep_mask=None):
+                                 goal_condition_keep_mask=None,
+                                 history_motion=None):
         """Align predicted horizontal root displacement with the ego goal."""
-        if FeatureVersion != 3:
-            raise NotImplementedError(
-                "goal_direction loss currently supports FeatureVersion 3 only"
-            )
-
-        future_motion = self.dataset.denormalize(future_motion_pred)
-        delta_yaw = future_motion[..., 4]
-        relative_yaw = torch.cat(
-            (torch.zeros_like(delta_yaw[:, :1]), delta_yaw[:, :-1]), dim=1
-        ).cumsum(dim=1)
-        cos_yaw = torch.cos(relative_yaw)
-        sin_yaw = torch.sin(relative_yaw)
-        delta_xy = future_motion[..., 7:9]
-        delta_xy_start_frame = torch.stack(
-            (
-                delta_xy[..., 0] * cos_yaw - delta_xy[..., 1] * sin_yaw,
-                delta_xy[..., 0] * sin_yaw + delta_xy[..., 1] * cos_yaw,
-            ),
-            dim=-1,
-        )
-        root_displacement = delta_xy_start_frame.sum(dim=1)
+        root_displacement = self.root_displacement_ego(
+            future_motion_pred, history_motion)
         goal_direction = ego_goal[..., :2]
         goal_distance = goal_direction.norm(dim=-1)
         valid = goal_distance > 0.1
@@ -971,6 +977,66 @@ class DARManager(BaseManager, GeometryLoss):
         cosine = (root_displacement * goal_direction).sum(dim=-1)
         cosine = (cosine / (displacement_norm * goal_norm)).clamp(-1.0, 1.0)
         return (1.0 - cosine[valid]).mean()
+
+    def calc_goal_position_loss(self, future_motion_pred, ego_goal,
+                                goal_condition_keep_mask=None,
+                                history_motion=None):
+        """Match generated horizontal root displacement to the goal endpoint."""
+        root_displacement = self.root_displacement_ego(
+            future_motion_pred, history_motion)
+        goal_position = ego_goal[..., :2]
+        valid = torch.ones(
+            goal_position.shape[0], dtype=torch.bool,
+            device=goal_position.device)
+        if goal_condition_keep_mask is not None:
+            valid = valid & goal_condition_keep_mask.to(
+                device=valid.device, dtype=torch.bool
+            )
+        if not valid.any():
+            return future_motion_pred.sum() * 0.0
+        return self.rec_criterion(
+            root_displacement[valid], goal_position[valid])
+
+    def root_displacement_ego(self, future_motion_pred, history_motion):
+        """Integrate reference-to-goal displacement in the reference ego frame."""
+        return self.root_trajectory_ego(future_motion_pred, history_motion)[:, -1]
+
+    def root_trajectory_ego(self, future_motion_pred, history_motion):
+        """Integrate root XY positions in the reference ego frame."""
+        if FeatureVersion != 3:
+            raise NotImplementedError(
+                "root trajectory integration currently supports FeatureVersion 3 only"
+            )
+        if history_motion is None:
+            raise ValueError(
+                "history_motion is required to integrate displacement from "
+                "the last history frame"
+            )
+
+        future_motion = self.dataset.denormalize(future_motion_pred)
+        history_last = self.dataset.denormalize(history_motion[:, -1:])
+        # Feature frame t stores the forward delta t -> t+1. The goal with
+        # goal_offset=0 is the last generated pose, so its path starts with the
+        # last history delta and ends with future[-2] -> future[-1].
+        path_motion = torch.cat((history_last, future_motion[:, :-1]), dim=1)
+        delta_yaw = path_motion[..., 4]
+        relative_yaw = torch.cat(
+            (torch.zeros_like(delta_yaw[:, :1]), delta_yaw[:, :-1]), dim=1
+        ).cumsum(dim=1)
+        cos_yaw = torch.cos(relative_yaw)
+        sin_yaw = torch.sin(relative_yaw)
+        delta_xy = path_motion[..., 7:9]
+        delta_xy_start_frame = torch.stack(
+            (
+                delta_xy[..., 0] * cos_yaw - delta_xy[..., 1] * sin_yaw,
+                delta_xy[..., 0] * sin_yaw + delta_xy[..., 1] * cos_yaw,
+            ),
+            dim=-1,
+        )
+        origin = torch.zeros_like(delta_xy_start_frame[:, :1])
+        return torch.cat(
+            (origin, delta_xy_start_frame.cumsum(dim=1)), dim=1
+        )
 
     def save_model(self) -> None:
         save_path = self.save_dir / f"ckpt_{self.step}.pth"

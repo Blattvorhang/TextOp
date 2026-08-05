@@ -12,6 +12,9 @@ class TrainPlatform:
     def report_media(self, title, series, iteration, local_path):
         pass
 
+    def report_figure(self, name, figure, iteration, group_name=None):
+        pass
+
     def report_args(self, args, name):
         pass
 
@@ -47,6 +50,10 @@ class TensorboardPlatform(TrainPlatform):
 
     def report_scalar(self, name, value, iteration, group_name=None):
         self.writer.add_scalar(f'{group_name}/{name}', value, iteration)
+
+    def report_figure(self, name, figure, iteration, group_name=None):
+        tag = f'{group_name}/{name}' if group_name else name
+        self.writer.add_figure(tag, figure, global_step=iteration, close=True)
 
     def close(self):
         self.writer.close()
@@ -85,5 +92,4 @@ class WandBPlatform(TrainPlatform):
 
     def close(self):
         self.wandb.finish()
-
 
