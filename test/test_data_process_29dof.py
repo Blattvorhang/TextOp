@@ -1,5 +1,6 @@
 """Parity and format checks for native 29-DoF Bones-SEED preparation."""
 
+import xml.etree.ElementTree as ET
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
@@ -22,6 +23,55 @@ def _load_script(name: str):
 
 converter = _load_script("convert_soma_csv_to_motion_lib")
 packer = _load_script("pack_motion_lib_to_textop")
+
+
+def _mjcf_dof_names(path: Path) -> list[str]:
+    root = ET.parse(path).getroot()
+    return [
+        joint.attrib["name"]
+        for joint in root.findall(".//worldbody//joint")
+        if joint.attrib.get("type") != "free"
+    ]
+
+
+def _mjcf_actuator_joint_names(path: Path) -> list[str]:
+    root = ET.parse(path).getroot()
+    return [node.attrib["joint"] for node in root.findall("./actuator/*")]
+
+
+def test_all_mjcf_and_preprocessing_joint_orders_match():
+    robot_dir = (
+        ROOT / "TextOpRobotMDAR" / "description" / "robots" / "g1"
+    )
+    expected = list(packer.TARGET_DOF_NAMES)
+    assert list(converter.MUJOCO_DOF_JOINT_NAMES) == expected
+
+    for xml_path in sorted(robot_dir.glob("g1_29dof*.xml")):
+        assert _mjcf_dof_names(xml_path) == expected, xml_path.name
+        assert _mjcf_actuator_joint_names(xml_path) == expected, xml_path.name
+
+    old_23 = _mjcf_dof_names(
+        robot_dir / "g1_23dof_lock_wrist_fitmotionONLY.xml"
+    )
+    assert old_23 == expected[:19] + expected[22:26]
+
+
+def test_packer_rejects_semantically_permuted_29dof_entry():
+    frames = 2
+    wrong_names = list(packer.TARGET_DOF_NAMES)
+    wrong_names[19], wrong_names[22] = wrong_names[22], wrong_names[19]
+    entry = {
+        "root_trans_offset": np.zeros((frames, 3), dtype=np.float32),
+        "root_rot": np.tile([0, 0, 0, 1], (frames, 1)).astype(np.float32),
+        "dof": np.zeros((frames, 29), dtype=np.float32),
+        "dof_order": "mujoco",
+        "dof_names": wrong_names,
+        "contact_mask": np.ones((frames, 2), dtype=np.float32),
+        "fps": 50,
+    }
+
+    with pytest.raises(ValueError, match="joint order"):
+        packer.motion_lib_entry_to_textop("bad_order", entry)
 
 
 def test_packer_retains_all_wrist_dofs():

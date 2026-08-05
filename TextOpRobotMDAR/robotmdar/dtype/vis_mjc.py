@@ -12,7 +12,7 @@ def mjc_load_everything(
     dt: float,
     keycb_fn: Optional[Callable[[int], None]] = None,
     humanoid_xml:
-    str = "./description/robots/g1/g1_23dof_lock_wrist.xml"):
+    str = "./description/robots/g1/g1_29dof.xml"):
 
     mj_model = mujoco.MjModel.from_xml_path(humanoid_xml)  # type: ignore
     mj_data = mujoco.MjData(mj_model)  # type: ignore

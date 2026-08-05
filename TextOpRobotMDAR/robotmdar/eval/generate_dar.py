@@ -132,7 +132,7 @@ def generate_next_motion(
                     init_image=None,
                     progress=False,
                     dump_steps=None,
-                    noise=None,
+                    noise=x_start_noise,
                     const_noise=False,
                 )
             else:
@@ -148,7 +148,7 @@ def generate_next_motion(
                     progress=False,
                     eta=0.0,
                     dump_steps=None,
-                    noise=None,
+                    noise=x_start_noise,
                     const_noise=False,
                 )
 

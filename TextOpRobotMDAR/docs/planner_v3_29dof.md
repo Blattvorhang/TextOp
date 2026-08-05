@@ -47,14 +47,47 @@ representation, data loading, model I/O, and boundary conversions — from
   position because it is the task-relevant limb endpoint and responds to all
   three wrist rotations. A wrist-joint origin does not move under its own yaw
   and therefore discards useful 29-DoF information.
-- The palm keypoint must be attached to `*_wrist_yaw_link` using a geometry-
-  derived offset. The collision hand capsule spans local X=0.05..0.10 m, so
-  its center, `[0.075, 0, 0]`, is the initial palm-center definition. This must
-  be verified visually against the rubber-hand mesh and controller keypoints.
+- The hand keypoint is attached to `*_wrist_yaw_link` at the rubber-hand mesh
+  origin: left `[0.0415, 0.003, 0]`, right `[0.0415, -0.003, 0]`. This is a
+  real geometry point, responds to all wrist rotations, and is the convention
+  implemented by the training FK and planner.
 
 ---
 
-## Current Architecture (23-DoF)
+## Canonical 29-DoF Index Order
+
+The model, packed data, training FK, MuJoCo qpos (`qpos[7:36]`), and MuJoCo
+actuators all use the same depth-first MJCF order:
+
+| Indices | Joints |
+|---|---|
+| 0-5 | left hip pitch/roll/yaw, knee, ankle pitch/roll |
+| 6-11 | right hip pitch/roll/yaw, knee, ankle pitch/roll |
+| 12-14 | waist yaw/roll/pitch |
+| 15-18 | left shoulder pitch/roll/yaw, elbow |
+| 19-21 | left wrist roll/pitch/yaw |
+| 22-25 | right shoulder pitch/roll/yaw, elbow |
+| 26-28 | right wrist roll/pitch/yaw |
+
+The migration is an insertion, not an append. The old 23-DoF vector maps to
+29-DoF indices `[0:19] + [22:26]`; old right-arm indices `19:23` become new
+indices `22:26`. Left wrists are inserted at `19:22`, and right wrists occupy
+`26:29`.
+
+FeatureVersion 3 preserves this order without permutation:
+
+- `feature[..., 11:40]`: current 29 joint angles
+- `feature[..., 40:69]`: forward differences of the same 29 joints
+
+IsaacLab order exists only at the controller boundary. Its maps are derived
+from semantic joint-name lists. New preprocessing output records
+`dof_order: mujoco` and ordered `dof_names`; MVAE and DAR startup validate
+these fields when present. Older packed 29-DoF datasets without this metadata
+remain loadable, while their MJCF/config order is still checked at startup.
+
+---
+
+## Pre-Migration Architecture (23-DoF)
 
 ```
 Bones-SEED CSV (29 columns)
@@ -395,19 +428,18 @@ extend_config:
 extend_config:
   - joint_name: "left_hand_link"
     parent_name: "left_wrist_yaw_link"   # wrist chain now exists
-    pos: [0.075, 0.0, 0.0]              # palm center from hand collision geometry
+    pos: [0.0415, 0.003, 0.0]           # left rubber-hand mesh origin
     rot: [1.0, 0.0, 0.0, 0.0]
   - joint_name: "right_hand_link"
     parent_name: "right_wrist_yaw_link"
-    pos: [0.075, 0.0, 0.0]
+    pos: [0.0415, -0.003, 0.0]          # right rubber-hand mesh origin
     rot: [1.0, 0.0, 0.0, 0.0]
 ```
 
 **Note:** Do not tune this offset by eye without defining the target. The
-29-DoF XML places the rubber-hand mesh origin at X=0.0415 m, while its hand
-collision capsule spans X=0.05..0.10 m. This plan defines the goal keypoint as
-the collision capsule/palm center at X=0.075 m. The renderer, training FK, and
-controller reference must use the same definition.
+29-DoF XML places the rubber-hand mesh origin at X=0.0415 m. The implemented
+goal keypoint uses that origin plus the XML's mirrored lateral offsets. The
+renderer, training FK, and controller reference must use the same definition.
 
 #### 4e. Visualization marker colors — add 6 wrist joint entries
 
@@ -846,14 +878,17 @@ Modified:
   docs/planner_v2_goal_scene.md                        (body count, wrist lock)
   docs/planner_vx_field_regulation.md                  (feature component table)
 
-No changes needed (auto-adapt to DOF_DIM):
-  robotmdar/skeleton/forward_kinematics.py             (reads XML generically)
+Mostly dimension-generic, with explicit order validation added:
+  robotmdar/skeleton/forward_kinematics.py             (reads XML generically;
+                                                        validates body/joint/
+                                                        actuator order)
   robotmdar/dataloader/data.py                         (reads NPZ generically)
   robotmdar/eval/generate_dar.py                       (uses val_data generically)
   robotmdar/planner/planner_dar.py                     (uses val_data generically)
   robotmdar/train/manager.py                           (loss calcs use
                                                         DOF_DIM-derived shapes)
-  robotmdar/train/train_dar.py                         (generic training loop)
+  robotmdar/train/train_dar.py                         (generic training loop;
+                                                        validates 29-DoF order)
 
 Must retrain:
   All VAE checkpoints

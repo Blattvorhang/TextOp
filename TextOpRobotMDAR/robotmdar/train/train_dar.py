@@ -12,8 +12,91 @@ from robotmdar.utils.goal import (
 from robotmdar.utils.occupancy import query_local_occupancy
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
-from robotmdar.dtype.motion import DOF_DIM, motion_feature_dim
+from robotmdar.dtype.motion import (
+    DOF_DIM,
+    G1_MUJOCO_DOF_JOINT_NAMES,
+    G1_MUJOCO_DOF_LINK_NAMES,
+    motion_feature_dim,
+)
 from robotmdar.train.manager import DARManager, is_main_process, get_ddp_model
+
+
+def _make_root_xy_figure(
+    generated_trajectory: torch.Tensor,
+    goal_xy: torch.Tensor,
+    ground_truth_trajectory: torch.Tensor = None,
+    goal_condition_keep_mask: torch.Tensor = None,
+    max_samples: int = 4,
+):
+    """Plot full-sample root paths in the reference ego horizontal plane."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    generated = generated_trajectory.detach().float().cpu()
+    goals = goal_xy.detach().float().cpu()
+    ground_truth = (
+        ground_truth_trajectory.detach().float().cpu()
+        if ground_truth_trajectory is not None else None
+    )
+    if goal_condition_keep_mask is None:
+        indices = torch.arange(generated.shape[0])
+    else:
+        keep = goal_condition_keep_mask.detach().bool().cpu()
+        indices = torch.nonzero(keep, as_tuple=False).flatten()
+    if indices.numel() == 0:
+        indices = torch.arange(generated.shape[0])
+    indices = indices[:max_samples]
+
+    count = max(int(indices.numel()), 1)
+    cols = min(2, count)
+    rows = (count + cols - 1) // cols
+    figure = Figure(figsize=(6.0 * cols, 5.0 * rows), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(rows, cols, squeeze=False)
+
+    for axis, sample_idx in zip(axes.flat, indices.tolist()):
+        generated_xy = generated[sample_idx].numpy()
+        goal = goals[sample_idx, :2].numpy()
+        axis.plot(
+            generated_xy[:, 0], generated_xy[:, 1],
+            color='#0072B2', linewidth=2.2, label='generated',
+        )
+        if ground_truth is not None:
+            ground_truth_xy = ground_truth[sample_idx].numpy()
+            axis.plot(
+                ground_truth_xy[:, 0], ground_truth_xy[:, 1],
+                color='#666666', linewidth=1.5, linestyle='--',
+                label='ground truth',
+            )
+        axis.plot(
+            [0.0, goal[0]], [0.0, goal[1]],
+            color='#BBBBBB', linewidth=1.0, linestyle=':', label='goal ray',
+        )
+        axis.scatter([0.0], [0.0], color='#222222', s=35, zorder=4,
+                     label='start')
+        axis.scatter([goal[0]], [goal[1]], color='#D55E00', marker='X',
+                     s=90, zorder=5, label='goal')
+        axis.scatter(
+            [generated_xy[-1, 0]], [generated_xy[-1, 1]],
+            color='#0072B2', marker='s', s=40, zorder=4,
+            label='generated end',
+        )
+        endpoint_error = torch.linalg.vector_norm(
+            generated[sample_idx, -1] - goals[sample_idx, :2]
+        ).item()
+        axis.set_title(
+            f'sample {sample_idx} | endpoint error {endpoint_error:.3f} m'
+        )
+        axis.set_xlabel('ego x (m)')
+        axis.set_ylabel('ego y (m)')
+        axis.set_aspect('equal', adjustable='datalim')
+        axis.grid(True, color='#DDDDDD', linewidth=0.7)
+        axis.legend(loc='best', fontsize=8)
+
+    for axis in axes.flat[count:]:
+        axis.set_visible(False)
+    figure.suptitle('Full-sample root XY trajectory (reference ego frame)')
+    return figure
 
 
 def _pose_dict(position: torch.Tensor, rotation: torch.Tensor):
@@ -123,6 +206,25 @@ def _validate_29dof_contract(cfg, datasets, vae, denoiser) -> None:
             raise ValueError(
                 f"{split} skeleton has {skeleton_dof} DoFs, expected {DOF_DIM}"
             )
+        stats_order = stats.get('dof_order')
+        if stats_order is not None and str(stats_order).lower() != 'mujoco':
+            raise ValueError(
+                f"{split} dataset uses {stats_order!r} DOF order, expected 'mujoco'"
+            )
+        stats_names = stats.get('dof_names')
+        if (stats_names is not None
+                and tuple(stats_names) != G1_MUJOCO_DOF_JOINT_NAMES):
+            raise ValueError(
+                f"{split} dataset DOF names do not match the G1 MuJoCo order"
+            )
+        if tuple(dataset.skeleton.fk.dof_joint_names) != G1_MUJOCO_DOF_JOINT_NAMES:
+            raise ValueError(
+                f"{split} MJCF joint order does not match the training contract"
+            )
+        if tuple(dataset.skeleton.fk.body_names[1:]) != G1_MUJOCO_DOF_LINK_NAMES:
+            raise ValueError(
+                f"{split} MJCF body order does not match the training contract"
+            )
         if (
             dataset.mean.shape[-1] != motion_feature_dim
             or dataset.std.shape[-1] != motion_feature_dim
@@ -202,6 +304,27 @@ def _validate_batch(batch, cfg) -> None:
                 )
 
 
+def _validate_goal_position_contract(cfg) -> None:
+    """Require the goal to be the generated primitive's terminal pose."""
+    weight = float(
+        cfg.train.manager.loss_weight.get('goal_position', 0.0))
+    if weight <= 0.0:
+        return
+
+    offset_range = cfg.data.get('goal_offset_range')
+    if offset_range is None:
+        offsets = (int(cfg.data.get('goal_offset', 0)),) * 2
+    else:
+        offsets = tuple(int(value) for value in offset_range)
+    if not bool(cfg.data.goal_per_primitive) or offsets != (0, 0):
+        raise ValueError(
+            "goal_position loss requires goal_per_primitive=true and a fixed "
+            "zero goal offset; otherwise the conditioned goal is not the "
+            f"generated primitive endpoint (got goal_per_primitive="
+            f"{cfg.data.goal_per_primitive}, goal_offset_range={offsets})"
+        )
+
+
 def main(cfg: DictConfig):
     # Initialize DDP
     rank, world_size, local_rank = ddp_setup()
@@ -210,6 +333,7 @@ def main(cfg: DictConfig):
     seed.set(cfg.seed + rank)
     logger.set(cfg)
     validate_goal_config(cfg.data.goal_type, cfg.denoiser.goal_dim)
+    _validate_goal_position_contract(cfg)
     if cfg.train.manager.use_static_pose:
         raise ValueError(
             "Static-pose replacement has no world reference pose and is not "
@@ -480,6 +604,74 @@ def main(cfg: DictConfig):
                         goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                         goal_type=cfg.data.goal_type,
                         is_eval=True)
+
+                    if getattr(manager, 'eval_full_sample', False):
+                        sample_latent = diffusion.p_sample_loop(
+                            denoiser,
+                            x_start.shape,
+                            clip_denoised=False,
+                            model_kwargs={'y': y},
+                            progress=False,
+                        )
+                        sample_future = vae.decode(
+                            sample_latent.permute(1, 0, 2),
+                            history_motion,
+                            nfuture=future_len,
+                        )
+                        sample_trajectory = manager.root_trajectory_ego(
+                            sample_future, history_motion)
+                        sample_displacement = sample_trajectory[:, -1]
+                        goal_keep_mask = y.get('goal_condition_keep_mask')
+                        extras['sample_goal_position'] = (
+                            manager.calc_goal_position_loss(
+                                sample_future,
+                                y['goal'],
+                                goal_keep_mask,
+                                history_motion=history_motion,
+                            )
+                        )
+                        extras['sample_goal_direction'] = (
+                            manager.calc_goal_direction_loss(
+                                sample_future,
+                                y['goal'],
+                                goal_keep_mask,
+                                history_motion=history_motion,
+                            )
+                        )
+                        endpoint_error = torch.linalg.vector_norm(
+                            sample_displacement - y['goal'][:, :2], dim=-1
+                        )
+                        if goal_keep_mask is not None:
+                            endpoint_error = endpoint_error[
+                                goal_keep_mask.to(dtype=torch.bool)
+                            ]
+                        if endpoint_error.numel() > 0:
+                            extras['sample_endpoint_error_m'] = (
+                                endpoint_error.mean()
+                            )
+                        extras['sample_root_displacement'] = (
+                            sample_displacement.norm(dim=-1).mean()
+                        )
+                        extras['goal_root_displacement'] = (
+                            y['goal'][:, :2].norm(dim=-1).mean()
+                        )
+                        extras['sample_latent_std'] = sample_latent.std()
+                        if manager.should_report_eval_visualization():
+                            ground_truth_trajectory = manager.root_trajectory_ego(
+                                future_motion_gt, history_motion
+                            )
+                            figure = _make_root_xy_figure(
+                                sample_trajectory,
+                                y['goal'][:, :2],
+                                ground_truth_trajectory,
+                                goal_keep_mask,
+                            )
+                            manager.platform.report_figure(
+                                'root_xy_trajectory',
+                                figure,
+                                manager.step,
+                                group_name='eval',
+                            )
 
                 manager.post_step(
                     is_eval=True,

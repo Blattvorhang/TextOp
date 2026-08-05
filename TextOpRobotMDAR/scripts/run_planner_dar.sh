@@ -1,6 +1,12 @@
-DATADIR=BONES-SEED-23dof-FULL-50fps
+#!/usr/bin/env bash
+set -euo pipefail
 
-robotmdar --config-name=planner_dar ckpt.dar=./logs/pretrained/goal_scene_v1/ckpt_37500.pth \
+DATADIR="BONES-SEED-29dof-FULL-50fps"
+DAR_CKPT="./logs/pretrained/body_29dof/ckpt_35000.pth"
+
+robotmdar --config-name=planner_dar \
+    ckpt.dar="${DAR_CKPT}" \
     data.datadir=./dataset/${DATADIR} \
     data.action_statistics_path=./dataset/${DATADIR}/action_statistics.json \
-    skeleton.asset.assetRoot=./description/robots/g1/
+    skeleton.asset.assetRoot=./description/robots/g1/ \
+    "$@"

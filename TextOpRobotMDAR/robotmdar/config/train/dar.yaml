@@ -21,6 +21,7 @@ manager:
   save_every: 20000
   eval_every: 2000
   eval_steps: 10
+  eval_full_sample: True
 
   device: ${...device}
   save_dir: ${...experiment_dir}
@@ -42,7 +43,8 @@ manager:
     dof_pos: 0.03
     dof_vel: 1e-5
     foot_contact: 0.01
-    goal_direction: 0.0
+    goal_direction: 0.01
+    goal_position: 0.5
 
     fk_joints_rec: 1.0
     joints_consistency: 1.0

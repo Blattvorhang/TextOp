@@ -33,7 +33,10 @@ from robotmdar.utils.goal import (
     build_ego_goal,
     validate_goal_config,
 )
-from robotmdar.utils.planner_convert import load_goal_keypoints_from_reference
+from robotmdar.utils.planner_convert import (
+    load_goal_keypoints_from_reference,
+    mujoco_to_isaaclab_dof,
+)
 from robotmdar.dtype import seed, logger as dtype_logger
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 from robotmdar.dtype.motion import (G1_ROOT_HEIGHT, motion_dict_to_qpos,
@@ -68,12 +71,6 @@ _NPZ_FPS = None
 _NPZ_HISTORY_LEN = None
 _NPZ_SKELETON_BODY_NAMES: list = []
 
-# MuJoCo → IsaacLab joint reindex
-_NPZ_MJC2ISAAC = [
-    0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24,
-    18, 25, 19, 26, 20, 27, 21, 28
-]
-
 # The 14 body names the TextOp Tracker expects (motion_loader.cpp body_names)
 _NPZ_TRACKER_BODIES = [
     "pelvis",
@@ -92,16 +89,6 @@ _NPZ_TRACKER_BODIES = [
     "right_wrist_yaw_link",
 ]
 
-
-def _npz_expand_23_to_29(v: np.ndarray) -> np.ndarray:
-    """Pad 23-DoF (wrists locked) → 29-DoF for IsaacLab."""
-    T = v.shape[0]
-    out = np.zeros((T, 29), dtype=v.dtype)
-    out[:, :19] = v[:, :19]
-    out[:, 22:26] = v[:, 19:23]
-    return out
-
-
 def _npz_save():
     """Called on exit. Concatenates all accumulated blocks and writes NPZ."""
     global _NPZ_BUFFER, _NPZ_SKELETON_BODY_NAMES
@@ -116,15 +103,13 @@ def _npz_save():
         all_body_trans.append(body_trans)
         all_body_rot.append(body_rot)
 
-    dof_pos_all  = np.concatenate(all_dof_pos, axis=0)    # [T, 23]
-    dof_vel_all  = np.concatenate(all_dof_vel, axis=0)    # [T, 23]
+    dof_pos_all  = np.concatenate(all_dof_pos, axis=0)    # [T, 29], MuJoCo order
+    dof_vel_all  = np.concatenate(all_dof_vel, axis=0)    # [T, 29], MuJoCo order
     body_trans_all = np.concatenate(all_body_trans, axis=0)  # [T, N, 3]
     body_rot_all = np.concatenate(all_body_rot, axis=0)      # [T, N, 4] xyzw
 
-    dof_pos_29 = _npz_expand_23_to_29(dof_pos_all)
-    dof_vel_29 = _npz_expand_23_to_29(dof_vel_all)
-    dof_pos_isaaclab = dof_pos_29[:, _NPZ_MJC2ISAAC]
-    dof_vel_isaaclab = dof_vel_29[:, _NPZ_MJC2ISAAC]
+    dof_pos_isaaclab = mujoco_to_isaaclab_dof(dof_pos_all)
+    dof_vel_isaaclab = mujoco_to_isaaclab_dof(dof_vel_all)
 
     # Convert body rotations: xyzw → wxyz (MuJoCo convention → IsaacLab convention)
     body_rot_all_wxyz = body_rot_all[..., [3, 0, 1, 2]]

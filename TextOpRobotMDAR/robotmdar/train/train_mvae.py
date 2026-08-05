@@ -7,7 +7,12 @@ from omegaconf import DictConfig
 
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import Dataset, VAE, Optimizer
-from robotmdar.dtype.motion import DOF_DIM, motion_feature_dim
+from robotmdar.dtype.motion import (
+    DOF_DIM,
+    G1_MUJOCO_DOF_JOINT_NAMES,
+    G1_MUJOCO_DOF_LINK_NAMES,
+    motion_feature_dim,
+)
 from robotmdar.train.manager import MVAEManager, is_main_process, get_ddp_model
 
 
@@ -77,6 +82,25 @@ def _validate_29dof_contract(cfg, datasets, vae) -> None:
         if skeleton_dof != DOF_DIM:
             raise ValueError(
                 f"{split} skeleton has {skeleton_dof} DoFs, expected {DOF_DIM}"
+            )
+        stats_order = stats.get('dof_order')
+        if stats_order is not None and str(stats_order).lower() != 'mujoco':
+            raise ValueError(
+                f"{split} dataset uses {stats_order!r} DOF order, expected 'mujoco'"
+            )
+        stats_names = stats.get('dof_names')
+        if (stats_names is not None
+                and tuple(stats_names) != G1_MUJOCO_DOF_JOINT_NAMES):
+            raise ValueError(
+                f"{split} dataset DOF names do not match the G1 MuJoCo order"
+            )
+        if tuple(dataset.skeleton.fk.dof_joint_names) != G1_MUJOCO_DOF_JOINT_NAMES:
+            raise ValueError(
+                f"{split} MJCF joint order does not match the training contract"
+            )
+        if tuple(dataset.skeleton.fk.body_names[1:]) != G1_MUJOCO_DOF_LINK_NAMES:
+            raise ValueError(
+                f"{split} MJCF body order does not match the training contract"
             )
         if (
             dataset.mean.shape[-1] != motion_feature_dim
