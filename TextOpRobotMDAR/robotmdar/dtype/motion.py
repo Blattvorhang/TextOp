@@ -44,6 +44,14 @@ G1_MUJOCO_DOF_LINK_NAMES = (
     "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
 )
 
+G1_WRIST_DOF_INDICES = tuple(
+    index for index, name in enumerate(G1_MUJOCO_DOF_JOINT_NAMES)
+    if '_wrist_' in name
+)
+G1_CORE_DOF_INDICES = tuple(
+    index for index in range(DOF_DIM) if index not in G1_WRIST_DOF_INDICES
+)
+
 G1_ROOT_HEIGHT = 0.77  # meters
 
 G1_DEFAULT_DOF = (
@@ -58,6 +66,8 @@ G1_DEFAULT_DOF = (
 assert len(G1_DEFAULT_DOF) == DOF_DIM
 assert len(G1_MUJOCO_DOF_JOINT_NAMES) == DOF_DIM
 assert len(G1_MUJOCO_DOF_LINK_NAMES) == DOF_DIM
+assert G1_WRIST_DOF_INDICES == (19, 20, 21, 26, 27, 28)
+assert len(G1_CORE_DOF_INDICES) == 23
 
 
 # Define MotionDict with explicit component shapes

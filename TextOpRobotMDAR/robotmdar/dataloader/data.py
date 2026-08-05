@@ -509,7 +509,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 device=motion_feature.device, dtype=torch.float32)
 
         if ret_fk:
-            return self.skeleton.forward_kinematics(motion_dict, return_full=ret_fk_full)
+            return self.skeleton.forward_kinematics(
+                motion_dict, return_full=ret_fk_full, fps=self.fps
+            )
         else:
             return motion_dict
 
@@ -539,7 +541,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 raw_motion['root_rot'][goal_frame:goal_frame + 1],
                 dtype=torch.float32),
         }
-        goal_fk = self.skeleton.forward_kinematics(goal_motion)
+        goal_fk = self.skeleton.forward_kinematics(
+            goal_motion, fps=self.fps
+        )
         keypoint_ids = (
             self.skeleton.goal_limb_keypoint_id
             if self.goal_type is GoalType.BODY_EXT
