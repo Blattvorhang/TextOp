@@ -1,5 +1,6 @@
 
 motion_lib_type: 'origin'
+dof_dim: ${data.dof_dim}
 asset:
   assetRoot: "description/robots/g1/"
   assetFileName: "g1_29dof.xml"

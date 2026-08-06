@@ -14,6 +14,7 @@ import joblib
 ROOT_TRANS_OFFSET_DIM = 3  # xyz (m)
 ROOT_ROT_DIM = 4  # Quat, xyzw
 DOF_DIM = 29  # Full G1 skeleton, including both 3-DoF wrists.
+SUPPORTED_DOF_DIMS = (23, 29)
 CONTACT_MASK_DIM = 2  # 2 feet
 
 G1_MUJOCO_DOF_JOINT_NAMES = (
@@ -51,6 +52,7 @@ G1_WRIST_DOF_INDICES = tuple(
 G1_CORE_DOF_INDICES = tuple(
     index for index in range(DOF_DIM) if index not in G1_WRIST_DOF_INDICES
 )
+G1_23DOF_FROM_29DOF_INDICES = G1_CORE_DOF_INDICES
 
 G1_ROOT_HEIGHT = 0.77  # meters
 
@@ -68,6 +70,26 @@ assert len(G1_MUJOCO_DOF_JOINT_NAMES) == DOF_DIM
 assert len(G1_MUJOCO_DOF_LINK_NAMES) == DOF_DIM
 assert G1_WRIST_DOF_INDICES == (19, 20, 21, 26, 27, 28)
 assert len(G1_CORE_DOF_INDICES) == 23
+
+
+def motion_feature_dim_for_dof(dof_dim: int) -> int:
+    """Return the FeatureVersion 3 width for a supported G1 contract."""
+    dof_dim = int(dof_dim)
+    if dof_dim not in SUPPORTED_DOF_DIMS:
+        raise ValueError(
+            f"G1 training supports dof_dim 23 or 29, got {dof_dim}"
+        )
+    return 11 + 2 * dof_dim
+
+
+def infer_feature_v3_dof_dim(feature_dim: int) -> int:
+    """Infer the G1 DoF count from a FeatureVersion 3 tensor width."""
+    for dof_dim in SUPPORTED_DOF_DIMS:
+        if int(feature_dim) == motion_feature_dim_for_dof(dof_dim):
+            return dof_dim
+    raise ValueError(
+        f"FeatureVersion 3 expects 57 or 69 features, got {feature_dim}"
+    )
 
 
 # Define MotionDict with explicit component shapes
@@ -348,7 +370,7 @@ def motion_dict_to_feature_v2(motion_dict: MotionDict) -> Tuple[MotionFeatureV2,
     # 输入N+1帧，返回N帧的feature
     trans = motion_dict['root_trans_offset']  # ([B,] T+1, 3)
     rot = motion_dict['root_rot']  # ([B], T+1, 4)
-    dof = motion_dict['dof']  # ([B], T+1, 29)
+    dof = motion_dict['dof']  # ([B], T+1, 23 or 29)
     contact = motion_dict['contact_mask']  # ([B], T+1, 2)
     if len(trans.shape) == 2:
         expanded = True
@@ -510,9 +532,9 @@ def motion_dict_to_feature_v3(motion_dict: MotionDict, skeleton: None = None) ->
     rot = motion_dict['root_rot']  # ([B], T+1, 4)
     dof = motion_dict['dof']  # ([B], T+1, 29)
     contact = motion_dict['contact_mask']  # ([B], T+1, 2)
-    if dof.shape[-1] != DOF_DIM:
+    if dof.shape[-1] not in SUPPORTED_DOF_DIMS:
         raise ValueError(
-            f"FeatureVersion 3 expects {DOF_DIM} DoFs, got {dof.shape[-1]}"
+            f"FeatureVersion 3 expects 23 or 29 DoFs, got {dof.shape[-1]}"
         )
     if len(trans.shape) == 2:
         expanded = True
@@ -564,14 +586,10 @@ def motion_feature_to_dict_v3(motion_feature: MotionFeatureV3, abs_pose: Optiona
     contact = motion_feature[..., 5:7]
     delta_trans_local = motion_feature[..., 7:10]  # (t+1) - t
     height = motion_feature[..., 10]  #+ 0.8  # 高度
-    expected_dim = 11 + 2 * DOF_DIM
-    if motion_feature.shape[-1] != expected_dim:
-        raise ValueError(
-            f"FeatureVersion 3 expects {expected_dim} features for "
-            f"{DOF_DIM} DoFs, got {motion_feature.shape[-1]}"
-        )
-    dof = motion_feature[..., 11:11 + DOF_DIM]
-    delta_dof = motion_feature[..., 11 + DOF_DIM:expected_dim]
+    dof_dim = infer_feature_v3_dof_dim(motion_feature.shape[-1])
+    expected_dim = motion_feature_dim_for_dof(dof_dim)
+    dof = motion_feature[..., 11:11 + dof_dim]
+    delta_dof = motion_feature[..., 11 + dof_dim:expected_dim]
 
     # 计算roll和pitch
     roll = torch.atan2(sin_roll, cos_roll)
@@ -1264,14 +1282,18 @@ def get_zero_feature_v1() -> MotionFeatureV1:
     return feat
 
 
-def get_zero_feature_v2() -> MotionFeatureV2:
+def get_zero_feature_v2(dof_dim: int = DOF_DIM) -> MotionFeatureV2:
     """
     Returns a zero-initialized motion feature tensor for v2.
     """
-    feat = torch.zeros((1, motion_feature_dim_v2), dtype=torch.float32)
+    feature_dim = motion_feature_dim_for_dof(dof_dim)
+    feat = torch.zeros((1, feature_dim), dtype=torch.float32)
     feat[0, 5:7] = 1.0  # contact mask
     feat[0, 10] = 0.75  # Set height
-    feat[0, 11:11 + DOF_DIM] = torch.tensor(G1_DEFAULT_DOF)
+    default_dof = torch.tensor(G1_DEFAULT_DOF)
+    if dof_dim == 23:
+        default_dof = default_dof[list(G1_23DOF_FROM_29DOF_INDICES)]
+    feat[0, 11:11 + dof_dim] = default_dof
     # delta dof部分保持为0
     return feat
 

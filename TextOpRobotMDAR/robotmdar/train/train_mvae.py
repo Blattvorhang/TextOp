@@ -5,11 +5,9 @@ from omegaconf import DictConfig
 
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import Dataset, VAE, Optimizer
-from robotmdar.dtype.motion import (
-    DOF_DIM,
-    G1_MUJOCO_DOF_JOINT_NAMES,
-    G1_MUJOCO_DOF_LINK_NAMES,
-    motion_feature_dim,
+from robotmdar.utils.dof_contract import (
+    configure_dof_contract,
+    validate_training_contract,
 )
 from robotmdar.train.manager import MVAEManager
 
@@ -35,74 +33,9 @@ def evaluate_distribution_match(normalized_data):
     }
 
 
-def _validate_29dof_contract(cfg, datasets, vae) -> None:
-    """Fail before training if data, FK, and VAE dimensions disagree."""
-    if DOF_DIM != 29 or motion_feature_dim != 69:
-        raise RuntimeError(
-            "MVAE 29-DoF training requires DOF_DIM=29 and FeatureVersion 3 "
-            f"dimension 69, got DOF_DIM={DOF_DIM}, nfeats={motion_feature_dim}"
-        )
-    if int(cfg.data.nfeats) != motion_feature_dim:
-        raise ValueError(
-            f"data.nfeats={cfg.data.nfeats}, expected {motion_feature_dim}"
-        )
-
-    for split, dataset in datasets:
-        stats = dataset.statistics
-        stats_dof = int(stats.get('dof_dim', DOF_DIM))
-        stats_nfeats = int(stats.get('nfeats', motion_feature_dim))
-        skeleton_dof = int(dataset.skeleton.fk.num_dof)
-        if stats_dof != DOF_DIM or stats_nfeats != motion_feature_dim:
-            raise ValueError(
-                f"{split} dataset is not native 29-DoF/69-D: "
-                f"statistics dof_dim={stats_dof}, nfeats={stats_nfeats}"
-            )
-        if skeleton_dof != DOF_DIM:
-            raise ValueError(
-                f"{split} skeleton has {skeleton_dof} DoFs, expected {DOF_DIM}"
-            )
-        stats_order = stats.get('dof_order')
-        if stats_order is not None and str(stats_order).lower() != 'mujoco':
-            raise ValueError(
-                f"{split} dataset uses {stats_order!r} DOF order, expected 'mujoco'"
-            )
-        stats_names = stats.get('dof_names')
-        if (stats_names is not None
-                and tuple(stats_names) != G1_MUJOCO_DOF_JOINT_NAMES):
-            raise ValueError(
-                f"{split} dataset DOF names do not match the G1 MuJoCo order"
-            )
-        if tuple(dataset.skeleton.fk.dof_joint_names) != G1_MUJOCO_DOF_JOINT_NAMES:
-            raise ValueError(
-                f"{split} MJCF joint order does not match the training contract"
-            )
-        if tuple(dataset.skeleton.fk.body_names[1:]) != G1_MUJOCO_DOF_LINK_NAMES:
-            raise ValueError(
-                f"{split} MJCF body order does not match the training contract"
-            )
-        if (
-            dataset.mean.shape[-1] != motion_feature_dim
-            or dataset.std.shape[-1] != motion_feature_dim
-        ):
-            raise ValueError(
-                f"{split} normalization has shape mean={tuple(dataset.mean.shape)}, "
-                f"std={tuple(dataset.std.shape)}; remove stale meanstd.pkl and "
-                f"recompute {motion_feature_dim}-D statistics"
-            )
-
-    if vae.skel_embedding.in_features != motion_feature_dim:
-        raise ValueError(
-            f"VAE encoder expects {vae.skel_embedding.in_features} features, "
-            f"expected {motion_feature_dim}"
-        )
-    if vae.final_layer.out_features != motion_feature_dim:
-        raise ValueError(
-            f"VAE decoder emits {vae.final_layer.out_features} features, "
-            f"expected {motion_feature_dim}"
-        )
-
-
-def _validate_batch(batch, num_primitive: int, context_len: int) -> None:
+def _validate_batch(
+    batch, num_primitive: int, context_len: int, nfeats: int
+) -> None:
     if len(batch) != num_primitive:
         raise ValueError(
             f"Dataset returned {len(batch)} primitives, expected {num_primitive}"
@@ -114,14 +47,15 @@ def _validate_batch(batch, num_primitive: int, context_len: int) -> None:
                 f"Primitive {primitive_idx} has {motion.shape[1]} frames, "
                 f"expected history+future={context_len}"
             )
-        if motion.shape[-1] != motion_feature_dim:
+        if motion.shape[-1] != nfeats:
             raise ValueError(
                 f"Primitive {primitive_idx} has {motion.shape[-1]} features, "
-                f"expected {motion_feature_dim}"
+                f"expected {nfeats}"
             )
 
 
 def main(cfg: DictConfig):
+    configure_dof_contract(cfg)
     logger.set(cfg)
     seed.set(cfg.seed)
 
@@ -132,7 +66,7 @@ def main(cfg: DictConfig):
     optimizer: Optimizer = torch.optim.Adam(vae.parameters(), **cfg.train.opt)
     manager: MVAEManager = instantiate(cfg.train.manager)
 
-    _validate_29dof_contract(
+    validate_training_contract(
         cfg, [('train', train_data), ('val', val_data)], vae
     )
 
@@ -161,7 +95,10 @@ def main(cfg: DictConfig):
         vae.train()
         batch = next(train_dataiter)
         if not train_batch_validated:
-            _validate_batch(batch, num_primitive, history_len + future_len)
+            _validate_batch(
+                batch, num_primitive, history_len + future_len,
+                int(cfg.data.nfeats),
+            )
             train_batch_validated = True
 
         prev_motion = None
@@ -221,7 +158,10 @@ def main(cfg: DictConfig):
         while manager.should_eval():
             batch = next(val_dataiter)
             if not val_batch_validated:
-                _validate_batch(batch, num_primitive, history_len + future_len)
+                _validate_batch(
+                    batch, num_primitive, history_len + future_len,
+                    int(cfg.data.nfeats),
+                )
                 val_batch_validated = True
             for pidx in range(num_primitive):
                 manager.pre_step(is_eval=True)

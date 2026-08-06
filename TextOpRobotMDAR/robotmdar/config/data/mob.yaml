@@ -1,6 +1,19 @@
 skeleton: ${..skeleton}
 
-nfeats: 69
+# Model-facing joint contract. Both variants read the same prepared 29-DoF
+# motions; the dataset projects them to the legacy 23-DoF order when selected.
+dof_dim: 29
+dof_variants:
+  dof23:
+    nfeats: 57
+    normalization_path: dataset/BONES-SEED-23dof-FULL-50fps/meanstd.pkl
+    vae_ckpt: logs/pretrained/long_horizon_64/vae.pth
+  dof29:
+    nfeats: 69
+    normalization_path: null
+    vae_ckpt: null
+nfeats: ${oc.select:data.dof_variants.dof${data.dof_dim}.nfeats}
+normalization_path: ${oc.select:data.dof_variants.dof${data.dof_dim}.normalization_path}
 history_len: 16
 future_len: 64
 num_primitive: 4
@@ -29,6 +42,8 @@ common: &common
   robot_cfg: ${skeleton}
   device: cuda
   nfeats: ${..nfeats}
+  dof_dim: ${..dof_dim}
+  normalization_path: ${..normalization_path}
   history_len: ${..history_len}
   future_len: ${..future_len}
   num_primitive: ${..num_primitive}
