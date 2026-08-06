@@ -15,8 +15,12 @@ from omegaconf import DictConfig, OmegaConf
 from robotmdar.dtype import logger as dtype_logger
 from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
-from robotmdar.dtype.motion import FeatureVersion
+from robotmdar.dtype.motion import FeatureVersion, infer_feature_v3_dof_dim
 from robotmdar.eval.generate_dar import generate_next_motion
+from robotmdar.utils.dof_contract import (
+    configure_dof_contract,
+    validate_training_contract,
+)
 from robotmdar.utils.goal import GoalType, validate_goal_config
 from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
@@ -61,7 +65,13 @@ def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
     model_cfg_path = Path(to_absolute_path(str(model_cfg_path)))
     model_cfg = OmegaConf.load(model_cfg_path)
 
+    runtime_dof_dim = int(cfg.data.dof_dim)
+    checkpoint_nfeats = int(model_cfg.data.nfeats)
+    checkpoint_dof_dim = int(
+        model_cfg.data.get(
+            "dof_dim", infer_feature_v3_dof_dim(checkpoint_nfeats)))
     expected = {
+        "dof_dim": (runtime_dof_dim, checkpoint_dof_dim),
         "nfeats": (int(cfg.data.nfeats), int(model_cfg.data.nfeats)),
         "history_len": (
             int(cfg.data.history_len), int(model_cfg.data.history_len)),
@@ -82,10 +92,17 @@ def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
             f"goal_type: runtime={runtime_goal_type.value}, "
             f"checkpoint={checkpoint_goal_type.value}")
     humanoid_type = str(model_cfg.data.skeleton.humanoid_type)
-    if int(model_cfg.data.nfeats) != 69 or humanoid_type != "g1_29dof":
+    expected_humanoid_type = {
+        23: "g1_23dof_lock_wrist",
+        29: "g1_29dof",
+    }.get(checkpoint_dof_dim)
+    if expected_humanoid_type is None:
         mismatches.append(
-            "checkpoint is not a 29-DoF G1 model "
-            f"(nfeats={model_cfg.data.nfeats}, humanoid_type={humanoid_type})")
+            f"checkpoint dof_dim={checkpoint_dof_dim}, expected 23 or 29")
+    elif humanoid_type != expected_humanoid_type:
+        mismatches.append(
+            f"checkpoint humanoid_type={humanoid_type}, expected "
+            f"{expected_humanoid_type} for {checkpoint_dof_dim} DoFs")
     if mismatches:
         raise ValueError(
             f"Incompatible DAR checkpoint config {model_cfg_path}: "
@@ -98,6 +115,7 @@ def main(cfg: DictConfig) -> None:
     from sonicmsg import PlannerNode
     from sonicmsg.messages import unpack_occ
 
+    configure_dof_contract(cfg)
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
     goal_type = validate_goal_config(
@@ -115,8 +133,12 @@ def main(cfg: DictConfig) -> None:
             f"planner_dar requires FeatureVersion 3, got {FeatureVersion}")
 
     _model_cfg_path, _model_cfg = _checkpoint_config(cfg)
-    logger.info("Loading 29-DoF DAR model and dataset statistics")
+    logger.info(
+        "Loading {}-DoF/{}-D DAR model and dataset statistics",
+        cfg.data.dof_dim, cfg.data.nfeats)
     vae, denoiser, diffusion, val_data = _load_models(cfg)
+    validate_training_contract(
+        cfg, [("planner", val_data)], vae, denoiser)
     history_len = int(cfg.data.history_len)
     future_len = int(cfg.data.future_len)
     motion_fps = float(cfg.motion_fps)
@@ -397,7 +419,10 @@ def main(cfg: DictConfig) -> None:
                 skip_history = (
                     0 if bool(cfg.pub_all_frames) else history_len - 1)
                 motion = motion_dict_to_g1data(
-                    motion_dict, skip_history=skip_history, fps=motion_fps)
+                    motion_dict, skip_history=skip_history, fps=motion_fps,
+                    locked_joint_pos=np.asarray(
+                        latest_state.raw["g1_joint_pos"][-1],
+                        dtype=np.float32))
                 measured_pos = np.asarray(
                     latest_state.raw["g1_pos"][-1], dtype=np.float32)
                 measured_rot_xyzw = np.asarray(

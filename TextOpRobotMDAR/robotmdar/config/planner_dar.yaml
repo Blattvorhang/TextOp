@@ -38,12 +38,13 @@ comm_config: ${hydra:runtime.cwd}/robotmdar/config/communication/pubsub.yaml
 occ_grid: null
 
 data:
-  goal_type: body_ext
+  dof_dim: 23
+  goal_type: body
   history_len: 16
   future_len: 64
 
 denoiser:
-  goal_dim: 21
+  goal_dim: 15
 
 # Root yaw is present on the wire for compatibility but is intentionally not
 # used by the deployed V4 planner.
