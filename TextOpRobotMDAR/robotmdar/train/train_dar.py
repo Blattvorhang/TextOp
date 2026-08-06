@@ -79,10 +79,14 @@ def _make_root_xy_figure(
     indices = indices[:max_samples]
     count = max(int(indices.numel()), 1)
 
-    # ── unified square XY limit ──
+    # ── unified square XY limit (only over plotted samples) ──
     if xy_limit is None:
+        sel = indices  # (up to max_samples)
         xy_limit = _compute_xy_limit(
-            generated, ground_truth, history, goals_xy=goals,
+            generated[sel],
+            ground_truth[sel] if ground_truth is not None else None,
+            history[sel] if history is not None else None,
+            goals_xy=goals[sel],
         )
 
     cols = min(2, count)
