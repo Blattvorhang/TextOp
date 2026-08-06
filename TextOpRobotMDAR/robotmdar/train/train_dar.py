@@ -340,15 +340,10 @@ def main(cfg: DictConfig):
             "supported by goal+scene training"
         )
 
-    # Validate goal_direction loss compatibility
-    goal_type = GoalType.parse(cfg.data.goal_type)
-    goal_direction_weight = cfg.train.manager.loss_weight.get('goal_direction', 0.0)
-    if goal_direction_weight > 0.0 and goal_type is not GoalType.ROOT:
-        raise ValueError(
-            f"goal_direction loss (weight={goal_direction_weight}) is only "
-            f"supported for goal_type='root', got '{goal_type.value}'. "
-            "Set train.manager.loss_weight.goal_direction=0.0 for body goal."
-        )
+    # goal_direction and goal_position losses work with all goal types:
+    # - ROOT: ego_goal[..., :2] is [ego_root_x, ego_root_y]
+    # - BODY: ego_goal[..., :2] is the first body keypoint (root joint, index 0)
+    # - BODY_EXT: ego_goal[..., :2] is [ego_root_x, ego_root_y] (prepended)
 
     # Override device in config for downstream components
     cfg.device = str(device)
