@@ -1155,6 +1155,76 @@ class DARManager(BaseManager, GeometryLoss):
             (origin, delta_xy_start_frame.cumsum(dim=1)), dim=1
         )
 
+    def history_trajectory_ego(self, history_motion):
+        """Reverse-integrate history root XY in the reference ego frame.
+
+        Traces where the character came from, with the origin at the last
+        history frame (the reference frame). Each frame *t* encodes the
+        forward delta t→t+1; we integrate forward first then transform all
+        positions back to the reference frame.
+
+        Returns:
+            Tensor [B, history_len, 2] — ego XY positions of history
+            frames.  The last frame (reference) is always (0, 0).
+        """
+        if FeatureVersion != 3:
+            raise NotImplementedError(
+                "history trajectory integration currently supports "
+                "FeatureVersion 3 only"
+            )
+        if history_motion is None:
+            raise ValueError(
+                "history_motion is required to integrate history trajectory"
+            )
+        history = self.dataset.denormalize(history_motion)
+        B, H, _ = history.shape
+        if H < 2:
+            return torch.zeros(B, H, 2, device=history.device)
+
+        delta_yaw = history[..., 4]       # [B, H]
+        delta_xy = history[..., 7:9]      # [B, H, 2]
+
+        # ── yaw of each frame relative to frame 0 ──
+        relative_yaw = torch.cat(
+            (torch.zeros_like(delta_yaw[:, :1]), delta_yaw[:, :-1]),
+            dim=1,
+        ).cumsum(dim=1)  # [B, H]
+
+        cos_yaw = torch.cos(relative_yaw)
+        sin_yaw = torch.sin(relative_yaw)
+
+        # ── express every delta in frame-0 coordinates ──
+        delta_in_frame0 = torch.stack(
+            (
+                delta_xy[..., 0] * cos_yaw - delta_xy[..., 1] * sin_yaw,
+                delta_xy[..., 0] * sin_yaw + delta_xy[..., 1] * cos_yaw,
+            ),
+            dim=-1,
+        )  # [B, H, 2]
+
+        # ── cumulative positions relative to frame 0 ──
+        origin_frame0 = torch.zeros_like(delta_in_frame0[:, :1])
+        pos_frame0 = torch.cat(
+            (origin_frame0, delta_in_frame0.cumsum(dim=1)), dim=1
+        )  # [B, H+1, 2]  — frame 0 … frame H (first future) in frame-0 coords
+
+        # ── transform to reference frame (last history = index H-1) ──
+        ref_pos = pos_frame0[:, H - 1 : H]    # [B, 1, 2]
+        ref_yaw = relative_yaw[:, H - 1 : H]  # [B, 1]
+        d_pos = pos_frame0[:, :H] - ref_pos   # [B, H, 2]
+
+        cos_ref = torch.cos(-ref_yaw)
+        sin_ref = torch.sin(-ref_yaw)
+        ego_pos = torch.stack(
+            (
+                d_pos[..., 0] * cos_ref - d_pos[..., 1] * sin_ref,
+                d_pos[..., 0] * sin_ref + d_pos[..., 1] * cos_ref,
+            ),
+            dim=-1,
+        )  # [B, H, 2]
+
+        return ego_pos
+
     def save_model(self) -> None:
         if not is_main_process():
             return

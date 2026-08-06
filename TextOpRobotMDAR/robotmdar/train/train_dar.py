@@ -1,4 +1,6 @@
 import os
+import math
+
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
@@ -19,14 +21,43 @@ from robotmdar.utils.dof_contract import (
 from robotmdar.train.manager import DARManager, is_main_process, get_ddp_model
 
 
+# ── Default XY plot limit from 64-frame goal distribution analysis ──
+# The mode (peak of KDE) is ~0.02 m — most goals lie near the origin.
+# 0.2 gives a tight 0.4×0.4 m view centred on the reference frame;
+# expands dynamically when a trajectory or goal exceeds it.
+# See dataset/data_analyze/analyze_64f_goal_xy.py
+_DEFAULT_XY_LIMIT = 0.2
+
+
+def _compute_xy_limit(*trajectories, goals_xy, default=_DEFAULT_XY_LIMIT):
+    """Unified symmetric XY limit expanded if any data exceeds *default*."""
+    limit = default
+    for traj in trajectories:
+        if traj is not None and traj.numel():
+            limit = max(limit, float(traj.abs().max()))
+    if goals_xy is not None and goals_xy.numel():
+        limit = max(limit, float(goals_xy[:, :2].abs().max()))
+    # round up to nearest 0.5 m for clean axis labels
+    limit = math.ceil(limit * 2) / 2
+    return max(limit, default)
+
+
 def _make_root_xy_figure(
     generated_trajectory: torch.Tensor,
     goal_xy: torch.Tensor,
     ground_truth_trajectory: torch.Tensor = None,
     goal_condition_keep_mask: torch.Tensor = None,
+    history_trajectory: torch.Tensor = None,
+    xy_limit: float | None = None,
     max_samples: int = 4,
 ):
-    """Plot full-sample root paths in the reference ego horizontal plane."""
+    """Plot full-sample root paths in the reference ego horizontal plane.
+
+    Convention: **x-forward, y-left, z-up** (TextOp ego frame).
+    The origin (0, 0) is the last history frame — the reference pose for
+    the generated primitive.  All subplots share the same square XY limits
+    so that scale is directly comparable across samples.
+    """
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
@@ -36,6 +67,10 @@ def _make_root_xy_figure(
         ground_truth_trajectory.detach().float().cpu()
         if ground_truth_trajectory is not None else None
     )
+    history = (
+        history_trajectory.detach().float().cpu()
+        if history_trajectory is not None else None
+    )
     if goal_condition_keep_mask is None:
         indices = torch.arange(generated.shape[0])
     else:
@@ -44,8 +79,14 @@ def _make_root_xy_figure(
     if indices.numel() == 0:
         indices = torch.arange(generated.shape[0])
     indices = indices[:max_samples]
-
     count = max(int(indices.numel()), 1)
+
+    # ── unified square XY limit ──
+    if xy_limit is None:
+        xy_limit = _compute_xy_limit(
+            generated, ground_truth, history, goals_xy=goals,
+        )
+
     cols = min(2, count)
     rows = (count + cols - 1) // cols
     figure = Figure(figsize=(6.0 * cols, 5.0 * rows), constrained_layout=True)
@@ -55,45 +96,77 @@ def _make_root_xy_figure(
     for axis, sample_idx in zip(axes.flat, indices.tolist()):
         generated_xy = generated[sample_idx].numpy()
         goal = goals[sample_idx, :2].numpy()
+
+        # ── history curve (reverse-integrated) ──
+        if history is not None:
+            hist_xy = history[sample_idx].numpy()
+            axis.plot(
+                hist_xy[:, 0], hist_xy[:, 1],
+                color='#56B4E9', linewidth=1.6, linestyle='--',
+                label='history', zorder=2,
+            )
+
+        # ── generated trajectory ──
         axis.plot(
             generated_xy[:, 0], generated_xy[:, 1],
-            color='#0072B2', linewidth=2.2, label='generated',
+            color='#0072B2', linewidth=2.2, label='generated', zorder=3,
         )
+
+        # ── ground truth ──
         if ground_truth is not None:
             ground_truth_xy = ground_truth[sample_idx].numpy()
             axis.plot(
                 ground_truth_xy[:, 0], ground_truth_xy[:, 1],
                 color='#666666', linewidth=1.5, linestyle='--',
-                label='ground truth',
+                label='ground truth', zorder=3,
             )
+
+        # ── goal ray ──
         axis.plot(
             [0.0, goal[0]], [0.0, goal[1]],
             color='#BBBBBB', linewidth=1.0, linestyle=':', label='goal ray',
         )
-        axis.scatter([0.0], [0.0], color='#222222', s=35, zorder=4,
+
+        # ── markers ──
+        axis.scatter([0.0], [0.0], color='#222222', s=35, zorder=6,
                      label='start')
+        if history is not None:
+            axis.scatter(
+                [hist_xy[0, 0]], [hist_xy[0, 1]],
+                color='#56B4E9', marker='o', s=30, zorder=5,
+                label='history start',
+            )
         axis.scatter([goal[0]], [goal[1]], color='#D55E00', marker='X',
-                     s=90, zorder=5, label='goal')
+                     s=90, zorder=6, label='goal')
         axis.scatter(
             [generated_xy[-1, 0]], [generated_xy[-1, 1]],
-            color='#0072B2', marker='s', s=40, zorder=4,
+            color='#0072B2', marker='s', s=40, zorder=6,
             label='generated end',
         )
+
+        # ── endpoint error ──
         endpoint_error = torch.linalg.vector_norm(
             generated[sample_idx, -1] - goals[sample_idx, :2]
         ).item()
         axis.set_title(
-            f'sample {sample_idx} | endpoint error {endpoint_error:.3f} m'
+            f'sample {sample_idx}  |  endpoint error {endpoint_error:.3f} m'
         )
-        axis.set_xlabel('ego x (m)')
-        axis.set_ylabel('ego y (m)')
-        axis.set_aspect('equal', adjustable='datalim')
+
+        # ── unified scale & ego-consistent labels ──
+        axis.set_xlim(-xy_limit, xy_limit)
+        axis.set_ylim(-xy_limit, xy_limit)
+        axis.set_aspect('equal')
+        axis.set_xlabel('x-forward (m)')
+        axis.set_ylabel('y-left (m)')
         axis.grid(True, color='#DDDDDD', linewidth=0.7)
-        axis.legend(loc='best', fontsize=8)
+        axis.legend(loc='best', fontsize=7)
 
     for axis in axes.flat[count:]:
         axis.set_visible(False)
-    figure.suptitle('Full-sample root XY trajectory (reference ego frame)')
+    figure.suptitle(
+        f'Root XY trajectory  |  ego frame (x-fwd, y-left)  '
+        f'|  limit ±{xy_limit:.2f} m'
+    )
     return figure
 
 
@@ -655,11 +728,15 @@ def main(cfg: DictConfig):
                             ground_truth_trajectory = manager.root_trajectory_ego(
                                 future_motion_gt, history_motion
                             )
+                            hist_traj = manager.history_trajectory_ego(
+                                history_motion
+                            )
                             figure = _make_root_xy_figure(
                                 sample_trajectory,
                                 y['goal'][:, :2],
-                                ground_truth_trajectory,
-                                goal_keep_mask,
+                                ground_truth_trajectory=ground_truth_trajectory,
+                                history_trajectory=hist_traj,
+                                goal_condition_keep_mask=goal_keep_mask,
                             )
                             manager.platform.report_figure(
                                 'root_xy_trajectory',

@@ -134,4 +134,4 @@ def test_root_xy_figure_plots_generated_ground_truth_and_goal():
 
     assert len(figure.axes) == 1
     assert 'endpoint error 0.000 m' in figure.axes[0].get_title()
-    assert figure.axes[0].get_xlabel() == 'ego x (m)'
+    assert figure.axes[0].get_xlabel() == 'x-forward (m)'

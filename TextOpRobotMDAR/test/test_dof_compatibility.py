@@ -103,6 +103,13 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
             overrides=['data.dof_dim=29', 'ckpt.vae=/tmp/vae29.pth'],
         )
         configure_dof_contract(full)
+        planner = compose(config_name='planner_dar')
+        configure_dof_contract(planner)
+        planner_full = compose(
+            config_name='planner_dar',
+            overrides=['data.dof_dim=29'],
+        )
+        configure_dof_contract(planner_full)
 
     assert int(legacy.data.nfeats) == 57
     assert legacy.skeleton.asset.assetFileName == (
@@ -112,3 +119,11 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
     assert int(full.data.nfeats) == 69
     assert full.skeleton.asset.assetFileName == 'g1_29dof.xml'
     assert full.ckpt.vae == '/tmp/vae29.pth'
+    assert int(planner.data.dof_dim) == 23
+    assert int(planner.data.nfeats) == 57
+    assert planner.skeleton.asset.assetFileName == (
+        'g1_23dof_lock_wrist_fitmotionONLY.xml'
+    )
+    assert int(planner_full.data.dof_dim) == 29
+    assert int(planner_full.data.nfeats) == 69
+    assert planner_full.skeleton.asset.assetFileName == 'g1_29dof.xml'

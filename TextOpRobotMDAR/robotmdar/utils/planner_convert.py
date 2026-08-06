@@ -11,8 +11,11 @@ import torch
 
 from robotmdar.utils.goal import GoalType, build_ego_goal
 from robotmdar.dtype.motion import (
+    G1_23DOF_FROM_29DOF_INDICES,
     G1_MUJOCO_DOF_JOINT_NAMES,
+    G1_WRIST_DOF_INDICES,
     motion_dict_to_feature_v3,
+    motion_feature_dim_for_dof,
     quaternion_to_euler_angles,
 )
 from robotmdar.dtype.rotation import quat_apply
@@ -45,6 +48,11 @@ _MUJOCO_TO_ISAACLAB = np.asarray([
     G1_MUJOCO_DOF_JOINT_NAMES.index(name)
     for name in G1_ISAACLAB_DOF_JOINT_NAMES
 ], dtype=np.int64)
+_G1_23DOF_FROM_29DOF = np.asarray(
+    G1_23DOF_FROM_29DOF_INDICES, dtype=np.int64)
+_WRIST_ISAACLAB_INDICES = _ISAACLAB_TO_MUJOCO[
+    np.asarray(G1_WRIST_DOF_INDICES, dtype=np.int64)
+]
 
 
 def isaaclab_to_mujoco_dof(values: np.ndarray) -> np.ndarray:
@@ -55,11 +63,31 @@ def isaaclab_to_mujoco_dof(values: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(values[..., _ISAACLAB_TO_MUJOCO])
 
 
-def mujoco_to_isaaclab_dof(values: np.ndarray) -> np.ndarray:
-    """Convert 29-DoF MuJoCo values to IsaacLab order."""
+def _reduce_mujoco_29_to_23(values: np.ndarray) -> np.ndarray:
+    """Drop the six locked wrist DoFs from MuJoCo-ordered values."""
     values = np.asarray(values)
     if values.shape[-1] != 29:
         raise ValueError(f"Expected 29 MuJoCo DoFs, got {values.shape}")
+    return np.ascontiguousarray(values[..., _G1_23DOF_FROM_29DOF])
+
+
+def _expand_mujoco_23_to_29(values: np.ndarray) -> np.ndarray:
+    """Insert zero-valued wrist DoFs into MuJoCo-ordered values."""
+    values = np.asarray(values)
+    if values.shape[-1] != 23:
+        raise ValueError(f"Expected 23 MuJoCo DoFs, got {values.shape}")
+    expanded = np.zeros(values.shape[:-1] + (29,), dtype=values.dtype)
+    expanded[..., _G1_23DOF_FROM_29DOF] = values
+    return expanded
+
+
+def mujoco_to_isaaclab_dof(values: np.ndarray) -> np.ndarray:
+    """Convert 23- or 29-DoF MuJoCo values to IsaacLab 29-DoF order."""
+    values = np.asarray(values)
+    if values.shape[-1] == 23:
+        values = _expand_mujoco_23_to_29(values)
+    elif values.shape[-1] != 29:
+        raise ValueError(f"Expected 23 or 29 MuJoCo DoFs, got {values.shape}")
     return np.ascontiguousarray(values[..., _MUJOCO_TO_ISAACLAB])
 
 
@@ -114,6 +142,12 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
     positions = positions[-history_len:]
     rotations = rotations[-history_len:]
     joints_mujoco = isaaclab_to_mujoco_dof(joints[-history_len:])
+    model_dof_dim = int(getattr(val_data, "dof_dim", 29))
+    if model_dof_dim == 23:
+        joints_mujoco = _reduce_mujoco_29_to_23(joints_mujoco)
+    elif model_dof_dim != 29:
+        raise ValueError(
+            f"Planner supports model dof_dim 23 or 29, got {model_dof_dim}")
     positions_with_terminal = np.concatenate((positions, positions[-1:]), axis=0)
     rotations_with_terminal = np.concatenate((rotations, rotations[-1:]), axis=0)
     joints_with_terminal = np.concatenate(
@@ -130,10 +164,11 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
             (1, history_len + 1, 2), dtype=torch.float32, device=device),
     }
     feature, abs_pose = motion_dict_to_feature_v3(motion_dict)
-    if feature.shape != (1, history_len, 69):
+    expected_nfeats = motion_feature_dim_for_dof(model_dof_dim)
+    if feature.shape != (1, history_len, expected_nfeats):
         raise ValueError(
             f"Unexpected FeatureVersion 3 shape {tuple(feature.shape)}; "
-            f"expected (1, {history_len}, 69)")
+            f"expected (1, {history_len}, {expected_nfeats})")
 
     # Estimate the unavailable current->next deltas from the most recent
     # physical interval. Roll/pitch and the pose fields already come directly
@@ -153,7 +188,8 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
         - motion_dict["root_trans_offset"][:, -3],
         w_last=True,
     )
-    feature[:, -1, 40:69] = (
+    delta_dof_start = 11 + model_dof_dim
+    feature[:, -1, delta_dof_start:delta_dof_start + model_dof_dim] = (
         motion_dict["dof"][:, -2] - motion_dict["dof"][:, -3])
 
     # motion_dict_to_feature_v3 subtracts Euler yaw directly. Wrap all yaw
@@ -390,7 +426,7 @@ def align_generated_history_pose(abs_pose: dict,
     aligned_history_motion = history_motion
     if history_motion is not None and val_data is not None:
         raw = val_data.denormalize(
-            history_motion.to(device))          # (B, T, 69)
+            history_motion.to(device))          # (B, T, 57 or 69)
         B, T = raw.shape[:2]
 
         # -- original per-frame Euler angles (matching motion_feature_to_dict_v3) --
@@ -568,7 +604,8 @@ def _textop_bodies_to_sonic(values: np.ndarray) -> np.ndarray:
 
 
 def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
-                          fps: float = 50.0):
+                          fps: float = 50.0,
+                          locked_joint_pos: np.ndarray | None = None):
     """Convert one reconstructed MuJoCo batch to ``G1MotionData``."""
     from sonicmsg.messages import G1MotionData
 
@@ -591,9 +628,25 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
 
     # Derive velocity before slicing so the history/future boundary remains
     # available if the velocity convention is changed to backward difference.
+    model_dof_dim = int(dof_pos.shape[-1])
+    if model_dof_dim not in (23, 29):
+        raise ValueError(
+            f"Reconstructed motion must contain 23 or 29 DoFs, got "
+            f"{dof_pos.shape}")
     dof_vel = _forward_velocity(dof_pos, fps)
     joint_pos = mujoco_to_isaaclab_dof(dof_pos)[skip_history:]
     joint_vel = mujoco_to_isaaclab_dof(dof_vel)[skip_history:]
+    if model_dof_dim == 23 and locked_joint_pos is not None:
+        locked_joint_pos = np.asarray(locked_joint_pos, dtype=np.float32)
+        if locked_joint_pos.shape != (29,):
+            raise ValueError(
+                f"locked_joint_pos must have shape (29,), got "
+                f"{locked_joint_pos.shape}")
+        # The 23-DoF model does not predict wrists. Preserve the measured
+        # SONIC wrist pose and command zero wrist velocity across the plan.
+        joint_pos[:, _WRIST_ISAACLAB_INDICES] = locked_joint_pos[
+            _WRIST_ISAACLAB_INDICES]
+        joint_vel[:, _WRIST_ISAACLAB_INDICES] = 0.0
     body_pos = _textop_bodies_to_sonic(body_pos[skip_history:])
     body_ori = np.ascontiguousarray(
         _textop_bodies_to_sonic(body_ori_xyzw[skip_history:])[
