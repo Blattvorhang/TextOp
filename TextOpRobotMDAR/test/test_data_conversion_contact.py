@@ -331,11 +331,12 @@ def test_motion_packer_and_reconstruction_surface_sliding_mask():
 
     class EchoSkeleton:
         @staticmethod
-        def forward_kinematics(motion_dict, return_full=False):
+        def forward_kinematics(motion_dict, return_full=False, fps=30.0):
             return motion_dict
 
     dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
     dataset.skeleton = EchoSkeleton()
+    dataset.fps = 50
     reconstructed = dataset.reconstruct_motion(
         torch.zeros((1, 2, 69)),
         need_denormalize=False,

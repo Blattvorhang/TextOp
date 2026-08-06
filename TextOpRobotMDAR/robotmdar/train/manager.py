@@ -14,7 +14,14 @@ from tqdm import tqdm
 import copy
 
 from robotmdar.utils.goal import GoalType
-from robotmdar.dtype.motion import get_zero_feature, perturb_feature_v3, FeatureVersion
+from robotmdar.dtype.motion import (
+    DOF_DIM,
+    FeatureVersion,
+    G1_CORE_DOF_INDICES,
+    G1_WRIST_DOF_INDICES,
+    get_zero_feature,
+    perturb_feature_v3,
+)
 from robotmdar.dtype.rotation import rot6d_to_matrix, matrix_to_rot6d, quaternion_to_matrix, xyzw_to_wxyz
 from isaac_utils.rotations import get_euler_xyz
 
@@ -468,15 +475,6 @@ class GeometryLoss:
         terms = {}
         extras = {}
 
-        # future_motion_denorm = self.dataset.denormalize(future_motion_pred)
-        # pred_dof_delta = future_motion_denorm[..., -23:]
-
-        # if history_motion is not None:
-        #     motion_denorm = self.dataset.denormalize(torch.cat((history_motion[:, -1, :].unsqueeze(1), future_motion_pred), dim=1))
-        #     cal_dof_delta = motion_denorm[:, 1:, -46:-23] - motion_denorm[:, :-1, -46:-23]
-        #     dof_delta_loss = self.rec_criterion(cal_dof_delta, pred_dof_delta)
-        #     terms['dof_delta'] = dof_delta_loss
-
         if smooth and history_motion is not None:
             motion_tensor = torch.cat([history_motion, future_motion_pred], dim=1)
             diff = motion_tensor[:, 1:, :] - motion_tensor[:, :-1, :]
@@ -491,12 +489,60 @@ class GeometryLoss:
 
         body_trans_loss = self.rec_criterion(
             future_motion_pred_fk['global_translation_extend'], future_motion_gt_fk['global_translation_extend']
-        )  # [B=512, T=8, L=27, 3]
+        )
         body_rot_loss = self.rec_criterion(
             future_motion_pred_fk['global_rotation'], future_motion_gt_fk['global_rotation']
         )
+        for label, fk_result in (
+            ('prediction', future_motion_pred_fk),
+            ('ground truth', future_motion_gt_fk),
+        ):
+            expected_shape = (*fk_result['dof_pos'].shape[:-1], DOF_DIM)
+            if tuple(fk_result['dof_pos'].shape) != expected_shape:
+                raise RuntimeError(
+                    f"{label} dof_pos must be [B, T, {DOF_DIM}], got "
+                    f"{tuple(fk_result['dof_pos'].shape)}"
+                )
+            if tuple(fk_result['dof_vel'].shape) != expected_shape:
+                raise RuntimeError(
+                    f"{label} dof_vel must match dof_pos shape "
+                    f"{expected_shape}, got {tuple(fk_result['dof_vel'].shape)}"
+                )
         dof_pos_loss = self.rec_criterion(future_motion_pred_fk['dof_pos'], future_motion_gt_fk['dof_pos'])
         dof_vel_loss = self.rec_criterion(future_motion_pred_fk['dof_vel'], future_motion_gt_fk['dof_vel'])
+
+        core_ids = torch.as_tensor(
+            G1_CORE_DOF_INDICES,
+            device=future_motion_pred_fk['dof_pos'].device,
+        )
+        wrist_ids = torch.as_tensor(
+            G1_WRIST_DOF_INDICES,
+            device=future_motion_pred_fk['dof_pos'].device,
+        )
+        extras['dof_pos_core'] = self.rec_criterion(
+            future_motion_pred_fk['dof_pos'].index_select(-1, core_ids),
+            future_motion_gt_fk['dof_pos'].index_select(-1, core_ids),
+        )
+        extras['dof_pos_wrist'] = self.rec_criterion(
+            future_motion_pred_fk['dof_pos'].index_select(-1, wrist_ids),
+            future_motion_gt_fk['dof_pos'].index_select(-1, wrist_ids),
+        )
+        extras['dof_vel_core'] = self.rec_criterion(
+            future_motion_pred_fk['dof_vel'].index_select(-1, core_ids),
+            future_motion_gt_fk['dof_vel'].index_select(-1, core_ids),
+        )
+        extras['dof_vel_wrist'] = self.rec_criterion(
+            future_motion_pred_fk['dof_vel'].index_select(-1, wrist_ids),
+            future_motion_gt_fk['dof_vel'].index_select(-1, wrist_ids),
+        )
+        extras['hand_translation'] = self.rec_criterion(
+            future_motion_pred_fk['global_translation_extend'][
+                :, :, self.dataset.skeleton.hand_id, :
+            ],
+            future_motion_gt_fk['global_translation_extend'][
+                :, :, self.dataset.skeleton.hand_id, :
+            ],
+        )
 
         foot_trans_pred = future_motion_pred_fk['global_translation_extend'][:, :, self.dataset.skeleton.foot_id, :]
         foot_contact_loss = self.calc_foot_sliding_loss(

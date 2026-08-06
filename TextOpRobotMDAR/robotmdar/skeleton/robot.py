@@ -60,7 +60,8 @@ class RobotSkeleton:
 
     def forward_kinematics(self,
                            motion_dict: MotionDict,
-                           return_full: bool = False) -> dict:
+                           return_full: bool = False,
+                           fps: float = 30.0) -> dict:
         """
         输入: motion_dict (root_trans_offset, root_rot, dof, contact_mask)
         输出: FK后的全局位姿信息（dict，含global_translation, global_rotation等）
@@ -101,13 +102,23 @@ class RobotSkeleton:
         pose_mat = torch.cat(
             (root_rot_mat, joint_rot_mat, extended_rot_mat), dim=-3)
 
+        if fps <= 0:
+            raise ValueError(f"fps must be positive, got {fps}")
         fk_result = self.fk.fk_batch(pose_mat,
                                      root_translation,
                                      convert_to_mat=False,
-                                     return_full=return_full)
+                                     return_full=return_full,
+                                     dt=1.0 / fps)
         # fk_batch normally recovers scalar joints by summing axis-angle
         # vectors. Its matrix-input path cannot do that, so retain the exact
         # source angles instead.
         fk_result.dof_pos = dof_batch
+        if dof_batch.shape[1] > 1:
+            dof_vel = (dof_batch[:, 1:] - dof_batch[:, :-1]) * fps
+            fk_result.dof_vel = torch.cat(
+                (dof_vel, dof_vel[:, -1:]), dim=1
+            )
+        else:
+            fk_result.dof_vel = torch.zeros_like(dof_batch)
         fk_result.update(motion_dict)
         return fk_result
