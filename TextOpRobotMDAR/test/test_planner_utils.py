@@ -37,6 +37,10 @@ class IdentityNormalization:
         return feature
 
 
+class IdentityNormalization23(IdentityNormalization):
+    dof_dim = 23
+
+
 def test_fk_preserves_non_upright_root_quaternion():
     project_root = Path(__file__).resolve().parents[1]
     cfg = OmegaConf.load(
@@ -186,6 +190,41 @@ def test_controller_history_ends_at_current_non_upright_pose():
     torch.testing.assert_close(
         torch.abs(torch.dot(reconstructed_current, expected_current)),
         torch.tensor(1.0), atol=1e-5, rtol=1e-5)
+
+
+def test_controller_29dof_history_builds_legacy_57d_model_input():
+    positions = np.asarray([
+        [0.0, 0.0, 0.77],
+        [0.1, 0.0, 0.77],
+        [0.2, 0.0, 0.77],
+    ], dtype=np.float32)
+    rotations = np.asarray([
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    joints = np.stack([
+        np.arange(29, dtype=np.float32) + frame * 100.0
+        for frame in range(3)
+    ])
+    state = SimpleNamespace(raw={
+        "g1_pos": positions,
+        "g1_root_rot": rotations,
+        "g1_joint_pos": joints,
+    })
+
+    feature, _ = state_to_model_input(
+        state, history_len=2, val_data=IdentityNormalization23(),
+        device="cpu")
+
+    mujoco = isaaclab_to_mujoco_dof(joints)
+    core = list(range(19)) + list(range(22, 26))
+    assert feature.shape == (1, 2, 57)
+    np.testing.assert_array_equal(
+        feature[0, -1, 11:34].numpy(), mujoco[-1, core])
+    np.testing.assert_array_equal(
+        feature[0, -1, 34:57].numpy(),
+        mujoco[-1, core] - mujoco[-2, core])
 
 
 def test_goal_uses_current_history_feature_reference():
@@ -368,3 +407,32 @@ def test_g1_packet_keeps_seam_and_maps_sonic_tracking_bodies():
     np.testing.assert_allclose(motion.joint_vel[:, 0], 1.0, atol=1e-6)
     np.testing.assert_array_equal(
         motion.body_ori[0, 0], np.asarray([1.0, 0.0, 0.0, 0.0]))
+
+
+def test_23dof_g1_packet_expands_and_holds_measured_wrist_joints():
+    frames = 3
+    dof_pos = torch.arange(
+        frames * 23, dtype=torch.float32).reshape(1, frames, 23) / 100.0
+    body_pos = torch.zeros((1, frames, 27, 3), dtype=torch.float32)
+    body_ori = torch.zeros((1, frames, 27, 4), dtype=torch.float32)
+    body_ori[..., 3] = 1.0
+    measured = np.arange(29, dtype=np.float32) + 10.0
+
+    motion = motion_dict_to_g1data({
+        "dof_pos": dof_pos,
+        "global_translation_extend": body_pos,
+        "global_rotation_extend": body_ori,
+    }, skip_history=1, fps=50.0, locked_joint_pos=measured)
+
+    assert motion.joint_pos.shape == (frames - 1, 29)
+    assert motion.joint_vel.shape == (frames - 1, 29)
+    wrist_indices = [
+        index for index, name in enumerate(G1_ISAACLAB_DOF_JOINT_NAMES)
+        if "_wrist_" in name
+    ]
+    np.testing.assert_array_equal(
+        motion.joint_pos[:, wrist_indices],
+        np.broadcast_to(measured[wrist_indices], (frames - 1, 6)))
+    np.testing.assert_array_equal(
+        motion.joint_vel[:, wrist_indices],
+        np.zeros((frames - 1, 6), dtype=np.float32))
