@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 echo "Working directory: $(pwd)"
 
 # ---- Required: pretrained VAE checkpoint ----
-VAE_CKPT="${VAE_CKPT:-}"
+VAE_CKPT="${VAE_CKPT:-'./logs/RobotMDAR/BONES-SEED-FUTURE-64/train-mvae-20260730_003954/ckpt_100000.pth'}"
 if [ -z "${VAE_CKPT}" ]; then
     echo "ERROR: VAE_CKPT is required. Set it to the pretrained VAE checkpoint path."
     echo "Example:"
@@ -43,6 +43,7 @@ if [ ${NUM_GPUS} -gt ${NUM_GPUS_AVAILABLE} ]; then
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# TIMESTAMP="20260730_112611"  # resume from previous run
 MASTER_PORT=$((RANDOM % 10000 + 20000))
 
 echo "Starting DDP training (DAR/LDM, BODY goal) with ${NUM_GPUS} GPUs..."
@@ -53,12 +54,12 @@ echo "Experiment timestamp: ${TIMESTAMP}"
 echo "Master port: ${MASTER_PORT}"
 
 # Optional: Resume from a DAR checkpoint
-# CKPT_PATH="./logs/RobotMDAR/DAR-BODY-GOAL/train-dar-20260727_120000/ckpt_20000.pth"
+# CKPT_PATH="./logs/RobotMDAR/BONES-SEED-FUTURE-64/train-dar-20260730_112611/ckpt_15000.pth"
 # CKPT_OVERRIDE="ckpt.dar=${CKPT_PATH}"
 
 # Scale stages by NUM_GPUS
 SCALE_FACTOR=1
-STAGE0=$((100000 / NUM_GPUS * SCALE_FACTOR))
+STAGE0=$((200000 / NUM_GPUS * SCALE_FACTOR))
 STAGE1=$((100000 / NUM_GPUS * SCALE_FACTOR))
 STAGE2=$((100000 / NUM_GPUS * SCALE_FACTOR))
 TOTAL_STEPS=$((STAGE0 + STAGE1 + STAGE2))
@@ -71,20 +72,25 @@ echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
 echo "  save_every:  ${SAVE_EVERY}"
 echo "  eval_every:  ${EVAL_EVERY}"
 
-DATADIR=BONES-SEED-23dof-FULL-50fps
+DATADIR=BONES-SEED-29dof-FULL-50fps
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 torchrun \
     --nproc_per_node=${NUM_GPUS} \
     --master_port=${MASTER_PORT} \
     -m robotmdar.cli \
-    --config-name=train_dar_v2 \
-    expname=BONES-SEED-BODY-GOAL \
+    --config-name=train_dar \
+    expname=BONES-SEED-FUTURE-64-23DOF \
     timestamp="'${TIMESTAMP}'" \
     ckpt.vae=${VAE_CKPT} \
     data.datadir=./dataset/${DATADIR} \
+    data.dof_dim=23 \
+    data.normalization_path=/ALG/yukang/dataset/bones-seed/legacy/g1_textop_legacy_2/meanstd.pkl \
+    data.history_len=16 \
+    data.future_len=64 \
     data.num_primitive=4 \
-    data.batch_size=512 \
+    data.goal_per_primitive=true \
+    data.batch_size=256 \
     data.weighted_sample=false \
     data.action_statistics_path=./dataset/${DATADIR}/action_statistics.json \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \

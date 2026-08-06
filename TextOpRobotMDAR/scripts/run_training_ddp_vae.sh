@@ -67,7 +67,7 @@ echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
 echo "  save_every:  ${SAVE_EVERY}"
 echo "  eval_every:  ${EVAL_EVERY}"
 
-DATADIR=BONES-SEED-23dof-FULL-50fps
+DATADIR=BONES-SEED-29dof-FULL-50fps
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 torchrun \
@@ -75,11 +75,13 @@ torchrun \
     --master_port=${MASTER_PORT} \
     -m robotmdar.cli \
     --config-name=train_mvae \
-    expname=BONES-SEED-GOAL \
+    expname=BONES-SEED-FUTURE-64-29DOF \
     timestamp="'${TIMESTAMP}'" \
     data.datadir=./dataset/${DATADIR} \
+    data.history_len=16 \
+    data.future_len=64 \
     data.num_primitive=4 \
-    data.batch_size=512 \
+    data.batch_size=256 \
     data.weighted_sample=false \
     data.action_statistics_path=./dataset/${DATADIR}/action_statistics.json \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \
