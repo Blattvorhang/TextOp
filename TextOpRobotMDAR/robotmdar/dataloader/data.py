@@ -25,7 +25,16 @@ from tqdm import tqdm
 # from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
 from robotmdar.utils.goal import GoalType, quaternion_yaw
-from robotmdar.dtype.motion import MotionDict, motion_dict_to_feature, AbsolutePose, motion_feature_to_dict, MotionKeys
+from robotmdar.dtype.motion import (
+    AbsolutePose,
+    G1_23DOF_FROM_29DOF_INDICES,
+    MotionDict,
+    MotionKeys,
+    infer_feature_v3_dof_dim,
+    motion_dict_to_feature,
+    motion_feature_dim_for_dof,
+    motion_feature_to_dict,
+)
 import json
 
 
@@ -62,6 +71,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         use_weighted_meanstd: bool = False,
         split: str = 'train',
         device: str = 'cuda',
+        dof_dim: Optional[int] = None,
+        normalization_path: Optional[str] = None,
         **kwargs: Any
     ):
         super().__init__()
@@ -71,7 +82,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.future_len = future_len
         self.num_primitive = num_primitive
 
-        self.nfeats = nfeats
+        self.nfeats = int(nfeats)
+        self.dof_dim = (
+            infer_feature_v3_dof_dim(self.nfeats)
+            if dof_dim is None else int(dof_dim)
+        )
+        expected_nfeats = motion_feature_dim_for_dof(self.dof_dim)
+        if self.nfeats != expected_nfeats:
+            raise ValueError(
+                f"dof_dim={self.dof_dim} requires nfeats={expected_nfeats}, "
+                f"got {self.nfeats}"
+            )
 
         self.segment_len = self.history_len + self.future_len * self.num_primitive + 1
         self.context_len = self.history_len + self.future_len
@@ -119,6 +140,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.use_weighted_meanstd = use_weighted_meanstd
 
         self.datadir = Path(datadir)
+        self.normalization_path = (
+            Path(normalization_path) if normalization_path else None
+        )
         self.split = split
         self.device = "cpu"  # Keep embeddings on CPU initially
         self.sample_cache_size = max(0, int(kwargs.get('sample_cache_size', 8)))
@@ -330,6 +354,22 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         with open(statistics_yaml, 'r') as f:
             self.statistics = yaml.safe_load(f)
         self.fps = self.statistics['fps']
+        source_nfeats = int(self.statistics.get('nfeats', self.nfeats))
+        self.source_dof_dim = int(
+            self.statistics.get('dof_dim', (source_nfeats - 11) // 2)
+        )
+
+    def _select_model_dof(self, dof):
+        """Adapt stored G1 joints to the selected model-facing contract."""
+        source_dim = int(dof.shape[-1])
+        if source_dim == self.dof_dim:
+            return dof
+        if source_dim == 29 and self.dof_dim == 23:
+            return dof[..., list(G1_23DOF_FROM_29DOF_INDICES)]
+        raise ValueError(
+            f"Cannot adapt stored {source_dim}-DoF motion to "
+            f"dof_dim={self.dof_dim}"
+        )
 
     # =========================================================================
     # DEPRECATED: Text embedding loading & computation.
@@ -383,7 +423,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _load_meanstd(self) -> None:
         """Load or compute mean/std for normalization"""
-        meanstd_cache_path = self.datadir / 'meanstd.pkl'
+        meanstd_cache_path = (
+            self.normalization_path
+            if self.normalization_path is not None
+            else self.datadir / 'meanstd.pkl'
+        )
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
             meanstd = torch.load(meanstd_cache_path, map_location="cpu")
@@ -402,7 +446,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _load_weighted_meanstd(self) -> None:
         """Load or compute mean/std for normalization"""
-        meanstd_cache_path = self.datadir / 'weighted_meanstd.pkl'
+        meanstd_cache_path = (
+            self.normalization_path
+            if self.normalization_path is not None
+            else self.datadir / 'weighted_meanstd.pkl'
+        )
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
             meanstd = torch.load(meanstd_cache_path, map_location="cpu")
@@ -535,9 +583,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
     def _world_goal_keypoints(self, raw_motion: Dict[str, Any],
                               goal_frame: int) -> torch.Tensor:
         goal_motion = {
-            'dof': torch.as_tensor(
+            'dof': self._select_model_dof(torch.as_tensor(
                 raw_motion['dof'][goal_frame:goal_frame + 1],
-                dtype=torch.float32),
+                dtype=torch.float32)),
             'root_trans_offset': torch.as_tensor(
                 raw_motion['root_trans_offset'][goal_frame:goal_frame + 1],
                 dtype=torch.float32),
@@ -593,7 +641,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         motion_data = {}
         for k in MotionKeys:
             if k in sample['motion']:
-                motion_data[k] = torch.tensor(sample['motion'][k][prim_start:prim_end], dtype=torch.float32)
+                value = torch.tensor(
+                    sample['motion'][k][prim_start:prim_end],
+                    dtype=torch.float32,
+                )
+                if k == 'dof':
+                    value = self._select_model_dof(value)
+                motion_data[k] = value
 
         raw_sliding_mask = sample['motion'].get('sliding_mask')
         if raw_sliding_mask is None:

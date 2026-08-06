@@ -15,7 +15,6 @@ import copy
 
 from robotmdar.utils.goal import GoalType
 from robotmdar.dtype.motion import (
-    DOF_DIM,
     FeatureVersion,
     G1_CORE_DOF_INDICES,
     G1_WRIST_DOF_INDICES,
@@ -377,7 +376,9 @@ class BaseManager(ABC):
 
         # 2. 检查是否使用static pose
         if self.should_static_pose():
-            zero_feature = get_zero_feature().expand_as(history_motion).to(history_motion.device)
+            zero_feature = get_zero_feature(
+                self.dataset.dof_dim
+            ).expand_as(history_motion).to(history_motion.device)
             # 添加扰动
             perturbation_scale = getattr(self, 'static_perturbation_scale', 0.0)
             if perturbation_scale > 0:
@@ -493,14 +494,15 @@ class GeometryLoss:
         body_rot_loss = self.rec_criterion(
             future_motion_pred_fk['global_rotation'], future_motion_gt_fk['global_rotation']
         )
+        dof_dim = int(self.dataset.dof_dim)
         for label, fk_result in (
             ('prediction', future_motion_pred_fk),
             ('ground truth', future_motion_gt_fk),
         ):
-            expected_shape = (*fk_result['dof_pos'].shape[:-1], DOF_DIM)
+            expected_shape = (*fk_result['dof_pos'].shape[:-1], dof_dim)
             if tuple(fk_result['dof_pos'].shape) != expected_shape:
                 raise RuntimeError(
-                    f"{label} dof_pos must be [B, T, {DOF_DIM}], got "
+                    f"{label} dof_pos must be [B, T, {dof_dim}], got "
                     f"{tuple(fk_result['dof_pos'].shape)}"
                 )
             if tuple(fk_result['dof_vel'].shape) != expected_shape:
@@ -511,30 +513,31 @@ class GeometryLoss:
         dof_pos_loss = self.rec_criterion(future_motion_pred_fk['dof_pos'], future_motion_gt_fk['dof_pos'])
         dof_vel_loss = self.rec_criterion(future_motion_pred_fk['dof_vel'], future_motion_gt_fk['dof_vel'])
 
-        core_ids = torch.as_tensor(
-            G1_CORE_DOF_INDICES,
-            device=future_motion_pred_fk['dof_pos'].device,
-        )
-        wrist_ids = torch.as_tensor(
-            G1_WRIST_DOF_INDICES,
-            device=future_motion_pred_fk['dof_pos'].device,
-        )
-        extras['dof_pos_core'] = self.rec_criterion(
-            future_motion_pred_fk['dof_pos'].index_select(-1, core_ids),
-            future_motion_gt_fk['dof_pos'].index_select(-1, core_ids),
-        )
-        extras['dof_pos_wrist'] = self.rec_criterion(
-            future_motion_pred_fk['dof_pos'].index_select(-1, wrist_ids),
-            future_motion_gt_fk['dof_pos'].index_select(-1, wrist_ids),
-        )
-        extras['dof_vel_core'] = self.rec_criterion(
-            future_motion_pred_fk['dof_vel'].index_select(-1, core_ids),
-            future_motion_gt_fk['dof_vel'].index_select(-1, core_ids),
-        )
-        extras['dof_vel_wrist'] = self.rec_criterion(
-            future_motion_pred_fk['dof_vel'].index_select(-1, wrist_ids),
-            future_motion_gt_fk['dof_vel'].index_select(-1, wrist_ids),
-        )
+        if dof_dim == 29:
+            core_ids = torch.as_tensor(
+                G1_CORE_DOF_INDICES,
+                device=future_motion_pred_fk['dof_pos'].device,
+            )
+            wrist_ids = torch.as_tensor(
+                G1_WRIST_DOF_INDICES,
+                device=future_motion_pred_fk['dof_pos'].device,
+            )
+            extras['dof_pos_core'] = self.rec_criterion(
+                future_motion_pred_fk['dof_pos'].index_select(-1, core_ids),
+                future_motion_gt_fk['dof_pos'].index_select(-1, core_ids),
+            )
+            extras['dof_pos_wrist'] = self.rec_criterion(
+                future_motion_pred_fk['dof_pos'].index_select(-1, wrist_ids),
+                future_motion_gt_fk['dof_pos'].index_select(-1, wrist_ids),
+            )
+            extras['dof_vel_core'] = self.rec_criterion(
+                future_motion_pred_fk['dof_vel'].index_select(-1, core_ids),
+                future_motion_gt_fk['dof_vel'].index_select(-1, core_ids),
+            )
+            extras['dof_vel_wrist'] = self.rec_criterion(
+                future_motion_pred_fk['dof_vel'].index_select(-1, wrist_ids),
+                future_motion_gt_fk['dof_vel'].index_select(-1, wrist_ids),
+            )
         extras['hand_translation'] = self.rec_criterion(
             future_motion_pred_fk['global_translation_extend'][
                 :, :, self.dataset.skeleton.hand_id, :

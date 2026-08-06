@@ -4,15 +4,18 @@ defaults:
   - train/dar
   - _self_
 
-expname: DAR-BODY-EXT-GOAL
+expname: DAR-BODY-GOAL
 task: train-dar
 
 data:
+  # Default to the original TextOp 23-DoF/57-D contract. Override with
+  # data.dof_dim=29 to train against the full-wrist model instead.
+  dof_dim: 23
   history_len: 16
   future_len: 64
   num_primitive: 4
   batch_size: 256
-  goal_type: body_ext
+  goal_type: body
   goal_per_primitive: true
   goal_offset: 0
   goal_offset_range: null
@@ -21,8 +24,22 @@ data:
     goal_offset_range: null
 
 denoiser:
-  goal_dim: 21
+  goal_dim: 15
   cond_goal_root_mask_prob: 0.1
-  cond_goal_yaw_mask_prob: 0.3
+  cond_goal_yaw_mask_prob: 0.0
   cond_goal_time_mask_prob: 0.0
-  cond_goal_body_mask_prob: 0.3
+  cond_goal_body_mask_prob: 0.1
+
+train:
+  manager:
+    # Match the last successful 23-DoF training objective. Goal metrics are
+    # still evaluated and visualized, but are not added as new objectives.
+    loss_weight:
+      foot_contact: 0.01
+      goal_direction: 0.0
+      goal_position: 0.0
+
+ckpt:
+  # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF
+  # variant intentionally requires an explicit checkpoint override.
+  vae: ${oc.select:data.dof_variants.dof${data.dof_dim}.vae_ckpt}

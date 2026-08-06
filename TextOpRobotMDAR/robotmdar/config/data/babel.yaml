@@ -1,6 +1,8 @@
 skeleton: ${..skeleton}
 
 nfeats: 57 # 57 69 205 222 currently we hardcode here
+dof_dim: 23
+normalization_path: null
 history_len: 2
 future_len: 8
 num_primitive: 4
@@ -43,6 +45,8 @@ common: &common
   robot_cfg: ${skeleton}
   device: cuda
   nfeats: ${..nfeats}
+  dof_dim: ${..dof_dim}
+  normalization_path: ${..normalization_path}
   history_len: ${..history_len}
   future_len: ${..future_len}
   num_primitive: ${..num_primitive}
