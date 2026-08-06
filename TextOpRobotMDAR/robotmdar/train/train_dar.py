@@ -37,8 +37,8 @@ def _compute_xy_limit(*trajectories, goals_xy, default=_DEFAULT_XY_LIMIT):
             limit = max(limit, float(traj.abs().max()))
     if goals_xy is not None and goals_xy.numel():
         limit = max(limit, float(goals_xy[:, :2].abs().max()))
-    # round up to nearest 0.5 m for clean axis labels
-    limit = math.ceil(limit * 2) / 2
+    # round up to nearest 0.1 m for clean axis labels
+    limit = math.ceil(limit * 10) / 10
     return max(limit, default)
 
 
