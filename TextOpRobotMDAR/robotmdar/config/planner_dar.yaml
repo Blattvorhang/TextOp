@@ -18,6 +18,14 @@ pub_all_frames: false
 # should produce nearby plans instead of independent samples at every seam.
 resample_noise_each_plan: false
 
+# Experimental: seed the diffusion initial noise from a motion_lib clip.
+# Set to a data/motion_lib/*.pkl path to enable; null (default) disables.
+motion_path: null
+# Starting frame index within the selected clip (raw frame, 0-based).
+motion_start_frame: 0
+# Clip name inside the pkl (required when pkl has >1 clip; auto-detected otherwise).
+motion_clip: null
+
 # Bootstrap from controller history once, then autoregress on generated history.
 # Before each replan, translate the generated history endpoint to the measured
 # G1 root position; local features and generated orientation remain unchanged.
@@ -38,13 +46,13 @@ comm_config: ${hydra:runtime.cwd}/robotmdar/config/communication/pubsub.yaml
 occ_grid: null
 
 data:
-  dof_dim: 23
-  goal_type: body
+  dof_dim: 29
+  goal_type: body_ext
   history_len: 16
   future_len: 64
 
 denoiser:
-  goal_dim: 15
+  goal_dim: 21
 
 # Root yaw is present on the wire for compatibility but is intentionally not
 # used by the deployed V4 planner.

@@ -16,7 +16,7 @@ from robotmdar.dtype import logger as dtype_logger
 from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
 from robotmdar.dtype.motion import FeatureVersion, infer_feature_v3_dof_dim
-from robotmdar.eval.generate_dar import generate_next_motion
+from robotmdar.eval.generate_dar import generate_next_motion, encode_motion_lib_initial_noise
 from robotmdar.utils.dof_contract import (
     configure_dof_contract,
     validate_training_contract,
@@ -181,6 +181,22 @@ def main(cfg: DictConfig) -> None:
     if not bool(cfg.get("resample_noise_each_plan", False)):
         fixed_sampling_noise = torch.randn(
             (1, *denoiser.noise_shape), device=cfg.device)
+
+    motion_path = cfg.get("motion_path")
+    if motion_path is not None:
+        motion_path = to_absolute_path(str(motion_path))
+        fixed_sampling_noise = encode_motion_lib_initial_noise(
+            vae=vae,
+            val_data=val_data,
+            motion_path=str(motion_path),
+            start_frame=int(cfg.get("motion_start_frame", 0)),
+            history_len=history_len,
+            future_len=future_len,
+            device=str(cfg.device),
+            clip_name=cfg.get("motion_clip"),
+        )
+        logger.info("Seeded diffusion latent from {} shape={}",
+                    motion_path, tuple(fixed_sampling_noise.shape))
 
     logger.info(
         "TextOp planner ready: replan={:.1f} Hz, motion={:.1f} Hz, "

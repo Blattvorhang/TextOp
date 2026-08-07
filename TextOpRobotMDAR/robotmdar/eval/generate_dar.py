@@ -8,9 +8,15 @@ Functions:
 - generate_next_motion: Generate next motion segment using DAR model
 """
 
-import torch
-from torch import nn
+from pathlib import Path
 from typing import Tuple, Dict, Any, Optional, Union
+
+import joblib
+import numpy as np
+import torch
+from loguru import logger
+from torch import nn
+
 from robotmdar.dtype.motion import motion_dict_to_abs_pose
 
 
@@ -37,6 +43,136 @@ class ClassifierFreeWrapper(nn.Module):
     @property
     def noise_shape(self):
         return self.model.noise_shape
+
+
+def encode_motion_lib_initial_noise(
+        vae,
+        val_data,
+        motion_path: str,
+        start_frame: int,
+        history_len: int,
+        future_len: int,
+        device: str,
+        clip_name: Optional[str] = None,
+) -> torch.Tensor:
+    """Encode a motion-library clip segment as diffusion initial noise.
+
+    Loads a joblib motion_lib pkl (``{name: motion_entry}`` dict), selects the
+    target clip, converts it to the TextOp sample format, then reuses the
+    Dataset pipeline (*_extract_single_primitive* → *_convert_to_motion_features*
+    → *normalize*) for feature extraction, and finally VAE-encodes the segment
+    to produce a latent tensor suitable as ``generate_next_motion``'s
+    *initial_noise*.
+
+    Returns:
+        Tensor of shape ``(1, *denoiser.noise_shape)`` — typically ``(1, 1, 128)``.
+    """
+    motion_path_resolved = Path(motion_path)
+    if not motion_path_resolved.exists():
+        raise FileNotFoundError(
+            f"motion_lib pkl not found: {motion_path_resolved}")
+
+    payload = joblib.load(motion_path_resolved)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Expected a dict, got {type(payload).__name__} "
+            f"from {motion_path_resolved}")
+
+    # ── select clip ──
+    _MOTION_REQUIRED_KEYS = frozenset((
+        "root_trans_offset", "root_rot", "dof", "contact_mask",
+    ))
+    if _MOTION_REQUIRED_KEYS.issubset(payload.keys()):
+        # flat single-clip pkl
+        if clip_name is not None:
+            raise ValueError(
+                "clip_name was given but the pkl is a flat single-clip dict")
+        entry = payload
+        used_clip = None
+    elif all(isinstance(v, dict) for v in payload.values()):
+        if clip_name is not None:
+            if clip_name not in payload:
+                raise ValueError(
+                    f"clip {clip_name!r} not found in pkl; "
+                    f"available: {sorted(payload)}")
+            entry = payload[clip_name]
+            used_clip = clip_name
+        elif len(payload) == 1:
+            (key, entry), = payload.items()
+            used_clip = key
+        else:
+            raise ValueError(
+                f"Multi-clip pkl requires motion_clip; "
+                f"available: {sorted(payload)}")
+    else:
+        raise ValueError(
+            f"Unrecognized pkl structure: top-level keys {sorted(payload)}")
+
+    used_name = (
+        f"{motion_path_resolved}::{used_clip}" if used_clip
+        else str(motion_path_resolved))
+    logger.info("motion_lib clip selected: {}", used_name)
+
+    # ── validate fps ──
+    pkl_fps = float(entry.get("fps", 0.0))
+    if pkl_fps <= 0:
+        raise ValueError(
+            f"Motion clip {used_name!r} has invalid fps={pkl_fps}")
+    if abs(pkl_fps - float(val_data.fps)) > 1e-6:
+        raise ValueError(
+            f"Motion clip fps ({pkl_fps}) does not match "
+            f"val_data.fps ({val_data.fps})")
+
+    # ── build TextOp sample dict ──
+    try:
+        root_trans_offset = np.asarray(entry["root_trans_offset"])
+        root_rot = np.asarray(entry["root_rot"])
+        dof = np.asarray(entry["dof"])
+        contact_mask = np.asarray(entry["contact_mask"])
+    except KeyError as exc:
+        raise ValueError(
+            f"Motion clip {used_name!r} missing key {exc}") from exc
+
+    sliding_mask = np.asarray(
+        entry.get("sliding_mask", contact_mask))
+
+    sample = {
+        "motion": {
+            "root_trans_offset": root_trans_offset,
+            "root_rot": root_rot,
+            "dof": dof,
+            "contact_mask": contact_mask,
+            "sliding_mask": sliding_mask,
+        },
+        "scene": entry.get("scene", {}),
+    }
+
+    # ── slice + contract DOFs + convert features via training pipeline ──
+    prim_start = int(start_frame)
+    prim_end = prim_start + int(future_len) + int(history_len) + 1
+    goal_frame = prim_end - 1  # not used for motion; any valid index works
+
+    primitive = val_data._extract_single_primitive(
+        sample, prim_start, prim_end, goal_frame)
+    features = val_data._convert_to_motion_features(
+        [primitive["motion"]])  # [1, H+F, nfeats]
+
+    # ── normalize ──
+    features = val_data.normalize(features).to(device)
+
+    # ── split history / future ──
+    history_motion = features[:, :history_len, :]
+    future_motion = features[:, history_len:, :]
+
+    # ── VAE encode ──
+    with torch.no_grad():
+        latent, _dist = vae.encode(future_motion, history_motion)
+    # latent: [latent_size=1, B=1, latent_dim=128]
+
+    # Permute to denoiser-compatible shape: [B=1, T=1, D=128]
+    initial_noise = latent.permute(1, 0, 2)
+
+    return initial_noise
 
 
 def generate_next_motion(
