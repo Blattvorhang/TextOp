@@ -125,8 +125,10 @@ fi
 # ============================================================================
 #  Stage 4: action_statistics.json for weighted_sample
 # ============================================================================
+# --neutral: keep natural data distribution (weight=1.0 for all categories).
+# Fall recovery is boosted separately via _recovery_boost in the dataloader.
 echo ""
-echo "Stage 4/4: cal_weighted_statistics.py"
+echo "Stage 4/4: cal_weighted_statistics.py (neutral)"
 echo "  Input : ${S3_OUT}/train.pkl"
 echo "  Output: ${S4_OUT}/action_statistics.json"
 
@@ -135,7 +137,8 @@ if [ -f "${S4_DONE}" ]; then
 else
     python3 "${SCRIPT_DIR}/cal_weighted_statistics.py" \
         --data_folder "${S3_OUT}" \
-        --trg_filename "${S4_OUT}/action_statistics.json"
+        --trg_filename "${S4_OUT}/action_statistics.json" \
+        --neutral
     touch "${S4_DONE}"
     echo "  [DONE]"
 fi
