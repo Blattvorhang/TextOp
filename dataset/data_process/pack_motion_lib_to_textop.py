@@ -200,6 +200,29 @@ def classify_coarse(fine_name: str) -> str:
     return "other"
 
 
+# ── Flat-lying fall recovery detection ──
+# Side-lying and crutch variants are excluded by filter_and_copy_bones_data.py.
+# The remaining kept recovery actions are:
+#   stand_up_lying, stand_up_lying_stomach,
+#   faint_stand_up_lying, faint_stand_up_lying_stomach,
+#   faint_stand_up_lying_puke_walk_ff*
+_RECOVERY_FINE_PATTERNS = (
+    "stand_up_lying",        # stand_up_lying, stand_up_lying_stomach
+    "faint_stand_up_lying",  # faint_stand_up_lying, faint_stand_up_lying_stomach,
+                             # faint_stand_up_lying_puke_walk_ff*
+)
+
+
+def _is_flat_recovery(fine_name: str) -> bool:
+    """Check whether a fine action name is a kept flat-lying recovery motion."""
+    lower = fine_name.lower()
+    # Belt-and-suspenders: side-lying should already be filtered, but
+    # explicitly exclude it in case the filter script wasn't used.
+    if "lying_side" in lower:
+        return False
+    return any(pat in lower for pat in _RECOVERY_FINE_PATTERNS)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -311,6 +334,7 @@ def _pack_source_file(task: tuple) -> tuple[list[dict], int, set[int], str | Non
             "_source": name,
             "_data_path": sample_relpath.as_posix(),
             "_fps": fps,
+            "_recovery_boost": item.get("_recovery_boost", False),
         })
     return records, skipped, fps_values, warning
 
@@ -445,9 +469,11 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
     duration = T / fps_val
     fine = _extract_action_name(str(name))
     coarse = classify_coarse(fine)
+    recovery_boost = _is_flat_recovery(fine)
 
     return {
         "length": T,
+        "_recovery_boost": recovery_boost,  # marks flat-lying recovery
         "motion": {
             "root_trans_offset": root_trans.astype(np.float32, copy=False),
             "root_rot": root_rot.astype(np.float32, copy=False),

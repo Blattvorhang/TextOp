@@ -254,6 +254,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         with open(self.action_statistics_path, 'r') as f:
             action_statistics = json.load(f)
 
+        # ── Recovery boost multiplier ──
+        # Flat-lying recovery sequences (stand_up_lying*, faint_stand_up_lying*)
+        # are rare (~0.4% of data). Multiply their sampling weight so the model
+        # sees them more often without changing the global category distribution.
+        RECOVERY_WEIGHT_MULTIPLIER = 5.0
+
         for data in self.raw_data:
             seq_weight = 0
             for seg in data['frame_ann']:
@@ -266,6 +272,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     else:
                         act_weights += action_statistics[act_cat]['weight']
                 seq_weight += (seg[1] - seg[0]) * act_weights
+
+            if data.get('_recovery_boost'):
+                seq_weight *= RECOVERY_WEIGHT_MULTIPLIER
+
             data['weight'] = seq_weight
             num_frames = data['length']
 

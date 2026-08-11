@@ -148,6 +148,10 @@ def compute_action_statistics(
         Cap: weight ≤ max_weight_ratio × median_weight across all categories.
         Set to 0 or negative to disable capping.
     """
+    # Neutral mode: all categories get weight=1.0 → natural data distribution.
+    # Category-level rebalancing is handled externally (e.g. _recovery_boost).
+    neutral = (target_mass is None)
+
     if target_mass is None:
         target_mass = TARGET_MASS
 
@@ -188,47 +192,60 @@ def compute_action_statistics(
     print(f"Total motion duration: {total_dur / 3600:.2f} hours "
           f"across {len(cat_duration)} categories\n")
 
-    # ── 2. Assign default mass for categories not in TARGET_MASS ──
-    # New categories (not explicitly listed) get mass = 0.5 (treated as "other")
-    for cat in cat_duration:
-        if cat not in target_mass:
-            target_mass[cat] = 0.5
-
-    total_mass = sum(target_mass[c] for c in cat_duration)
-
-    # ── 3. Compute weight = target_mass / total_duration ──
+    # ── 2. Compute weights ──
     action_stats: dict[str, dict] = {}
-    for cat, dur in cat_duration.items():
-        mass = target_mass.get(cat, 0.5)
-        w = mass / dur if dur > 0 else 0.0
-        action_stats[cat] = {
-            "total_len": round(dur, 3),
-            "target_mass": mass,
-            "target_pct": round(mass / total_mass * 100, 1),
-            "weight": round(w, 10),
-        }
 
-    # ── 4. Soft-cap extreme weights ──
-    if max_weight_ratio > 0:
-        weights = np.array([s["weight"] for s in action_stats.values()])
-        median_w = float(np.median(weights))
-        cap = median_w * max_weight_ratio
-        capped_cats = []
-        for cat in action_stats:
-            if action_stats[cat]["weight"] > cap:
-                action_stats[cat]["weight"] = round(cap, 10)
-                action_stats[cat]["capped"] = True
-                capped_cats.append(cat)
-        if capped_cats:
-            print(f"Weight cap: {max_weight_ratio}× median = {cap:.6f}")
-            for cat in capped_cats:
-                orig_w = action_stats[cat]["target_mass"] / action_stats[cat]["total_len"]
-                print(f"  Capped: {cat}  "
-                      f"({orig_w:.6f} → {cap:.6f})")
-            print()
+    if neutral:
+        # weight=1.0 for all categories → natural data distribution.
+        # P(sequence) ∝ duration; no category-level reshaping.
+        for cat, dur in cat_duration.items():
+            action_stats[cat] = {
+                "total_len": round(dur, 3),
+                "weight": 1.0,
+            }
+    else:
+        # ── 2a. Assign default mass for categories not in TARGET_MASS ──
+        for cat in cat_duration:
+            if cat not in target_mass:
+                target_mass[cat] = 0.5
+
+        total_mass = sum(target_mass[c] for c in cat_duration)
+
+        # ── 2b. weight = target_mass / total_duration ──
+        for cat, dur in cat_duration.items():
+            mass = target_mass.get(cat, 0.5)
+            w = mass / dur if dur > 0 else 0.0
+            action_stats[cat] = {
+                "total_len": round(dur, 3),
+                "target_mass": mass,
+                "target_pct": round(mass / total_mass * 100, 1),
+                "weight": round(w, 10),
+            }
+
+        # ── 2c. Soft-cap extreme weights ──
+        if max_weight_ratio > 0:
+            weights = np.array([s["weight"] for s in action_stats.values()])
+            median_w = float(np.median(weights))
+            cap = median_w * max_weight_ratio
+            capped_cats = []
+            for cat in action_stats:
+                if action_stats[cat]["weight"] > cap:
+                    action_stats[cat]["weight"] = round(cap, 10)
+                    action_stats[cat]["capped"] = True
+                    capped_cats.append(cat)
+            if capped_cats:
+                print(f"Weight cap: {max_weight_ratio}× median = {cap:.6f}")
+                for cat in capped_cats:
+                    orig_w = action_stats[cat]["target_mass"] / action_stats[cat]["total_len"]
+                    print(f"  Capped: {cat}  "
+                          f"({orig_w:.6f} → {cap:.6f})")
+                print()
 
     # ── 5. Report ──
-    _print_report(action_stats, cat_duration, target_mass, total_mass)
+    if neutral:
+        _print_report_neutral(action_stats, cat_duration)
+    else:
+        _print_report(action_stats, cat_duration, target_mass, total_mass)
 
     # ── 6. Save (data loader needs 'weight' and 'total_len') ──
     export = {}
@@ -251,7 +268,36 @@ def compute_action_statistics(
 
 
 # ---------------------------------------------------------------------------
-# Report
+# Report (neutral mode)
+# ---------------------------------------------------------------------------
+def _print_report_neutral(
+    action_stats: dict[str, dict],
+    cat_duration: dict[str, float],
+):
+    """Print a summary for neutral-weight mode."""
+    total_hours = sum(cat_duration.values()) / 3600
+    sorted_cats = sorted(cat_duration.items(), key=lambda x: -x[1])
+
+    header = f"{'Category':<14s} {'Hours':>7s}  {'%Data':>6s}  {'Weight':>8s}"
+    sep = "-" * len(header)
+
+    print("Neutral weight mode (weight=1.0 for all categories):")
+    print(sep)
+    print(header)
+    print(sep)
+    for cat, dur in sorted_cats:
+        hours = dur / 3600
+        pct = dur / (total_hours * 3600) * 100
+        print(f"  {cat:<12s} {hours:>7.2f}  {pct:>5.2f}%  {1.0:>8.1f}")
+    print(sep)
+    print(f"  Total: {total_hours:.2f} hours across {len(cat_duration)} categories")
+    print()
+    print("  Training distribution = natural data distribution (P ∝ duration).")
+    print("  Category rebalancing is handled externally (e.g. _recovery_boost).")
+
+
+# ---------------------------------------------------------------------------
+# Report (TARGET_MASS mode)
 # ---------------------------------------------------------------------------
 def _print_report(
     action_stats: dict[str, dict],
@@ -343,11 +389,22 @@ def main():
         help="Cap weight at max_weight_ratio × median_weight (default: 10.0). "
              "Set to 0 to disable. Prevents ultra-rare categories from dominating.",
     )
+    parser.add_argument(
+        "--neutral", action="store_true",
+        help="Generate neutral weights (weight=1.0 for all categories). "
+             "Training distribution matches natural data distribution. "
+             "Use this when data-level boosting (e.g. recovery_boost) handles "
+             "rebalancing instead of TARGET_MASS.",
+    )
 
     args = parser.parse_args()
 
     target_mass = TARGET_MASS
-    if args.mass_config:
+    if args.neutral:
+        # Neutral mode: weight=1.0 for all categories → natural data distribution.
+        # Category-level rebalancing is handled externally (e.g. _recovery_boost).
+        target_mass = None  # signal compute_action_statistics to use neutral
+    elif args.mass_config:
         config_path = Path(args.mass_config)
         if config_path.suffix in (".yaml", ".yml"):
             import yaml

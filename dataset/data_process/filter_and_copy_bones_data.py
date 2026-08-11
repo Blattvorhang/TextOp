@@ -247,6 +247,7 @@ def main():
             "walking_on_edge",
             "push_obstacle",
             "choreography",
+            "lying_side",  # tracker cannot reliably execute side-lying recovery.
         ],
         nargs="+",
         help="Keywords to filter out from filenames",
