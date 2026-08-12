@@ -1,6 +1,7 @@
 import os
 import math
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
@@ -48,6 +49,9 @@ def _make_root_xy_figure(
     ground_truth_trajectory: torch.Tensor = None,
     goal_condition_keep_mask: torch.Tensor = None,
     history_trajectory: torch.Tensor = None,
+    voxel: torch.Tensor = None,
+    grid_size: int = 25,
+    grid_unit: float = 0.08,
     xy_limit: float | None = None,
     max_samples: int = 4,
 ):
@@ -57,9 +61,19 @@ def _make_root_xy_figure(
     The origin (0, 0) is the last history frame — the reference pose for
     the generated primitive.  All subplots share the same square XY limits
     so that scale is directly comparable across samples.
+
+    *voxel* optionally overlays the local occupancy slice at the reference
+    root height (z=0 slice of the ego-frame grid, per query_local_occupancy's
+    vertical centering on the reference pose).  The slice is clipped by the
+    shared XY limit — it does not expand the view.
     """
     from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.colors import ListedColormap
     from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+
+    # occupied cells: semi-transparent gray; free cells: fully transparent
+    occ_cmap = ListedColormap([(0.0, 0.0, 0.0, 0.0), (0.5, 0.5, 0.5, 0.4)])
 
     generated = generated_trajectory.detach().float().cpu()
     goals = goal_xy.detach().float().cpu()
@@ -71,6 +85,7 @@ def _make_root_xy_figure(
         history_trajectory.detach().float().cpu()
         if history_trajectory is not None else None
     )
+    vox = voxel.detach().float().cpu() if voxel is not None else None
     if goal_condition_keep_mask is None:
         indices = torch.arange(generated.shape[0])
     else:
@@ -100,6 +115,31 @@ def _make_root_xy_figure(
     for axis, sample_idx in zip(axes.flat, indices.tolist()):
         generated_xy = generated[sample_idx].numpy()
         goal = goals[sample_idx, :2].numpy()
+
+        # ── local occupancy slice at the reference root height (z=0) ──
+        # Offsets from _local_grid_offsets are cell CENTERS (forward axis is
+        # biased forward by grid_size // 4), so cell edges sit half a unit
+        # outside the outermost centers.  pcolormesh renders via the data
+        # transform (like the trajectory lines), so it is clipped by the
+        # shared XY limit — occupancy does not expand the view.
+        if vox is not None:
+            half = grid_size // 2
+            forward_origin = grid_size // 4
+            x_edges = (np.arange(grid_size + 1) - forward_origin - 0.5) * grid_unit
+            y_edges = (np.arange(grid_size + 1) - half - 0.5) * grid_unit
+            occ_xy = vox[sample_idx].reshape(
+                grid_size, grid_size, grid_size
+            )[:, :, half]  # [forward, left] cell centers at z=0
+            axis.pcolormesh(
+                x_edges,
+                y_edges,
+                occ_xy.T.numpy(),  # rows = left → y, cols = forward → x
+                cmap=occ_cmap,
+                vmin=0,
+                vmax=1,
+                shading='flat',
+                zorder=0,
+            )
 
         # ── history curve (reverse-integrated) ──
         if history is not None:
@@ -163,7 +203,21 @@ def _make_root_xy_figure(
         axis.set_xlabel('x-forward (m)')
         axis.set_ylabel('y-left (m)')
         axis.grid(True, color='#DDDDDD', linewidth=0.7)
-        axis.legend(loc='best', fontsize=7)
+        if vox is not None:
+            # QuadMesh is not directly supported by legend — use a proxy patch
+            # matching the occupied-cell facecolor.
+            occ_proxy = Rectangle(
+                (0, 0), 1, 1,
+                facecolor=(0.5, 0.5, 0.5, 0.4),
+                edgecolor='none',
+                label='occupied',
+            )
+            axis.legend(
+                loc='best', fontsize=7,
+                handles=[occ_proxy] + axis.get_legend_handles_labels()[0],
+            )
+        else:
+            axis.legend(loc='best', fontsize=7)
 
     for axis in axes.flat[count:]:
         axis.set_visible(False)
@@ -480,6 +534,7 @@ def main(cfg: DictConfig):
     # Training loop following train_mvae.py approach
     while manager:
         denoiser.train()
+        train_data.set_training_step(manager.step)
         batch = next(train_dataiter)
         if not train_batch_validated:
             _validate_batch(batch, cfg)
@@ -741,6 +796,9 @@ def main(cfg: DictConfig):
                                 ground_truth_trajectory=ground_truth_trajectory,
                                 history_trajectory=hist_traj,
                                 goal_condition_keep_mask=goal_keep_mask,
+                                voxel=y['voxel'],
+                                grid_size=cfg.denoiser.grid_size,
+                                grid_unit=cfg.data.occupancy_unit,
                             )
                             manager.platform.report_figure(
                                 'root_xy_trajectory',

@@ -20,6 +20,11 @@ data:
   goal_offset: 0
   goal_offset_range: null
   goal_timestep_mode: zero
+  # Keep clean histories for the warm-up, then enable recovery DR in the
+  # dataloader. The server training launch may override this threshold.
+  augmentation_enabled: true
+  augmentation_start_step: 50000
+  augmentation_prob: 0.5
   val:
     goal_offset_range: null
 
@@ -32,8 +37,6 @@ denoiser:
 
 train:
   manager:
-    # Match the last successful 23-DoF training objective. Goal metrics are
-    # still evaluated and visualized, but are not added as new objectives.
     loss_weight:
       foot_contact: 0.01
       goal_direction: 0.0
