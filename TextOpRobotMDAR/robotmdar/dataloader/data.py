@@ -35,6 +35,7 @@ from robotmdar.dtype.motion import (
     motion_feature_dim_for_dof,
     motion_feature_to_dict,
 )
+from robotmdar.dtype.rotation import euler_angles_to_quaternion, quaternion_to_euler_angles
 import json
 
 
@@ -146,6 +147,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.split = split
         self.device = "cpu"  # Keep embeddings on CPU initially
         self.sample_cache_size = max(0, int(kwargs.get('sample_cache_size', 8)))
+        # Planner-side DR is disabled by default: augmentation_enabled must be
+        # explicitly set to true (LDM configs only — VAE training stays clean).
+        # Once enabled, augmentation activates from augmentation_start_step
+        # global optimizer steps onward; the training loop updates the current
+        # step through set_training_step.
+        self.augmentation_start_step = int(kwargs.get('augmentation_start_step', 0))
+        self.augmentation_prob = float(kwargs.get('augmentation_prob', 0.5))
+        self.augmentation_enabled = bool(kwargs.get('augmentation_enabled', False))
+        self.training_step = 0
+        if not 0.0 <= self.augmentation_prob <= 1.0:
+            raise ValueError('augmentation_prob must be in [0, 1]')
         self._sample_cache = OrderedDict()
 
         # Load and prepare data
@@ -376,6 +388,110 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             f"Cannot adapt stored {source_dim}-DoF motion to "
             f"dof_dim={self.dof_dim}"
         )
+
+    def set_training_step(self, step: int) -> None:
+        """Update the step gate used by train-time history augmentation."""
+        self.training_step = int(step)
+
+    def _load_joint_limits(self) -> Optional[torch.Tensor]:
+        """Lazily parse per-joint limits [dof_dim, 2] from the G1 MJCF.
+
+        Returns None when limits are unavailable, in which case the
+        augmentation falls back to the coarse ±π clamp.
+        """
+        import xml.etree.ElementTree as ETree
+        try:
+            mjcf = Path(self.skeleton.fk.mjcf_file)
+            if not mjcf.exists():
+                return None
+            tree = ETree.parse(mjcf)
+            joint_nodes = tree.getroot().findall('.//joint')
+            ranges = {}
+            for node in joint_nodes:
+                name = node.attrib.get('name')
+                rng = node.attrib.get('range')
+                if name is None or rng is None:
+                    continue
+                parts = [float(v) for v in rng.split()]
+                if len(parts) == 2:
+                    ranges[name] = parts
+            limits = []
+            for name in self.skeleton.fk.dof_joint_names:
+                limits.append(ranges.get(name, [-np.pi, np.pi]))
+            return torch.as_tensor(limits, dtype=torch.float32)
+        except Exception:
+            return None
+
+    def _joint_limit_tensor(self) -> Optional[torch.Tensor]:
+        if not hasattr(self, '_cached_joint_limits'):
+            self._cached_joint_limits = self._load_joint_limits()
+        return self._cached_joint_limits
+
+    def _augment_history_features(self, features: torch.Tensor,
+                                  recovery: bool,
+                                  generator: Optional[torch.Generator]) -> torch.Tensor:
+        """Apply one coherent uniform offset to the history portion.
+
+        Features are already built here so the trigonometric roll/pitch channels
+        can be updated with angle-addition identities. The final history delta_q
+        is intentionally restored from the clean feature: its next pose is
+        outside the perturbed history window (Planner V5 v1 contract).
+        """
+        if (not self.augmentation_enabled or self.split != 'train'
+                or self.training_step < self.augmentation_start_step):
+            return features
+        if torch.rand((), generator=generator).item() >= self.augmentation_prob:
+            return features
+
+        out = features.clone()
+        H = min(self.history_len, out.shape[0])
+        if H <= 0:
+            return out
+        device = out.device
+        w = torch.linspace(0.5, 1.0, H, device=device, dtype=out.dtype)
+        if recovery:
+            a_up, a_leg, a_roll, a_pitch, a_h = 0.12, 0.08, 0.25, 0.15, 0.03
+        else:
+            a_up, a_leg, a_roll, a_pitch, a_h = 0.03, 0.02, 0.05, 0.05, 0.01
+        q = (torch.rand(self.dof_dim, generator=generator, device=device,
+                        dtype=out.dtype) * 2 - 1)
+        # Model-facing order is legs/waist/upper body; upper-body starts at 15.
+        q[:15] *= a_leg
+        q[15:] *= a_up
+        # Clamp to real G1 joint limits parsed from the MJCF when available;
+        # TODO(joint-limits): prefer skeleton-cfg-provided limits once exposed.
+        limits = self._joint_limit_tensor()
+        if limits is None:
+            limits = torch.as_tensor(
+                [[-np.pi, np.pi]] * self.dof_dim, dtype=out.dtype, device=device)
+        else:
+            limits = limits.to(device=device, dtype=out.dtype)
+        out[:H, 11:11 + self.dof_dim] = torch.clamp(
+            out[:H, 11:11 + self.dof_dim] + w[:, None] * q,
+            min=limits[:, 0], max=limits[:, 1])
+        # Recompute internal history deltas from the perturbed joint poses.
+        # The last history delta remains clean by the explicit v1 boundary rule.
+        if H > 1 and out.shape[-1] >= 11 + 2 * self.dof_dim:
+            delta_slice = slice(11 + self.dof_dim, 11 + 2 * self.dof_dim)
+            out[:H - 1, delta_slice] = (
+                out[1:H, 11:11 + self.dof_dim]
+                - out[:H - 1, 11:11 + self.dof_dim]
+            )
+
+        dr = (torch.rand((), generator=generator, device=device, dtype=out.dtype) * 2 - 1) * a_roll
+        dp = (torch.rand((), generator=generator, device=device, dtype=out.dtype) * 2 - 1) * a_pitch
+        for sin_i, cos_i, delta in ((0, 1, dr), (2, 3, dp)):
+            sin_r, c_r = out[:H, sin_i].clone(), out[:H, cos_i].clone()
+            angle = w * delta
+            out[:H, sin_i] = sin_r * torch.cos(angle) + (c_r + 1) * torch.sin(angle)
+            out[:H, cos_i] = (c_r + 1) * torch.cos(angle) - sin_r * torch.sin(angle) - 1
+        out[:H, 10] += w * ((torch.rand((), generator=generator, device=device,
+                                           dtype=out.dtype) * 2 - 1) * a_h)
+        if out.shape[-1] >= 11 + 2 * self.dof_dim and H:
+            # Keep the boundary delta clean by explicit v1 policy.
+            out[H - 1, 11 + self.dof_dim:11 + 2 * self.dof_dim] = features[
+                H - 1, 11 + self.dof_dim:11 + 2 * self.dof_dim]
+        return out
 
     # =========================================================================
     # DEPRECATED: Text embedding loading & computation.
@@ -676,6 +792,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'gt_ref_pos': torch.as_tensor(raw_motion['root_trans_offset'][reference_frame], dtype=torch.float32),
             'gt_ref_rot': torch.as_tensor(raw_motion['root_rot'][reference_frame], dtype=torch.float32),
             'scene': sample.get('scene', {}),
+            'is_recovery': bool(sample.get('_recovery_boost', False)),
         }
         if self.goal_type.uses_keypoints:
             if world_goal_keypoints is None:
@@ -753,8 +870,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if not self.weighted_sample:
             rand_idx = torch.randint(0, len(self.valid_indices), (self.batch_size, ), generator=generator)
         else:
-            rand_idx = torch.from_numpy(
-                np.random.choice(len(self.valid_indices), size=self.batch_size, replace=True, p=self.seq_weights)
+            # Use the worker-local Torch generator for reproducible weighted
+            # sequence selection; NumPy's global RNG ignored the caller seed.
+            rand_idx = torch.multinomial(
+                torch.as_tensor(self.seq_weights, dtype=torch.float64),
+                self.batch_size, replacement=True, generator=generator,
             )
 
         all_motion_primitives = []
@@ -791,7 +911,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         return all_motion_primitives
 
     def _organize_primitives_by_index(
-        self, all_motion_primitives: List[List[Dict[str, Any]]]
+        self, all_motion_primitives: List[List[Dict[str, Any]]],
+        generator: Optional[torch.Generator] = None,
     ) -> List[Dict[str, Any]]:
         """Organize primitives by primitive index for batching.
 
@@ -825,6 +946,46 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             # Convert to tensors and motion features
             motion_features = self._convert_to_motion_features(motion_batch)
             feature_len = motion_features.shape[1]
+            recovery_flags = [p['is_recovery'] for p in primitives]
+            for b, is_recovery in enumerate(recovery_flags):
+                clean_features = motion_features[b].clone()
+                motion_features[b] = self._augment_history_features(
+                    motion_features[b], is_recovery, generator)
+                if not torch.equal(clean_features, motion_features[b]):
+                    # Goals stay clean, but ego-centric conditioning is reset to
+                    # the perturbed latest history state (v1 contract).
+                    ref = self.history_len - 1
+                    base_euler = quaternion_to_euler_angles(
+                        primitives[b]['gt_ref_rot'].unsqueeze(0))[0]
+                    pert_euler = torch.stack((
+                        torch.atan2(motion_features[b, ref, 0],
+                                    motion_features[b, ref, 1] + 1),
+                        torch.atan2(motion_features[b, ref, 2],
+                                    motion_features[b, ref, 3] + 1),
+                        base_euler[2],
+                    ))
+                    primitives[b]['gt_ref_rot'] = euler_angles_to_quaternion(
+                        pert_euler.unsqueeze(0))[0]
+                    primitives[b]['gt_ref_pos'] = primitives[b]['gt_ref_pos'].clone()
+                    primitives[b]['gt_ref_pos'][2] = motion_features[b, ref, 10]
+
+                    # Frame-0 anchor consistency: history_start_* must match the
+                    # feature-implied pose at the primitive's first frame, since
+                    # _next_rollout_poses integrates generated motion from it.
+                    start_euler = quaternion_to_euler_angles(
+                        primitives[b]['history_start_rot'].unsqueeze(0))[0]
+                    start_pert = torch.stack((
+                        torch.atan2(motion_features[b, 0, 0],
+                                    motion_features[b, 0, 1] + 1),
+                        torch.atan2(motion_features[b, 0, 2],
+                                    motion_features[b, 0, 3] + 1),
+                        start_euler[2],
+                    ))
+                    primitives[b]['history_start_rot'] = euler_angles_to_quaternion(
+                        start_pert.unsqueeze(0))[0]
+                    primitives[b]['history_start_pos'] = primitives[
+                        b]['history_start_pos'].clone()
+                    primitives[b]['history_start_pos'][2] = motion_features[b, 0, 10]
 
             batch = {
                 'motion': self.normalize(motion_features),
@@ -832,6 +993,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     p['sliding_mask'][:feature_len] for p in primitives
                 ]),
                 'scene': [p['scene'] for p in primitives],
+                'is_recovery': torch.as_tensor(recovery_flags, dtype=torch.bool),
             }
             batch.update({
                 key: torch.stack([p[key] for p in primitives])
@@ -860,7 +1022,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         all_motion_primitives = self._sample_motion_batch(generator)
 
         # Step 2: Organize primitives by index for batching
-        batch_primitives = self._organize_primitives_by_index(all_motion_primitives)
+        batch_primitives = self._organize_primitives_by_index(
+            all_motion_primitives, generator)
 
         return batch_primitives
 

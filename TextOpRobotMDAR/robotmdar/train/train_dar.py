@@ -394,6 +394,7 @@ def main(cfg: DictConfig):
     # Training loop following train_mvae.py approach
     while manager:
         denoiser.train()
+        train_data.set_training_step(manager.step)
         batch = next(train_dataiter)
         if not train_batch_validated:
             _validate_batch(batch, cfg)

@@ -29,6 +29,12 @@ goal_per_primitive: false
 goal_timestep_mode: relative
 occupancy_unit: 0.08
 
+# Planner V5 history augmentation (LDM-only). This explicit opt-in keeps VAE
+# training clean even if a shared start-step override is supplied.
+augmentation_enabled: false
+augmentation_start_step: 50000
+augmentation_prob: 0.5
+
 action_statistics_path: ${.datadir}/action_statistics.json
 
 datadir: dataset/BONES-SEED-29dof-FULL-50fps
@@ -56,6 +62,9 @@ common: &common
   goal_type: ${..goal_type}
   goal_per_primitive: ${..goal_per_primitive}
   goal_timestep_mode: ${..goal_timestep_mode}
+  augmentation_start_step: ${..augmentation_start_step}
+  augmentation_prob: ${..augmentation_prob}
+  augmentation_enabled: ${..augmentation_enabled}
 
 train:
   <<: *common
