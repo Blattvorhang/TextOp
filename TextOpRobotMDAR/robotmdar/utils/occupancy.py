@@ -10,6 +10,106 @@ import torch
 # 3D voxel morphology
 # ---------------------------------------------------------------------------
 
+def erode_voxel_6(occupancy: np.ndarray) -> np.ndarray:
+    """Erode a 3D binary voxel grid with a 6-neighbourhood structuring element.
+
+    A voxel survives only when it AND all 6 face-sharing neighbours (±x, ±y,
+    ±z) are occupied — the weakest neighbourhood erosion, since only direct
+    neighbours constrain survival.  Boundary voxels are padded with occupied
+    (1) so they survive as long as their in-grid neighbours are all occupied.
+
+    Parameters
+    ----------
+    occupancy : np.ndarray
+        3-D boolean or binary integer array.  ``True`` / non-zero means
+        occupied.
+
+    Returns
+    -------
+    np.ndarray
+        Eroded boolean array with the same shape as *occupancy*.
+    """
+    if occupancy.ndim != 3:
+        raise ValueError(
+            f"Expected a 3-D occupancy array, got shape {occupancy.shape}"
+        )
+
+    # Pad with ones so boundary voxels are naturally eroded only by in-grid
+    # neighbours.
+    padded = np.pad(
+        occupancy.astype(np.uint8, copy=False),
+        pad_width=1,
+        mode="constant",
+        constant_values=1,
+    )
+
+    # A voxel survives only when the centre and all 6 face neighbours (±x,
+    # ±y, ±z) are non-zero: AND seven 1-voxel-shifted copies of the grid.
+    eroded: np.ndarray = (
+        padded[1:-1, 1:-1, 1:-1]    # centre
+        & padded[2:, 1:-1, 1:-1]    # +x
+        & padded[:-2, 1:-1, 1:-1]   # -x
+        & padded[1:-1, 2:, 1:-1]    # +y
+        & padded[1:-1, :-2, 1:-1]   # -y
+        & padded[1:-1, 1:-1, 2:]    # +z
+        & padded[1:-1, 1:-1, :-2]   # -z
+    ).astype(bool)
+    return eroded
+
+
+def erode_voxel_10(occupancy: np.ndarray) -> np.ndarray:
+    """Erode a 3D binary voxel grid with an anisotropic 10-neighbourhood.
+
+    A voxel survives only when it AND all 10 neighbours — the 6 face-sharing
+    neighbours plus the 4 diagonal neighbours in the same horizontal (xy)
+    plane — are occupied.  Compared to :func:`erode_voxel_6`, the extra
+    diagonal constraints strengthen the erosion in the horizontal plane while
+    the vertical direction keeps the weak face-only strength.
+
+    Parameters
+    ----------
+    occupancy : np.ndarray
+        3-D boolean or binary integer array.  ``True`` / non-zero means
+        occupied.
+
+    Returns
+    -------
+    np.ndarray
+        Eroded boolean array with the same shape as *occupancy*.
+    """
+    if occupancy.ndim != 3:
+        raise ValueError(
+            f"Expected a 3-D occupancy array, got shape {occupancy.shape}"
+        )
+
+    # Pad with ones so boundary voxels are naturally eroded only by in-grid
+    # neighbours.
+    padded = np.pad(
+        occupancy.astype(np.uint8, copy=False),
+        pad_width=1,
+        mode="constant",
+        constant_values=1,
+    )
+
+    # A voxel survives only when the centre, the 6 face neighbours, and the
+    # 4 diagonal neighbours in the same horizontal (xy) plane are non-zero:
+    # AND eleven 1-voxel-shifted copies of the grid.
+    eroded: np.ndarray = (
+        padded[1:-1, 1:-1, 1:-1]    # centre
+        & padded[2:, 1:-1, 1:-1]    # +x
+        & padded[:-2, 1:-1, 1:-1]   # -x
+        & padded[1:-1, 2:, 1:-1]    # +y
+        & padded[1:-1, :-2, 1:-1]   # -y
+        & padded[1:-1, 1:-1, 2:]    # +z
+        & padded[1:-1, 1:-1, :-2]   # -z
+        & padded[2:, 2:, 1:-1]      # horizontal diagonals
+        & padded[2:, :-2, 1:-1]
+        & padded[:-2, 2:, 1:-1]
+        & padded[:-2, :-2, 1:-1]
+    ).astype(bool)
+    return eroded
+
+
 def erode_voxel_26(occupancy: np.ndarray) -> np.ndarray:
     """Erode a 3D binary voxel grid with a 26-neighbourhood structuring element.
 
@@ -33,7 +133,8 @@ def erode_voxel_26(occupancy: np.ndarray) -> np.ndarray:
             f"Expected a 3-D occupancy array, got shape {occupancy.shape}"
         )
 
-    # Pad with zeros so boundary voxels are naturally eroded away.
+    # Pad with ones so boundary voxels are preserved as long as their 
+    # in-grid neighbours are all occupied.
     padded = np.pad(
         occupancy.astype(np.uint8, copy=False),
         pad_width=1,

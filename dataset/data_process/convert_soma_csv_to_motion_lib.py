@@ -49,11 +49,14 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import torch
 from scipy.interpolate import interp1d
 from scipy.spatial import transform
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 from tqdm import tqdm
+
+from robotmdar.utils.occupancy import erode_voxel_26
 
 # IsaacLab ↔ MuJoCo joint reordering (29 DOFs for G1).
 # MJ_TO_IL[mj] = il: for MuJoCo DOF index mj, gives the IsaacLab index il.
@@ -428,8 +431,6 @@ def _get_collision_geom_ids(model) -> list:
 
 def _quat_wxyz_to_matrix_torch(quat):
     """Convert normalized wxyz quaternions to rotation matrices."""
-    import torch
-
     quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1e-12)
     w, x, y, z = quat.unbind(dim=-1)
     two = 2.0
@@ -447,8 +448,6 @@ def _quat_wxyz_to_matrix_torch(quat):
 
 def _axis_angle_to_matrix_torch(axis, angle):
     """Convert fixed rotation axes and batched scalar angles to matrices."""
-    import torch
-
     axis = axis / torch.linalg.vector_norm(axis, dim=-1, keepdim=True).clamp_min(1e-12)
     half = angle * 0.5
     xyz = axis.unsqueeze(0) * torch.sin(half).unsqueeze(-1)
@@ -461,7 +460,6 @@ class _TorchBatchKinematics:
 
     def __init__(self, model, device: str):
         import mujoco
-        import torch
 
         if model.nbody - 1 != NUM_BODIES:
             raise ValueError(
@@ -516,8 +514,6 @@ class _TorchBatchKinematics:
         )
 
     def forward(self, root_trans, root_rot_xyzw, dof, mob_frame_ids):
-        import torch
-
         if self.device.type == "cpu":
             # The outer data pipeline already parallelizes by process.
             torch.set_num_threads(1)
@@ -979,8 +975,16 @@ def compute_contact_and_mob(
 
         # ~swept_occu → where the robot never went → assumed obstacle
         # True = occupied (obstacle), False = free (robot passed through here)
+        occu_global = ~swept_occu
+
+        # Collision geoms undershoot the real body volume, leaving the free
+        # corridor along the root trajectory only ~1 voxel (0.08 m) wide.
+        # Erode the occupied set to widen it; the MJCF geoms stay untouched
+        # so simulator physics are unchanged.
+        occu_global = erode_voxel_26(occu_global)
+
         result["scene"] = {
-            "occu_global": ~swept_occu,
+            "occu_global": occu_global,
             "unit": mob_unit,
             "llb": llb.astype(np.float32),
         }
