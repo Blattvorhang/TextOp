@@ -696,6 +696,27 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         overlap_len = max(0, min(seg1[1], seg2[1]) - max(seg1[0], seg2[0]))
         return overlap_len
 
+    def _primitive_action_label(self, sample: Dict[str, Any],
+                                prim_start: int, prim_end: int) -> str:
+        """Best-overlap BABEL verb for the primitive window; 'unknown' fallback.
+
+        frame_ann entries are (start_s, end_s, verb, [desc, ...]) in seconds.
+        The window is [prim_start, prim_end) frames; units match via fps.
+        """
+        frame_ann = sample.get('frame_ann')
+        if not frame_ann:
+            return 'unknown'
+        start_t = prim_start / float(self.fps)
+        end_t = (prim_end - 1) / float(self.fps)
+        best_ann = None
+        best_overlap = 0.0
+        for ann in frame_ann:
+            overlap = self._get_overlap([ann[0], ann[1]], [start_t, end_t])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_ann = ann
+        return str(best_ann[2]) if best_ann is not None else 'unknown'
+
     def have_overlap(self, seg1, seg2):
         if seg1[0] > seg2[1] or seg2[0] > seg1[1]:
             return False
@@ -793,6 +814,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'gt_ref_rot': torch.as_tensor(raw_motion['root_rot'][reference_frame], dtype=torch.float32),
             'scene': sample.get('scene', {}),
             'is_recovery': bool(sample.get('_recovery_boost', False)),
+            'action_label': self._primitive_action_label(
+                sample, prim_start, prim_end),
         }
         if self.goal_type.uses_keypoints:
             if world_goal_keypoints is None:
@@ -993,6 +1016,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     p['sliding_mask'][:feature_len] for p in primitives
                 ]),
                 'scene': [p['scene'] for p in primitives],
+                'action_label': [p['action_label'] for p in primitives],
                 'is_recovery': torch.as_tensor(recovery_flags, dtype=torch.bool),
             }
             batch.update({
