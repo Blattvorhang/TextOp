@@ -1,4 +1,5 @@
 import math
+import random
 from typing import List, Optional
 
 import numpy as np
@@ -11,7 +12,7 @@ from robotmdar.utils.goal import (
     build_ego_goal,
     validate_goal_config,
 )
-from robotmdar.utils.occupancy import query_local_occupancy
+from robotmdar.utils.occupancy import compute_scene_surface, query_local_occupancy
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
 from robotmdar.utils.dof_contract import (
@@ -237,7 +238,8 @@ def _pose_dict(position: torch.Tensor, rotation: torch.Tensor):
     return {"root_trans_offset": position, "root_rot": rotation}
 
 
-def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
+def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
+                use_scene: bool = True):
     goal_type = GoalType.parse(cfg.data.goal_type)
     goal = build_ego_goal(
         primitive['world_goal_pos'].to(cfg.device),
@@ -258,13 +260,44 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
             if goal_type is GoalType.BODY_EXT else None
         ),
     )
-    voxel = query_local_occupancy(
-        primitive['scene'],
-        reference_pos,
-        reference_rot,
-        grid_size=cfg.denoiser.grid_size,
-        grid_unit=cfg.data.occupancy_unit,
-    )
+    if use_scene:
+        voxel = query_local_occupancy(
+            primitive['scene'],
+            reference_pos,
+            reference_rot,
+            grid_size=cfg.denoiser.grid_size,
+            grid_unit=cfg.data.occupancy_unit,
+        )
+        if bool(cfg.data.get('use_scene_surface', True)):
+            # Surface (motion-envelope) scene representation: a LOCAL
+            # operation on the ego occupancy from query_local_occupancy —
+            # the global scene dicts are never modified.  Only the obstacle
+            # boundary shell conditions the denoiser; the envelope thickness
+            # is randomized per sample (uniform in {1, 2, 3}) like the other
+            # domain-randomization knobs.  Applied at the source so training,
+            # eval and rollout all consume the same representation.
+            grid_size = int(cfg.denoiser.grid_size)
+            grid = voxel.view(voxel.shape[0], grid_size, grid_size, grid_size)
+            # torch input -> torch output, so as_tensor is a no-op that only
+            # satisfies the static union type of compute_scene_surface
+            surfaces = [
+                torch.as_tensor(
+                    compute_scene_surface(grid[i], thickness=random.choice(
+                        (1, 2, 3))),
+                    dtype=torch.bool,
+                )
+                for i in range(grid.shape[0])
+            ]
+            voxel = torch.stack(surfaces).view(voxel.shape[0], -1).to(
+                dtype=voxel.dtype)
+    else:
+        # Pre-scene curriculum phase (step < manager.scene_start_step): the
+        # denoiser learns basic goal-driven motion on a blank occupancy grid.
+        voxel = torch.zeros(
+            reference_pos.shape[0],
+            int(cfg.denoiser.grid_size) ** 3,
+            device=reference_pos.device,
+        )
     return {
         'goal': goal,
         'voxel': voxel,
@@ -364,7 +397,8 @@ def _sample_segment_rollout(batch, dataset, vae, denoiser, diffusion,
             reference_rot = primitive['gt_ref_rot'].to(device)
 
         y = _conditions(primitive, reference_pos, reference_rot,
-                        history_motion, cfg)
+                        history_motion, cfg,
+                        use_scene=manager.should_use_scene())
 
         with torch.no_grad():
             # full DDPM sample, mirroring the eval loop's sampling path
@@ -600,7 +634,10 @@ def _build_segment_figure(batch, dataset, vae, denoiser, diffusion,
     goal_pidx = -1 if bool(cfg.data.goal_per_primitive) else 0
     world_goal_pos = sliced[goal_pidx]['world_goal_pos']
     labels = sliced[0].get('action_label')
-    scenes = sliced[0].get('scene')
+    # Pre-scene phase: draw trajectory + goal only, no occupancy overlay.
+    # The surface representation is a LOCAL operation on the ego grid, so
+    # the world-frame segment figure keeps drawing the raw global occupancy.
+    scenes = sliced[0].get('scene') if manager.should_use_scene() else None
     return _make_segment_figure(
         viz_data, world_goal_pos, labels=labels,
         stage_idx=manager.stage_idx, max_samples=max_samples,
@@ -705,7 +742,10 @@ def main(cfg: DictConfig):
     optimizer: Optimizer = torch.optim.AdamW(
         denoiser.parameters(), lr=cfg.train.manager.learning_rate)
 
-    manager: DARManager = instantiate(cfg.train.manager)
+    # scene_start_step lives in the data config (data/mob.yaml); hand it to
+    # the manager explicitly since it is no longer part of train.manager.
+    manager: DARManager = instantiate(
+        cfg.train.manager, scene_start_step=cfg.data.scene_start_step)
 
     manager.hold_model(vae, denoiser, optimizer, train_data)
 
@@ -758,7 +798,9 @@ def main(cfg: DictConfig):
                 reference_pos = primitive['gt_ref_pos'].to(cfg.device)
                 reference_rot = primitive['gt_ref_rot'].to(cfg.device)
 
-            y = _conditions(primitive, reference_pos, reference_rot, history_motion, cfg)
+            y = _conditions(primitive, reference_pos, reference_rot,
+                            history_motion, cfg,
+                            use_scene=manager.should_use_scene())
 
             # Sample timesteps
             batch_size = motion.shape[0]
@@ -867,12 +909,14 @@ def main(cfg: DictConfig):
                 sliding_mask = batch[pidx]['sliding_mask'].to(
                     cfg.device)[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]
+                use_scene = manager.should_use_scene()
                 y = _conditions(
                     primitive,
                     primitive['gt_ref_pos'].to(cfg.device),
                     primitive['gt_ref_rot'].to(cfg.device),
                     history_motion,
                     cfg,
+                    use_scene=use_scene,
                 )
 
                 with torch.no_grad():
@@ -975,7 +1019,8 @@ def main(cfg: DictConfig):
                                 ground_truth_trajectory=ground_truth_trajectory,
                                 history_trajectory=hist_traj,
                                 goal_condition_keep_mask=goal_keep_mask,
-                                voxel=y['voxel'],
+                                # Pre-scene phase: draw trajectory + goal only
+                                voxel=y['voxel'] if use_scene else None,
                                 grid_size=cfg.denoiser.grid_size,
                                 grid_unit=cfg.data.occupancy_unit,
                                 labels=batch[pidx].get('action_label'),
