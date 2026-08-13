@@ -1,5 +1,7 @@
 import os
 import math
+import random
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -12,7 +14,7 @@ from robotmdar.utils.goal import (
     build_ego_goal,
     validate_goal_config,
 )
-from robotmdar.utils.occupancy import query_local_occupancy
+from robotmdar.utils.occupancy import compute_scene_surface, query_local_occupancy
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
 from robotmdar.utils.dof_contract import (
@@ -54,6 +56,7 @@ def _make_root_xy_figure(
     grid_unit: float = 0.08,
     xy_limit: float | None = None,
     max_samples: int = 4,
+    labels: Optional[List[str]] = None,
 ):
     """Plot full-sample root paths in the reference ego horizontal plane.
 
@@ -192,8 +195,13 @@ def _make_root_xy_figure(
         endpoint_error = torch.linalg.vector_norm(
             generated[sample_idx, -1] - goals[sample_idx, :2]
         ).item()
+        label = None
+        if (labels is not None and sample_idx < len(labels)
+                and labels[sample_idx]):
+            label = labels[sample_idx]
+        title_label = label if label is not None else f'sample {sample_idx}'
         axis.set_title(
-            f'sample {sample_idx}  |  endpoint error {endpoint_error:.3f} m'
+            f'{title_label}  |  endpoint error {endpoint_error:.3f} m'
         )
 
         # ── unified scale & ego-consistent labels ──
@@ -232,7 +240,8 @@ def _pose_dict(position: torch.Tensor, rotation: torch.Tensor):
     return {"root_trans_offset": position, "root_rot": rotation}
 
 
-def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
+def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
+                use_scene: bool = True):
     goal_type = GoalType.parse(cfg.data.goal_type)
     goal = build_ego_goal(
         primitive['world_goal_pos'].to(cfg.device),
@@ -253,13 +262,44 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg):
             if goal_type is GoalType.BODY_EXT else None
         ),
     )
-    voxel = query_local_occupancy(
-        primitive['scene'],
-        reference_pos,
-        reference_rot,
-        grid_size=cfg.denoiser.grid_size,
-        grid_unit=cfg.data.occupancy_unit,
-    )
+    if use_scene:
+        voxel = query_local_occupancy(
+            primitive['scene'],
+            reference_pos,
+            reference_rot,
+            grid_size=cfg.denoiser.grid_size,
+            grid_unit=cfg.data.occupancy_unit,
+        )
+        if bool(cfg.data.get('use_scene_surface', True)):
+            # Surface (motion-envelope) scene representation: a LOCAL
+            # operation on the ego occupancy from query_local_occupancy —
+            # the global scene dicts are never modified.  Only the obstacle
+            # boundary shell conditions the denoiser; the envelope thickness
+            # is randomized per sample (uniform in {1, 2, 3}) like the other
+            # domain-randomization knobs.  Applied at the source so training,
+            # eval and rollout all consume the same representation.
+            grid_size = int(cfg.denoiser.grid_size)
+            grid = voxel.view(voxel.shape[0], grid_size, grid_size, grid_size)
+            # torch input -> torch output, so as_tensor is a no-op that only
+            # satisfies the static union type of compute_scene_surface
+            surfaces = [
+                torch.as_tensor(
+                    compute_scene_surface(grid[i], thickness=random.choice(
+                        (1, 2, 3))),
+                    dtype=torch.bool,
+                )
+                for i in range(grid.shape[0])
+            ]
+            voxel = torch.stack(surfaces).view(voxel.shape[0], -1).to(
+                dtype=voxel.dtype)
+    else:
+        # Pre-scene curriculum phase (step < manager.scene_start_step): the
+        # denoiser learns basic goal-driven motion on a blank occupancy grid.
+        voxel = torch.zeros(
+            reference_pos.shape[0],
+            int(cfg.denoiser.grid_size) ** 3,
+            device=reference_pos.device,
+        )
     return {
         'goal': goal,
         'voxel': voxel,
@@ -280,6 +320,330 @@ def _next_rollout_poses(dataset, motion, history_start_pos, history_start_rot, h
         reconstructed['root_trans_offset'][:, -1].detach(),
         reconstructed['root_rot'][:, -1].detach(),
     )
+
+
+class _preserve_rng:
+    """Save/restore CPU+CUDA RNG state so visualization sampling cannot
+    perturb subsequent eval-step metrics."""
+
+    def __enter__(self):
+        self.cpu_state = torch.random.get_rng_state()
+        self.cuda_state = (
+            torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        )
+        return self
+
+    def __exit__(self, *exc):
+        torch.random.set_rng_state(self.cpu_state)
+        if self.cuda_state is not None:
+            torch.cuda.set_rng_state(self.cuda_state)
+        return False
+
+
+def _slice_batch_for_viz(batch, max_samples: int = 4):
+    """Slice every key of every primitive dict to the first max_samples.
+
+    Tensor keys (motion, world_goal_pos, ...) and list keys (scene,
+    action_label) both support [:] slicing, so they are handled uniformly.
+    """
+    return [
+        {key: value[:max_samples] for key, value in primitive.items()}
+        for primitive in batch
+    ]
+
+
+def _sample_segment_rollout(batch, dataset, vae, denoiser, diffusion,
+                            manager, cfg):
+    """Autoregressive full-segment rollout under the TRAINING history policy.
+
+    Stage policy is delegated to manager.choose_history:
+      stage 0 -> always GT history (should_rollout False)
+      stage 1 -> probabilistic GT/predicted history (linear ramp)
+      stage 2 -> always predicted history from primitive 1 on (prob=1)
+    window 0 always uses GT history (prev_motion is None).  Visualization
+    only: no loss/extras writes, no manager state mutation.
+
+    Returns a dict of CPU tensors for plotting:
+      gt_segment   [N, H + F*Np, 3]  world GT positions, whole segment
+      pred_segment [N, H + F*Np, 3]  world predicted positions, whole segment
+      hist_world   [Np, N, H, 3]     world positions of the USED history
+      anchors      [Np, N, 3]        world anchor (history start) per window
+      used_rollout [Np]              bool per window
+    """
+    device = cfg.device
+    num_primitive = len(batch)
+    history_len = int(cfg.data.history_len)
+    future_len = int(cfg.data.future_len)
+
+    prev_motion = None
+    rollout_history_start_pos = rollout_history_start_rot = None
+    rollout_ref_pos = rollout_ref_rot = None
+    per_window = []
+
+    for primitive in batch:
+        motion = primitive['motion'].to(device)              # [N, H+F, D]
+        gt_history = motion[:, :history_len]
+
+        history_motion, used_rollout = manager.choose_history(
+            gt_history, prev_motion, history_len, return_rollout=True)
+
+        if used_rollout:
+            history_start_pos = rollout_history_start_pos
+            history_start_rot = rollout_history_start_rot
+            reference_pos = rollout_ref_pos
+            reference_rot = rollout_ref_rot
+        else:
+            history_start_pos = primitive['history_start_pos'].to(device)
+            history_start_rot = primitive['history_start_rot'].to(device)
+            reference_pos = primitive['gt_ref_pos'].to(device)
+            reference_rot = primitive['gt_ref_rot'].to(device)
+
+        y = _conditions(primitive, reference_pos, reference_rot,
+                        history_motion, cfg,
+                        use_scene=manager.should_use_scene())
+
+        with torch.no_grad():
+            # full DDPM sample, mirroring the eval loop's sampling path
+            latent_gt, _ = vae.encode(
+                future_motion=motion[:, -future_len:],
+                history_motion=history_motion)
+            sample_latent = diffusion.p_sample_loop(
+                denoiser, latent_gt.permute(1, 0, 2).shape,
+                clip_denoised=False, model_kwargs={'y': y}, progress=False)
+            future_pred = vae.decode(
+                sample_latent.permute(1, 0, 2),
+                history_motion, nfuture=future_len)           # [N, F, D]
+
+            # world reconstruction of the full used window (H + F frames)
+            window = torch.cat([history_motion, future_pred], dim=1)
+            recon = dataset.reconstruct_motion(
+                window,
+                abs_pose=_pose_dict(history_start_pos, history_start_rot),
+                ret_fk=False)['root_trans_offset']            # [N, H+F, 3]
+            # GT window: batch features anchored at the GT segment pose
+            recon_gt = dataset.reconstruct_motion(
+                motion,
+                abs_pose=_pose_dict(
+                    primitive['history_start_pos'].to(device),
+                    primitive['history_start_rot'].to(device)),
+                ret_fk=False)['root_trans_offset']
+
+        per_window.append({
+            'pred_full': recon.detach().float().cpu(),
+            'gt_full': recon_gt.detach().float().cpu(),
+            'anchor': history_start_pos.detach().float().cpu(),
+            'used_rollout': bool(used_rollout),
+        })
+
+        prev_motion = torch.cat(
+            [history_motion, future_pred], dim=1).detach()
+        (rollout_history_start_pos, rollout_history_start_rot,
+         rollout_ref_pos, rollout_ref_rot) = _next_rollout_poses(
+            dataset, prev_motion, history_start_pos,
+            history_start_rot, history_len)
+
+    # ── stitch: consecutive future slices are contiguous in world frame ──
+    gt_segment = torch.cat(
+        [per_window[0]['gt_full'][:, :history_len]]
+        + [w['gt_full'][:, history_len:] for w in per_window], dim=1)
+    pred_segment = torch.cat(
+        [per_window[0]['pred_full'][:, :history_len]]
+        + [w['pred_full'][:, history_len:] for w in per_window], dim=1)
+    hist_world = torch.stack(
+        [w['pred_full'][:, :history_len] for w in per_window], dim=0)
+    anchors = torch.stack([w['anchor'] for w in per_window], dim=0)
+
+    return {
+        'gt_segment': gt_segment,        # [N, H + F*Np, 3]
+        'pred_segment': pred_segment,    # [N, H + F*Np, 3]
+        'hist_world': hist_world,        # [Np, N, H, 3]
+        'anchors': anchors,              # [Np, N, 3]
+        'used_rollout': [w['used_rollout'] for w in per_window],
+    }
+
+
+def _world_occupancy_slice(scene, origin_xy, z, xy_limit):
+    """2-D world-aligned occupancy slice from the scene's global grid.
+
+    Returns (x_edges, y_edges, occ_2d) in plot coordinates (origin_xy
+    subtracted), clipped to the ±xy_limit window, or None when the scene
+    is missing / the z slice falls outside the grid.  Axis order matches
+    query_local_occupancy: occupancy[x, y, z] with llb as the world
+    lower-left-back corner.
+    """
+    if not scene or not {'occu_global', 'unit', 'llb'}.issubset(scene):
+        return None
+    occupancy = np.asarray(scene['occu_global'], dtype=bool)
+    unit = float(scene['unit'])
+    llb = np.asarray(scene['llb'], dtype=np.float32)
+    nz = occupancy.shape[2]
+    z_idx = int(np.floor((z - llb[2]) / unit))
+    if z_idx < 0 or z_idx >= nz:
+        return None
+    nx, ny = occupancy.shape[0], occupancy.shape[1]
+    x_lo = max(0, int(np.floor((origin_xy[0] - xy_limit - llb[0]) / unit)))
+    x_hi = min(nx, int(np.ceil((origin_xy[0] + xy_limit - llb[0]) / unit)) + 1)
+    y_lo = max(0, int(np.floor((origin_xy[1] - xy_limit - llb[1]) / unit)))
+    y_hi = min(ny, int(np.ceil((origin_xy[1] + xy_limit - llb[1]) / unit)) + 1)
+    if x_lo >= x_hi or y_lo >= y_hi:
+        return None
+    occ = occupancy[x_lo:x_hi, y_lo:y_hi, z_idx]
+    x_edges = llb[0] + np.arange(x_lo, x_hi + 1) * unit - origin_xy[0]
+    y_edges = llb[1] + np.arange(y_lo, y_hi + 1) * unit - origin_xy[1]
+    return x_edges, y_edges, occ
+
+
+def _make_segment_figure(viz_data, world_goal_pos, labels=None,
+                         stage_idx=None, max_samples: int = 4,
+                         scenes=None):
+    """One subplot per sample: the whole segment stitched in WORLD frame,
+    translated so the segment start (window-0 anchor) is at the origin.
+
+    *world_goal_pos*: [N, 3] tensor of the segment terminal goal.
+    *labels*: list of B str (action label per sample) or None.
+    *scenes*: list of B occupancy dicts (occu_global/unit/llb) or None;
+    when present, a world-aligned occupancy slice at the segment-start
+    height is drawn, clipped by the shared XY limit.
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.colors import ListedColormap
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+
+    # occupied cells: semi-transparent gray; free cells: fully transparent
+    occ_cmap = ListedColormap([(0.0, 0.0, 0.0, 0.0), (0.5, 0.5, 0.5, 0.4)])
+
+    gt_segment = viz_data['gt_segment']          # [N, T, 3]
+    pred_segment = viz_data['pred_segment']      # [N, T, 3]
+    hist_world = viz_data['hist_world']          # [Np, N, H, 3]
+    anchors = viz_data['anchors']                # [Np, N, 3]
+    goals = world_goal_pos.detach().float().cpu()
+    count = min(int(gt_segment.shape[0]), max_samples)
+    num_primitive = hist_world.shape[0]
+
+    # translate every world point so the segment start is the origin
+    origin = gt_segment[:, :1]                   # [N, 1, 3] = window-0 anchor
+    gt_seg = gt_segment - origin
+    pred_seg = pred_segment - origin
+    hist = hist_world - origin                   # [Np, N, H, 3] - [N, 1, 3]
+    anc = anchors - origin[:, 0]                 # [Np, N, 3]
+    goal_xy = goals[:, :2] - origin[:, 0, :2]    # [N, 2]
+
+    # shared symmetric XY limit over the plotted data (2D only, z excluded)
+    xy_limit = _compute_xy_limit(
+        gt_seg[:count, ..., :2], pred_seg[:count, ..., :2],
+        goals_xy=goal_xy[:count, ...],
+    )
+
+    cols = min(2, count)
+    rows = (count + cols - 1) // cols
+    figure = Figure(figsize=(6.0 * cols, 5.0 * rows), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(rows, cols, squeeze=False)
+
+    for axis, sample_idx in zip(axes.flat, range(count)):
+        # ── world-aligned occupancy slice at the segment-start height ──
+        # The slice is clipped by the shared XY limit — occupancy does not
+        # expand the view.
+        has_occ = False
+        if scenes is not None and sample_idx < len(scenes):
+            occ_slice = _world_occupancy_slice(
+                scenes[sample_idx],
+                origin[sample_idx, 0, :2].numpy(),
+                float(origin[sample_idx, 0, 2]),
+                xy_limit,
+            )
+            if occ_slice is not None:
+                x_edges, y_edges, occ = occ_slice
+                axis.pcolormesh(
+                    x_edges, y_edges, occ.T,  # rows = y, cols = x
+                    cmap=occ_cmap, vmin=0, vmax=1, shading='flat',
+                    zorder=0,
+                )
+                has_occ = True
+
+        # GT full segment (gray dashed)
+        axis.plot(gt_seg[sample_idx, :, 0], gt_seg[sample_idx, :, 1],
+                  color='#666666', linewidth=1.5, linestyle='--',
+                  label='GT segment', zorder=2)
+        # per-primitive used history (light blue dashed)
+        for pidx in range(num_primitive):
+            axis.plot(hist[pidx, sample_idx, :, 0],
+                      hist[pidx, sample_idx, :, 1],
+                      color='#56B4E9', linewidth=1.4, linestyle='--',
+                      zorder=2)
+        # predicted stitched segment (blue solid)
+        axis.plot(pred_seg[sample_idx, :, 0], pred_seg[sample_idx, :, 1],
+                  color='#0072B2', linewidth=2.2, zorder=3,
+                  label='predicted')
+        # primitive boundary / anchor markers (black dots)
+        axis.scatter(anc[:, sample_idx, 0], anc[:, sample_idx, 1],
+                     color='#222222', s=22, zorder=6,
+                     label='primitive anchor')
+        # start and goal markers
+        axis.scatter([0.0], [0.0], color='#222222', s=35, zorder=6,
+                     label='start')
+        axis.scatter([goal_xy[sample_idx, 0]], [goal_xy[sample_idx, 1]],
+                     color='#D55E00', marker='X', s=90, zorder=6,
+                     label='goal')
+
+        label = None
+        if (labels is not None and sample_idx < len(labels)
+                and labels[sample_idx]):
+            label = labels[sample_idx]
+        title_label = label if label is not None else f'sample {sample_idx}'
+        stage_text = '' if stage_idx is None else f' | stage {stage_idx}'
+        axis.set_title(f'{title_label}{stage_text}')
+
+        axis.set_xlim(-xy_limit, xy_limit)
+        axis.set_ylim(-xy_limit, xy_limit)
+        axis.set_aspect('equal')
+        axis.set_xlabel('x (m)')
+        axis.set_ylabel('y (m)')
+        axis.grid(True, color='#DDDDDD', linewidth=0.7)
+        if has_occ:
+            # QuadMesh is not directly supported by legend — use a proxy patch
+            occ_proxy = Rectangle(
+                (0, 0), 1, 1,
+                facecolor=(0.5, 0.5, 0.5, 0.4),
+                edgecolor='none',
+                label='occupied',
+            )
+            axis.legend(
+                loc='best', fontsize=7,
+                handles=[occ_proxy] + axis.get_legend_handles_labels()[0],
+            )
+        else:
+            axis.legend(loc='best', fontsize=7)
+
+    for axis in axes.flat[count:]:
+        axis.set_visible(False)
+    figure.suptitle(
+        f'Full-segment rollout  |  world frame (segment start at origin)  '
+        f'|  limit ±{xy_limit:.2f} m'
+    )
+    return figure
+
+
+def _build_segment_figure(batch, dataset, vae, denoiser, diffusion,
+                          manager, cfg, max_samples: int = 4):
+    """Slice the eval batch, run the mirrored rollout, return the figure."""
+    with torch.no_grad(), _preserve_rng():
+        sliced = _slice_batch_for_viz(batch, max_samples)
+        viz_data = _sample_segment_rollout(
+            sliced, dataset, vae, denoiser, diffusion, manager, cfg)
+    # segment goal: shared (goal_per_primitive=false) vs terminal (true)
+    goal_pidx = -1 if bool(cfg.data.goal_per_primitive) else 0
+    world_goal_pos = sliced[goal_pidx]['world_goal_pos']
+    labels = sliced[0].get('action_label')
+    # Pre-scene phase: draw trajectory + goal only, no occupancy overlay.
+    # The surface representation is a LOCAL operation on the ego grid, so
+    # the world-frame segment figure keeps drawing the raw global occupancy.
+    scenes = sliced[0].get('scene') if manager.should_use_scene() else None
+    return _make_segment_figure(
+        viz_data, world_goal_pos, labels=labels,
+        stage_idx=manager.stage_idx, max_samples=max_samples,
+        scenes=scenes)
 
 
 def _detach_mapping(values):
@@ -516,7 +880,10 @@ def main(cfg: DictConfig):
     optimizer: Optimizer = torch.optim.AdamW(
         denoiser.parameters(), lr=cfg.train.manager.learning_rate)
 
-    manager: DARManager = instantiate(cfg.train.manager)
+    # scene_start_step lives in the data config (data/mob.yaml); hand it to
+    # the manager explicitly since it is no longer part of train.manager.
+    manager: DARManager = instantiate(
+        cfg.train.manager, scene_start_step=cfg.data.scene_start_step)
 
     manager.hold_model(vae, denoiser, optimizer, train_data)
     manager.rank = rank
@@ -571,7 +938,9 @@ def main(cfg: DictConfig):
                 reference_pos = primitive['gt_ref_pos'].to(cfg.device)
                 reference_rot = primitive['gt_ref_rot'].to(cfg.device)
 
-            y = _conditions(primitive, reference_pos, reference_rot, history_motion, cfg)
+            y = _conditions(primitive, reference_pos, reference_rot,
+                            history_motion, cfg,
+                            use_scene=manager.should_use_scene())
 
             # Sample timesteps
             batch_size = motion.shape[0]
@@ -687,12 +1056,14 @@ def main(cfg: DictConfig):
                 sliding_mask = batch[pidx]['sliding_mask'].to(
                     cfg.device)[:, -future_len:, :]
                 history_motion = motion[:, :history_len, :]
+                use_scene = manager.should_use_scene()
                 y = _conditions(
                     primitive,
                     primitive['gt_ref_pos'].to(cfg.device),
                     primitive['gt_ref_rot'].to(cfg.device),
                     history_motion,
                     cfg,
+                    use_scene=use_scene,
                 )
 
                 with torch.no_grad():
@@ -796,13 +1167,27 @@ def main(cfg: DictConfig):
                                 ground_truth_trajectory=ground_truth_trajectory,
                                 history_trajectory=hist_traj,
                                 goal_condition_keep_mask=goal_keep_mask,
-                                voxel=y['voxel'],
+                                # Pre-scene phase: draw trajectory + goal only
+                                voxel=y['voxel'] if use_scene else None,
                                 grid_size=cfg.denoiser.grid_size,
                                 grid_unit=cfg.data.occupancy_unit,
+                                labels=batch[pidx].get('action_label'),
                             )
                             manager.platform.report_figure(
                                 'root_xy_trajectory',
                                 figure,
+                                manager.step,
+                                group_name='eval',
+                            )
+                            # Full-segment rollout figure: visualization only,
+                            # does not feed eval metrics. RNG state is
+                            # preserved so later eval steps are unaffected.
+                            segment_figure = _build_segment_figure(
+                                batch, val_data, vae, denoiser, diffusion,
+                                manager, cfg)
+                            manager.platform.report_figure(
+                                'segment_rollout_trajectory',
+                                segment_figure,
                                 manager.step,
                                 group_name='eval',
                             )

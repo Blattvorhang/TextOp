@@ -35,7 +35,6 @@ from robotmdar.dtype.motion import (
     motion_feature_dim_for_dof,
     motion_feature_to_dict,
 )
-from robotmdar.dtype.rotation import euler_angles_to_quaternion, quaternion_to_euler_angles
 import json
 
 
@@ -431,71 +430,70 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self._cached_joint_limits = self._load_joint_limits()
         return self._cached_joint_limits
 
-    def _augment_history_features(self, features: torch.Tensor,
-                                  recovery: bool,
-                                  generator: Optional[torch.Generator]) -> torch.Tensor:
-        """Apply one coherent uniform offset to the history portion.
+    @staticmethod
+    def _quat_mul_xyzw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        ax, ay, az, aw = a.unbind(-1)
+        bx, by, bz, bw = b.unbind(-1)
+        return torch.stack((
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ), dim=-1)
 
-        Features are already built here so the trigonometric roll/pitch channels
-        can be updated with angle-addition identities. The final history delta_q
-        is intentionally restored from the clean feature: its next pose is
-        outside the perturbed history window (Planner V5 v1 contract).
-        """
+    def _augment_raw_motion(self, motion: Dict[str, torch.Tensor],
+                            recovery: bool,
+                            generator: Optional[torch.Generator]) -> bool:
+        """Perturb raw 29-DoF motion before FeatureVersion 3 extraction."""
         if (not self.augmentation_enabled or self.split != 'train'
                 or self.training_step < self.augmentation_start_step):
-            return features
+            return False
         if torch.rand((), generator=generator).item() >= self.augmentation_prob:
-            return features
+            return False
 
-        out = features.clone()
-        H = min(self.history_len, out.shape[0])
+        H = min(self.history_len, motion['dof'].shape[0] - 1)
         if H <= 0:
-            return out
-        device = out.device
-        w = torch.linspace(0.5, 1.0, H, device=device, dtype=out.dtype)
+            return False
+        device, dtype = motion['dof'].device, motion['dof'].dtype
+        w = torch.linspace(0.5, 1.0, H, device=device, dtype=dtype)
         if recovery:
-            a_up, a_leg, a_roll, a_pitch, a_h = 0.12, 0.08, 0.25, 0.15, 0.03
+            groups = {'shoulder': 1.50, 'elbow': 1.50, 'hip': 1.20,
+                      'knee': 1.20, 'ankle': 0.08, 'waist': 0.08, 'wrist': 0.12}
+            a_roll = a_pitch = 1.50
         else:
-            a_up, a_leg, a_roll, a_pitch, a_h = 0.03, 0.02, 0.05, 0.05, 0.01
-        q = (torch.rand(self.dof_dim, generator=generator, device=device,
-                        dtype=out.dtype) * 2 - 1)
-        # Model-facing order is legs/waist/upper body; upper-body starts at 15.
-        q[:15] *= a_leg
-        q[15:] *= a_up
-        # Clamp to real G1 joint limits parsed from the MJCF when available;
-        # TODO(joint-limits): prefer skeleton-cfg-provided limits once exposed.
+            groups = {'shoulder': 0.03, 'elbow': 0.03, 'hip': 0.02,
+                      'knee': 0.02, 'ankle': 0.02, 'waist': 0.02, 'wrist': 0.03}
+            a_roll = a_pitch = 0.05
+        a_h = 0.03 if recovery else 0.01
+        names29 = tuple(self.skeleton.fk.dof_joint_names)
+        indices = list(range(29)) if self.dof_dim == 29 else list(G1_23DOF_FROM_29DOF_INDICES)
+        names = [names29[i] for i in indices]
+        amps = torch.tensor([next(v for k, v in groups.items() if k in n)
+                             for n in names], device=device, dtype=dtype)
         limits = self._joint_limit_tensor()
         if limits is None:
             limits = torch.as_tensor(
-                [[-np.pi, np.pi]] * self.dof_dim, dtype=out.dtype, device=device)
+                [[-np.pi, np.pi]] * 29, dtype=dtype, device=device)
         else:
-            limits = limits.to(device=device, dtype=out.dtype)
-        out[:H, 11:11 + self.dof_dim] = torch.clamp(
-            out[:H, 11:11 + self.dof_dim] + w[:, None] * q,
-            min=limits[:, 0], max=limits[:, 1])
-        # Recompute internal history deltas from the perturbed joint poses.
-        # The last history delta remains clean by the explicit v1 boundary rule.
-        if H > 1 and out.shape[-1] >= 11 + 2 * self.dof_dim:
-            delta_slice = slice(11 + self.dof_dim, 11 + 2 * self.dof_dim)
-            out[:H - 1, delta_slice] = (
-                out[1:H, 11:11 + self.dof_dim]
-                - out[:H - 1, 11:11 + self.dof_dim]
-            )
+            limits = limits.to(device=device, dtype=dtype)
+        limits = limits[indices]
+        x = motion['dof'][:H]
+        lo = ((limits[:, 0] - x) / w[:, None]).amax(dim=0)
+        hi = ((limits[:, 1] - x) / w[:, None]).amin(dim=0)
+        lower, upper = torch.maximum(lo, -amps), torch.minimum(hi, amps)
+        q = lower + (upper - lower) * torch.rand(self.dof_dim, generator=generator, device=device, dtype=dtype)
+        q = torch.where(lower <= upper, q, torch.zeros_like(q))
+        motion['dof'][:H] += w[:, None] * q
 
-        dr = (torch.rand((), generator=generator, device=device, dtype=out.dtype) * 2 - 1) * a_roll
-        dp = (torch.rand((), generator=generator, device=device, dtype=out.dtype) * 2 - 1) * a_pitch
-        for sin_i, cos_i, delta in ((0, 1, dr), (2, 3, dp)):
-            sin_r, c_r = out[:H, sin_i].clone(), out[:H, cos_i].clone()
-            angle = w * delta
-            out[:H, sin_i] = sin_r * torch.cos(angle) + (c_r + 1) * torch.sin(angle)
-            out[:H, cos_i] = (c_r + 1) * torch.cos(angle) - sin_r * torch.sin(angle) - 1
-        out[:H, 10] += w * ((torch.rand((), generator=generator, device=device,
-                                           dtype=out.dtype) * 2 - 1) * a_h)
-        if out.shape[-1] >= 11 + 2 * self.dof_dim and H:
-            # Keep the boundary delta clean by explicit v1 policy.
-            out[H - 1, 11 + self.dof_dim:11 + 2 * self.dof_dim] = features[
-                H - 1, 11 + self.dof_dim:11 + 2 * self.dof_dim]
-        return out
+        dr = (torch.rand((), generator=generator, device=device, dtype=dtype) * 2 - 1) * a_roll
+        dp = (torch.rand((), generator=generator, device=device, dtype=dtype) * 2 - 1) * a_pitch
+        half = 0.5 * w
+        qr = torch.stack((torch.sin(half * dr), torch.zeros_like(half), torch.zeros_like(half), torch.cos(half * dr)), -1)
+        qp = torch.stack((torch.zeros_like(half), torch.sin(half * dp), torch.zeros_like(half), torch.cos(half * dp)), -1)
+        motion['root_rot'][:H] = self._quat_mul_xyzw(qp, self._quat_mul_xyzw(qr, motion['root_rot'][:H]))
+        dh = (torch.rand((), generator=generator, device=device, dtype=dtype) * 2 - 1) * a_h
+        motion['root_trans_offset'][:H, 2] += w * dh
+        return True
 
     # =========================================================================
     # DEPRECATED: Text embedding loading & computation.
@@ -700,6 +698,27 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         overlap_len = max(0, min(seg1[1], seg2[1]) - max(seg1[0], seg2[0]))
         return overlap_len
 
+    def _primitive_action_label(self, sample: Dict[str, Any],
+                                prim_start: int, prim_end: int) -> str:
+        """Best-overlap BABEL verb for the primitive window; 'unknown' fallback.
+
+        frame_ann entries are (start_s, end_s, verb, [desc, ...]) in seconds.
+        The window is [prim_start, prim_end) frames; units match via fps.
+        """
+        frame_ann = sample.get('frame_ann')
+        if not frame_ann:
+            return 'unknown'
+        start_t = prim_start / float(self.fps)
+        end_t = (prim_end - 1) / float(self.fps)
+        best_ann = None
+        best_overlap = 0.0
+        for ann in frame_ann:
+            overlap = self._get_overlap([ann[0], ann[1]], [start_t, end_t])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_ann = ann
+        return str(best_ann[2]) if best_ann is not None else 'unknown'
+
     def have_overlap(self, seg1, seg2):
         if seg1[0] > seg2[1] or seg2[0] > seg1[1]:
             return False
@@ -797,7 +816,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'gt_ref_rot': torch.as_tensor(raw_motion['root_rot'][reference_frame], dtype=torch.float32),
             'scene': sample.get('scene', {}),
             'is_recovery': bool(sample.get('_recovery_boost', False)),
+            'action_label': self._primitive_action_label(
+                sample, prim_start, prim_end),
         }
+        primitive['_clean_history_delta_q'] = (
+            motion_data['dof'][self.history_len]
+            - motion_data['dof'][self.history_len - 1]
+        ).clone()
         if self.goal_type.uses_keypoints:
             if world_goal_keypoints is None:
                 world_goal_keypoints = self._world_goal_keypoints(
@@ -944,6 +969,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
             for batch_idx in range(self.batch_size):
                 primitive = all_motion_primitives[batch_idx][primitive_idx]
+                primitive['_augmented'] = self._augment_raw_motion(
+                    primitive['motion'], primitive['is_recovery'], generator)
                 motion_batch.append(primitive['motion'])
                 primitives.append(primitive)
 
@@ -951,45 +978,26 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             motion_features = self._convert_to_motion_features(motion_batch)
             feature_len = motion_features.shape[1]
             recovery_flags = [p['is_recovery'] for p in primitives]
-            for b, is_recovery in enumerate(recovery_flags):
-                clean_features = motion_features[b].clone()
-                motion_features[b] = self._augment_history_features(
-                    motion_features[b], is_recovery, generator)
-                if not torch.equal(clean_features, motion_features[b]):
+            for b, primitive in enumerate(primitives):
+                if primitive['_augmented']:
+                    # Keep the final history delta clean: it references the
+                    # first future pose, which is outside the perturbed window.
+                    delta_start = 11 + self.dof_dim
+                    clean_delta = self._select_model_dof(
+                        primitive['_clean_history_delta_q'].unsqueeze(0))[0]
+                    motion_features[b, self.history_len - 1,
+                                    delta_start:delta_start + self.dof_dim] = clean_delta
                     # Goals stay clean, but ego-centric conditioning is reset to
                     # the perturbed latest history state (v1 contract).
                     ref = self.history_len - 1
-                    base_euler = quaternion_to_euler_angles(
-                        primitives[b]['gt_ref_rot'].unsqueeze(0))[0]
-                    pert_euler = torch.stack((
-                        torch.atan2(motion_features[b, ref, 0],
-                                    motion_features[b, ref, 1] + 1),
-                        torch.atan2(motion_features[b, ref, 2],
-                                    motion_features[b, ref, 3] + 1),
-                        base_euler[2],
-                    ))
-                    primitives[b]['gt_ref_rot'] = euler_angles_to_quaternion(
-                        pert_euler.unsqueeze(0))[0]
-                    primitives[b]['gt_ref_pos'] = primitives[b]['gt_ref_pos'].clone()
-                    primitives[b]['gt_ref_pos'][2] = motion_features[b, ref, 10]
+                    primitives[b]['gt_ref_rot'] = primitive['motion']['root_rot'][ref].clone()
+                    primitives[b]['gt_ref_pos'] = primitive['motion']['root_trans_offset'][ref].clone()
 
                     # Frame-0 anchor consistency: history_start_* must match the
                     # feature-implied pose at the primitive's first frame, since
                     # _next_rollout_poses integrates generated motion from it.
-                    start_euler = quaternion_to_euler_angles(
-                        primitives[b]['history_start_rot'].unsqueeze(0))[0]
-                    start_pert = torch.stack((
-                        torch.atan2(motion_features[b, 0, 0],
-                                    motion_features[b, 0, 1] + 1),
-                        torch.atan2(motion_features[b, 0, 2],
-                                    motion_features[b, 0, 3] + 1),
-                        start_euler[2],
-                    ))
-                    primitives[b]['history_start_rot'] = euler_angles_to_quaternion(
-                        start_pert.unsqueeze(0))[0]
-                    primitives[b]['history_start_pos'] = primitives[
-                        b]['history_start_pos'].clone()
-                    primitives[b]['history_start_pos'][2] = motion_features[b, 0, 10]
+                    primitives[b]['history_start_rot'] = primitive['motion']['root_rot'][0].clone()
+                    primitives[b]['history_start_pos'] = primitive['motion']['root_trans_offset'][0].clone()
 
             batch = {
                 'motion': self.normalize(motion_features),
@@ -997,6 +1005,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     p['sliding_mask'][:feature_len] for p in primitives
                 ]),
                 'scene': [p['scene'] for p in primitives],
+                'action_label': [p['action_label'] for p in primitives],
                 'is_recovery': torch.as_tensor(recovery_flags, dtype=torch.bool),
             }
             batch.update({

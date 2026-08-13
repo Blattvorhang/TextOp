@@ -116,6 +116,12 @@ class BaseManager(ABC):
         #     -1] == self.max_steps, "Stage steps must sum to max_steps"
         self.max_steps = int(self._stage_steps[-1])
 
+        # Scene conditioning curriculum: before scene_start_step global steps
+        # the denoiser trains on blank scenes (see should_use_scene). The
+        # value comes from the data config (data/mob.yaml), passed at
+        # instantiation; keep the 0 fallback for managers that never see it.
+        self.scene_start_step = int(getattr(self, 'scene_start_step', 0))
+
         self.step = 0
 
         self._to_eval_steps = 0
@@ -144,6 +150,8 @@ class BaseManager(ABC):
             len(self.stages) - 1,
         )  # type:ignore
         self.extra['stage'] = self.stage_idx
+        self.extra['scene_active'] = float(self.should_use_scene())
+        self.extra['augmentation_active'] = float(self.should_use_augmentation())
 
         if not self._tqdm and is_main_process():
             self._tqdm = tqdm(total=self.max_steps, initial=self.step, ncols=120, desc="Training")
@@ -316,6 +324,45 @@ class BaseManager(ABC):
     def calc_loss(self, *args, **kwargs) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """子类实现: 计算损失，返回 (terms, extras)"""
         pass
+
+    def should_use_scene(self) -> bool:
+        """
+        Whether scene conditioning is active at the current global step.
+
+        scene_start_step is a global-step gate on the same level as the stage
+        boundaries: before it the model learns basic goal-driven locomotion on
+        blank scenes (occupancy zeroed in training, eval and visualization);
+        after it the denoiser's cond_scene_mask_prob dropout applies, keeping
+        some blank scenes to retain the basic-motion capability.
+
+        Returns:
+            True once step has reached scene_start_step, False otherwise
+        """
+        return self.step >= self.scene_start_step
+
+    def should_use_augmentation(self) -> bool:
+        """
+        Whether planner-side history domain randomization is active at the
+        current global step.
+
+        Mirrors the train dataset's augmentation gate
+        (augmentation_enabled, augmentation_start_step, split == 'train').
+        The manager's step is equivalent to the dataset's training_step
+        because set_training_step is called at the top of every training
+        loop iteration. Reported to tensorboard for monitoring.
+
+        Returns:
+            True once the train split enables augmentation and step has
+            reached augmentation_start_step, False otherwise
+        """
+        dataset = getattr(self, 'dataset', None)
+        if dataset is None:
+            return False
+        return (
+            bool(getattr(dataset, 'augmentation_enabled', False))
+            and getattr(dataset, 'split', None) == 'train'
+            and self.step >= int(getattr(dataset, 'augmentation_start_step', 0))
+        )
 
     def should_rollout(self) -> bool:
         """

@@ -35,6 +35,18 @@ augmentation_enabled: false
 augmentation_start_step: 50000
 augmentation_prob: 0.5
 
+# Scene conditioning curriculum (DAR training): before this global step the
+# denoiser sees zeroed scene occupancy in training, eval and visualization
+# to learn basic goal-driven locomotion; after it, the denoiser's
+# cond_scene_mask_prob dropout applies (keeping some blank scenes). Set to 0
+# to enable scenes from step 0.
+scene_start_step: 50000
+
+# Surface (motion-envelope) scene representation: keep only the obstacle
+# boundary shell (occupancy XOR its 26-neighbourhood erosion) as the scene
+# conditioning, in training, eval and visualization alike.
+use_scene_surface: true
+
 action_statistics_path: ${.datadir}/action_statistics.json
 
 datadir: dataset/BONES-SEED-29dof-FULL-50fps
