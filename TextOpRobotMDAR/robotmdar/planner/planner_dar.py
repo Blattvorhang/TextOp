@@ -53,6 +53,29 @@ def _cuda_synchronize(device: str) -> None:
         torch.cuda.synchronize(device)
 
 
+def _time_to_arrival_from_state(
+    state_msg,
+    motion_fps: float,
+    device: str | torch.device,
+) -> tuple[float, torch.Tensor]:
+    goal_timestamp_ns = getattr(state_msg, "goal_timestamp_ns", None)
+    timestamps_ns = getattr(state_msg, "timestamps_ns", None)
+    if goal_timestamp_ns is None:
+        raise ValueError("Goal requires goal_timestamp_ns for arrival PE")
+    if timestamps_ns is None or len(timestamps_ns) == 0:
+        raise ValueError("Goal requires controller timestamps_ns for arrival PE")
+    time_to_arrival_s = max(
+        0.0,
+        (int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9,
+    )
+    time_to_arrival_frame = torch.round(torch.tensor(
+        [time_to_arrival_s * float(motion_fps)],
+        dtype=torch.float32,
+        device=device,
+    )).to(dtype=torch.long)
+    return time_to_arrival_s, time_to_arrival_frame
+
+
 def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
     """Load and validate the config associated with the DAR checkpoint."""
     model_cfg_path = cfg.ckpt.get("load_cfg")
@@ -343,8 +366,21 @@ def main(cfg: DictConfig) -> None:
                     else:
                         _goal_ego_yaw_deg = math.degrees(math.atan2(
                             float(ego_goal[0, 4]), float(ego_goal[0, 3])))
+                elif goal_type is GoalType.JOINT_STATE:
+                    if (_force_drop_yaw
+                            or bool(cfg.get("force_drop_goal_orientation", False))):
+                        _goal_ego_yaw_deg = 0.0
+                    else:
+                        _goal_ego_yaw_deg = math.degrees(float(ego_goal[0, 7]))
                 else:
                     _goal_ego_yaw_deg = float('nan')
+
+                time_to_arrival_frame = None
+                time_to_arrival_s = float('nan')
+                if goal_type.uses_arrival_time:
+                    time_to_arrival_s, time_to_arrival_frame = (
+                        _time_to_arrival_from_state(
+                            latest_state, motion_fps, cfg.device))
 
                 _cuda_synchronize(str(cfg.device))
                 infer_start = time.perf_counter()
@@ -381,6 +417,16 @@ def main(cfg: DictConfig) -> None:
                         cfg.get("force_drop_goal_time", False)),
                     force_drop_goal_body=bool(
                         cfg.get("force_drop_goal_body", False)),
+                    force_drop_goal_orientation=bool(
+                        cfg.get("force_drop_goal_orientation", False)),
+                    force_drop_goal_joint=bool(
+                        cfg.get("force_drop_goal_joint", False)),
+                    force_drop_goal_velocity=bool(
+                        cfg.get("force_drop_goal_velocity", False)),
+                    force_drop_arrival_time=bool(
+                        cfg.get("force_drop_arrival_time",
+                                cfg.get("force_drop_goal_time", False))),
+                    time_to_arrival_frame=time_to_arrival_frame,
                 )
                 _cuda_synchronize(str(cfg.device))
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
@@ -411,7 +457,7 @@ def main(cfg: DictConfig) -> None:
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
                         occ_count, infer_ms, avg_ms)
-                else:
+                elif goal_type is GoalType.BODY_EXT:
                     logger.info(
                         "goal[body_ext]: world(pos=({:.3f},{:.3f},{:.3f}) "
                         "yaw={:.1f} deg vel=({:.3f},{:.3f},{:.3f})) "
@@ -426,7 +472,23 @@ def main(cfg: DictConfig) -> None:
                         _goal_ego_yaw_deg,
                         float(ego_goal[0, 5]), float(ego_goal[0, 6]),
                         float(ego_goal[0, 7]),
-                        0.0 if _force_drop_time else float(ego_goal[0, 8]),
+                        0.0 if _force_drop_time else time_to_arrival_s,
+                        occ_count, infer_ms, avg_ms)
+                else:
+                    logger.info(
+                        "goal[joint_state]: world(pos=({:.3f},{:.3f},{:.3f}) "
+                        "vel=({:.3f},{:.3f},{:.3f})) "
+                        "ego(pos=({:.3f},{:.3f},{:.3f}) "
+                        "yaw={:.1f} deg "
+                        "vel=({:.3f},{:.3f},{:.3f}) dt={:.3f}s) | "
+                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        _goal_world_x, _goal_world_y, _goal_world_z,
+                        _vel_world_x, _vel_world_y, _vel_world_z,
+                        _goal_ego_x, _goal_ego_y, _goal_delta_z,
+                        _goal_ego_yaw_deg,
+                        float(ego_goal[0, 37]), float(ego_goal[0, 38]),
+                        float(ego_goal[0, 39]),
+                        0.0 if _force_drop_time else time_to_arrival_s,
                         occ_count, infer_ms, avg_ms)
 
                 # SonicRunner resets each newly received G1 plan to frame 0.

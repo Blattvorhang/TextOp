@@ -217,6 +217,16 @@ def state_to_ego_goal(state_msg: Any,
         goal_type=goal_type, goal_reference_path=goal_reference_path)
 
 
+def _state_field(state_msg: Any, name: str):
+    value = getattr(state_msg, name, None)
+    if value is not None:
+        return value
+    raw = getattr(state_msg, 'raw', {})
+    if isinstance(raw, dict):
+        return raw.get(name)
+    return None
+
+
 @lru_cache(maxsize=8)
 def _load_goal_keypoint_template(ref_path: str) -> np.ndarray:
     path = Path(ref_path)
@@ -280,15 +290,18 @@ def state_goal_from_reference(state_msg: Any,
     goal_type = GoalType.parse(goal_type)
     goal_keypoints_world = None
 
-    if (goal_type is not GoalType.BODY
-            and (state_msg.goal_root_pos_world is None
-                 or state_msg.goal_yaw_world is None)):
+    state_root_pos = _state_field(state_msg, 'goal_root_pos_world')
+    state_yaw = _state_field(state_msg, 'goal_yaw_world')
+    if (goal_type not in (GoalType.BODY, GoalType.JOINT_STATE)
+            and (state_root_pos is None or state_yaw is None)):
         raise ValueError("TextOp state is missing its root-heading goal")
+    if goal_type is GoalType.JOINT_STATE and state_root_pos is None:
+        raise ValueError(
+            "joint_state goal requires goal_root_pos_world [3]")
 
     if goal_type.uses_keypoints:
         raw = getattr(state_msg, 'raw', {})
-        state_keypoints_world = getattr(
-            state_msg, 'goal_keypoints_world', None)
+        state_keypoints_world = _state_field(state_msg, 'goal_keypoints_world')
         if state_keypoints_world is None:
             state_keypoints_world = raw.get('goal_keypoints_world')
         if state_keypoints_world is None:
@@ -322,46 +335,86 @@ def state_goal_from_reference(state_msg: Any,
         goal_yaw_world = torch.zeros(1, dtype=torch.float32, device=device)
     else:
         goal_pos_world = torch.tensor(
-            state_msg.goal_root_pos_world, dtype=torch.float32,
+            state_root_pos, dtype=torch.float32,
             device=device).reshape(1, 3)
+        if not torch.isfinite(goal_pos_world).all():
+            raise ValueError("goal_root_pos_world must be finite")
         goal_yaw_world = torch.tensor(
-            state_msg.goal_yaw_world, dtype=torch.float32,
+            0.0 if state_yaw is None else state_yaw, dtype=torch.float32,
             device=device).reshape(1)
 
     world_root_velocity = None
     timestep = None
-    if goal_type is GoalType.BODY_EXT:
-        state_velocity = getattr(
-            state_msg, 'goal_root_velocity_world', None)
-        goal_timestamp_ns = getattr(state_msg, 'goal_timestamp_ns', None)
-        timestamps_ns = getattr(state_msg, 'timestamps_ns', None)
+    world_goal_rot = None
+    world_goal_dof = None
+    if goal_type.uses_arrival_time:
+        state_velocity = _state_field(
+            state_msg, 'goal_root_velocity_world')
+        goal_timestamp_ns = _state_field(state_msg, 'goal_timestamp_ns')
+        timestamps_ns = _state_field(state_msg, 'timestamps_ns')
         if state_velocity is None:
             raise ValueError(
-                "body_ext goal requires goal_root_velocity_world [3]")
+                f"{goal_type.value} goal requires "
+                "goal_root_velocity_world [3]")
         if goal_timestamp_ns is None:
-            raise ValueError("body_ext goal requires goal_timestamp_ns")
-        if not timestamps_ns:
-            raise ValueError("body_ext goal requires controller timestamps_ns")
+            raise ValueError(
+                f"{goal_type.value} goal requires goal_timestamp_ns")
+        if timestamps_ns is None or len(timestamps_ns) == 0:
+            raise ValueError(
+                f"{goal_type.value} goal requires controller timestamps_ns")
         state_velocity = np.asarray(state_velocity, dtype=np.float32)
         if state_velocity.shape != (3,):
             raise ValueError(
-                "body_ext goal_root_velocity_world must have shape (3,), got "
+                f"{goal_type.value} goal_root_velocity_world must have "
+                "shape (3,), got "
                 f"{state_velocity.shape}")
         if not np.isfinite(state_velocity).all():
             raise ValueError(
-                "body_ext goal_root_velocity_world must be finite")
+                f"{goal_type.value} goal_root_velocity_world must be finite")
         world_root_velocity = torch.as_tensor(
             state_velocity, dtype=torch.float32, device=device).reshape(1, 3)
-        remaining_seconds = (
-            int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9
+        remaining_seconds = max(
+            0.0,
+            (int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9,
+        )
         timestep = torch.tensor(
             [[remaining_seconds]], dtype=torch.float32, device=device)
+
+    if goal_type is GoalType.JOINT_STATE:
+        state_goal_rot = _state_field(state_msg, 'goal_root_rot_world')
+        state_goal_dof = _state_field(state_msg, 'goal_dof_pos')
+        if state_goal_dof is None:
+            state_goal_dof = _state_field(state_msg, 'goal_joint_pos')
+        if state_goal_rot is None:
+            raise ValueError(
+                "joint_state goal requires goal_root_rot_world [4]")
+        if state_goal_dof is None:
+            raise ValueError("joint_state goal requires goal_dof_pos [29]")
+        state_goal_rot = np.asarray(state_goal_rot, dtype=np.float32)
+        if state_goal_rot.shape != (4,):
+            raise ValueError(
+                "joint_state goal_root_rot_world must have shape (4,), got "
+                f"{state_goal_rot.shape}")
+        state_goal_rot = _normalized_quaternions_xyzw(
+            state_goal_rot.reshape(1, 4))
+        state_goal_dof = np.asarray(state_goal_dof, dtype=np.float32)
+        if state_goal_dof.shape != (29,):
+            raise ValueError(
+                "joint_state goal_dof_pos must have shape (29,), got "
+                f"{state_goal_dof.shape}")
+        if not np.isfinite(state_goal_dof).all():
+            raise ValueError("joint_state goal_dof_pos must be finite")
+        world_goal_rot = torch.as_tensor(
+            state_goal_rot, dtype=torch.float32, device=device)
+        world_goal_dof = torch.as_tensor(
+            state_goal_dof, dtype=torch.float32, device=device).reshape(1, 29)
 
     return build_ego_goal(
         goal_pos_world, goal_yaw_world, reference_pos.to(device),
         reference_rot.to(device), goal_type=goal_type,
         world_goal_keypoints=goal_keypoints_world,
-        world_root_velocity=world_root_velocity, timestep=timestep)
+        world_root_velocity=world_root_velocity, timestep=timestep,
+        world_goal_rot=world_goal_rot, world_goal_dof=world_goal_dof)
 
 
 def align_generated_history_pose(abs_pose: dict,

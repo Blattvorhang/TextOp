@@ -272,6 +272,12 @@ def main(cfg: DictConfig):
         goal_reference_path = to_absolute_path(str(goal_reference_path))
     if goal_type is GoalType.BODY and goal_reference_path is None:
         raise ValueError("Body-goal loop requires goal_reference_path")
+    if goal_type is GoalType.JOINT_STATE:
+        raise ValueError(
+            "Interactive loop_dar cannot synthesize a joint_state goal from "
+            "the root-only keyboard target; use dataset vis_dar or "
+            "planner_dar with controller-provided goal_root_rot_world and "
+            "goal_dof_pos")
     # torch.set_default_device(cfg.device)
 
     # Load models

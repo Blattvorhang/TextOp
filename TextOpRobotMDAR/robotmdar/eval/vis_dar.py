@@ -19,6 +19,15 @@ from robotmdar.dtype.motion import get_zero_feature_v3
 from robotmdar.eval.generate_dar import generate_next_motion
 
 
+def _time_to_arrival_frame(time_to_arrival: torch.Tensor,
+                           fps: float) -> torch.Tensor:
+    if time_to_arrival.ndim > 1:
+        time_to_arrival = time_to_arrival.squeeze(-1)
+    return torch.round(
+        time_to_arrival.to(dtype=torch.float32).clamp_min(0.0) * float(fps)
+    ).to(dtype=torch.long)
+
+
 def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                  num_primitive, future_len, history_len, cfg):
 
@@ -62,6 +71,16 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
             # For vis_dar (teacher forcing), we use gt_ref_pos/gt_ref_rot as the
             # reference pose matching training logic
             goal_type = GoalType.parse(cfg.data.goal_type)
+            time_to_arrival = batch_item.get(
+                'time_to_arrival', batch_item.get('goal_timestep'))
+            if goal_type.uses_arrival_time:
+                if time_to_arrival is None:
+                    raise ValueError(
+                        f"{goal_type.value} visualization requires "
+                        "time_to_arrival")
+                goal_time = time_to_arrival.to(cfg.device)
+            else:
+                goal_time = None
             ego_goal = build_ego_goal(
                 batch_item['world_goal_pos'].to(cfg.device),
                 batch_item['world_goal_yaw'].to(cfg.device),
@@ -74,13 +93,22 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 ),
                 world_root_velocity=(
                     batch_item['world_goal_vel'].to(cfg.device)
-                    if goal_type is GoalType.BODY_EXT else None
+                    if goal_type.uses_arrival_time else None
                 ),
-                timestep=(
-                    batch_item['goal_timestep'].to(cfg.device)
-                    if goal_type is GoalType.BODY_EXT else None
+                timestep=goal_time,
+                world_goal_rot=(
+                    batch_item['world_goal_rot'].to(cfg.device)
+                    if goal_type is GoalType.JOINT_STATE else None
+                ),
+                world_goal_dof=(
+                    batch_item['world_goal_dof'].to(cfg.device)
+                    if goal_type is GoalType.JOINT_STATE else None
                 ),
             )
+            time_to_arrival_frame = None
+            if goal_type.uses_arrival_time:
+                time_to_arrival_frame = _time_to_arrival_frame(
+                    time_to_arrival.to(cfg.device), val_data.fps)
             voxel = query_local_occupancy(
                 batch_item['scene'],
                 batch_item['gt_ref_pos'],
@@ -101,7 +129,8 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 abs_pose=pd_abs_pose,
                 future_len=future_len,
                 use_full_sample=use_full_sample,
-                guidance_scale=cfg.guidance_scale)
+                guidance_scale=cfg.guidance_scale,
+                time_to_arrival_frame=time_to_arrival_frame)
 
             # Store the full predicted motion (history + future) for next iteration
             if use_autoregressive:

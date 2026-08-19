@@ -5,8 +5,8 @@ import torch.nn.functional as F
 # import clip
 import loralib as lora
 
-
-EXTENDED_BODY_GOAL_DIM = 21
+from robotmdar.diffusion.nn import timestep_embedding
+from robotmdar.utils.goal import EXTENDED_BODY_GOAL_DIM, JOINT_STATE_GOAL_DIM
 
 
 def _resolve_root_mask_prob(value, kwargs):
@@ -23,6 +23,38 @@ def _resolve_root_mask_prob(value, kwargs):
 
 def _mask_goal(model, goal, y):
     """Mask V4 components independently while preserving legacy goal behavior."""
+    if model.goal_dim == JOINT_STATE_GOAL_DIM:
+        root, root_keep = model.mask_condition(
+            goal[:, 0:3],
+            model.cond_goal_root_mask_prob,
+            force_mask=y.get('force_drop_goal_root', False),
+            return_keep_mask=True,
+        )
+        orientation, orientation_keep = model.mask_condition(
+            goal[:, 3:8],
+            model.cond_goal_orientation_mask_prob,
+            force_mask=(
+                y.get('force_drop_goal_orientation', False)
+                or y.get('force_drop_goal_yaw', False)),
+            return_keep_mask=True,
+        )
+        joints, joint_keep = model.mask_condition(
+            goal[:, 8:37],
+            model.cond_goal_joint_mask_prob,
+            force_mask=y.get('force_drop_goal_joint', False),
+            return_keep_mask=True,
+        )
+        velocity, velocity_keep = model.mask_condition(
+            goal[:, 37:40],
+            model.cond_goal_velocity_mask_prob,
+            force_mask=y.get('force_drop_goal_velocity', False),
+            return_keep_mask=True,
+        )
+        y['goal_orientation_condition_keep_mask'] = orientation_keep
+        y['goal_joint_condition_keep_mask'] = joint_keep
+        y['goal_velocity_condition_keep_mask'] = velocity_keep
+        return torch.cat((root, orientation, joints, velocity), dim=-1), root_keep
+
     if model.goal_dim != EXTENDED_BODY_GOAL_DIM:
         return model.mask_condition(
             goal,
@@ -49,7 +81,9 @@ def _mask_goal(model, goal, y):
     goal_time, time_keep = model.mask_condition(
         goal[:, 8:9],
         model.cond_goal_time_mask_prob,
-        force_mask=y.get('force_drop_goal_time', False),
+        force_mask=(
+            y.get('force_drop_goal_time', False)
+            or y.get('force_drop_arrival_time', False)),
         return_keep_mask=True,
     )
     limbs, body_keep = model.mask_condition(
@@ -62,6 +96,35 @@ def _mask_goal(model, goal, y):
     y['goal_time_condition_keep_mask'] = time_keep
     y['goal_body_condition_keep_mask'] = body_keep
     return torch.cat((root, yaw, velocity, goal_time, limbs), dim=-1), root_keep
+
+
+def _goal_dim_uses_arrival_pe(goal_dim: int) -> bool:
+    return int(goal_dim) in (EXTENDED_BODY_GOAL_DIM, JOINT_STATE_GOAL_DIM)
+
+
+def _goal_dim_name(goal_dim: int) -> str:
+    if int(goal_dim) == EXTENDED_BODY_GOAL_DIM:
+        return "body_ext"
+    if int(goal_dim) == JOINT_STATE_GOAL_DIM:
+        return "joint_state"
+    return f"{goal_dim}-D"
+
+
+class ArrivalTimeEmbedder(nn.Module):
+
+    def __init__(self, h_dim: int):
+        super().__init__()
+        self.time_embed = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.SiLU(),
+            nn.Linear(h_dim, h_dim),
+        )
+
+    def forward(self, arrival_time_frame):
+        arrival_time_frame = arrival_time_frame.reshape(-1).float()
+        emb = timestep_embedding(
+            arrival_time_frame, self.time_embed[0].in_features)
+        return self.time_embed(emb)
 
 
 class DenoiserMLP(nn.Module):
@@ -88,6 +151,9 @@ class DenoiserMLP(nn.Module):
                  cond_goal_yaw_mask_prob=0.0,
                  cond_goal_time_mask_prob=0.0,
                  cond_goal_body_mask_prob=0.0,
+                 cond_goal_orientation_mask_prob=0.0,
+                 cond_goal_joint_mask_prob=0.0,
+                 cond_goal_velocity_mask_prob=0.0,
                  cond_scene_mask_prob=0.1,
                  **kargs):
         super().__init__()
@@ -107,6 +173,9 @@ class DenoiserMLP(nn.Module):
         self.cond_goal_yaw_mask_prob = cond_goal_yaw_mask_prob
         self.cond_goal_time_mask_prob = cond_goal_time_mask_prob
         self.cond_goal_body_mask_prob = cond_goal_body_mask_prob
+        self.cond_goal_orientation_mask_prob = cond_goal_orientation_mask_prob
+        self.cond_goal_joint_mask_prob = cond_goal_joint_mask_prob
+        self.cond_goal_velocity_mask_prob = cond_goal_velocity_mask_prob
         self.cond_scene_mask_prob = cond_scene_mask_prob
 
         self.sequence_pos_encoder = PositionalEncoding(self.h_dim,
@@ -118,6 +187,7 @@ class DenoiserMLP(nn.Module):
         self.embed_scene = nn.Linear(self.scene_dim, self.h_dim)
         self.embed_history = nn.Linear(self.history_shape[-1], self.h_dim)
         self.embed_noise = nn.Linear(self.noise_shape[-1], self.h_dim)
+        self.arrival_embedder = ArrivalTimeEmbedder(self.h_dim)
 
         # input: time + goal + scene + history + noise → all projected to h_dim
         input_dim = self.h_dim * 5
@@ -168,7 +238,34 @@ class DenoiserMLP(nn.Module):
         voxel = self.mask_condition(
             y['voxel'], self.cond_scene_mask_prob,
             force_mask=y.get('force_drop_scene', False))
+        arrival_time_frame = y.get(
+            'time_to_arrival_frame', y.get('arrival_time_frame'))
+        if _goal_dim_uses_arrival_pe(self.goal_dim):
+            if arrival_time_frame is None:
+                raise ValueError(
+                    f"{_goal_dim_name(self.goal_dim)} denoiser requires "
+                    "y['time_to_arrival_frame']")
+            arrival_time_frame, arrival_keep_mask = self.mask_condition(
+                arrival_time_frame.reshape(-1, 1).to(goal.device).float(),
+                self.cond_goal_time_mask_prob,
+                force_mask=(
+                    y.get('force_drop_arrival_time', False)
+                    or y.get('force_drop_goal_time', False)),
+                return_keep_mask=True,
+            )
+            y['arrival_time_condition_keep_mask'] = arrival_keep_mask
+            arrival_pe = self.arrival_embedder(
+                arrival_time_frame.squeeze(-1))
+            arrival_pe = arrival_pe * arrival_keep_mask.unsqueeze(
+                -1).to(arrival_pe.dtype)
+            if self.goal_dim == EXTENDED_BODY_GOAL_DIM:
+                goal = goal.clone()
+                goal[:, 8:9] = 0.0
+        else:
+            arrival_pe = 0.0
         emb_goal = self.embed_goal(goal)     # [bs, h_dim]
+        if _goal_dim_uses_arrival_pe(self.goal_dim):
+            emb_goal = emb_goal + arrival_pe
         emb_scene = self.embed_scene(voxel)  # [bs, h_dim]
 
         emb_history = self.embed_history(
@@ -204,6 +301,9 @@ class DenoiserTransformer(nn.Module):
                  cond_goal_yaw_mask_prob=0.0,
                  cond_goal_time_mask_prob=0.0,
                  cond_goal_body_mask_prob=0.0,
+                 cond_goal_orientation_mask_prob=0.0,
+                 cond_goal_joint_mask_prob=0.0,
+                 cond_goal_velocity_mask_prob=0.0,
                  cond_scene_mask_prob=0.1,
                  use_vae=True,
                  **kargs):
@@ -226,6 +326,9 @@ class DenoiserTransformer(nn.Module):
         self.cond_goal_yaw_mask_prob = cond_goal_yaw_mask_prob
         self.cond_goal_time_mask_prob = cond_goal_time_mask_prob
         self.cond_goal_body_mask_prob = cond_goal_body_mask_prob
+        self.cond_goal_orientation_mask_prob = cond_goal_orientation_mask_prob
+        self.cond_goal_joint_mask_prob = cond_goal_joint_mask_prob
+        self.cond_goal_velocity_mask_prob = cond_goal_velocity_mask_prob
         self.cond_scene_mask_prob = cond_scene_mask_prob
 
         # input embeddings
@@ -238,6 +341,7 @@ class DenoiserTransformer(nn.Module):
         self.embed_scene = nn.Linear(self.scene_dim, self.h_dim)
         self.embed_history = nn.Linear(self.history_shape[-1], self.h_dim)
         self.embed_noise = nn.Linear(self.noise_shape[-1], self.h_dim)
+        self.arrival_embedder = ArrivalTimeEmbedder(self.h_dim)
 
         # transformer encoder layers
         print("TRANS_ENC init")
@@ -286,7 +390,34 @@ class DenoiserTransformer(nn.Module):
         voxel = self.mask_condition(
             y['voxel'], self.cond_scene_mask_prob,
             force_mask=y.get('force_drop_scene', False))
+        arrival_time_frame = y.get(
+            'time_to_arrival_frame', y.get('arrival_time_frame'))
+        if _goal_dim_uses_arrival_pe(self.goal_dim):
+            if arrival_time_frame is None:
+                raise ValueError(
+                    f"{_goal_dim_name(self.goal_dim)} denoiser requires "
+                    "y['time_to_arrival_frame']")
+            arrival_time_frame, arrival_keep_mask = self.mask_condition(
+                arrival_time_frame.reshape(-1, 1).to(goal.device).float(),
+                self.cond_goal_time_mask_prob,
+                force_mask=(
+                    y.get('force_drop_arrival_time', False)
+                    or y.get('force_drop_goal_time', False)),
+                return_keep_mask=True,
+            )
+            y['arrival_time_condition_keep_mask'] = arrival_keep_mask
+            arrival_pe = self.arrival_embedder(
+                arrival_time_frame.squeeze(-1))
+            arrival_pe = arrival_pe * arrival_keep_mask.unsqueeze(
+                -1).to(arrival_pe.dtype)
+            if self.goal_dim == EXTENDED_BODY_GOAL_DIM:
+                goal = goal.clone()
+                goal[:, 8:9] = 0.0
+        else:
+            arrival_pe = 0.0
         emb_goal = self.embed_goal(goal).unsqueeze(0)
+        if _goal_dim_uses_arrival_pe(self.goal_dim):
+            emb_goal = emb_goal + arrival_pe.unsqueeze(0)
         emb_scene = self.embed_scene(voxel).unsqueeze(0)
         emb_history = self.embed_history(
             y['history_motion_normalized']).permute(1, 0,

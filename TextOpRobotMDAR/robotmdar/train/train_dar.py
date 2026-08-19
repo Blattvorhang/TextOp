@@ -49,6 +49,7 @@ def _make_root_xy_figure(
     generated_trajectory: torch.Tensor,
     goal_xy: torch.Tensor,
     ground_truth_trajectory: torch.Tensor = None,
+    goal_time_frame: torch.Tensor = None,
     goal_condition_keep_mask: torch.Tensor = None,
     history_trajectory: torch.Tensor = None,
     voxel: torch.Tensor = None,
@@ -80,6 +81,10 @@ def _make_root_xy_figure(
 
     generated = generated_trajectory.detach().float().cpu()
     goals = goal_xy.detach().float().cpu()
+    goal_time = (
+        goal_time_frame.detach().long().cpu()
+        if goal_time_frame is not None else None
+    )
     ground_truth = (
         ground_truth_trajectory.detach().float().cpu()
         if ground_truth_trajectory is not None else None
@@ -118,6 +123,14 @@ def _make_root_xy_figure(
     for axis, sample_idx in zip(axes.flat, indices.tolist()):
         generated_xy = generated[sample_idx].numpy()
         goal = goals[sample_idx, :2].numpy()
+        goal_idx = generated_xy.shape[0] - 1
+        if goal_time is not None:
+            goal_idx = int(goal_time[sample_idx].item())
+            goal_idx = max(0, min(goal_idx, generated_xy.shape[0] - 1))
+        goal_frame_xy = generated_xy[goal_idx]
+        primitive_end_xy = generated_xy[-1]
+        goal_error = float(np.linalg.norm(goal_frame_xy - goal))
+        primitive_end_error = float(np.linalg.norm(primitive_end_xy - goal))
 
         # ── local occupancy slice at the reference root height (z=0) ──
         # Offsets from _local_grid_offsets are cell CENTERS (forward axis is
@@ -183,26 +196,35 @@ def _make_root_xy_figure(
                 color='#56B4E9', marker='o', s=30, zorder=5,
                 label='history start',
             )
+        if goal_time is not None:
+            axis.scatter(
+                [goal_frame_xy[0]], [goal_frame_xy[1]],
+                color='#009E73', marker='o', s=42, zorder=6,
+                label='goal frame',
+            )
         axis.scatter([goal[0]], [goal[1]], color='#D55E00', marker='X',
                      s=90, zorder=6, label='goal')
         axis.scatter(
-            [generated_xy[-1, 0]], [generated_xy[-1, 1]],
-            color='#0072B2', marker='s', s=40, zorder=6,
-            label='generated end',
+            [primitive_end_xy[0]], [primitive_end_xy[1]],
+            color='#CC79A7', marker='s', s=42, zorder=6,
+            label='primitive end',
         )
 
-        # ── endpoint error ──
-        endpoint_error = torch.linalg.vector_norm(
-            generated[sample_idx, -1] - goals[sample_idx, :2]
-        ).item()
         label = None
         if (labels is not None and sample_idx < len(labels)
                 and labels[sample_idx]):
             label = labels[sample_idx]
         title_label = label if label is not None else f'sample {sample_idx}'
-        axis.set_title(
-            f'{title_label}  |  endpoint error {endpoint_error:.3f} m'
-        )
+        if goal_time is not None:
+            axis.set_title(
+                f'{title_label}  |  goal error {goal_error:.3f} m'
+                f'  |  primitive end error {primitive_end_error:.3f} m'
+            )
+        else:
+            axis.set_title(
+                f'{title_label}  |  primitive end error '
+                f'{primitive_end_error:.3f} m'
+            )
 
         # ── unified scale & ego-consistent labels ──
         axis.set_xlim(-xy_limit, xy_limit)
@@ -240,9 +262,39 @@ def _pose_dict(position: torch.Tensor, rotation: torch.Tensor):
     return {"root_trans_offset": position, "root_rot": rotation}
 
 
+def _time_to_arrival_frame(time_to_arrival: torch.Tensor,
+                           fps: float,
+                           device: str | torch.device) -> torch.Tensor:
+    time_to_arrival = time_to_arrival.to(device=device, dtype=torch.float32)
+    if time_to_arrival.ndim > 1:
+        time_to_arrival = time_to_arrival.squeeze(-1)
+    return torch.round(time_to_arrival.clamp_min(0.0) * float(fps)).to(
+        dtype=torch.long)
+
+
+def _goal_time_frame_for_loss(conditions, cfg):
+    goal_timestep_mode = str(cfg.data.get(
+        'goal_timestep_mode', cfg.data.get('time_to_arrival_mode', 'relative'))
+    ).lower()
+    if goal_timestep_mode == 'zero':
+        return None
+    return conditions.get('time_to_arrival_frame',
+                          conditions.get('arrival_time_frame'))
+
+
 def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
-                use_scene: bool = True):
+                fps: float, use_scene: bool = True):
     goal_type = GoalType.parse(cfg.data.goal_type)
+    time_to_arrival = primitive.get(
+        'time_to_arrival', primitive.get('goal_timestep'))
+    if goal_type.uses_arrival_time:
+        if time_to_arrival is None:
+            raise ValueError(
+                f"{goal_type.value} training requires "
+                "primitive['time_to_arrival']")
+        goal_time = time_to_arrival.to(cfg.device)
+    else:
+        goal_time = None
     goal = build_ego_goal(
         primitive['world_goal_pos'].to(cfg.device),
         primitive['world_goal_yaw'].to(cfg.device),
@@ -255,13 +307,22 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         ),
         world_root_velocity=(
             primitive['world_goal_vel'].to(cfg.device)
-            if goal_type is GoalType.BODY_EXT else None
+            if goal_type.uses_arrival_time else None
         ),
-        timestep=(
-            primitive['goal_timestep'].to(cfg.device)
-            if goal_type is GoalType.BODY_EXT else None
+        timestep=goal_time,
+        world_goal_rot=(
+            primitive['world_goal_rot'].to(cfg.device)
+            if goal_type is GoalType.JOINT_STATE else None
+        ),
+        world_goal_dof=(
+            primitive['world_goal_dof'].to(cfg.device)
+            if goal_type is GoalType.JOINT_STATE else None
         ),
     )
+    time_to_arrival_frame = None
+    if goal_type.uses_arrival_time:
+        time_to_arrival_frame = _time_to_arrival_frame(
+            time_to_arrival, fps=fps, device=cfg.device)
     if use_scene:
         voxel = query_local_occupancy(
             primitive['scene'],
@@ -304,6 +365,13 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         'goal': goal,
         'voxel': voxel,
         'history_motion_normalized': history_motion,
+        **(
+            {
+                'time_to_arrival_frame': time_to_arrival_frame,
+                'arrival_time_frame': time_to_arrival_frame,
+            }
+            if time_to_arrival_frame is not None else {}
+        ),
     }
 
 
@@ -399,7 +467,7 @@ def _sample_segment_rollout(batch, dataset, vae, denoiser, diffusion,
             reference_rot = primitive['gt_ref_rot'].to(device)
 
         y = _conditions(primitive, reference_pos, reference_rot,
-                        history_motion, cfg,
+                        history_motion, cfg, dataset.fps,
                         use_scene=manager.should_use_scene())
 
         with torch.no_grad():
@@ -499,11 +567,16 @@ def _make_segment_figure(viz_data, world_goal_pos, labels=None,
     """One subplot per sample: the whole segment stitched in WORLD frame,
     translated so the segment start (window-0 anchor) is at the origin.
 
-    *world_goal_pos*: [N, 3] tensor of the segment terminal goal.
+    *world_goal_pos*: [N, 3] tensor of the segment goal position.
     *labels*: list of B str (action label per sample) or None.
     *scenes*: list of B occupancy dicts (occu_global/unit/llb) or None;
     when present, a world-aligned occupancy slice at the segment-start
     height is drawn, clipped by the shared XY limit.
+
+    Per-window timeline markers: black dot = history start (window anchor,
+    segment frame k*F); amber triangle = future start / stitch boundary
+    (segment frame k*F + H).  Dot -> triangle spans the H-frame history,
+    triangle -> next triangle the F-frame future.
     """
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.colors import ListedColormap
@@ -520,6 +593,18 @@ def _make_segment_figure(viz_data, world_goal_pos, labels=None,
     goals = world_goal_pos.detach().float().cpu()
     count = min(int(gt_segment.shape[0]), max_samples)
     num_primitive = hist_world.shape[0]
+    # timeline: window k covers segment frames [k*F, k*F+H) as history and
+    # [k*F+H, (k+1)*F+H) as future; stitch boundaries sit at H + k*F
+    history_len = int(hist_world.shape[2])
+    total_len = int(gt_segment.shape[1])
+    future_len = (total_len - history_len) // num_primitive
+    assert history_len + future_len * num_primitive == total_len
+    future_start_idx = [history_len + pidx * future_len
+                        for pidx in range(num_primitive)]
+    primitive_end_idx = [
+        history_len + future_len * (pidx + 1) - 1
+        for pidx in range(num_primitive)
+    ]
 
     # translate every world point so the segment start is the origin
     origin = gt_segment[:, :1]                   # [N, 1, 3] = window-0 anchor
@@ -576,10 +661,22 @@ def _make_segment_figure(viz_data, world_goal_pos, labels=None,
         axis.plot(pred_seg[sample_idx, :, 0], pred_seg[sample_idx, :, 1],
                   color='#0072B2', linewidth=2.2, zorder=3,
                   label='predicted')
-        # primitive boundary / anchor markers (black dots)
+        # history-start (anchor) markers (black dots): window k's history
+        # spans from its dot to the next amber triangle below
         axis.scatter(anc[:, sample_idx, 0], anc[:, sample_idx, 1],
                      color='#222222', s=22, zorder=6,
-                     label='primitive anchor')
+                     label='history start (anchor)')
+        # future-start markers (amber triangles) at the stitch boundaries:
+        # frames H + k*F of the stitched curve.  Dot -> triangle = H-frame
+        # history; triangle -> next triangle = F-frame future.
+        future_starts = pred_seg[sample_idx, future_start_idx]  # [Np, 3]
+        axis.scatter(future_starts[:, 0], future_starts[:, 1],
+                     color='#E69F00', marker='v', s=45, zorder=6,
+                     label='future start')
+        primitive_ends = pred_seg[sample_idx, primitive_end_idx]
+        axis.scatter(primitive_ends[:, 0], primitive_ends[:, 1],
+                     color='#CC79A7', marker='s', s=40, zorder=6,
+                     label='primitive end')
         # start and goal markers
         axis.scatter([0.0], [0.0], color='#222222', s=35, zorder=6,
                      label='start')
@@ -632,7 +729,7 @@ def _build_segment_figure(batch, dataset, vae, denoiser, diffusion,
         sliced = _slice_batch_for_viz(batch, max_samples)
         viz_data = _sample_segment_rollout(
             sliced, dataset, vae, denoiser, diffusion, manager, cfg)
-    # segment goal: shared (goal_per_primitive=false) vs terminal (true)
+    # segment goal: shared (goal_per_primitive=false) vs per-primitive target (true)
     goal_pidx = -1 if bool(cfg.data.goal_per_primitive) else 0
     world_goal_pos = sliced[goal_pidx]['world_goal_pos']
     labels = sliced[0].get('action_label')
@@ -781,25 +878,41 @@ def _validate_batch(batch, cfg) -> None:
                     f"Primitive {primitive_idx} body goal keypoints have shape "
                     f"{shape}, expected [batch, {num_keypoints}, 3]"
                 )
-        if goal_type is GoalType.BODY_EXT:
+        if goal_type is GoalType.JOINT_STATE:
+            goal_rot = primitive.get('world_goal_rot')
+            goal_dof = primitive.get('world_goal_dof')
+            if goal_rot is None or goal_rot.shape[-1:] != (4,):
+                shape = None if goal_rot is None else tuple(goal_rot.shape)
+                raise ValueError(
+                    f"Primitive {primitive_idx} joint_state goal rotation "
+                    f"has shape {shape}, expected [batch, 4]"
+                )
+            if goal_dof is None or goal_dof.shape[-1:] != (29,):
+                shape = None if goal_dof is None else tuple(goal_dof.shape)
+                raise ValueError(
+                    f"Primitive {primitive_idx} joint_state goal dof has "
+                    f"shape {shape}, expected [batch, 29]"
+                )
+        if goal_type.uses_arrival_time:
             velocity = primitive.get('world_goal_vel')
-            timestep = primitive.get('goal_timestep')
+            time_to_arrival = primitive.get(
+                'time_to_arrival', primitive.get('goal_timestep'))
             if velocity is None or velocity.shape[-1:] != (3,):
                 shape = None if velocity is None else tuple(velocity.shape)
                 raise ValueError(
                     f"Primitive {primitive_idx} goal velocity has shape {shape}, "
                     "expected [batch, 3]"
                 )
-            if timestep is None or timestep.shape[-1:] != (1,):
-                shape = None if timestep is None else tuple(timestep.shape)
+            if time_to_arrival is None or time_to_arrival.shape[-1:] != (1,):
+                shape = None if time_to_arrival is None else tuple(time_to_arrival.shape)
                 raise ValueError(
-                    f"Primitive {primitive_idx} goal timestep has shape {shape}, "
+                    f"Primitive {primitive_idx} goal time_to_arrival has shape {shape}, "
                     "expected [batch, 1]"
                 )
 
 
 def _validate_goal_position_contract(cfg) -> None:
-    """Require the goal to be the generated primitive's terminal pose."""
+    """Validate the goal-position loss timing contract."""
     weight = float(
         cfg.train.manager.loss_weight.get('goal_position', 0.0))
     if weight <= 0.0:
@@ -810,12 +923,57 @@ def _validate_goal_position_contract(cfg) -> None:
         offsets = (int(cfg.data.get('goal_offset', 0)),) * 2
     else:
         offsets = tuple(int(value) for value in offset_range)
-    if not bool(cfg.data.goal_per_primitive) or offsets != (0, 0):
+    goal_type = GoalType.parse(cfg.data.goal_type)
+    goal_timestep_mode = str(cfg.data.get(
+        'goal_timestep_mode', cfg.data.get('time_to_arrival_mode', 'relative'))
+    ).lower()
+    if offsets != (0, 0):
+        if not goal_type.uses_arrival_time:
+            raise ValueError(
+                "goal_position loss with randomized offsets requires "
+                "a goal type with explicit arrival time"
+            )
+        if goal_timestep_mode != 'relative':
+            raise ValueError(
+                "goal_position loss with randomized offsets requires "
+                "goal_timestep_mode=relative"
+            )
+    if not bool(cfg.data.goal_per_primitive):
+        if not goal_type.uses_arrival_time:
+            raise ValueError(
+                "goal_position loss with goal_per_primitive=false requires "
+                "a goal type with explicit arrival time"
+            )
+        if goal_timestep_mode != 'relative':
+            raise ValueError(
+                "goal_position loss with goal_per_primitive=false requires "
+                "goal_timestep_mode=relative"
+            )
+
+
+def _validate_joint_state_contract(cfg) -> None:
+    """Validate v6 joint_state and randomized-arrival constraints."""
+    goal_type = GoalType.parse(cfg.data.goal_type)
+    if goal_type is GoalType.JOINT_STATE and int(cfg.data.dof_dim) != 29:
         raise ValueError(
-            "goal_position loss requires goal_per_primitive=true and a fixed "
-            "zero goal offset; otherwise the conditioned goal is not the "
-            f"generated primitive endpoint (got goal_per_primitive="
-            f"{cfg.data.goal_per_primitive}, goal_offset_range={offsets})"
+            "goal_type=joint_state requires data.dof_dim=29, got "
+            f"{cfg.data.dof_dim}"
+        )
+
+    offset_range = cfg.data.get('goal_offset_range')
+    if offset_range is None:
+        offsets = (int(cfg.data.get('goal_offset', 0)),) * 2
+    else:
+        offsets = tuple(int(value) for value in offset_range)
+    if offsets == (0, 0):
+        return
+    goal_timestep_mode = str(cfg.data.get(
+        'goal_timestep_mode', cfg.data.get('time_to_arrival_mode', 'relative'))
+    ).lower()
+    if goal_type.uses_arrival_time and goal_timestep_mode != 'relative':
+        raise ValueError(
+            f"goal_type={goal_type.value} with randomized goal offsets "
+            "requires goal_timestep_mode=relative"
         )
 
 
@@ -828,6 +986,7 @@ def main(cfg: DictConfig):
     seed.set(cfg.seed + rank)
     logger.set(cfg)
     validate_goal_config(cfg.data.goal_type, cfg.denoiser.goal_dim)
+    _validate_joint_state_contract(cfg)
     _validate_goal_position_contract(cfg)
     if cfg.train.manager.use_static_pose:
         raise ValueError(
@@ -939,8 +1098,9 @@ def main(cfg: DictConfig):
                 reference_rot = primitive['gt_ref_rot'].to(cfg.device)
 
             y = _conditions(primitive, reference_pos, reference_rot,
-                            history_motion, cfg,
+                            history_motion, cfg, train_data.fps,
                             use_scene=manager.should_use_scene())
+            goal_time_frame = _goal_time_frame_for_loss(y, cfg)
 
             # Sample timesteps
             batch_size = motion.shape[0]
@@ -985,8 +1145,15 @@ def main(cfg: DictConfig):
                 history_motion=history_motion,  # dist=None for DAR
                 sliding_mask=sliding_mask,
                 ego_goal=y['goal'],
-                goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                 goal_type=cfg.data.goal_type,
+                goal_condition_keep_mask=y['goal_condition_keep_mask'],
+                goal_orientation_condition_keep_mask=y.get(
+                    'goal_orientation_condition_keep_mask'),
+                goal_joint_condition_keep_mask=y.get(
+                    'goal_joint_condition_keep_mask'),
+                goal_velocity_condition_keep_mask=y.get(
+                    'goal_velocity_condition_keep_mask'),
+                goal_time_frame=goal_time_frame,
             )
             loss = loss_dict['total']
 
@@ -1063,8 +1230,10 @@ def main(cfg: DictConfig):
                     primitive['gt_ref_rot'].to(cfg.device),
                     history_motion,
                     cfg,
+                    val_data.fps,
                     use_scene=use_scene,
                 )
+                goal_time_frame = _goal_time_frame_for_loss(y, cfg)
 
                 with torch.no_grad():
                     t, weights = schedule_sampler.sample(motion.shape[0],
@@ -1101,6 +1270,13 @@ def main(cfg: DictConfig):
                         ego_goal=y['goal'],
                         goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                         goal_type=cfg.data.goal_type,
+                        goal_orientation_condition_keep_mask=y.get(
+                            'goal_orientation_condition_keep_mask'),
+                        goal_joint_condition_keep_mask=y.get(
+                            'goal_joint_condition_keep_mask'),
+                        goal_velocity_condition_keep_mask=y.get(
+                            'goal_velocity_condition_keep_mask'),
+                        goal_time_frame=goal_time_frame,
                         is_eval=True)
 
                     if getattr(manager, 'eval_full_sample', False):
@@ -1119,6 +1295,9 @@ def main(cfg: DictConfig):
                         sample_trajectory = manager.root_trajectory_ego(
                             sample_future, history_motion)
                         sample_displacement = sample_trajectory[:, -1]
+                        sample_goal_displacement = manager.root_displacement_ego(
+                            sample_future, history_motion,
+                            goal_time_frame=goal_time_frame)
                         goal_keep_mask = y.get('goal_condition_keep_mask')
                         extras['sample_goal_position'] = (
                             manager.calc_goal_position_loss(
@@ -1126,6 +1305,7 @@ def main(cfg: DictConfig):
                                 y['goal'],
                                 goal_keep_mask,
                                 history_motion=history_motion,
+                                goal_time_frame=goal_time_frame,
                             )
                         )
                         extras['sample_goal_direction'] = (
@@ -1134,21 +1314,33 @@ def main(cfg: DictConfig):
                                 y['goal'],
                                 goal_keep_mask,
                                 history_motion=history_motion,
+                                goal_time_frame=goal_time_frame,
                             )
                         )
-                        endpoint_error = torch.linalg.vector_norm(
+                        goal_error = torch.linalg.vector_norm(
+                            sample_goal_displacement - y['goal'][:, :2], dim=-1
+                        )
+                        primitive_end_error = torch.linalg.vector_norm(
                             sample_displacement - y['goal'][:, :2], dim=-1
                         )
                         if goal_keep_mask is not None:
-                            endpoint_error = endpoint_error[
+                            goal_error = goal_error[
                                 goal_keep_mask.to(dtype=torch.bool)
                             ]
-                        if endpoint_error.numel() > 0:
+                            primitive_end_error = primitive_end_error[
+                                goal_keep_mask.to(dtype=torch.bool)
+                            ]
+                        if goal_error.numel() > 0:
+                            extras['sample_goal_error_m'] = goal_error.mean()
+                        if primitive_end_error.numel() > 0:
                             extras['sample_endpoint_error_m'] = (
-                                endpoint_error.mean()
+                                primitive_end_error.mean()
                             )
                         extras['sample_root_displacement'] = (
                             sample_displacement.norm(dim=-1).mean()
+                        )
+                        extras['sample_goal_root_displacement'] = (
+                            sample_goal_displacement.norm(dim=-1).mean()
                         )
                         extras['goal_root_displacement'] = (
                             y['goal'][:, :2].norm(dim=-1).mean()
@@ -1165,6 +1357,7 @@ def main(cfg: DictConfig):
                                 sample_trajectory,
                                 y['goal'][:, :2],
                                 ground_truth_trajectory=ground_truth_trajectory,
+                                goal_time_frame=goal_time_frame,
                                 history_trajectory=hist_traj,
                                 goal_condition_keep_mask=goal_keep_mask,
                                 # Pre-scene phase: draw trajectory + goal only
