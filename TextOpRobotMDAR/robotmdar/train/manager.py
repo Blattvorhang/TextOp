@@ -20,6 +20,7 @@ from robotmdar.dtype.motion import (
     perturb_feature_v3,
 )
 from robotmdar.dtype.rotation import rot6d_to_matrix, matrix_to_rot6d, quaternion_to_matrix, xyzw_to_wxyz
+from robotmdar.utils.goal import JOINT_STATE_GOAL_DIM
 from isaac_utils.rotations import get_euler_xyz
 
 
@@ -951,6 +952,10 @@ class DARManager(BaseManager, GeometryLoss):
         sliding_mask=None,
         ego_goal=None,
         goal_condition_keep_mask=None,
+        goal_orientation_condition_keep_mask=None,
+        goal_joint_condition_keep_mask=None,
+        goal_velocity_condition_keep_mask=None,
+        goal_time_frame=None,
         is_eval: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         terms = {}
@@ -1023,6 +1028,7 @@ class DARManager(BaseManager, GeometryLoss):
             terms['goal_direction'] = self.calc_goal_direction_loss(
                 future_motion_pred, ego_goal, goal_condition_keep_mask,
                 history_motion=history_motion,
+                goal_time_frame=goal_time_frame,
             )
 
         compute_goal_position = (
@@ -1037,7 +1043,42 @@ class DARManager(BaseManager, GeometryLoss):
             terms['goal_position'] = self.calc_goal_position_loss(
                 future_motion_pred, ego_goal, goal_condition_keep_mask,
                 history_motion=history_motion,
+                goal_time_frame=goal_time_frame,
             )
+
+        if ego_goal is not None and ego_goal.shape[-1] == JOINT_STATE_GOAL_DIM:
+            if (self.loss_weight.get('goal_root_orientation', 0.0) > 0.0
+                    or is_eval):
+                terms['goal_root_orientation'] = (
+                    self.calc_goal_root_orientation_loss(
+                        future_motion_pred,
+                        ego_goal,
+                        goal_orientation_condition_keep_mask,
+                        history_motion=history_motion,
+                        goal_time_frame=goal_time_frame,
+                    )
+                )
+            if (self.loss_weight.get('goal_joint_position', 0.0) > 0.0
+                    or is_eval):
+                terms['goal_joint_position'] = (
+                    self.calc_goal_joint_position_loss(
+                        future_motion_pred,
+                        ego_goal,
+                        goal_joint_condition_keep_mask,
+                        goal_time_frame=goal_time_frame,
+                    )
+                )
+            if (self.loss_weight.get('goal_root_velocity', 0.0) > 0.0
+                    or is_eval):
+                terms['goal_root_velocity'] = (
+                    self.calc_goal_root_velocity_loss(
+                        future_motion_pred,
+                        ego_goal,
+                        goal_velocity_condition_keep_mask,
+                        history_motion=history_motion,
+                        goal_time_frame=goal_time_frame,
+                    )
+                )
 
         total_loss = sum(
             self.loss_weight.get(k, 0.0) * v for k, v in terms.items()
@@ -1052,10 +1093,12 @@ class DARManager(BaseManager, GeometryLoss):
 
     def calc_goal_direction_loss(self, future_motion_pred, ego_goal,
                                  goal_condition_keep_mask=None,
-                                 history_motion=None):
+                                 history_motion=None,
+                                 goal_time_frame=None):
         """Align predicted horizontal root displacement with the ego goal."""
         root_displacement = self.root_displacement_ego(
-            future_motion_pred, history_motion)
+            future_motion_pred, history_motion,
+            goal_time_frame=goal_time_frame)
         goal_direction = ego_goal[..., :2]
         goal_distance = goal_direction.norm(dim=-1)
         valid = goal_distance > 0.1
@@ -1076,10 +1119,12 @@ class DARManager(BaseManager, GeometryLoss):
 
     def calc_goal_position_loss(self, future_motion_pred, ego_goal,
                                 goal_condition_keep_mask=None,
-                                history_motion=None):
+                                history_motion=None,
+                                goal_time_frame=None):
         """Match generated horizontal root displacement to the goal endpoint."""
         root_displacement = self.root_displacement_ego(
-            future_motion_pred, history_motion)
+            future_motion_pred, history_motion,
+            goal_time_frame=goal_time_frame)
         goal_position = ego_goal[..., :2]
         valid = torch.ones(
             goal_position.shape[0], dtype=torch.bool,
@@ -1093,9 +1138,153 @@ class DARManager(BaseManager, GeometryLoss):
         return self.rec_criterion(
             root_displacement[valid], goal_position[valid])
 
-    def root_displacement_ego(self, future_motion_pred, history_motion):
+    def _valid_goal_component_mask(self, batch_size, device, keep_mask=None):
+        valid = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if keep_mask is not None:
+            valid = valid & keep_mask.to(device=device, dtype=torch.bool)
+        return valid
+
+    def _future_step_from_goal_time(self, future_motion_pred,
+                                    goal_time_frame=None):
+        if goal_time_frame is None:
+            return torch.full(
+                (future_motion_pred.shape[0],),
+                future_motion_pred.shape[1] - 1,
+                dtype=torch.long,
+                device=future_motion_pred.device,
+            )
+        goal_step = goal_time_frame.to(
+            device=future_motion_pred.device, dtype=torch.long
+        )
+        if goal_step.ndim > 1:
+            goal_step = goal_step.squeeze(-1)
+        return (goal_step - 1).clamp(
+            min=0, max=future_motion_pred.shape[1] - 1)
+
+    def _future_feature_at_goal(self, future_motion_pred,
+                                goal_time_frame=None):
+        future_motion = self.dataset.denormalize(future_motion_pred)
+        goal_step = self._future_step_from_goal_time(
+            future_motion, goal_time_frame)
+        batch_idx = torch.arange(
+            future_motion.shape[0], device=future_motion.device)
+        return future_motion[batch_idx, goal_step]
+
+    def _future_yaw_ego_at_goal(self, future_motion_pred, history_motion,
+                                goal_time_frame=None):
+        if history_motion is None:
+            raise ValueError(
+                "history_motion is required to integrate goal-frame yaw")
+        future_motion = self.dataset.denormalize(future_motion_pred)
+        history_last = self.dataset.denormalize(history_motion[:, -1:])
+        delta_yaw = torch.cat(
+            (history_last[..., 4], future_motion[..., 4]), dim=1)
+        yaw_future = delta_yaw[:, :future_motion.shape[1]].cumsum(dim=1)
+        goal_step = self._future_step_from_goal_time(
+            future_motion, goal_time_frame)
+        batch_idx = torch.arange(
+            future_motion.shape[0], device=future_motion.device)
+        return yaw_future[batch_idx, goal_step]
+
+    def calc_goal_root_orientation_loss(
+        self,
+        future_motion_pred,
+        ego_goal,
+        goal_orientation_condition_keep_mask=None,
+        history_motion=None,
+        goal_time_frame=None,
+    ):
+        """Match TextOp-style root orientation at the selected goal frame."""
+        selected = self._future_feature_at_goal(
+            future_motion_pred, goal_time_frame)
+        yaw = self._future_yaw_ego_at_goal(
+            future_motion_pred, history_motion, goal_time_frame)
+        predicted = torch.cat((selected[..., 0:4], yaw.unsqueeze(-1)), dim=-1)
+        target = ego_goal[..., 3:8]
+        error = predicted - target
+        error[..., 4] = torch.atan2(
+            torch.sin(error[..., 4]), torch.cos(error[..., 4]))
+        valid = self._valid_goal_component_mask(
+            target.shape[0], target.device,
+            goal_orientation_condition_keep_mask)
+        if not valid.any():
+            return future_motion_pred.sum() * 0.0
+        return self.rec_criterion(error[valid], torch.zeros_like(error[valid]))
+
+    def calc_goal_joint_position_loss(
+        self,
+        future_motion_pred,
+        ego_goal,
+        goal_joint_condition_keep_mask=None,
+        goal_time_frame=None,
+    ):
+        """Match the 29-DOF joint target at the selected goal frame."""
+        dof_dim = int(self.dataset.dof_dim)
+        if dof_dim != 29:
+            raise ValueError(
+                "joint_state goal losses require dataset.dof_dim=29, got "
+                f"{dof_dim}"
+            )
+        selected = self._future_feature_at_goal(
+            future_motion_pred, goal_time_frame)
+        predicted = selected[..., 11:40]
+        target = ego_goal[..., 8:37]
+        valid = self._valid_goal_component_mask(
+            target.shape[0], target.device, goal_joint_condition_keep_mask)
+        if not valid.any():
+            return future_motion_pred.sum() * 0.0
+        return self.rec_criterion(predicted[valid], target[valid])
+
+    def calc_goal_root_velocity_loss(
+        self,
+        future_motion_pred,
+        ego_goal,
+        goal_velocity_condition_keep_mask=None,
+        history_motion=None,
+        goal_time_frame=None,
+    ):
+        """Match reference-ego root velocity at the selected goal frame."""
+        selected = self._future_feature_at_goal(
+            future_motion_pred, goal_time_frame)
+        yaw = self._future_yaw_ego_at_goal(
+            future_motion_pred, history_motion, goal_time_frame)
+        delta = selected[..., 7:10] * float(self.dataset.fps)
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        predicted = torch.stack(
+            (
+                delta[..., 0] * cos_yaw - delta[..., 1] * sin_yaw,
+                delta[..., 0] * sin_yaw + delta[..., 1] * cos_yaw,
+                delta[..., 2],
+            ),
+            dim=-1,
+        )
+        target = ego_goal[..., 37:40]
+        valid = self._valid_goal_component_mask(
+            target.shape[0], target.device, goal_velocity_condition_keep_mask)
+        if not valid.any():
+            return future_motion_pred.sum() * 0.0
+        return self.rec_criterion(predicted[valid], target[valid])
+
+    def _trajectory_at_step(self, trajectory, goal_time_frame=None):
+        if goal_time_frame is None:
+            return trajectory[:, -1]
+        goal_time_frame = goal_time_frame.to(
+            device=trajectory.device, dtype=torch.long
+        )
+        if goal_time_frame.ndim > 1:
+            goal_time_frame = goal_time_frame.squeeze(-1)
+        goal_time_frame = goal_time_frame.clamp(
+            min=0, max=trajectory.shape[1] - 1
+        )
+        batch_idx = torch.arange(trajectory.shape[0], device=trajectory.device)
+        return trajectory[batch_idx, goal_time_frame]
+
+    def root_displacement_ego(self, future_motion_pred, history_motion,
+                              goal_time_frame=None):
         """Integrate reference-to-goal displacement in the reference ego frame."""
-        return self.root_trajectory_ego(future_motion_pred, history_motion)[:, -1]
+        trajectory = self.root_trajectory_ego(future_motion_pred, history_motion)
+        return self._trajectory_at_step(trajectory, goal_time_frame)
 
     def root_trajectory_ego(self, future_motion_pred, history_motion):
         """Integrate root XY positions in the reference ego frame."""
@@ -1111,9 +1300,8 @@ class DARManager(BaseManager, GeometryLoss):
 
         future_motion = self.dataset.denormalize(future_motion_pred)
         history_last = self.dataset.denormalize(history_motion[:, -1:])
-        # Feature frame t stores the forward delta t -> t+1. The goal with
-        # goal_offset=0 is the last generated pose, so its path starts with the
-        # last history delta and ends with future[-2] -> future[-1].
+        # Feature frame t stores the forward delta t -> t+1. The path starts
+        # with the last history delta and ends with future[-2] -> future[-1].
         path_motion = torch.cat((history_last, future_motion[:, :-1]), dim=1)
         delta_yaw = path_motion[..., 4]
         relative_yaw = torch.cat(
@@ -1222,17 +1410,51 @@ class DARManager(BaseManager, GeometryLoss):
         logger.info(f"Saved DAR model & optimizer to {save_path}")
         logger.info(f"Current step: {self.step}")
 
+    @staticmethod
+    def _fill_missing_arrival_embedder_state(model: nn.Module,
+                                             checkpoint_state: Dict[str, Any],
+                                             ckpt_path: Path):
+        current_state = model.state_dict()
+        missing_keys = [
+            key for key in current_state
+            if key.startswith('arrival_embedder.')
+            and key not in checkpoint_state
+        ]
+        if not missing_keys:
+            return checkpoint_state, False
+
+        checkpoint_state = dict(checkpoint_state)
+        for key in missing_keys:
+            checkpoint_state[key] = current_state[key]
+        logger.warning(
+            "DAR checkpoint {} is missing {} arrival_embedder keys; "
+            "initializing them from the current model and keeping all other "
+            "state-dict checks strict",
+            ckpt_path, len(missing_keys))
+        return checkpoint_state, True
+
     def load_model(self, ckpt_path: Path):
         state_dict = torch.load(ckpt_path, map_location=self.device)
-        self.denoiser.load_state_dict(state_dict['denoiser'])
+        denoiser_state, initialized_arrival = (
+            self._fill_missing_arrival_embedder_state(
+                self.denoiser, state_dict['denoiser'], ckpt_path))
+        self.denoiser.load_state_dict(denoiser_state)
         if self.optimizer is not None:
-            self.optimizer.load_state_dict(state_dict['optimizer'])
+            if initialized_arrival:
+                logger.warning(
+                    "Skipping optimizer state restore for {} because the "
+                    "arrival_embedder parameters were initialized fresh",
+                    ckpt_path)
+            else:
+                self.optimizer.load_state_dict(state_dict['optimizer'])
         self.step = state_dict['step']
 
         # 加载EMA模型
         if self.use_ema and 'ema_models' in state_dict:
             for name, ema_state in state_dict['ema_models'].items():
                 if name in self.ema_models:
+                    ema_state, _ = self._fill_missing_arrival_embedder_state(
+                        self.ema_models[name], ema_state, ckpt_path)
                     self.ema_models[name].load_state_dict(ema_state)
                     logger.info(f"Loaded EMA model: {name}")
 

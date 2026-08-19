@@ -4,36 +4,39 @@ defaults:
   - train/dar
   - _self_
 
-expname: DAR-BODY-GOAL
+expname: DAR-JOINT-STATE-GOAL
 task: train-dar
 
 data:
-  # Default to the original TextOp 23-DoF/57-D contract. Override with
-  # data.dof_dim=29 to train against the full-wrist model instead.
+  # V6 joint_state targets the full-wrist G1 model directly.
   dof_dim: 29
   history_len: 16
   future_len: 64
   num_primitive: 4
   batch_size: 256
-  goal_type: body_ext
+  goal_type: joint_state
   goal_per_primitive: true
   goal_offset: 0
-  goal_offset_range: null
-  goal_timestep_mode: zero
+  # Arrival time disambiguates randomized targets, so training can cover every
+  # future frame inside each primitive window.
+  goal_offset_range: [-63, 0]
+  goal_timestep_mode: relative
   # Keep clean histories for the warm-up, then enable recovery DR in the
   # dataloader. The server training launch may override this threshold.
   augmentation_enabled: true
   augmentation_start_step: 50000
   augmentation_prob: 0.5
   val:
-    goal_offset_range: null
+    # Mirror training so validation measures the same randomized goal window.
+    goal_offset_range: ${..goal_offset_range}
 
 denoiser:
-  goal_dim: 21
+  goal_dim: 40
   cond_goal_root_mask_prob: 0.1
-  cond_goal_yaw_mask_prob: 0.0
+  cond_goal_orientation_mask_prob: 0.1
+  cond_goal_joint_mask_prob: 0.1
+  cond_goal_velocity_mask_prob: 0.0
   cond_goal_time_mask_prob: 0.0
-  cond_goal_body_mask_prob: 0.1
 
 train:
   manager:

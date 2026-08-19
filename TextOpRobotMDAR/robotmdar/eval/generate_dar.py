@@ -195,7 +195,12 @@ def generate_next_motion(
         force_drop_goal_root: bool = False,
         force_drop_goal_yaw: bool = False,
         force_drop_goal_time: bool = False,
-        force_drop_goal_body: bool = False):
+        force_drop_goal_body: bool = False,
+        force_drop_goal_orientation: bool = False,
+        force_drop_goal_joint: bool = False,
+        force_drop_goal_velocity: bool = False,
+        force_drop_arrival_time: bool = False,
+        time_to_arrival_frame: Optional[torch.Tensor] = None):
     """
     Generate next motion segment using DAR model.
 
@@ -214,6 +219,11 @@ def generate_next_motion(
         force_drop_goal_yaw: Mask the root-yaw component at inference.
         force_drop_goal_time: Mask the remaining-time component at inference.
         force_drop_goal_body: Mask the limb-keypoint component at inference.
+        force_drop_goal_orientation: Mask the joint_state orientation block.
+        force_drop_goal_joint: Mask the joint_state 29-DOF target block.
+        force_drop_goal_velocity: Mask the joint_state root-velocity block.
+        force_drop_arrival_time: Mask the arrival-time PE at inference.
+        time_to_arrival_frame: Optional frame index passed to the arrival PE.
 
     Returns:
         Tuple of (future_motion_pred, motion_dict, new_abs_pose)
@@ -242,6 +252,14 @@ def generate_next_motion(
                         device=device) + diffusion.num_timesteps - 1
 
         # Prepare conditioning
+        force_drop_arrival_time = (
+            bool(force_drop_arrival_time) or bool(force_drop_goal_time)
+        )
+        if time_to_arrival_frame is None and goal.shape[-1] == 21:
+            fps = float(getattr(val_data, 'fps', 50.0))
+            time_to_arrival_frame = torch.round(
+                goal[:, 8].clamp_min(0.0) * fps
+            ).to(dtype=torch.long)
         y: Dict[str, Any] = {
             'goal': goal,
             'voxel': voxel,
@@ -250,7 +268,14 @@ def generate_next_motion(
             'force_drop_goal_yaw': force_drop_goal_yaw,
             'force_drop_goal_time': force_drop_goal_time,
             'force_drop_goal_body': force_drop_goal_body,
+            'force_drop_goal_orientation': force_drop_goal_orientation,
+            'force_drop_goal_joint': force_drop_goal_joint,
+            'force_drop_goal_velocity': force_drop_goal_velocity,
+            'force_drop_arrival_time': force_drop_arrival_time,
         }
+        if time_to_arrival_frame is not None:
+            y['time_to_arrival_frame'] = time_to_arrival_frame
+            y['arrival_time_frame'] = time_to_arrival_frame
         if guidance_scale is not None:
             y['scale'] = guidance_scale
 

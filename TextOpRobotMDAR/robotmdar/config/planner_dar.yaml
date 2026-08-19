@@ -8,7 +8,7 @@ task: planner-dar
 # Let SONIC consume the complete generated segment before replacing it.
 # Resetting its frame-index cursor faster than the 8-frame / 50 Hz horizon
 # repeatedly discards most of every reference and destabilizes tracking.
-infer_period_ms: 500
+infer_period_ms: 200
 motion_fps: 50.0
 state_timeout_ms: 1
 log_every: 20
@@ -33,7 +33,7 @@ use_generated_history: false
 
 # Keep false while debugging pure autoregressive history. When enabled, the
 # selected generated-history endpoint is translated onto the measured G1 root.
-align_generated_history_to_g1: true
+align_generated_history_to_g1: false
 
 # Single-step denoising is the real-time path. Full diffusion can be enabled
 # explicitly for offline experiments, but is not expected to meet the online
@@ -47,21 +47,23 @@ occ_grid: null
 
 data:
   dof_dim: 29
-  goal_type: body_ext
+  goal_type: joint_state
   history_len: 16
   future_len: 64
 
 denoiser:
-  goal_dim: 21
+  goal_dim: 40
 
-# Root yaw is present on the wire for compatibility but is intentionally not
-# used by the deployed V4 planner.
-force_drop_goal_yaw: true
+# V6 uses the TextOp-style root orientation block. Dropping yaw is treated as
+# dropping the whole orientation block for joint_state.
+force_drop_goal_yaw: false
+force_drop_goal_orientation: false
+force_drop_goal_joint: false
+force_drop_goal_velocity: false
 
-# The recommended V4 ablation keeps the 21-D layout but trains and deploys the
-# remaining-time channel as zero. Relative timestamps remain on the wire for
-# future checkpoints trained with goal_timestep_mode=relative.
-force_drop_goal_time: true
+# V6 arrival time is a separate positional encoding.
+force_drop_goal_time: false
 
-# body_ext requires protocol-v5 world velocity, goal timestamp, and keypoints.
+# joint_state requires protocol-v5+ root pose, 29-DOF joint position, root
+# velocity, and timestamp. No FK keypoint reference is needed.
 goal_reference_path: null

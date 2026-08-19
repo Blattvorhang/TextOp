@@ -66,6 +66,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         goal_type: GoalType | str = GoalType.ROOT,
         goal_per_primitive: bool = False,
         goal_timestep_mode: str = "relative",
+        time_to_arrival_mode: Optional[str] = None,
         weighted_sample: bool = False,
         frame_weight: bool = False,
         use_weighted_meanstd: bool = False,
@@ -98,11 +99,20 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.context_len = self.history_len + self.future_len
 
         self.goal_type = GoalType.parse(goal_type)
+        if self.goal_type is GoalType.JOINT_STATE and self.dof_dim != 29:
+            raise ValueError(
+                "goal_type='joint_state' requires dof_dim=29, got "
+                f"{self.dof_dim}"
+            )
         self.goal_per_primitive = goal_per_primitive
+        if time_to_arrival_mode is not None:
+            goal_timestep_mode = time_to_arrival_mode
         self.goal_timestep_mode = str(goal_timestep_mode).lower()
+        self.time_to_arrival_mode = self.goal_timestep_mode
         if self.goal_timestep_mode not in ("relative", "zero"):
             raise ValueError(
-                "goal_timestep_mode must be 'relative' or 'zero', got "
+                "time_to_arrival_mode/goal_timestep_mode must be "
+                "'relative' or 'zero', got "
                 f"{goal_timestep_mode!r}"
             )
         self.goal_offset = int(goal_offset)
@@ -126,10 +136,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 f"after the reference frame, got {self.goal_offset_range}"
             )
 
-        # BODY_EXT uses a forward difference at the goal. A shared snippet goal
-        # sits on the final raw frame, so it needs one additional source frame.
+        # Goal types with root velocity use a forward difference at the goal. A
+        # shared snippet goal sits on the final raw frame, so it needs one
+        # additional source frame.
         forward_diff_extra = int(
-            self.goal_type is GoalType.BODY_EXT and not self.goal_per_primitive
+            self.goal_type.uses_arrival_time and not self.goal_per_primitive
         )
         self.required_length = self.segment_len + max(
             0, self.max_goal_offset + forward_diff_extra
@@ -441,8 +452,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                             recovery: bool,
                             generator: Optional[torch.Generator]) -> bool:
         """Perturb raw 29-DoF motion before FeatureVersion 3 extraction."""
-        if (not self.augmentation_enabled or self.split != 'train'
-                or self.training_step < self.augmentation_start_step):
+        augmentation_enabled = bool(getattr(self, 'augmentation_enabled', False))
+        training_step = int(getattr(self, 'training_step', 0))
+        augmentation_start_step = int(
+            getattr(self, 'augmentation_start_step', 0))
+        if (not augmentation_enabled or getattr(self, 'split', '') != 'train'
+                or training_step < augmentation_start_step):
             return False
         if torch.rand((), generator=generator).item() >= self.augmentation_prob:
             return False
@@ -723,6 +738,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _world_goal_keypoints(self, raw_motion: Dict[str, Any],
                               goal_frame: int) -> torch.Tensor:
+        goal_type = GoalType.parse(self.goal_type)
         goal_motion = {
             'dof': self._select_model_dof(torch.as_tensor(
                 raw_motion['dof'][goal_frame:goal_frame + 1],
@@ -739,7 +755,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         )
         keypoint_ids = (
             self.skeleton.goal_limb_keypoint_id
-            if self.goal_type is GoalType.BODY_EXT
+            if goal_type is GoalType.BODY_EXT
             else self.skeleton.goal_keypoint_id
         )
         return goal_fk['global_translation_extend'][0, 0, keypoint_ids]
@@ -757,12 +773,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             - torch.as_tensor(root_position[goal_frame], dtype=torch.float32)
         ) * float(self.fps)
 
-    def _goal_timestep(self, reference_frame: int,
-                       goal_frame: int) -> torch.Tensor:
+    def _time_to_arrival(self, reference_frame: int,
+                         goal_frame: int) -> torch.Tensor:
         if self.goal_timestep_mode == "zero":
             return torch.zeros(1, dtype=torch.float32)
         return torch.tensor(
-            [(goal_frame - reference_frame) / float(self.fps)],
+            [max(0.0, (goal_frame - reference_frame) / float(self.fps))],
             dtype=torch.float32,
         )
 
@@ -779,6 +795,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
           - gt_ref_pos / gt_ref_rot: last-history-frame absolute pose (egocentric reference)
           - scene: per-sequence occupancy grid dict
         """
+        goal_type = GoalType.parse(self.goal_type)
         motion_data = {}
         for k in MotionKeys:
             if k in sample['motion']:
@@ -819,16 +836,22 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             motion_data['dof'][self.history_len]
             - motion_data['dof'][self.history_len - 1]
         ).clone()
-        if self.goal_type.uses_keypoints:
+        if goal_type.uses_keypoints:
             if world_goal_keypoints is None:
                 world_goal_keypoints = self._world_goal_keypoints(
                     raw_motion, goal_frame)
             primitive['world_goal_keypoints'] = world_goal_keypoints
-        if self.goal_type is GoalType.BODY_EXT:
+        if goal_type is GoalType.JOINT_STATE:
+            primitive['world_goal_rot'] = goal_rot.float()
+            primitive['world_goal_dof'] = self._select_model_dof(
+                torch.as_tensor(
+                    raw_motion['dof'][goal_frame], dtype=torch.float32))
+        if goal_type.uses_arrival_time:
             primitive['world_goal_vel'] = self._world_goal_velocity(
                 raw_motion, goal_frame)
-            primitive['goal_timestep'] = self._goal_timestep(
+            primitive['time_to_arrival'] = self._time_to_arrival(
                 reference_frame, goal_frame)
+            primitive['goal_timestep'] = primitive['time_to_arrival']
         return primitive
 
     def _generate_motion_primitives(self, sample: Dict[str, Any],
@@ -869,7 +892,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     f"frame {prim_start + self.history_len - 1}"
                 )
             required_last_frame = goal_frame + int(
-                goal_type is GoalType.BODY_EXT
+                goal_type.uses_arrival_time
             )
             if required_last_frame >= clip_len:
                 raise IndexError(
@@ -954,8 +977,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         )
         if goal_type.uses_keypoints:
             tensor_keys += ('world_goal_keypoints',)
-        if goal_type is GoalType.BODY_EXT:
-            tensor_keys += ('world_goal_vel', 'goal_timestep')
+        if goal_type is GoalType.JOINT_STATE:
+            tensor_keys += ('world_goal_rot', 'world_goal_dof')
+        if goal_type.uses_arrival_time:
+            tensor_keys += ('world_goal_vel', 'time_to_arrival',
+                            'goal_timestep')
         batch_primitives = []
 
         for primitive_idx in range(self.num_primitive):
@@ -966,14 +992,18 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             for batch_idx in range(self.batch_size):
                 primitive = all_motion_primitives[batch_idx][primitive_idx]
                 primitive['_augmented'] = self._augment_raw_motion(
-                    primitive['motion'], primitive['is_recovery'], generator)
+                    primitive['motion'],
+                    bool(primitive.get('is_recovery', False)),
+                    generator)
                 motion_batch.append(primitive['motion'])
                 primitives.append(primitive)
 
             # Convert to tensors and motion features
             motion_features = self._convert_to_motion_features(motion_batch)
             feature_len = motion_features.shape[1]
-            recovery_flags = [p['is_recovery'] for p in primitives]
+            recovery_flags = [
+                bool(p.get('is_recovery', False)) for p in primitives
+            ]
             for b, primitive in enumerate(primitives):
                 if primitive['_augmented']:
                     # Keep the final history delta clean: it references the
@@ -1001,7 +1031,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     p['sliding_mask'][:feature_len] for p in primitives
                 ]),
                 'scene': [p['scene'] for p in primitives],
-                'action_label': [p['action_label'] for p in primitives],
+                'action_label': [
+                    p.get('action_label') for p in primitives
+                ],
                 'is_recovery': torch.as_tensor(recovery_flags, dtype=torch.bool),
             }
             batch.update({
