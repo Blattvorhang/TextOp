@@ -24,8 +24,8 @@ frame_weight: false
 use_weighted_meanstd: false
 goal_offset: 0
 goal_offset_range: null
-goal_type: body
-goal_per_primitive: false
+goal_type: joint_state
+goal_per_primitive: true
 goal_timestep_mode: relative
 occupancy_unit: 0.08
 

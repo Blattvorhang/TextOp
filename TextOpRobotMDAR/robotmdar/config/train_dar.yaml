@@ -36,7 +36,7 @@ denoiser:
   cond_goal_orientation_mask_prob: 0.1
   cond_goal_joint_mask_prob: 0.1
   cond_goal_velocity_mask_prob: 0.0
-  cond_goal_time_mask_prob: 0.0
+  cond_goal_time_mask_prob: 0.1
 
 train:
   manager:
