@@ -1146,7 +1146,7 @@ def main(cfg: DictConfig):
                 sliding_mask=sliding_mask,
                 ego_goal=y['goal'],
                 goal_type=cfg.data.goal_type,
-                goal_condition_keep_mask=y['goal_condition_keep_mask'],
+                goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                 goal_orientation_condition_keep_mask=y.get(
                     'goal_orientation_condition_keep_mask'),
                 goal_joint_condition_keep_mask=y.get(

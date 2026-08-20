@@ -119,7 +119,7 @@ def main() -> None:
             config_name="train_dar",
             overrides=[
                 "device=cpu",
-                f"data.datadir={ROOT / 'data' / 'g1_textop_29dof'}",
+                f"data.datadir={ROOT / 'TextOpRobotMDAR' / 'dataset' / 'BONES-SEED-29dof-FULL-50fps'}",
                 # 29-DoF dataset; normalization falls back to the local
                 # datadir/meanstd.pkl (dof23 would look for the BONES-SEED
                 # 23-dof meanstd that is not present on this machine)
@@ -150,6 +150,7 @@ def main() -> None:
         primitive["gt_ref_rot"].to(cfg.device),
         history_motion,
         cfg,
+        val_data.fps,
     )
 
     gt_traj = _root_trajectory_ego(val_data, future_motion_gt, history_motion)
