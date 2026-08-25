@@ -29,6 +29,7 @@ from loguru import logger
 from omegaconf import DictConfig
 
 from robotmdar.utils.goal import (
+    GoalEncoding,
     GoalType,
     build_ego_goal,
     validate_goal_config,
@@ -265,8 +266,25 @@ def _update_goal_vis(viewer, world_goal: list, goal_received: bool):
 def main(cfg: DictConfig):
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
+    goal_encoding = GoalEncoding.parse(
+        cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
+    )
+    denoiser_goal_encoding = GoalEncoding.parse(
+        cfg.denoiser.get('goal_encoding', goal_encoding)
+    )
+    if denoiser_goal_encoding is not goal_encoding:
+        raise ValueError(
+            f"data.goal_encoding={goal_encoding.value!r} must match "
+            f"denoiser.goal_encoding={denoiser_goal_encoding.value!r}"
+        )
     goal_type = validate_goal_config(
-        cfg.data.goal_type, cfg.denoiser.goal_dim)
+        cfg.data.goal_type,
+        cfg.denoiser.goal_dim,
+        goal_encoding,
+        dof_dim=cfg.data.dof_dim,
+        goal_offset_range=cfg.data.get('goal_offset_range'),
+        goal_timestep_mode=cfg.data.get('goal_timestep_mode'),
+    )
     goal_reference_path = cfg.get("goal_reference_path")
     if goal_reference_path is not None:
         goal_reference_path = to_absolute_path(str(goal_reference_path))
