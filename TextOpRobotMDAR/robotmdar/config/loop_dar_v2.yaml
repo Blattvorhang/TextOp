@@ -5,7 +5,7 @@ defaults:
 
 data:
   goal_type: body
-  goal_encoding: legacy40
+  goal_encoding: split
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
