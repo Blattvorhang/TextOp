@@ -70,9 +70,9 @@ goal_timestep = (goal_frame - reference_frame) / fps
 
 It is stored and batched as `[B, 1]`.
 
-`goal_timestep_mode=zero` emits zero in the same channel. This is the
-recommended V4 retraining default: it preserves the 21-D checkpoint interface
-while removing time as a learned condition.
+`goal_timestep_mode=zero` emits zero in the same channel. That remains an
+ablation, but the retraining default now uses real remaining time so the model
+can handle randomized goal offsets without ambiguity.
 
 ## Goal-Frame Sampling
 
@@ -84,7 +84,7 @@ min >= 1 - future_len
 ```
 
 This ensures every goal lies strictly after its primitive reference frame.
-For `future_len=64`, the optional random-offset experiment may use `[-63, 0]`.
+For `future_len=64`, the randomized training range is `[-63, 0]`.
 
 The loader samples one offset per motion snippet and uses it consistently for
 all primitives in that snippet.
@@ -106,18 +106,16 @@ frame because `segment_len` contains the raw `+1` frame used by motion-feature
 conversion. For V4 shared goals, valid-sequence filtering reserves one further
 raw frame for the goal velocity forward difference.
 
-The recommended training configuration uses `goal_per_primitive=true`, fixed
-offset `0`, and therefore the last frame of each primitive as its goal. This
-matches the last successful 23-DOF/64-future experiment. Validation uses the
-same fixed goal. Bounds are checked before FK or velocity extraction for both
-`goal_per_primitive` modes.
+The recommended training configuration uses `goal_per_primitive=true`,
+`goal_offset_range=[-63, 0]`, and `goal_timestep_mode=relative`, which lets the
+model see every future frame in a primitive as a possible goal while still
+learning the remaining-time signal. Validation now uses the same offset range
+so it measures the same randomized goal window. Bounds are checked before FK
+or velocity extraction for both `goal_per_primitive` modes.
 
-Random offsets remain supported as an explicit experiment. They make the task
-materially harder: the model must generate the full 64-frame future while an
-intermediate frame is selected as the goal, and the timestamp is needed to
-locate that frame. Do not combine this experiment with
-`goal_timestep_mode=zero`, because different offsets would then become
-temporally ambiguous.
+The fixed zero-time ablation remains supported as an explicit experiment. It
+removes the arrival-time signal, so do not combine it with randomized goal
+offsets, because different offsets would then become temporally ambiguous.
 
 ## Component Masking
 
@@ -177,10 +175,10 @@ data:
   goal_type: body_ext
   goal_per_primitive: true
   goal_offset: 0
-  goal_offset_range: null
-  goal_timestep_mode: zero
+  goal_offset_range: [-63, 0]
+  goal_timestep_mode: relative
   val:
-    goal_offset_range: null
+    goal_offset_range: [-63, 0]
 
 denoiser:
   goal_dim: 21
@@ -348,13 +346,13 @@ train:
       goal_position: 0.5
 ```
 
-`goal_position` is horizontal Huber loss between integrated generated root
-displacement and goal dimensions `0:2`. It applies to `root`, `body`, and
-`body_ext`; root-condition masking also masks this loss. It supplies magnitude
-supervision that the cosine-only `goal_direction` loss cannot provide.
-FeatureVersion 3 stores a forward delta on each pose feature. Therefore the
-reference-to-goal integration uses the last history-frame delta followed by
-future deltas `0:-1`; summing all future deltas is shifted one frame forward.
+`goal_position` is horizontal Huber loss between the generated root
+displacement at the goal frame and goal dimensions `0:2`. It applies to
+`root`, `body`, and `body_ext`; root-condition masking also masks this loss.
+It supplies magnitude supervision that the cosine-only `goal_direction` loss
+cannot provide. FeatureVersion 3 stores a forward delta on each pose feature,
+so the loss indexes the integrated trajectory at the goal step instead of
+always using the primitive end.
 
 When merging this change into `ddp-training`, remove its root-only
 `goal_direction` validation/zeroing. A 15-D `body` goal starts with pelvis XYZ,
@@ -363,8 +361,10 @@ losses. The saved failed body run used `goal_direction: 0.0`; enabling the new
 weights requires the DDP branch to retain this body-goal handling.
 
 Full-DDPM validation now reports `sample_goal_position`,
-`sample_goal_direction`, `sample_root_displacement`,
-`goal_root_displacement`, and `sample_latent_std`.
+`sample_goal_direction`, `sample_goal_error_m`, `sample_endpoint_error_m`,
+`sample_root_displacement`, `sample_goal_root_displacement`,
+`goal_root_displacement`, and `sample_latent_std`. The root-XY eval plot marks
+the actual goal frame and the primitive end separately.
 Do not enable rollout based only on teacher-forced `eval_total`: the stage-0
 checkpoint must first show moving-goal displacement and non-collapsed sampled
 latent variance. Keep checkpoints around the stage boundary for this check.
