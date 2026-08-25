@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 echo "Working directory: $(pwd)"
 
 # ---- Required: pretrained VAE checkpoint ----
-VAE_CKPT="${VAE_CKPT:-'./logs/RobotMDAR/BONES-SEED-FUTURE-64/train-mvae-20260730_003954/ckpt_100000.pth'}"
+VAE_CKPT="./logs/RobotMDAR/BONES-SEED-FUTURE-64-29DOF-RECOVERY/train-mvae-20260813_050039/ckpt_100000.pth"
 if [ -z "${VAE_CKPT}" ]; then
     echo "ERROR: VAE_CKPT is required. Set it to the pretrained VAE checkpoint path."
     echo "Example:"
@@ -31,10 +31,10 @@ if [ -z "${VAE_CKPT}" ]; then
 fi
 
 # ---- GPU configuration ----
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,0,1,2,3,5,6,7}
+CUDA_VISIBLE_DEVICES=2,0,1,3,4,5,6,7
 
 # Number of GPUs to use
-NUM_GPUS=${NUM_GPUS:-8}
+NUM_GPUS=8
 
 # Count actually visible GPUs
 NUM_GPUS_AVAILABLE=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
@@ -67,6 +67,9 @@ TOTAL_STEPS=$((STAGE0 + STAGE1 + STAGE2))
 SAVE_EVERY=$((20000 / NUM_GPUS * SCALE_FACTOR))
 EVAL_EVERY=$((2000 / NUM_GPUS * SCALE_FACTOR))
 
+AUGMENTATION_START_STEP=$((80000 / NUM_GPUS * SCALE_FACTOR))
+SCENE_START_STEP=$((120000 / NUM_GPUS * SCALE_FACTOR))
+
 echo "Scaled for ${NUM_GPUS} GPUs:"
 echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
 echo "  save_every:  ${SAVE_EVERY}"
@@ -80,18 +83,22 @@ torchrun \
     --master_port=${MASTER_PORT} \
     -m robotmdar.cli \
     --config-name=train_dar \
-    expname=BONES-SEED-FUTURE-64-23DOF \
+    expname=BONES-SEED-FUTURE-64-JOINT-GOAL \
     timestamp="'${TIMESTAMP}'" \
     ckpt.vae=${VAE_CKPT} \
     data.datadir=./dataset/${DATADIR} \
-    data.dof_dim=23 \
-    data.normalization_path=/ALG/yukang/dataset/bones-seed/legacy/g1_textop_legacy_2/meanstd.pkl \
+    data.dof_dim=29 \
     data.history_len=16 \
     data.future_len=64 \
-    data.num_primitive=4 \
+    data.num_primitive=3 \
     data.goal_per_primitive=true \
     data.batch_size=256 \
-    data.weighted_sample=false \
+    data.weighted_sample=true \
+    data.augmentation_enabled=true \
+    data.augmentation_start_step=${AUGMENTATION_START_STEP} \
+    data.augmentation_prob=0.5 \
+    data.scene_start_step=${SCENE_START_STEP} \
+    data.use_scene_surface=true \
     data.action_statistics_path=./dataset/${DATADIR}/action_statistics.json \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \
     train.manager.save_every=${SAVE_EVERY} \

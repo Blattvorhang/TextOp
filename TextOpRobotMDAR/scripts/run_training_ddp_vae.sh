@@ -75,15 +75,14 @@ torchrun \
     --master_port=${MASTER_PORT} \
     -m robotmdar.cli \
     --config-name=train_mvae \
-    expname=BONES-SEED-FUTURE-64-29DOF \
+    expname=BONES-SEED-FUTURE-64-29DOF-RECOVERY \
     timestamp="'${TIMESTAMP}'" \
     data.datadir=./dataset/${DATADIR} \
     data.history_len=16 \
     data.future_len=64 \
-    data.num_primitive=4 \
+    data.num_primitive=3 \
     data.batch_size=256 \
-    data.weighted_sample=false \
-    data.action_statistics_path=./dataset/${DATADIR}/action_statistics.json \
+    data.weighted_sample=true \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \
     train.manager.save_every=${SAVE_EVERY} \
     train.manager.eval_every=${EVAL_EVERY} \
