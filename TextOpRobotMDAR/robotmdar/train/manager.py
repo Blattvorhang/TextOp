@@ -1481,6 +1481,16 @@ class DARManager(BaseManager, GeometryLoss):
             save_dict['ema_models'] = {name: model.state_dict() for name, model in self.ema_models.items()}
 
         torch.save(save_dict, save_path)
+        goal_stats_source = getattr(self.dataset, 'goal_stats_path', None)
+        if goal_stats_source is not None:
+            goal_stats_source = Path(goal_stats_source)
+            if goal_stats_source.exists():
+                goal_stats_target = self.save_dir / "goal_stats.pkl"
+                shutil.copy2(goal_stats_source, goal_stats_target)
+                logger.info(
+                    "Copied goal stats from {} to {}",
+                    goal_stats_source, goal_stats_target,
+                )
         logger.info(f"Saved DAR model & optimizer to {save_path}")
         logger.info(f"Current step: {self.step}")
 

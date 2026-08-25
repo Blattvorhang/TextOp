@@ -13,6 +13,10 @@ goal_reference_path: null
 
 # Override data settings for loop generation
 data:
+  goal_encoding: legacy40
   val:
     batch_size: 1  # Fixed batch size for loop generation
     split: none # No need to load data
+
+denoiser:
+  goal_encoding: ${data.goal_encoding}

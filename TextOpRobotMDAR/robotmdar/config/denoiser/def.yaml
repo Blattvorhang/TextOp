@@ -9,6 +9,7 @@ history_shape:
   - ${...data.history_len}
   - ${...nfeats}
 noise_shape: [1, 128]
+goal_encoding: legacy40
 goal_dim: 5
 grid_size: 25
 cond_goal_root_mask_prob: 0.1

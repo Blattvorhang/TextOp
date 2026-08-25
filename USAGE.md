@@ -37,7 +37,7 @@ For details on the dataset composition and data processing pipeline, refer to [D
 ### Installation
 
 ```bash
-conda create -n textop python=3.8 -y
+conda create -n textop python=3.11 -y
 conda activate textop
 
 pip install -e deps/isaac_utils

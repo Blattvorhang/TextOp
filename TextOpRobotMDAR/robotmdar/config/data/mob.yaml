@@ -22,9 +22,11 @@ batch_size: 64
 weighted_sample: false
 frame_weight: false
 use_weighted_meanstd: false
+load_goal_stats: true
 goal_offset: 0
 goal_offset_range: null
 goal_type: joint_state
+goal_encoding: split
 goal_per_primitive: true
 goal_timestep_mode: relative
 occupancy_unit: 0.08
@@ -69,9 +71,11 @@ common: &common
   weighted_sample: ${..weighted_sample}
   frame_weight: ${..frame_weight}
   use_weighted_meanstd: ${..use_weighted_meanstd}
+  load_goal_stats: ${..load_goal_stats}
   goal_offset: ${..goal_offset}
   goal_offset_range: ${..goal_offset_range}
   goal_type: ${..goal_type}
+  goal_encoding: ${..goal_encoding}
   goal_per_primitive: ${..goal_per_primitive}
   goal_timestep_mode: ${..goal_timestep_mode}
   augmentation_start_step: ${..augmentation_start_step}

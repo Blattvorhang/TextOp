@@ -399,14 +399,39 @@ def test_g1_packet_keeps_seam_and_maps_sonic_tracking_bodies():
     assert motion.num_frames == 9
     assert motion.joint_pos.shape == (9, 29)
     assert motion.joint_vel.shape == (9, 29)
-    assert motion.body_pos.shape == (9, 30, 3)
-    np.testing.assert_array_equal(
-        motion.body_pos, np.repeat(body_pos.numpy()[0, 1:, :1], 30, axis=1))
+    if hasattr(motion, "root_pos"):
+        assert motion.root_pos.shape == (9, 3)
+        assert motion.root_ori.shape == (9, 4)
+        assert motion.body_pos is None
+        assert motion.body_ori is None
+        np.testing.assert_array_equal(
+            motion.root_pos, body_pos.numpy()[0, 1:, 0])
+        np.testing.assert_array_equal(
+            motion.root_ori[0], np.asarray([1.0, 0.0, 0.0, 0.0]))
+    else:
+        assert motion.body_pos.shape == (9, 30, 3)
+        assert motion.body_ori.shape == (9, 30, 4)
     np.testing.assert_array_equal(
         motion.joint_pos, mujoco_to_isaaclab_dof(dof_pos.numpy()[0, 1:]))
     np.testing.assert_allclose(motion.joint_vel[:, 0], 1.0, atol=1e-6)
+
+    motion_with_body = motion_dict_to_g1data({
+        "dof_pos": dof_pos,
+        "global_translation_extend": body_pos,
+        "global_rotation_extend": body_ori,
+    }, skip_history=1, fps=50.0, include_body=True)
+
+    assert motion_with_body.body_pos.shape == (9, 30, 3)
+    assert motion_with_body.body_ori.shape == (9, 30, 4)
     np.testing.assert_array_equal(
-        motion.body_ori[0, 0], np.asarray([1.0, 0.0, 0.0, 0.0]))
+        motion_with_body.body_pos,
+        np.repeat(body_pos.numpy()[0, 1:, :1], 30, axis=1))
+    np.testing.assert_array_equal(
+        motion_with_body.joint_pos,
+        mujoco_to_isaaclab_dof(dof_pos.numpy()[0, 1:]))
+    np.testing.assert_array_equal(
+        motion_with_body.body_ori[0, 0],
+        np.asarray([1.0, 0.0, 0.0, 0.0]))
 
 
 def test_23dof_g1_packet_expands_and_holds_measured_wrist_joints():

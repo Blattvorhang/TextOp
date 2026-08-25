@@ -21,7 +21,12 @@ from robotmdar.utils.dof_contract import (
     configure_dof_contract,
     validate_training_contract,
 )
-from robotmdar.utils.goal import GoalType, validate_goal_config
+from robotmdar.utils.goal import (
+    GoalEncoding,
+    GoalType,
+    validate_goal_config,
+    validate_goal_stats,
+)
 from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
     generated_history_at_frame,
@@ -114,6 +119,31 @@ def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
         mismatches.append(
             f"goal_type: runtime={runtime_goal_type.value}, "
             f"checkpoint={checkpoint_goal_type.value}")
+    runtime_goal_encoding = GoalEncoding.parse(
+        cfg.data.get("goal_encoding", GoalEncoding.LEGACY40)
+    )
+    runtime_denoiser_goal_encoding = GoalEncoding.parse(
+        cfg.denoiser.get("goal_encoding", runtime_goal_encoding)
+    )
+    checkpoint_goal_encoding = GoalEncoding.parse(
+        model_cfg.data.get(
+            "goal_encoding",
+            model_cfg.denoiser.get("goal_encoding", GoalEncoding.LEGACY40),
+        )
+    )
+    checkpoint_denoiser_goal_encoding = GoalEncoding.parse(
+        model_cfg.denoiser.get("goal_encoding", checkpoint_goal_encoding)
+    )
+    if runtime_goal_encoding is not checkpoint_goal_encoding:
+        mismatches.append(
+            f"data.goal_encoding: runtime={runtime_goal_encoding.value}, "
+            f"checkpoint={checkpoint_goal_encoding.value}"
+        )
+    if runtime_denoiser_goal_encoding is not checkpoint_denoiser_goal_encoding:
+        mismatches.append(
+            f"denoiser.goal_encoding: runtime={runtime_denoiser_goal_encoding.value}, "
+            f"checkpoint={checkpoint_denoiser_goal_encoding.value}"
+        )
     humanoid_type = str(model_cfg.data.skeleton.humanoid_type)
     expected_humanoid_type = {
         23: "g1_23dof_lock_wrist",
@@ -133,6 +163,25 @@ def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
     return model_cfg_path, model_cfg
 
 
+def _checkpoint_goal_stats_path(cfg: DictConfig) -> Path:
+    ckpt_dar = cfg.ckpt.get("dar")
+    if ckpt_dar is None:
+        raise ValueError("ckpt.dar must be set to load frozen goal stats")
+    return Path(to_absolute_path(str(ckpt_dar))).with_name("goal_stats.pkl")
+
+
+def _goal_log_slices(goal_encoding: GoalEncoding) -> dict[str, object]:
+    if goal_encoding is GoalEncoding.LEGACY40:
+        return {
+            "yaw": 7,
+            "velocity": slice(37, 40),
+        }
+    return {
+        "yaw": 12,
+        "velocity": slice(42, 45),
+    }
+
+
 def main(cfg: DictConfig) -> None:
     """Run the TextOp planner until interrupted."""
     from sonicmsg import PlannerNode
@@ -141,8 +190,18 @@ def main(cfg: DictConfig) -> None:
     configure_dof_contract(cfg)
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
-    goal_type = validate_goal_config(
-        cfg.data.goal_type, cfg.denoiser.goal_dim)
+    goal_encoding = GoalEncoding.parse(
+        cfg.data.get("goal_encoding", GoalEncoding.LEGACY40)
+    )
+    denoiser_goal_encoding = GoalEncoding.parse(
+        cfg.denoiser.get("goal_encoding", goal_encoding)
+    )
+    if denoiser_goal_encoding is not goal_encoding:
+        raise ValueError(
+            f"data.goal_encoding={goal_encoding.value!r} must match "
+            f"denoiser.goal_encoding={denoiser_goal_encoding.value!r}"
+        )
+    goal_type = GoalType.parse(cfg.data.goal_type)
     goal_reference_path = cfg.get("goal_reference_path")
     if goal_reference_path is not None:
         goal_reference_path = to_absolute_path(str(goal_reference_path))
@@ -160,6 +219,32 @@ def main(cfg: DictConfig) -> None:
         "Loading {}-DoF/{}-D DAR model and dataset statistics",
         cfg.data.dof_dim, cfg.data.nfeats)
     vae, denoiser, diffusion, val_data = _load_models(cfg)
+    goal_stats = None
+    if goal_encoding is not GoalEncoding.LEGACY40:
+        goal_stats_path = _checkpoint_goal_stats_path(cfg)
+        if not goal_stats_path.exists():
+            raise FileNotFoundError(
+                f"Missing frozen goal stats at {goal_stats_path}")
+        goal_stats = torch.load(goal_stats_path, map_location="cpu")
+        goal_stats = validate_goal_stats(
+            goal_stats,
+            goal_encoding=goal_encoding,
+            goal_offset_range=cfg.data.goal_offset_range,
+            goal_per_primitive=cfg.data.goal_per_primitive,
+            future_len=cfg.data.future_len,
+            fps=float(val_data.fps),
+            goal_timestep_mode=cfg.data.goal_timestep_mode,
+            datadir=str(val_data.datadir),
+        )
+    goal_type = validate_goal_config(
+        cfg.data.goal_type,
+        cfg.denoiser.goal_dim,
+        goal_encoding,
+        dof_dim=cfg.data.dof_dim,
+        goal_offset_range=cfg.data.goal_offset_range,
+        goal_timestep_mode=cfg.data.goal_timestep_mode,
+        goal_stats=goal_stats,
+    )
     validate_training_contract(
         cfg, [("planner", val_data)], vae, denoiser)
     history_len = int(cfg.data.history_len)
@@ -289,22 +374,44 @@ def main(cfg: DictConfig) -> None:
                                 latest_state, cfg.device,
                                 history_motion=history_motion,
                                 val_data=val_data))
-                        ego_goal = state_goal_from_reference(
+                        ego_goal_raw = state_goal_from_reference(
                             latest_state, goal_reference_pos,
                             goal_reference_rot, cfg.device,
                             goal_type=goal_type,
-                            goal_reference_path=goal_reference_path)
+                            goal_reference_path=goal_reference_path,
+                            goal_encoding=GoalEncoding.LEGACY40)
+                        ego_goal = (
+                            ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
+                            else state_goal_from_reference(
+                                latest_state, goal_reference_pos,
+                                goal_reference_rot, cfg.device,
+                                goal_type=goal_type,
+                                goal_reference_path=goal_reference_path,
+                                goal_encoding=goal_encoding,
+                                goal_stats=goal_stats)
+                        )
                     else:
                         abs_pose = {
                             k: v.to(cfg.device)
                             for k, v in generated_abs_pose.items()
                         }
                         history_translation = None
-                        ego_goal = state_goal_from_reference(
+                        ego_goal_raw = state_goal_from_reference(
                             latest_state, generated_reference_pos,
                             generated_reference_rot, cfg.device,
                             goal_type=goal_type,
-                            goal_reference_path=goal_reference_path)
+                            goal_reference_path=goal_reference_path,
+                            goal_encoding=GoalEncoding.LEGACY40)
+                        ego_goal = (
+                            ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
+                            else state_goal_from_reference(
+                                latest_state, generated_reference_pos,
+                                generated_reference_rot, cfg.device,
+                                goal_type=goal_type,
+                                goal_reference_path=goal_reference_path,
+                                goal_encoding=goal_encoding,
+                                goal_stats=goal_stats)
+                        )
                 else:
                     tracked_frame = None
                     if latest_state.current_root_rot is None:
@@ -317,9 +424,18 @@ def main(cfg: DictConfig) -> None:
                             f"entries; need at least {history_len}")
                     history_motion, abs_pose = state_to_model_input(
                         latest_state, history_len, val_data, cfg.device)
-                    ego_goal = state_to_ego_goal(
+                    ego_goal_raw = state_to_ego_goal(
                         latest_state, cfg.device, goal_type=goal_type,
-                        goal_reference_path=goal_reference_path)
+                        goal_reference_path=goal_reference_path,
+                        goal_encoding=GoalEncoding.LEGACY40)
+                    ego_goal = (
+                        ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
+                        else state_to_ego_goal(
+                            latest_state, cfg.device, goal_type=goal_type,
+                            goal_reference_path=goal_reference_path,
+                            goal_encoding=goal_encoding,
+                            goal_stats=goal_stats)
+                    )
                     history_translation = None
 
                 # DEBUG: overwrite the ego_goal
@@ -327,9 +443,9 @@ def main(cfg: DictConfig) -> None:
                 # ego_goal[0, 1] = 0.0
                 # ego_goal[0, 2] = 0.0
 
-                _goal_ego_x = float(ego_goal[0, 0])
-                _goal_ego_y = float(ego_goal[0, 1])
-                _goal_delta_z = float(ego_goal[0, 2])
+                _goal_ego_x = float(ego_goal_raw[0, 0])
+                _goal_ego_y = float(ego_goal_raw[0, 1])
+                _goal_delta_z = float(ego_goal_raw[0, 2])
 
                 _world_goal = getattr(latest_state, 'goal_root_pos_world', None)
                 if _world_goal is not None:
@@ -365,13 +481,13 @@ def main(cfg: DictConfig) -> None:
                         _goal_ego_yaw_deg = 0.0  # mask_condition zeros the yaw channels
                     else:
                         _goal_ego_yaw_deg = math.degrees(math.atan2(
-                            float(ego_goal[0, 4]), float(ego_goal[0, 3])))
+                            float(ego_goal_raw[0, 4]), float(ego_goal_raw[0, 3])))
                 elif goal_type is GoalType.JOINT_STATE:
                     if (_force_drop_yaw
                             or bool(cfg.get("force_drop_goal_orientation", False))):
                         _goal_ego_yaw_deg = 0.0
                     else:
-                        _goal_ego_yaw_deg = math.degrees(float(ego_goal[0, 7]))
+                        _goal_ego_yaw_deg = math.degrees(float(ego_goal_raw[0, 7]))
                 else:
                     _goal_ego_yaw_deg = float('nan')
 
@@ -470,8 +586,8 @@ def main(cfg: DictConfig) -> None:
                         _vel_world_x, _vel_world_y, _vel_world_z,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
-                        float(ego_goal[0, 5]), float(ego_goal[0, 6]),
-                        float(ego_goal[0, 7]),
+                        float(ego_goal_raw[0, 5]), float(ego_goal_raw[0, 6]),
+                        float(ego_goal_raw[0, 7]),
                         0.0 if _force_drop_time else time_to_arrival_s,
                         occ_count, infer_ms, avg_ms)
                 else:
@@ -486,8 +602,8 @@ def main(cfg: DictConfig) -> None:
                         _vel_world_x, _vel_world_y, _vel_world_z,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
-                        float(ego_goal[0, 37]), float(ego_goal[0, 38]),
-                        float(ego_goal[0, 39]),
+                        float(ego_goal_raw[0, 37]), float(ego_goal_raw[0, 38]),
+                        float(ego_goal_raw[0, 39]),
                         0.0 if _force_drop_time else time_to_arrival_s,
                         occ_count, infer_ms, avg_ms)
 
@@ -505,11 +621,18 @@ def main(cfg: DictConfig) -> None:
                     latest_state.raw["g1_pos"][-1], dtype=np.float32)
                 measured_rot_xyzw = np.asarray(
                     latest_state.raw["g1_root_rot"][-1], dtype=np.float32)
-                published_rot_xyzw = motion.body_ori[0, 0, [1, 2, 3, 0]]
+                if getattr(motion, "root_ori", None) is not None:
+                    published_rot_xyzw = motion.root_ori[0, [1, 2, 3, 0]]
+                else:
+                    published_rot_xyzw = motion.body_ori[0, 0, [1, 2, 3, 0]]
                 quat_dot = float(np.clip(np.abs(np.dot(
                     measured_rot_xyzw, published_rot_xyzw)), 0.0, 1.0))
+                published_root_pos = (
+                    motion.root_pos[0]
+                    if getattr(motion, "root_pos", None) is not None
+                    else motion.body_pos[0, 0])
                 seam_root_error = float(np.linalg.norm(
-                    motion.body_pos[0, 0] - measured_pos))
+                    published_root_pos - measured_pos))
                 seam_root_angle_deg = math.degrees(2.0 * math.acos(quat_dot))
                 seam_joint_error = float(np.max(np.abs(
                     motion.joint_pos[0]

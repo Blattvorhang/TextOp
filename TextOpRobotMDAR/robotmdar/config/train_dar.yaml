@@ -15,6 +15,7 @@ data:
   num_primitive: 4
   batch_size: 256
   goal_type: joint_state
+  goal_encoding: split
   goal_per_primitive: true
   goal_offset: 0
   # Arrival time disambiguates randomized targets, so training can cover every
@@ -31,7 +32,8 @@ data:
     goal_offset_range: ${..goal_offset_range}
 
 denoiser:
-  goal_dim: 40
+  goal_encoding: ${data.goal_encoding}
+  goal_dim: 45
   cond_goal_root_mask_prob: 0.1
   cond_goal_orientation_mask_prob: 0.1
   cond_goal_joint_mask_prob: 0.1

@@ -10,6 +10,7 @@ from omegaconf import DictConfig
 from hydra.utils import instantiate
 
 from robotmdar.utils.goal import (
+    GoalEncoding,
     GoalType,
     build_ego_goal,
     validate_goal_config,
@@ -283,8 +284,11 @@ def _goal_time_frame_for_loss(conditions, cfg):
 
 
 def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
-                fps: float, use_scene: bool = True):
+                fps: float, goal_stats=None, use_scene: bool = True):
     goal_type = GoalType.parse(cfg.data.goal_type)
+    goal_encoding = GoalEncoding.parse(
+        cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
+    )
     time_to_arrival = primitive.get(
         'time_to_arrival', primitive.get('goal_timestep'))
     if goal_type.uses_arrival_time:
@@ -295,12 +299,13 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         goal_time = time_to_arrival.to(cfg.device)
     else:
         goal_time = None
-    goal = build_ego_goal(
+    ego_goal_raw = build_ego_goal(
         primitive['world_goal_pos'].to(cfg.device),
         primitive['world_goal_yaw'].to(cfg.device),
         reference_pos,
         reference_rot,
         goal_type=goal_type,
+        goal_encoding=GoalEncoding.LEGACY40,
         world_goal_keypoints=(
             primitive['world_goal_keypoints'].to(cfg.device)
             if goal_type.uses_keypoints else None
@@ -319,6 +324,35 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             if goal_type is GoalType.JOINT_STATE else None
         ),
     )
+    if goal_type is GoalType.JOINT_STATE and goal_encoding is not GoalEncoding.LEGACY40:
+        if goal_stats is None:
+            raise ValueError(
+                "joint_state goal_encoding requires goal_stats")
+        goal = build_ego_goal(
+            primitive['world_goal_pos'].to(cfg.device),
+            primitive['world_goal_yaw'].to(cfg.device),
+            reference_pos,
+            reference_rot,
+            goal_type=goal_type,
+            goal_encoding=goal_encoding,
+            goal_stats=goal_stats,
+            fps=fps,
+            world_goal_rot=(
+                primitive['world_goal_rot'].to(cfg.device)
+                if goal_type is GoalType.JOINT_STATE else None
+            ),
+            world_goal_dof=(
+                primitive['world_goal_dof'].to(cfg.device)
+                if goal_type is GoalType.JOINT_STATE else None
+            ),
+            world_root_velocity=(
+                primitive['world_goal_vel'].to(cfg.device)
+                if goal_type.uses_arrival_time else None
+            ),
+            time_to_arrival_seconds=goal_time,
+        )
+    else:
+        goal = ego_goal_raw
     time_to_arrival_frame = None
     if goal_type.uses_arrival_time:
         time_to_arrival_frame = _time_to_arrival_frame(
@@ -363,6 +397,7 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         )
     return {
         'goal': goal,
+        'ego_goal_raw': ego_goal_raw,
         'voxel': voxel,
         'history_motion_normalized': history_motion,
         **(
@@ -985,7 +1020,27 @@ def main(cfg: DictConfig):
     configure_dof_contract(cfg)
     seed.set(cfg.seed + rank)
     logger.set(cfg)
-    validate_goal_config(cfg.data.goal_type, cfg.denoiser.goal_dim)
+    train_data: Dataset = instantiate(cfg.data.train)
+    goal_encoding = GoalEncoding.parse(
+        cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
+    )
+    denoiser_goal_encoding = GoalEncoding.parse(
+        cfg.denoiser.get('goal_encoding', goal_encoding)
+    )
+    if denoiser_goal_encoding is not goal_encoding:
+        raise ValueError(
+            f"data.goal_encoding={goal_encoding.value!r} must match "
+            f"denoiser.goal_encoding={denoiser_goal_encoding.value!r}"
+        )
+    validate_goal_config(
+        cfg.data.goal_type,
+        cfg.denoiser.goal_dim,
+        goal_encoding,
+        dof_dim=cfg.data.dof_dim,
+        goal_offset_range=cfg.data.goal_offset_range,
+        goal_timestep_mode=cfg.data.goal_timestep_mode,
+        goal_stats=getattr(train_data, 'goal_stats', None),
+    )
     _validate_joint_state_contract(cfg)
     _validate_goal_position_contract(cfg)
     if cfg.train.manager.use_static_pose:
@@ -1099,6 +1154,7 @@ def main(cfg: DictConfig):
 
             y = _conditions(primitive, reference_pos, reference_rot,
                             history_motion, cfg, train_data.fps,
+                            goal_stats=getattr(train_data, 'goal_stats', None),
                             use_scene=manager.should_use_scene())
             goal_time_frame = _goal_time_frame_for_loss(y, cfg)
 
@@ -1144,7 +1200,7 @@ def main(cfg: DictConfig):
                 weights,
                 history_motion=history_motion,  # dist=None for DAR
                 sliding_mask=sliding_mask,
-                ego_goal=y['goal'],
+                ego_goal=y['ego_goal_raw'],
                 goal_type=cfg.data.goal_type,
                 goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                 goal_orientation_condition_keep_mask=y.get(
@@ -1231,6 +1287,7 @@ def main(cfg: DictConfig):
                     history_motion,
                     cfg,
                     val_data.fps,
+                    goal_stats=getattr(val_data, 'goal_stats', None),
                     use_scene=use_scene,
                 )
                 goal_time_frame = _goal_time_frame_for_loss(y, cfg)
@@ -1267,7 +1324,7 @@ def main(cfg: DictConfig):
                         weights,
                         history_motion=history_motion,
                         sliding_mask=sliding_mask,
-                        ego_goal=y['goal'],
+                        ego_goal=y['ego_goal_raw'],
                         goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                         goal_type=cfg.data.goal_type,
                         goal_orientation_condition_keep_mask=y.get(
@@ -1302,7 +1359,7 @@ def main(cfg: DictConfig):
                         extras['sample_goal_position'] = (
                             manager.calc_goal_position_loss(
                                 sample_future,
-                                y['goal'],
+                                y['ego_goal_raw'],
                                 goal_keep_mask,
                                 history_motion=history_motion,
                                 goal_time_frame=goal_time_frame,
@@ -1311,17 +1368,17 @@ def main(cfg: DictConfig):
                         extras['sample_goal_direction'] = (
                             manager.calc_goal_direction_loss(
                                 sample_future,
-                                y['goal'],
+                                y['ego_goal_raw'],
                                 goal_keep_mask,
                                 history_motion=history_motion,
                                 goal_time_frame=goal_time_frame,
                             )
                         )
                         goal_error = torch.linalg.vector_norm(
-                            sample_goal_displacement - y['goal'][:, :2], dim=-1
+                            sample_goal_displacement - y['ego_goal_raw'][:, :2], dim=-1
                         )
                         primitive_end_error = torch.linalg.vector_norm(
-                            sample_displacement - y['goal'][:, :2], dim=-1
+                            sample_displacement - y['ego_goal_raw'][:, :2], dim=-1
                         )
                         if goal_keep_mask is not None:
                             goal_error = goal_error[
@@ -1343,7 +1400,7 @@ def main(cfg: DictConfig):
                             sample_goal_displacement.norm(dim=-1).mean()
                         )
                         extras['goal_root_displacement'] = (
-                            y['goal'][:, :2].norm(dim=-1).mean()
+                            y['ego_goal_raw'][:, :2].norm(dim=-1).mean()
                         )
                         extras['sample_latent_std'] = sample_latent.std()
                         if manager.should_report_eval_visualization():
@@ -1355,7 +1412,7 @@ def main(cfg: DictConfig):
                             )
                             figure = _make_root_xy_figure(
                                 sample_trajectory,
-                                y['goal'][:, :2],
+                                y['ego_goal_raw'][:, :2],
                                 ground_truth_trajectory=ground_truth_trajectory,
                                 goal_time_frame=goal_time_frame,
                                 history_trajectory=hist_traj,

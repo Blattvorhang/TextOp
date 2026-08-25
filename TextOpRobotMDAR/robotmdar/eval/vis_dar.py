@@ -4,6 +4,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from robotmdar.utils.goal import (
+    GoalEncoding,
     GoalType,
     build_ego_goal,
     validate_goal_config,
@@ -21,6 +22,7 @@ from robotmdar.eval.generate_dar import generate_next_motion
 
 def _time_to_arrival_frame(time_to_arrival: torch.Tensor,
                            fps: float) -> torch.Tensor:
+    """Convert time-to-arrival in SECONDS to a FRAME INDEX for the arrival PE."""
     if time_to_arrival.ndim > 1:
         time_to_arrival = time_to_arrival.squeeze(-1)
     return torch.round(
@@ -71,6 +73,9 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
             # For vis_dar (teacher forcing), we use gt_ref_pos/gt_ref_rot as the
             # reference pose matching training logic
             goal_type = GoalType.parse(cfg.data.goal_type)
+            goal_encoding = GoalEncoding.parse(
+                cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
+            )
             time_to_arrival = batch_item.get(
                 'time_to_arrival', batch_item.get('goal_timestep'))
             if goal_type.uses_arrival_time:
@@ -87,6 +92,9 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 batch_item['gt_ref_pos'].to(cfg.device),
                 batch_item['gt_ref_rot'].to(cfg.device),
                 goal_type=goal_type,
+                goal_encoding=goal_encoding,
+                goal_stats=getattr(val_data, 'goal_stats', None),
+                fps=val_data.fps,
                 world_goal_keypoints=(
                     batch_item['world_goal_keypoints'].to(cfg.device)
                     if goal_type.uses_keypoints else None
@@ -96,6 +104,7 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                     if goal_type.uses_arrival_time else None
                 ),
                 timestep=goal_time,
+                time_to_arrival_seconds=goal_time,
                 world_goal_rot=(
                     batch_item['world_goal_rot'].to(cfg.device)
                     if goal_type is GoalType.JOINT_STATE else None
@@ -162,9 +171,28 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
 def main(cfg: DictConfig):
     dtypelogger.set(cfg)
     seed.set(cfg.seed)
-    validate_goal_config(cfg.data.goal_type, cfg.denoiser.goal_dim)
 
     val_data: Dataset = instantiate(cfg.data.val)
+    goal_encoding = GoalEncoding.parse(
+        cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
+    )
+    denoiser_goal_encoding = GoalEncoding.parse(
+        cfg.denoiser.get('goal_encoding', goal_encoding)
+    )
+    if denoiser_goal_encoding is not goal_encoding:
+        raise ValueError(
+            f"data.goal_encoding={goal_encoding.value!r} must match "
+            f"denoiser.goal_encoding={denoiser_goal_encoding.value!r}"
+        )
+    validate_goal_config(
+        cfg.data.goal_type,
+        cfg.denoiser.goal_dim,
+        goal_encoding,
+        dof_dim=cfg.data.dof_dim,
+        goal_offset_range=cfg.data.goal_offset_range,
+        goal_timestep_mode=cfg.data.goal_timestep_mode,
+        goal_stats=getattr(val_data, 'goal_stats', None),
+    )
     val_dataiter = iter(val_data)
 
     # Load models

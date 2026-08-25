@@ -8,11 +8,16 @@ from TextOpRobotMDAR.robotmdar.utils.goal import (
     GoalType,
     _world_to_ego,
     build_ego_goal,
+    build_ego_joint_state_goal,
     validate_goal_config,
 )
 from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
     load_goal_keypoints_from_reference,
     state_goal_from_reference,
+)
+from TextOpRobotMDAR.robotmdar.dtype.rotation import (
+    euler_angles_to_quaternion,
+    quat_mul,
 )
 
 
@@ -98,6 +103,7 @@ def test_goal_configuration_requires_matching_dimension():
     assert validate_goal_config("root", 5) is GoalType.ROOT
     assert validate_goal_config("body", 15) is GoalType.BODY
     assert validate_goal_config("body_ext", 21) is GoalType.BODY_EXT
+    assert validate_goal_config("joint_state", 40) is GoalType.JOINT_STATE
     with pytest.raises(ValueError, match="requires goal_dim=15"):
         validate_goal_config("body", 5)
 
@@ -156,6 +162,67 @@ def test_extended_body_goal_requires_velocity_and_column_timestep():
             goal_type="body_ext", world_goal_keypoints=limbs,
             world_root_velocity=torch.zeros((2, 3)), timestep=torch.ones(2),
         )
+
+
+def test_joint_state_goal_layout_uses_textop_orientation_and_direct_dof():
+    reference_pos = torch.tensor([[1.0, 2.0, 0.7]])
+    reference_yaw = torch.tensor([np.pi / 2], dtype=torch.float32)
+    reference_rot = _yaw_quaternion(reference_yaw)
+    goal_euler_ego = torch.tensor([[0.2, -0.1, 0.3]], dtype=torch.float32)
+    world_goal_rot = quat_mul(
+        reference_rot,
+        euler_angles_to_quaternion(goal_euler_ego),
+        w_last=True,
+    )
+    world_goal_pos = torch.tensor([[3.0, 3.0, 1.0]])
+    world_velocity = torch.tensor([[2.0, 1.0, -0.5]])
+    goal_dof = torch.linspace(-1.0, 1.0, 29).reshape(1, 29)
+
+    goal = build_ego_joint_state_goal(
+        world_goal_pos=world_goal_pos,
+        world_goal_rot=world_goal_rot,
+        world_goal_dof=goal_dof,
+        world_root_velocity=world_velocity,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+    )
+
+    assert goal.shape == (1, 40)
+    torch.testing.assert_close(goal[0, 0:3], torch.tensor([1.0, -2.0, 0.3]))
+    torch.testing.assert_close(
+        goal[0, 3:8],
+        torch.tensor([
+            np.sin(0.2),
+            np.cos(0.2) - 1.0,
+            np.sin(-0.1),
+            np.cos(-0.1) - 1.0,
+            0.3,
+        ], dtype=torch.float32),
+        atol=1e-6,
+        rtol=0,
+    )
+    torch.testing.assert_close(goal[0, 8:37], goal_dof[0])
+    torch.testing.assert_close(goal[0, 37:40], torch.tensor([1.0, -2.0, -0.5]))
+
+
+def test_build_ego_goal_dispatches_joint_state():
+    root = torch.zeros((1, 3))
+    rotation = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+    dof = torch.zeros((1, 29))
+
+    goal = build_ego_goal(
+        root,
+        torch.zeros(1),
+        root,
+        rotation,
+        goal_type="joint_state",
+        world_goal_rot=rotation,
+        world_goal_dof=dof,
+        world_root_velocity=root,
+    )
+
+    assert goal.shape == (1, 40)
+    torch.testing.assert_close(goal, torch.zeros((1, 40)))
 
 
 def test_reference_pose_transforms_xy_and_preserves_z(tmp_path):
@@ -237,3 +304,61 @@ def test_state_extended_body_goal_uses_velocity_and_absolute_timestamp():
     torch.testing.assert_close(
         goal[0, 9:21],
         (torch.from_numpy(keypoints) - torch.tensor([1.0, 2.0, 0.7])).flatten())
+
+
+def test_state_joint_state_goal_uses_root_rotation_dof_and_velocity():
+    goal_dof = np.linspace(-0.2, 0.2, 29, dtype=np.float32)
+    state = SimpleNamespace(
+        raw={},
+        goal_root_pos_world=np.asarray([2.0, 3.0, 0.8], dtype=np.float32),
+        goal_yaw_world=None,
+        goal_root_rot_world=np.asarray(
+            [0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        goal_dof_pos=goal_dof,
+        goal_root_velocity_world=np.asarray(
+            [0.5, -0.25, 0.0], dtype=np.float32),
+        goal_timestamp_ns=4_500_000_000,
+        timestamps_ns=[2_000_000_000, 2_500_000_000],
+    )
+
+    goal = state_goal_from_reference(
+        state,
+        reference_pos=torch.tensor([[1.0, 2.0, 0.7]]),
+        reference_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+        device="cpu",
+        goal_type="joint_state",
+    )
+
+    assert goal.shape == (1, 40)
+    torch.testing.assert_close(goal[0, 0:3], torch.tensor([1.0, 1.0, 0.1]))
+    torch.testing.assert_close(goal[0, 3:8], torch.zeros(5))
+    torch.testing.assert_close(goal[0, 8:37], torch.from_numpy(goal_dof))
+    torch.testing.assert_close(goal[0, 37:40], torch.tensor([0.5, -0.25, 0.0]))
+
+
+def test_state_joint_state_goal_accepts_world_euler_rotation():
+    goal_dof = np.zeros(29, dtype=np.float32)
+    state = SimpleNamespace(
+        raw={},
+        goal_root_pos_world=np.asarray([1.0, 0.0, 0.7], dtype=np.float32),
+        goal_yaw_world=None,
+        goal_root_euler_world=np.asarray(
+            [0.0, 0.0, np.pi / 2.0], dtype=np.float32),
+        goal_dof_pos=goal_dof,
+        goal_root_velocity_world=np.zeros(3, dtype=np.float32),
+        goal_timestamp_ns=2_000_000_000,
+        timestamps_ns=[1_000_000_000],
+    )
+
+    goal = state_goal_from_reference(
+        state,
+        reference_pos=torch.tensor([[0.0, 0.0, 0.7]]),
+        reference_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+        device="cpu",
+        goal_type="joint_state",
+    )
+
+    assert goal.shape == (1, 40)
+    torch.testing.assert_close(
+        goal[0, 3:8],
+        torch.tensor([0.0, 0.0, 0.0, 0.0, np.pi / 2.0]))

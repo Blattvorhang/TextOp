@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from robotmdar.utils.goal import GoalType, build_ego_goal
+from robotmdar.utils.goal import GoalEncoding, GoalType, build_ego_goal
 from robotmdar.dtype.motion import (
     G1_23DOF_FROM_29DOF_INDICES,
     G1_MUJOCO_DOF_JOINT_NAMES,
@@ -18,7 +18,7 @@ from robotmdar.dtype.motion import (
     motion_feature_dim_for_dof,
     quaternion_to_euler_angles,
 )
-from robotmdar.dtype.rotation import quat_apply
+from robotmdar.dtype.rotation import euler_angles_to_quaternion, quat_apply
 
 
 G1_ISAACLAB_DOF_JOINT_NAMES = (
@@ -202,7 +202,9 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
 def state_to_ego_goal(state_msg: Any,
                       device: str | torch.device,
                       goal_type: GoalType | str = GoalType.ROOT,
-                      goal_reference_path: str | Path | None = None
+                      goal_reference_path: str | Path | None = None,
+                      goal_encoding: GoalEncoding | str | None = None,
+                      goal_stats: dict | None = None,
                       ) -> torch.Tensor:
     """Convert the root goal relative to the current history-feature pose."""
     reference_pos = torch.tensor(
@@ -214,7 +216,8 @@ def state_to_ego_goal(state_msg: Any,
         reference_rot_np, dtype=torch.float32, device=device)
     return state_goal_from_reference(
         state_msg, reference_pos, reference_rot, device,
-        goal_type=goal_type, goal_reference_path=goal_reference_path)
+        goal_type=goal_type, goal_reference_path=goal_reference_path,
+        goal_encoding=goal_encoding, goal_stats=goal_stats)
 
 
 def _state_field(state_msg: Any, name: str):
@@ -284,10 +287,16 @@ def state_goal_from_reference(state_msg: Any,
                               reference_rot: torch.Tensor,
                               device: str | torch.device,
                               goal_type: GoalType | str = GoalType.ROOT,
-                              goal_reference_path: str | Path | None = None
+                              goal_reference_path: str | Path | None = None,
+                              goal_encoding: GoalEncoding | str | None = None,
+                              goal_stats: dict | None = None,
                               ) -> torch.Tensor:
     """Convert the state goal relative to an explicit generated-history pose."""
     goal_type = GoalType.parse(goal_type)
+    parsed_encoding = (
+        GoalEncoding.parse(goal_encoding)
+        if goal_encoding is not None else None
+    )
     goal_keypoints_world = None
 
     state_root_pos = _state_field(state_msg, 'goal_root_pos_world')
@@ -382,19 +391,34 @@ def state_goal_from_reference(state_msg: Any,
 
     if goal_type is GoalType.JOINT_STATE:
         state_goal_rot = _state_field(state_msg, 'goal_root_rot_world')
+        state_goal_euler = _state_field(state_msg, 'goal_root_euler_world')
         state_goal_dof = _state_field(state_msg, 'goal_dof_pos')
         if state_goal_dof is None:
             state_goal_dof = _state_field(state_msg, 'goal_joint_pos')
-        if state_goal_rot is None:
+        if state_goal_rot is None and state_goal_euler is None:
             raise ValueError(
-                "joint_state goal requires goal_root_rot_world [4]")
+                "joint_state goal requires goal_root_rot_world [4] "
+                "or goal_root_euler_world [3]")
         if state_goal_dof is None:
             raise ValueError("joint_state goal requires goal_dof_pos [29]")
-        state_goal_rot = np.asarray(state_goal_rot, dtype=np.float32)
-        if state_goal_rot.shape != (4,):
-            raise ValueError(
-                "joint_state goal_root_rot_world must have shape (4,), got "
-                f"{state_goal_rot.shape}")
+        if state_goal_rot is None:
+            state_goal_euler = np.asarray(state_goal_euler, dtype=np.float32)
+            if state_goal_euler.shape != (3,):
+                raise ValueError(
+                    "joint_state goal_root_euler_world must have shape "
+                    f"(3,), got {state_goal_euler.shape}")
+            if not np.isfinite(state_goal_euler).all():
+                raise ValueError(
+                    "joint_state goal_root_euler_world must be finite")
+            state_goal_rot = euler_angles_to_quaternion(torch.as_tensor(
+                state_goal_euler, dtype=torch.float32).reshape(1, 3)
+            ).cpu().numpy()
+        else:
+            state_goal_rot = np.asarray(state_goal_rot, dtype=np.float32)
+            if state_goal_rot.shape != (4,):
+                raise ValueError(
+                    "joint_state goal_root_rot_world must have shape "
+                    f"(4,), got {state_goal_rot.shape}")
         state_goal_rot = _normalized_quaternions_xyzw(
             state_goal_rot.reshape(1, 4))
         state_goal_dof = np.asarray(state_goal_dof, dtype=np.float32)
@@ -412,8 +436,11 @@ def state_goal_from_reference(state_msg: Any,
     return build_ego_goal(
         goal_pos_world, goal_yaw_world, reference_pos.to(device),
         reference_rot.to(device), goal_type=goal_type,
+        goal_encoding=parsed_encoding,
+        goal_stats=goal_stats,
         world_goal_keypoints=goal_keypoints_world,
         world_root_velocity=world_root_velocity, timestep=timestep,
+        time_to_arrival_seconds=timestep,
         world_goal_rot=world_goal_rot, world_goal_dof=world_goal_dof)
 
 
@@ -658,7 +685,8 @@ def _textop_bodies_to_sonic(values: np.ndarray) -> np.ndarray:
 
 def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
                           fps: float = 50.0,
-                          locked_joint_pos: np.ndarray | None = None):
+                          locked_joint_pos: np.ndarray | None = None,
+                          include_body: bool = False):
     """Convert one reconstructed MuJoCo batch to ``G1MotionData``."""
     from sonicmsg.messages import G1MotionData
 
@@ -700,15 +728,34 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
         joint_pos[:, _WRIST_ISAACLAB_INDICES] = locked_joint_pos[
             _WRIST_ISAACLAB_INDICES]
         joint_vel[:, _WRIST_ISAACLAB_INDICES] = 0.0
-    body_pos = _textop_bodies_to_sonic(body_pos[skip_history:])
-    body_ori = np.ascontiguousarray(
-        _textop_bodies_to_sonic(body_ori_xyzw[skip_history:])[
-            ..., [3, 0, 1, 2]])
+    root_pos = np.ascontiguousarray(body_pos[skip_history:, 0, :])
+    root_ori = np.ascontiguousarray(
+        body_ori_xyzw[skip_history:, 0, :][..., [3, 0, 1, 2]])
+    g1_fields = getattr(G1MotionData, "model_fields", {})
+    supports_root_payload = (
+        "root_pos" in g1_fields and "root_ori" in g1_fields)
+    body_pos_packet = None
+    body_ori_packet = None
+    if include_body or not supports_root_payload:
+        body_pos_packet = _textop_bodies_to_sonic(body_pos[skip_history:])
+        body_ori_packet = np.ascontiguousarray(
+            _textop_bodies_to_sonic(body_ori_xyzw[skip_history:])[
+                ..., [3, 0, 1, 2]])
+    if not supports_root_payload:
+        return G1MotionData(
+            joint_pos=joint_pos,
+            joint_vel=joint_vel,
+            body_pos=body_pos_packet,
+            body_ori=body_ori_packet,
+            framerate=float(fps),
+        )
 
     return G1MotionData(
         joint_pos=joint_pos,
         joint_vel=joint_vel,
-        body_pos=body_pos,
-        body_ori=body_ori,
+        root_pos=root_pos,
+        root_ori=root_ori,
+        body_pos=body_pos_packet,
+        body_ori=body_ori_packet,
         framerate=float(fps),
     )

@@ -96,34 +96,33 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
     with initialize_config_dir(
         config_dir=str(config_dir.resolve()), version_base=None
     ):
-        legacy = compose(config_name='train_dar')
-        configure_dof_contract(legacy)
-        full = compose(
+        v6 = compose(config_name='train_dar')
+        configure_dof_contract(v6)
+        legacy_23 = compose(
             config_name='train_dar',
-            overrides=['data.dof_dim=29', 'ckpt.vae=/tmp/vae29.pth'],
+            overrides=[
+                'data.dof_dim=23',
+                'data.goal_type=root',
+                'denoiser.goal_dim=5',
+            ],
         )
-        configure_dof_contract(full)
+        configure_dof_contract(legacy_23)
         planner = compose(config_name='planner_dar')
         configure_dof_contract(planner)
-        planner_full = compose(
-            config_name='planner_dar',
-            overrides=['data.dof_dim=29'],
-        )
-        configure_dof_contract(planner_full)
 
-    assert int(legacy.data.nfeats) == 57
-    assert legacy.skeleton.asset.assetFileName == (
+    assert int(v6.data.dof_dim) == 29
+    assert int(v6.data.nfeats) == 69
+    assert v6.data.goal_type == 'joint_state'
+    assert int(v6.denoiser.goal_dim) == 45
+    assert v6.skeleton.asset.assetFileName == 'g1_29dof.xml'
+    assert v6.ckpt.vae is None
+    assert int(legacy_23.data.nfeats) == 57
+    assert legacy_23.skeleton.asset.assetFileName == (
         'g1_23dof_lock_wrist_fitmotionONLY.xml'
     )
-    assert legacy.ckpt.vae == 'logs/pretrained/long_horizon_64/vae.pth'
-    assert int(full.data.nfeats) == 69
-    assert full.skeleton.asset.assetFileName == 'g1_29dof.xml'
-    assert full.ckpt.vae == '/tmp/vae29.pth'
-    assert int(planner.data.dof_dim) == 23
-    assert int(planner.data.nfeats) == 57
-    assert planner.skeleton.asset.assetFileName == (
-        'g1_23dof_lock_wrist_fitmotionONLY.xml'
-    )
-    assert int(planner_full.data.dof_dim) == 29
-    assert int(planner_full.data.nfeats) == 69
-    assert planner_full.skeleton.asset.assetFileName == 'g1_29dof.xml'
+    assert legacy_23.ckpt.vae == 'logs/pretrained/long_horizon_64/vae.pth'
+    assert int(planner.data.dof_dim) == 29
+    assert int(planner.data.nfeats) == 69
+    assert planner.data.goal_type == 'joint_state'
+    assert int(planner.denoiser.goal_dim) == 45
+    assert planner.skeleton.asset.assetFileName == 'g1_29dof.xml'

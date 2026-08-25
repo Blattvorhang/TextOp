@@ -24,7 +24,14 @@ from torch.utils import data
 from tqdm import tqdm
 # from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
-from robotmdar.utils.goal import GoalType, quaternion_yaw
+from robotmdar.utils.goal import (
+    GoalEncoding,
+    GoalType,
+    build_ego_split_goal,
+    SPLIT_GOAL_DIM,
+    quaternion_yaw,
+    validate_goal_stats,
+)
 from robotmdar.dtype.motion import (
     AbsolutePose,
     G1_23DOF_FROM_29DOF_INDICES,
@@ -36,6 +43,21 @@ from robotmdar.dtype.motion import (
     motion_feature_to_dict,
 )
 import json
+
+
+_GOAL_STATS_POSITION_CLIP = 3.0
+_GOAL_STATS_VELOCITY_CLIP = 5.0
+
+
+def _abs_p50_p99(values: torch.Tensor) -> tuple[float, float]:
+    values = values.detach().abs().reshape(-1).float()
+    if values.numel() == 0:
+        return 0.0, 0.0
+    quantiles = torch.quantile(
+        values,
+        torch.tensor([0.5, 0.99], device=values.device, dtype=values.dtype),
+    )
+    return float(quantiles[0]), float(quantiles[1])
 
 
 class SkeletonPrimitiveDataset(data.IterableDataset):
@@ -64,6 +86,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         goal_offset: int = 0,
         goal_offset_range: Optional[Tuple[int, int]] = None,
         goal_type: GoalType | str = GoalType.ROOT,
+        goal_encoding: GoalEncoding | str | None = None,
         goal_per_primitive: bool = False,
         goal_timestep_mode: str = "relative",
         time_to_arrival_mode: Optional[str] = None,
@@ -74,6 +97,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         device: str = 'cuda',
         dof_dim: Optional[int] = None,
         normalization_path: Optional[str] = None,
+        load_goal_stats: bool = True,
         **kwargs: Any
     ):
         super().__init__()
@@ -99,6 +123,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.context_len = self.history_len + self.future_len
 
         self.goal_type = GoalType.parse(goal_type)
+        self.goal_encoding = GoalEncoding.parse(
+            goal_encoding if goal_encoding is not None else GoalEncoding.LEGACY40
+        )
         if self.goal_type is GoalType.JOINT_STATE and self.dof_dim != 29:
             raise ValueError(
                 "goal_type='joint_state' requires dof_dim=29, got "
@@ -151,6 +178,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.use_weighted_meanstd = use_weighted_meanstd
 
         self.datadir = Path(datadir)
+        self.load_goal_stats = bool(load_goal_stats)
+        self.goal_stats_path = self.datadir / 'goal_stats.pkl'
+        self.goal_stats = None
         self.normalization_path = (
             Path(normalization_path) if normalization_path else None
         )
@@ -184,6 +214,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self._load_weighted_meanstd()
         else:
             self._load_meanstd()
+
+        self._load_goal_stats()
 
     def _load_data(self) -> None:
         """Load and prepare data efficiently"""
@@ -606,6 +638,194 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         self.mean, self.std = meanstd
 
+    def _goal_stats_meta(self) -> Dict[str, Any]:
+        return {
+            'goal_offset_range': list(self.goal_offset_range),
+            'goal_per_primitive': bool(self.goal_per_primitive),
+            'future_len': int(self.future_len),
+            'fps': float(self.fps),
+            'goal_timestep_mode': self.goal_timestep_mode,
+            'encodings': [
+                GoalEncoding.SINGLE.value,
+                GoalEncoding.SPLIT.value,
+            ],
+            'dataset_path': str(self.datadir),
+            'goal_type': self.goal_type.value,
+            'goal_dim': SPLIT_GOAL_DIM,
+            'dof_dim': int(self.dof_dim),
+        }
+
+    def _goal_stats_from_batch(self, batch_data: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        pos_terms = []
+        log_terms = []
+        urgency_terms = []
+        velocity_terms = []
+        orientation_terms = []
+        pose_terms = []
+
+        for primitive in batch_data:
+            goal = build_ego_split_goal(
+                world_goal_pos=primitive['world_goal_pos'],
+                world_goal_rot=primitive['world_goal_rot'],
+                world_goal_dof=primitive['world_goal_dof'],
+                world_root_velocity=primitive['world_goal_vel'],
+                reference_pos=primitive['gt_ref_pos'],
+                reference_rot=primitive['gt_ref_rot'],
+                time_to_arrival_seconds=primitive['time_to_arrival'],
+                fps=float(self.fps),
+            )
+            trans = goal[:, 0:8]
+            orientation = goal[:, 8:13]
+            pose = goal[:, 13:42]
+            velocity = goal[:, 42:45]
+
+            pos_terms.append(trans[:, 0:4])
+            log_terms.append(trans[:, 4:5])
+            urgency_terms.append(trans[:, 5:8])
+            orientation_terms.append(orientation)
+            pose_terms.append(pose)
+            velocity_terms.append(velocity)
+
+        if not pos_terms:
+            raise ValueError("Unable to compute goal statistics from empty batch")
+
+        pos = torch.cat(pos_terms, dim=0)
+        log_terms = torch.cat(log_terms, dim=0)
+        urgency = torch.cat(urgency_terms, dim=0)
+        orientation = torch.cat(orientation_terms, dim=0)
+        pose = torch.cat(pose_terms, dim=0)
+        velocity = torch.cat(velocity_terms, dim=0)
+
+        pos = pos.clone().clamp(
+            -_GOAL_STATS_POSITION_CLIP, _GOAL_STATS_POSITION_CLIP
+        )
+        urgency = urgency.clone().clamp(
+            -_GOAL_STATS_VELOCITY_CLIP, _GOAL_STATS_VELOCITY_CLIP
+        )
+        velocity = velocity.clone().clamp(
+            -_GOAL_STATS_VELOCITY_CLIP, _GOAL_STATS_VELOCITY_CLIP
+        )
+
+        s_p = 1.0 / torch.clamp(pos.reshape(-1).std(unbiased=False), min=1e-6)
+        s_l = 1.0 / torch.clamp(log_terms.reshape(-1).std(unbiased=False), min=1e-6)
+        s_v = 1.0 / torch.clamp(
+            torch.cat((urgency.reshape(-1), velocity.reshape(-1)), dim=0).std(unbiased=False),
+            min=1e-6,
+        )
+        s_o = 1.0 / torch.clamp(
+            orientation.std(dim=0, unbiased=False), min=1e-6
+        )
+
+        q_mean = self.mean[11:40].detach().cpu().clone()
+        q_std = self.std[11:40].detach().cpu().clone()
+
+        pos_scaled = pos * s_p
+        log_scaled = log_terms * s_l
+        urgency_scaled = urgency * s_v
+        velocity_scaled = velocity * s_v
+        orientation_scaled = orientation * s_o
+        pose_scaled = (pose - q_mean.to(pose.device, pose.dtype)) / q_std.to(
+            pose.device, pose.dtype).clamp_min(1e-6)
+        pos_p50, pos_p99 = _abs_p50_p99(pos_scaled)
+        log_p50, log_p99 = _abs_p50_p99(log_scaled)
+        urgency_p50, urgency_p99 = _abs_p50_p99(urgency_scaled)
+        velocity_p50, velocity_p99 = _abs_p50_p99(velocity_scaled)
+        orientation_p50, orientation_p99 = _abs_p50_p99(orientation_scaled)
+        pose_p50, pose_p99 = _abs_p50_p99(pose_scaled)
+        s_o_list = [round(float(value), 4) for value in s_o.tolist()]
+        logger.info(
+            "Goal stats (split45) scales: s_p={:.4f} s_l={:.4f} s_v={:.4f} s_o={}",
+            float(s_p), float(s_l), float(s_v), s_o_list,
+        )
+        logger.info(
+            "Goal stats (split45) scaled |p50/p99|: pos={:.3f}/{:.3f} "
+            "log={:.3f}/{:.3f} urg={:.3f}/{:.3f} vel={:.3f}/{:.3f} "
+            "ori={:.3f}/{:.3f} pose={:.3f}/{:.3f}",
+            pos_p50, pos_p99, log_p50, log_p99, urgency_p50, urgency_p99,
+            velocity_p50, velocity_p99, orientation_p50, orientation_p99,
+            pose_p50, pose_p99,
+        )
+        return {
+            's_p': torch.as_tensor(float(s_p)),
+            's_l': torch.as_tensor(float(s_l)),
+            's_v': torch.as_tensor(float(s_v)),
+            's_o': s_o.detach().cpu(),
+            'q_mean': q_mean,
+            'q_std': q_std,
+            'meta': self._goal_stats_meta(),
+        }
+
+    def _compute_goal_stats(self) -> Dict[str, torch.Tensor]:
+        if self.goal_type is not GoalType.JOINT_STATE:
+            raise ValueError("goal statistics are only defined for joint_state goals")
+        if self.goal_encoding is GoalEncoding.LEGACY40:
+            raise ValueError("goal statistics are not required for legacy40 goals")
+
+        saved_mean = self.mean
+        saved_std = self.std
+        try:
+            N = 10000 // self.batch_size + 1
+            samples = []
+            for i in tqdm(range(N)):
+                batch_data = self._generate_batch_optimized(
+                    generator=torch.Generator().manual_seed(i)
+                )
+                samples.extend(batch_data)
+            stats = self._goal_stats_from_batch(samples)
+        finally:
+            self.mean = saved_mean
+            self.std = saved_std
+        return stats
+
+    def _load_goal_stats(self) -> None:
+        if not self.load_goal_stats:
+            self.goal_stats = None
+            return
+        if self.goal_type is not GoalType.JOINT_STATE:
+            self.goal_stats = None
+            return
+        if self.goal_encoding is GoalEncoding.LEGACY40:
+            self.goal_stats = None
+            return
+
+        goal_stats_path = self.goal_stats_path
+        if goal_stats_path.exists():
+            logger.info(f" Loading cached goal stats from {goal_stats_path}...")
+            goal_stats = torch.load(goal_stats_path, map_location="cpu")
+            try:
+                validate_goal_stats(
+                    goal_stats,
+                    goal_encoding=self.goal_encoding,
+                    goal_offset_range=self.goal_offset_range,
+                    goal_per_primitive=self.goal_per_primitive,
+                    future_len=self.future_len,
+                    fps=float(self.fps),
+                    goal_timestep_mode=self.goal_timestep_mode,
+                    datadir=str(self.datadir),
+                )
+            except ValueError:
+                if self.split != 'train':
+                    raise
+                logger.warning(
+                    "Cached goal stats at {} do not match the active train "
+                    "config; recomputing",
+                    goal_stats_path,
+                )
+                goal_stats = self._compute_goal_stats()
+                torch.save(goal_stats, goal_stats_path)
+            self.goal_stats = goal_stats
+            return
+
+        if self.split != 'train':
+            raise FileNotFoundError(
+                f"Missing goal stats cache {goal_stats_path} for split={self.split!r}"
+            )
+        logger.info(" Computing goal stats...")
+        goal_stats = self._compute_goal_stats()
+        torch.save(goal_stats, goal_stats_path)
+        logger.info(f" Saved goal stats to {goal_stats_path}")
+        self.goal_stats = goal_stats
+
     def _compute_meanstd(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute mean and std efficiently"""
         motion_sum = torch.zeros(self.nfeats)
@@ -777,8 +997,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             - torch.as_tensor(root_position[goal_frame], dtype=torch.float32)
         ) * float(self.fps)
 
-    def _time_to_arrival(self, reference_frame: int,
-                         goal_frame: int) -> torch.Tensor:
+    def _time_to_arrival_seconds(self, reference_frame: int,
+                                 goal_frame: int) -> torch.Tensor:
+        """Time from reference frame to goal, in SECONDS.
+
+        Downstream (train/eval/planner) converts this to a frame index via
+        round(seconds * fps) before feeding it to the arrival-time PE.
+        """
         if self.goal_timestep_mode == "zero":
             return torch.zeros(1, dtype=torch.float32)
         return torch.tensor(
@@ -853,7 +1078,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if goal_type.uses_arrival_time:
             primitive['world_goal_vel'] = self._world_goal_velocity(
                 raw_motion, goal_frame)
-            primitive['time_to_arrival'] = self._time_to_arrival(
+            # Seconds. Converted to a frame index (round(s * fps)) at the
+            # train/eval/planner boundary before the arrival-time PE.
+            primitive['time_to_arrival'] = self._time_to_arrival_seconds(
                 reference_frame, goal_frame)
             primitive['goal_timestep'] = primitive['time_to_arrival']
         return primitive

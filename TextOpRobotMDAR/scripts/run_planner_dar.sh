@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOF_DIM=23
-DATADIR="BONES-SEED-23dof-FULL-50fps"
-DAR_CKPT="./logs/pretrained/long_horizon_64/ckpt_7500.pth"
+DOF_DIM=29
+DATADIR="BONES-SEED-29dof-FULL-50fps"
+# DAR_CKPT="./logs/pretrained/0807_velocity_29dof/ckpt_45000.pth"
+DAR_CKPT="./logs/pretrained/0820_joint_state_goal/ckpt_15000.pth"
 
 robotmdar --config-name=planner_dar \
     ckpt.dar="${DAR_CKPT}" \

@@ -5,8 +5,10 @@ defaults:
 
 data:
   goal_type: body
+  goal_encoding: legacy40
 
 denoiser:
+  goal_encoding: ${data.goal_encoding}
   goal_dim: 15
 
 goal_reference_path: ${hydra:runtime.cwd}/assets/ref_poses/stand.npz
