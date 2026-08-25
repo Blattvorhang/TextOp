@@ -14,6 +14,8 @@ import joblib
 import yaml
 from typing import Any, Tuple, Dict, List, Optional
 import sys
+import os
+import time
 import random
 from omegaconf import DictConfig
 from loguru import logger
@@ -58,6 +60,65 @@ def _abs_p50_p99(values: torch.Tensor) -> tuple[float, float]:
         torch.tensor([0.5, 0.99], device=values.device, dtype=values.dtype),
     )
     return float(quantiles[0]), float(quantiles[1])
+
+
+def _is_goal_stats_writer() -> bool:
+    """True only for the process allowed to create/replace the goal-stats cache.
+
+    Under DDP the process group is initialized before datasets are built, so
+    rank 0 is the single writer. torchrun also sets RANK per worker, which
+    covers the no-process-group case; plain single-process runs default to 0.
+    """
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _is_torchrun() -> bool:
+    return "RANK" in os.environ
+
+
+def _save_goal_stats_cache(goal_stats, goal_stats_path: Path) -> None:
+    """Persist the cache atomically; only the writer rank saves.
+
+    torch.save is not atomic, so concurrent ranks must never write the same
+    pkl: a single writer serializes to a temp file and renames it into place.
+    """
+    if not _is_goal_stats_writer():
+        return
+    tmp_path = goal_stats_path.with_name(goal_stats_path.name + ".tmp")
+    try:
+        torch.save(goal_stats, tmp_path)
+        tmp_path.replace(goal_stats_path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot write goal stats cache {goal_stats_path}: the dataset "
+            "directory is not writable. Make it writable (chmod) or place a "
+            "precomputed goal_stats.pkl into the dataset directory."
+        ) from exc
+    logger.info(f" Saved goal stats to {goal_stats_path}")
+
+
+def _wait_for_goal_stats_cache(goal_stats_path: Path,
+                               timeout_s: float = 900.0) -> None:
+    """Wait for the writer rank's train dataset to publish the cache file.
+
+    The atomic rename in _save_goal_stats_cache guarantees that a visible
+    file is always a complete one.
+    """
+    deadline = time.monotonic() + timeout_s
+    while not goal_stats_path.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Timed out after {timeout_s:.0f}s waiting for "
+                f"{goal_stats_path}; the train dataset on the writer rank "
+                "never produced it (dataset directory not writable?)"
+            )
+        time.sleep(2.0)
 
 
 class SkeletonPrimitiveDataset(data.IterableDataset):
@@ -792,38 +853,42 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if goal_stats_path.exists():
             logger.info(f" Loading cached goal stats from {goal_stats_path}...")
             goal_stats = torch.load(goal_stats_path, map_location="cpu")
-            try:
-                validate_goal_stats(
-                    goal_stats,
-                    goal_encoding=self.goal_encoding,
-                    goal_offset_range=self.goal_offset_range,
-                    goal_per_primitive=self.goal_per_primitive,
-                    future_len=self.future_len,
-                    fps=float(self.fps),
-                    goal_timestep_mode=self.goal_timestep_mode,
-                    datadir=str(self.datadir),
+        elif self.split != 'train':
+            if not _is_torchrun():
+                raise FileNotFoundError(
+                    f"Missing goal stats cache {goal_stats_path} for "
+                    f"split={self.split!r}"
                 )
-            except ValueError:
-                if self.split != 'train':
-                    raise
-                logger.warning(
-                    "Cached goal stats at {} do not match the active train "
-                    "config; recomputing",
-                    goal_stats_path,
-                )
-                goal_stats = self._compute_goal_stats()
-                torch.save(goal_stats, goal_stats_path)
-            self.goal_stats = goal_stats
-            return
+            # Multi-rank job: the writer rank's train dataset is producing
+            # the cache right now; poll until the atomic rename publishes it.
+            _wait_for_goal_stats_cache(goal_stats_path)
+            goal_stats = torch.load(goal_stats_path, map_location="cpu")
+        else:
+            logger.info(" Computing goal stats...")
+            goal_stats = self._compute_goal_stats()
+            _save_goal_stats_cache(goal_stats, goal_stats_path)
 
-        if self.split != 'train':
-            raise FileNotFoundError(
-                f"Missing goal stats cache {goal_stats_path} for split={self.split!r}"
+        try:
+            validate_goal_stats(
+                goal_stats,
+                goal_encoding=self.goal_encoding,
+                goal_offset_range=self.goal_offset_range,
+                goal_per_primitive=self.goal_per_primitive,
+                future_len=self.future_len,
+                fps=float(self.fps),
+                goal_timestep_mode=self.goal_timestep_mode,
+                datadir=str(self.datadir),
             )
-        logger.info(" Computing goal stats...")
-        goal_stats = self._compute_goal_stats()
-        torch.save(goal_stats, goal_stats_path)
-        logger.info(f" Saved goal stats to {goal_stats_path}")
+        except ValueError:
+            if self.split != 'train':
+                raise
+            logger.warning(
+                "Cached goal stats at {} do not match the active train "
+                "config; recomputing",
+                goal_stats_path,
+            )
+            goal_stats = self._compute_goal_stats()
+            _save_goal_stats_cache(goal_stats, goal_stats_path)
         self.goal_stats = goal_stats
 
     def _compute_meanstd(self) -> Tuple[torch.Tensor, torch.Tensor]:
