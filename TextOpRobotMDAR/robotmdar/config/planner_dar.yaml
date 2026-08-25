@@ -8,7 +8,7 @@ task: planner-dar
 # Let SONIC consume the complete generated segment before replacing it.
 # Resetting its frame-index cursor faster than the 8-frame / 50 Hz horizon
 # repeatedly discards most of every reference and destabilizes tracking.
-infer_period_ms: 200
+infer_period_ms: 800
 motion_fps: 50.0
 state_timeout_ms: 1
 log_every: 20
@@ -48,11 +48,17 @@ occ_grid: null
 data:
   dof_dim: 29
   goal_type: joint_state
+  goal_encoding: split
+  goal_per_primitive: true
+  goal_offset_range: [-63, 0]
+  goal_timestep_mode: relative
   history_len: 16
   future_len: 64
+  load_goal_stats: false
 
 denoiser:
-  goal_dim: 40
+  goal_encoding: ${data.goal_encoding}
+  goal_dim: 45
 
 # V6 uses the TextOp-style root orientation block. Dropping yaw is treated as
 # dropping the whole orientation block for joint_state.

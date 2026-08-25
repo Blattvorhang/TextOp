@@ -5,9 +5,11 @@ defaults:
 
 data:
   goal_type: body_ext
+  goal_encoding: legacy40
   goal_offset_range: null
 
 denoiser:
+  goal_encoding: ${data.goal_encoding}
   goal_dim: 21
   cond_goal_root_mask_prob: 0.1
   cond_goal_yaw_mask_prob: 0.3
