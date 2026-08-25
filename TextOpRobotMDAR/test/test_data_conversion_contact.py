@@ -159,6 +159,51 @@ def test_negative_goal_offset_is_bounded_for_both_goal_modes(
     assert [item[2] for item in observed] == expected_goal_frames
 
 
+def test_joint_state_goal_extraction_uses_direct_gt_frame_without_keypoints():
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.history_len = 2
+    dataset.goal_type = GoalType.JOINT_STATE
+    dataset.goal_timestep_mode = "relative"
+    dataset.fps = 50
+    dataset._select_model_dof = lambda value: value
+    dataset._primitive_action_label = lambda sample, start, end: "synthetic"
+
+    def fail_keypoints(*args, **kwargs):
+        raise AssertionError("joint_state goal must not extract FK keypoints")
+
+    dataset._world_goal_keypoints = fail_keypoints
+
+    length = 6
+    root_pos = np.zeros((length, 3), dtype=np.float32)
+    root_pos[:, 0] = np.arange(length, dtype=np.float32) * 0.1
+    root_rot = np.tile(
+        np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (length, 1))
+    dof = np.arange(length * 29, dtype=np.float32).reshape(length, 29)
+    contact = np.ones((length, 2), dtype=np.float32)
+    sample = {
+        "motion": {
+            "root_trans_offset": root_pos,
+            "root_rot": root_rot,
+            "dof": dof,
+            "contact_mask": contact,
+        },
+        "scene": {},
+    }
+
+    primitive = dataset._extract_single_primitive(
+        sample, prim_start=0, prim_end=5, goal_frame=3)
+
+    torch.testing.assert_close(
+        primitive["world_goal_rot"], torch.from_numpy(root_rot[3]))
+    torch.testing.assert_close(
+        primitive["world_goal_dof"], torch.from_numpy(dof[3]))
+    torch.testing.assert_close(
+        primitive["world_goal_vel"], torch.tensor([5.0, 0.0, 0.0]))
+    torch.testing.assert_close(
+        primitive["time_to_arrival"], torch.tensor([0.04]))
+    assert "world_goal_keypoints" not in primitive
+
+
 def test_shared_extended_goal_rejects_missing_forward_difference_frame():
     dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
     dataset.history_len = 2
@@ -185,13 +230,13 @@ def test_goal_timestep_mode_supports_zero_ablation_and_relative_time():
 
     dataset.goal_timestep_mode = "zero"
     torch.testing.assert_close(
-        dataset._goal_timestep(reference_frame=10, goal_frame=60),
+        dataset._time_to_arrival_seconds(reference_frame=10, goal_frame=60),
         torch.zeros(1),
     )
 
     dataset.goal_timestep_mode = "relative"
     torch.testing.assert_close(
-        dataset._goal_timestep(reference_frame=10, goal_frame=60),
+        dataset._time_to_arrival_seconds(reference_frame=10, goal_frame=60),
         torch.ones(1),
     )
 

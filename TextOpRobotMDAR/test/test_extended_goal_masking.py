@@ -49,6 +49,59 @@ def test_extended_goal_root_force_mask_does_not_drop_other_components():
     torch.testing.assert_close(masked[:, 3:], torch.ones((1, 18)))
 
 
+def test_joint_state_goal_force_masks_are_componentwise():
+    model = DenoiserTransformer(
+        h_dim=16,
+        ff_size=32,
+        num_layers=1,
+        num_heads=4,
+        dropout=0.0,
+        history_shape=(2, 69),
+        noise_shape=(1, 8),
+        goal_dim=40,
+        grid_size=2,
+        cond_goal_root_mask_prob=0.0,
+        cond_goal_orientation_mask_prob=0.0,
+        cond_goal_joint_mask_prob=0.0,
+        cond_goal_velocity_mask_prob=0.0,
+    ).eval()
+    goal = torch.arange(1, 41, dtype=torch.float32).unsqueeze(0)
+
+    masked, root_keep = _mask_goal(model, goal, {
+        "force_drop_goal_root": True,
+        "force_drop_goal_orientation": True,
+        "force_drop_goal_joint": True,
+        "force_drop_goal_velocity": True,
+    })
+
+    torch.testing.assert_close(masked, torch.zeros_like(goal))
+    assert not root_keep.item()
+
+
+def test_joint_state_goal_root_mask_does_not_drop_other_components():
+    model = DenoiserTransformer(
+        h_dim=16,
+        ff_size=32,
+        num_layers=1,
+        num_heads=4,
+        dropout=0.0,
+        history_shape=(2, 69),
+        noise_shape=(1, 8),
+        goal_dim=40,
+        grid_size=2,
+        cond_goal_root_mask_prob=0.0,
+        cond_goal_orientation_mask_prob=0.0,
+        cond_goal_joint_mask_prob=0.0,
+        cond_goal_velocity_mask_prob=0.0,
+    ).eval()
+    goal = torch.ones((1, 40))
+
+    masked, _ = _mask_goal(model, goal, {"force_drop_goal_root": True})
+
+    torch.testing.assert_close(masked[:, 0:3], torch.zeros((1, 3)))
+    torch.testing.assert_close(masked[:, 3:], torch.ones((1, 37)))
+
+
 def test_legacy_goal_mask_config_maps_to_root_mask_probability():
     model = DenoiserTransformer(
         h_dim=16,
