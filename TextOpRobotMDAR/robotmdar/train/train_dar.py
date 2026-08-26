@@ -503,6 +503,7 @@ def _sample_segment_rollout(batch, dataset, vae, denoiser, diffusion,
 
         y = _conditions(primitive, reference_pos, reference_rot,
                         history_motion, cfg, dataset.fps,
+                        goal_stats=getattr(dataset, 'goal_stats', None),
                         use_scene=manager.should_use_scene())
 
         with torch.no_grad():
