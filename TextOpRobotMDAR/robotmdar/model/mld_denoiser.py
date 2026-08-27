@@ -546,6 +546,21 @@ class DenoiserTransformer(nn.Module):
                 emb_goal_rot = emb_goal_rot + arrival_pe_
                 emb_goal_pose = emb_goal_pose + arrival_pe_
                 emb_goal_vel = emb_goal_vel + arrival_pe_
+            # Mask before sequence_pos_encoder: zero component content, MLP
+            # bias, and arrival PE (the V6 no-timing-leak rule), but let the
+            # slot PE survive so the transformer still knows which condition
+            # is missing.
+            emb_goal_trans = emb_goal_trans * goal_keep_mask.unsqueeze(
+                -1).to(emb_goal_trans.dtype)
+            emb_goal_rot = emb_goal_rot * y[
+                'goal_orientation_condition_keep_mask'].unsqueeze(
+                    -1).to(emb_goal_rot.dtype)
+            emb_goal_pose = emb_goal_pose * y[
+                'goal_joint_condition_keep_mask'].unsqueeze(
+                    -1).to(emb_goal_pose.dtype)
+            emb_goal_vel = emb_goal_vel * y[
+                'goal_velocity_condition_keep_mask'].unsqueeze(
+                    -1).to(emb_goal_vel.dtype)
             xseq = torch.cat(
                 (
                     emb_time,
@@ -567,14 +582,6 @@ class DenoiserTransformer(nn.Module):
                 (emb_time, emb_goal, emb_scene, emb_history, emb_noise), dim=0
             )
         xseq = self.sequence_pos_encoder(xseq)
-        if self.goal_encoding is GoalEncoding.SPLIT:
-            xseq[1] = xseq[1] * goal_keep_mask.unsqueeze(-1).to(xseq.dtype)
-            xseq[2] = xseq[2] * y['goal_orientation_condition_keep_mask'].unsqueeze(
-                -1).to(xseq.dtype)
-            xseq[3] = xseq[3] * y['goal_joint_condition_keep_mask'].unsqueeze(
-                -1).to(xseq.dtype)
-            xseq[4] = xseq[4] * y['goal_velocity_condition_keep_mask'].unsqueeze(
-                -1).to(xseq.dtype)
         output = self.seqTransEncoder(xseq)[
             -self.noise_shape[0]:]  # [1, bs, h_dim]
         output = self.output_process(output)  # [1, B, noise_shape[-1]]
