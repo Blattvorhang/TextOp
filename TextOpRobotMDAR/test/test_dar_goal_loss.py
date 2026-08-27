@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 from TextOpRobotMDAR.robotmdar.train.manager import DARManager
 from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _make_root_xy_figure,
-    _validate_goal_position_contract,
+    _validate_goal_root_position_contract,
 )
 
 
@@ -34,34 +34,34 @@ def _future(displacement_xy):
     return future
 
 
-def test_goal_position_loss_is_zero_for_matching_endpoint():
+def test_goal_root_position_loss_is_zero_for_matching_endpoint():
     manager = _manager()
     future = _future([[1.0, 0.0], [0.0, -0.5]])
     history = _history([[0.25, 0.0], [0.0, -0.125]])
     goal = torch.zeros((2, 15))
     goal[:, :2] = torch.tensor([[1.0, 0.0], [0.0, -0.5]])
 
-    loss = manager.calc_goal_position_loss(
+    loss = manager.calc_goal_root_position_loss(
         future, goal, history_motion=history)
 
     torch.testing.assert_close(loss, torch.tensor(0.0))
 
 
-def test_goal_position_loss_ignores_dropped_root_conditions():
+def test_goal_root_position_loss_ignores_dropped_root_conditions():
     manager = _manager()
     future = _future([[1.0, 0.0], [0.0, 0.0]])
     history = _history([[0.25, 0.0], [0.0, 0.0]])
     goal = torch.zeros((2, 21))
     goal[:, :2] = torch.tensor([[1.0, 0.0], [5.0, 0.0]])
 
-    loss = manager.calc_goal_position_loss(
+    loss = manager.calc_goal_root_position_loss(
         future, goal, goal_condition_keep_mask=torch.tensor([True, False]),
         history_motion=history)
 
     torch.testing.assert_close(loss, torch.tensor(0.0))
 
 
-def test_goal_position_loss_uses_goal_frame_when_provided():
+def test_goal_root_position_loss_uses_goal_frame_when_provided():
     manager = _manager()
     future = torch.zeros((1, 4, 69), dtype=torch.float32)
     future[0, :3, 7] = 0.25
@@ -69,29 +69,11 @@ def test_goal_position_loss_uses_goal_frame_when_provided():
     goal = torch.zeros((1, 21), dtype=torch.float32)
     goal[:, :2] = torch.tensor([[0.5, 0.0]])
 
-    loss = manager.calc_goal_position_loss(
+    loss = manager.calc_goal_root_position_loss(
         future,
         goal,
         history_motion=history,
         goal_time_frame=torch.tensor([2]),
-    )
-
-    torch.testing.assert_close(loss, torch.tensor(0.0))
-
-
-def test_goal_direction_loss_uses_goal_frame_when_provided():
-    manager = _manager()
-    future = torch.zeros((1, 4, 69), dtype=torch.float32)
-    future[0, 0, 8] = 1.0
-    history = _history([[1.0, 0.0]])
-    goal = torch.zeros((1, 21), dtype=torch.float32)
-    goal[:, :2] = torch.tensor([[1.0, 0.0]])
-
-    loss = manager.calc_goal_direction_loss(
-        future,
-        goal,
-        history_motion=history,
-        goal_time_frame=torch.tensor([1]),
     )
 
     torch.testing.assert_close(loss, torch.tensor(0.0))
@@ -141,7 +123,7 @@ def test_root_displacement_excludes_terminal_forward_delta():
     torch.testing.assert_close(displacement, torch.tensor([[1.0, 0.0]]))
 
 
-def test_goal_position_contract_allows_random_offsets_with_relative_time():
+def test_goal_root_position_contract_allows_random_offsets_with_relative_time():
     cfg = OmegaConf.create({
         'data': {
             'goal_type': 'body_ext',
@@ -150,17 +132,17 @@ def test_goal_position_contract_allows_random_offsets_with_relative_time():
             'goal_offset_range': [-2, 2],
             'goal_timestep_mode': 'relative',
         },
-        'train': {'manager': {'loss_weight': {'goal_position': 0.5}}},
+        'train': {'manager': {'loss_weight': {'goal_root_position': 0.5}}},
     })
 
-    _validate_goal_position_contract(cfg)
+    _validate_goal_root_position_contract(cfg)
 
     cfg.data.goal_timestep_mode = 'zero'
     with pytest.raises(ValueError, match='goal_timestep_mode=relative'):
-        _validate_goal_position_contract(cfg)
+        _validate_goal_root_position_contract(cfg)
 
 
-def test_goal_position_contract_allows_joint_state_random_offsets():
+def test_goal_root_position_contract_allows_joint_state_random_offsets():
     cfg = OmegaConf.create({
         'data': {
             'goal_type': 'joint_state',
@@ -169,10 +151,10 @@ def test_goal_position_contract_allows_joint_state_random_offsets():
             'goal_offset_range': [-3, 0],
             'goal_timestep_mode': 'relative',
         },
-        'train': {'manager': {'loss_weight': {'goal_position': 0.5}}},
+        'train': {'manager': {'loss_weight': {'goal_root_position': 0.5}}},
     })
 
-    _validate_goal_position_contract(cfg)
+    _validate_goal_root_position_contract(cfg)
 
 
 def test_joint_state_goal_losses_use_selected_goal_frame():
@@ -209,7 +191,7 @@ def test_joint_state_goal_losses_use_selected_goal_frame():
         rtol=0,
     )
     torch.testing.assert_close(
-        manager.calc_goal_joint_position_loss(
+        manager.calc_goal_joint_angle_loss(
             future, goal, goal_time_frame=goal_time_frame),
         torch.tensor(0.0),
         atol=1e-6,

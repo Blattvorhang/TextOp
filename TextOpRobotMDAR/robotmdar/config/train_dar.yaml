@@ -44,8 +44,7 @@ train:
   manager:
     loss_weight:
       foot_contact: 0.01
-      goal_direction: 0.0
-      goal_position: 0.0
+      goal_root_position: 0.0
 
 ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF

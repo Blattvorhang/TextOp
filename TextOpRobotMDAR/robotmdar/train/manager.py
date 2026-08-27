@@ -1017,30 +1017,16 @@ class DARManager(BaseManager, GeometryLoss):
         terms.update(geometry_terms)
         extras.update(geometry_extras)
 
-        compute_goal_direction = (
-            self.loss_weight.get('goal_direction', 0.0) > 0.0 or is_eval
+        compute_goal_root_position = (
+            self.loss_weight.get('goal_root_position', 0.0) > 0.0 or is_eval
         )
-        if compute_goal_direction:
+        if compute_goal_root_position:
             if ego_goal is None:
                 raise ValueError(
-                    "ego_goal is required when goal_direction loss is enabled or during eval"
-                )
-            terms['goal_direction'] = self.calc_goal_direction_loss(
-                future_motion_pred, ego_goal, goal_condition_keep_mask,
-                history_motion=history_motion,
-                goal_time_frame=goal_time_frame,
-            )
-
-        compute_goal_position = (
-            self.loss_weight.get('goal_position', 0.0) > 0.0 or is_eval
-        )
-        if compute_goal_position:
-            if ego_goal is None:
-                raise ValueError(
-                    "ego_goal is required when goal_position loss is enabled "
+                    "ego_goal is required when goal_root_position loss is enabled "
                     "or during eval"
                 )
-            terms['goal_position'] = self.calc_goal_position_loss(
+            terms['goal_root_position'] = self.calc_goal_root_position_loss(
                 future_motion_pred, ego_goal, goal_condition_keep_mask,
                 history_motion=history_motion,
                 goal_time_frame=goal_time_frame,
@@ -1058,10 +1044,10 @@ class DARManager(BaseManager, GeometryLoss):
                         goal_time_frame=goal_time_frame,
                     )
                 )
-            if (self.loss_weight.get('goal_joint_position', 0.0) > 0.0
+            if (self.loss_weight.get('goal_joint_angle', 0.0) > 0.0
                     or is_eval):
-                terms['goal_joint_position'] = (
-                    self.calc_goal_joint_position_loss(
+                terms['goal_joint_angle'] = (
+                    self.calc_goal_joint_angle_loss(
                         future_motion_pred,
                         ego_goal,
                         goal_joint_condition_keep_mask,
@@ -1091,44 +1077,18 @@ class DARManager(BaseManager, GeometryLoss):
         terms['total'] = total_loss
         return terms, extras
 
-    def calc_goal_direction_loss(self, future_motion_pred, ego_goal,
-                                 goal_condition_keep_mask=None,
-                                 history_motion=None,
-                                 goal_time_frame=None):
-        """Align predicted horizontal root displacement with the ego goal."""
-        root_displacement = self.root_displacement_ego(
-            future_motion_pred, history_motion,
-            goal_time_frame=goal_time_frame)
-        goal_direction = ego_goal[..., :2]
-        goal_distance = goal_direction.norm(dim=-1)
-        valid = goal_distance > 0.1
-        if goal_condition_keep_mask is not None:
-            valid = valid & goal_condition_keep_mask.to(
-                device=valid.device, dtype=torch.bool
-            )
-        if not valid.any():
-            return future_motion_pred.sum() * 0.0
-
-        # A 5 cm denominator floor keeps useful gradients for near-zero motion
-        # without the instability of cosine similarity at zero displacement.
-        displacement_norm = root_displacement.norm(dim=-1).clamp_min(0.05)
-        goal_norm = goal_distance.clamp_min(0.05)
-        cosine = (root_displacement * goal_direction).sum(dim=-1)
-        cosine = (cosine / (displacement_norm * goal_norm)).clamp(-1.0, 1.0)
-        return (1.0 - cosine[valid]).mean()
-
-    def calc_goal_position_loss(self, future_motion_pred, ego_goal,
-                                goal_condition_keep_mask=None,
-                                history_motion=None,
-                                goal_time_frame=None):
+    def calc_goal_root_position_loss(self, future_motion_pred, ego_goal,
+                                     goal_condition_keep_mask=None,
+                                     history_motion=None,
+                                     goal_time_frame=None):
         """Match generated horizontal root displacement to the goal endpoint."""
         root_displacement = self.root_displacement_ego(
             future_motion_pred, history_motion,
             goal_time_frame=goal_time_frame)
-        goal_position = ego_goal[..., :2]
+        goal_root_position = ego_goal[..., :2]
         valid = torch.ones(
-            goal_position.shape[0], dtype=torch.bool,
-            device=goal_position.device)
+            goal_root_position.shape[0], dtype=torch.bool,
+            device=goal_root_position.device)
         if goal_condition_keep_mask is not None:
             valid = valid & goal_condition_keep_mask.to(
                 device=valid.device, dtype=torch.bool
@@ -1136,7 +1096,7 @@ class DARManager(BaseManager, GeometryLoss):
         if not valid.any():
             return future_motion_pred.sum() * 0.0
         return self.rec_criterion(
-            root_displacement[valid], goal_position[valid])
+            root_displacement[valid], goal_root_position[valid])
 
     def _valid_goal_component_mask(self, batch_size, device, keep_mask=None):
         valid = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -1211,14 +1171,14 @@ class DARManager(BaseManager, GeometryLoss):
             return future_motion_pred.sum() * 0.0
         return self.rec_criterion(error[valid], torch.zeros_like(error[valid]))
 
-    def calc_goal_joint_position_loss(
+    def calc_goal_joint_angle_loss(
         self,
         future_motion_pred,
         ego_goal,
         goal_joint_condition_keep_mask=None,
         goal_time_frame=None,
     ):
-        """Match the 29-DOF joint target at the selected goal frame."""
+        """Match the 29-DOF joint angles at the selected goal frame."""
         dof_dim = int(self.dataset.dof_dim)
         if dof_dim != 29:
             raise ValueError(
