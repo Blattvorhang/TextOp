@@ -222,13 +222,18 @@ Implementation notes:
   all four tokens. Shared parameters keep the time signal consistent across
   modalities.
 - Keep the V6 leak rule, extended to the transformer sequence: build the
-  tokens `emb_goal_* = MLP_*(...) + arrival_pe`, concatenate the full
-  `xseq`, apply `sequence_pos_encoder`, and only then multiply the four goal
-  slots by their keep masks. Masking after the positional encoding is what
-  makes the null-token claim exact: the masked token reaching the transformer
-  is all-zeros — no learned MLP bias, no arrival-PE residue, and no
-  position-dependent constant either. (Masking only after the MLP would
-  still leave the fixed `pe[i]` constant in the slot.)
+  tokens `emb_goal_* = MLP_*(...) + arrival_pe`, multiply each slot by its
+  keep mask, and only then concatenate `xseq` and apply
+  `sequence_pos_encoder`. The mask zeroes everything content- or
+  time-carrying — component channels, the learned MLP bias, and the
+  `arrival_pe` — so no timing information leaks from a masked slot. The
+  slot positional encoding `pe[i]` is deliberately NOT masked: it is a
+  fixed, time-independent sequence code, and keeping it lets the
+  transformer tell which condition is missing. This follows the V4/V6
+  precedent — both generations masked the goal pre-embedding and added
+  `sequence_pos_encoder` afterwards, so a masked goal token has always
+  carried `pe[i]`; the only post-MLP mask ever specified is on the
+  `arrival_pe` itself (the timing-leak rule).
 - When time is masked — training dropout (`cond_goal_time_mask_prob`) and
   eval flags (`force_drop_arrival_time` / `force_drop_goal_time`) alike —
   zero **everything** that carries timing: the `arrival_pe` contribution to
@@ -288,10 +293,11 @@ denoiser:
 | `split` | 45-D split features, scaled | 4 | 45 | V6.1 target |
 
 `legacy40` and `single` both feed one goal token and therefore use the V6
-pre-embedding vector-slice masking; only `split` gets per-token post-embedding
-masking (see Goal Masking). `goal_dim` alone no longer determines the token
-layout — `single` and `split` are both 45-D — so the denoiser carries its own
-`goal_encoding` key that must match `data.goal_encoding`.
+pre-embedding vector-slice masking; only `split` gets per-token masking
+before the sequence positional encoding (see Goal Masking). `goal_dim` alone
+no longer determines the token layout — `single` and `split` are both 45-D —
+so the denoiser carries its own `goal_encoding` key that must match
+`data.goal_encoding`.
 
 `GoalType.JOINT_STATE` keeps its physical 40-D dimension for protocol
 validation; a new `SPLIT_GOAL_DIM = 45` describes the model-facing
@@ -317,9 +323,10 @@ planner conversion using the checkpoint's frozen `goal_stats.pkl`.
 ## Goal Masking
 
 Component masks (same Bernoulli policy as V6). Where they are applied
-depends on the encoding: `split` masks the final goal tokens after the
-shared positional encoding (true all-zero null tokens, no bias leak);
-`legacy40` and `single` have a single goal token and keep the V6
+depends on the encoding: `split` masks each goal token before the shared
+sequence positional encoding (content, MLP bias, and arrival PE zeroed; the
+time-free slot PE survives so the transformer knows which condition is
+missing); `legacy40` and `single` have a single goal token and keep the V6
 pre-embedding vector-slice masking:
 
 | Component | Slice | Training mask |
@@ -426,8 +433,9 @@ train:
     shared `arrival_pe`, pre-embedding vector-slice masking on the 45-D
     slices, urgency `f_trans[5:8]` zeroed when time is masked;
   - `split`: the four `MLP_*` embedders, 4-token sequence, shared
-    `arrival_pe` added to each token, masks applied after the positional
-    encoding, urgency zeroed when time is masked.
+    `arrival_pe` added to each token, masks applied before the sequence
+    positional encoding (slot PE survives masking), urgency zeroed when
+    time is masked.
 
 ### 4. Training (`robotmdar/train/train_dar.py`)
 
@@ -457,7 +465,8 @@ train:
 - 45-D layout and dispatch of `build_ego_split_goal`, incl. `T_eff`
   clamp at `T=0`;
 - urgency channels zeroed when arrival time is masked; masking of all four
-  tokens applied after the positional encoding (masked token is all-zeros);
+  tokens applied before the sequence positional encoding (masked token keeps
+  only the slot PE, no time or content residue);
 - denoiser sequence shape: `history_len + 7` tokens for `split`, `+4` for
   `single` and `legacy40`;
 - losses still consume the raw 40-D `ego_goal_raw`, not the scaled vector;
