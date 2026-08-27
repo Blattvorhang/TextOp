@@ -57,8 +57,8 @@ manager:
     quantize_rot: 0.0
     quantize_trans: 0.0
     
-    drift_yaw: 0.0
-    drift_xy: 0.0
+    endpoint_yaw: 0.0
+    endpoint_xy: 0.0
 
   ckpt: ${...ckpt}
 

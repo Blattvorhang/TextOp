@@ -459,7 +459,7 @@ class GeometryLoss:
         history_motion=None,
         smooth=False,
         quantize=False,
-        drift=False,
+        endpoint=False,
         sliding_mask=None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """计算几何损失"""
@@ -557,21 +557,21 @@ class GeometryLoss:
             terms['quantize_rot'] = self.rec_criterion(quantize_pred_rot, quantize_gt_rot)
             terms['quantize_trans'] = self.rec_criterion(quantize_pred_trans_xy, quantize_gt_trans_xy)
 
-        drift_yaw_pred = get_euler_xyz(future_motion_pred_fk['global_rotation'][:, -1, 0], w_last=True)[2]  # (B,)
-        drift_yaw_gt = get_euler_xyz(future_motion_gt_fk['global_rotation'][:, -1, 0], w_last=True)[2]  # (B,)
+        endpoint_yaw_pred = get_euler_xyz(future_motion_pred_fk['global_rotation'][:, -1, 0], w_last=True)[2]  # (B,)
+        endpoint_yaw_gt = get_euler_xyz(future_motion_gt_fk['global_rotation'][:, -1, 0], w_last=True)[2]  # (B,)
 
-        drift_yaw_diff = (drift_yaw_pred - drift_yaw_gt) % (2 * torch.pi)
-        drift_yaw_diff[drift_yaw_diff > torch.pi] -= 2 * torch.pi
-        drift_yaw_loss = self.rec_criterion(drift_yaw_diff, torch.zeros_like(drift_yaw_diff))
+        endpoint_yaw_diff = (endpoint_yaw_pred - endpoint_yaw_gt) % (2 * torch.pi)
+        endpoint_yaw_diff[endpoint_yaw_diff > torch.pi] -= 2 * torch.pi
+        endpoint_yaw_loss = self.rec_criterion(endpoint_yaw_diff, torch.zeros_like(endpoint_yaw_diff))
 
-        drift_xy_loss = self.rec_criterion(
+        endpoint_xy_loss = self.rec_criterion(
             future_motion_pred_fk['global_translation_extend'][:, -1, 0, :2],
             future_motion_gt_fk['global_translation_extend'][:, -1, 0, :2]
         )
 
-        if drift:
-            terms['drift_yaw'] = drift_yaw_loss
-            terms['drift_xy'] = drift_xy_loss
+        if endpoint:
+            terms['endpoint_yaw'] = endpoint_yaw_loss
+            terms['endpoint_xy'] = endpoint_xy_loss
 
         terms['body_trans'] = body_trans_loss
         terms['body_rot'] = body_rot_loss
@@ -579,8 +579,8 @@ class GeometryLoss:
         terms['dof_vel'] = dof_vel_loss
         terms['foot_contact'] = foot_contact_loss
 
-        extras['drift_xy'] = drift_xy_loss
-        extras['drift_yaw'] = drift_yaw_loss
+        extras['endpoint_xy'] = endpoint_xy_loss
+        extras['endpoint_yaw'] = endpoint_yaw_loss
         # if smooth:
         #     jerk_loss = self.calc_jerk(
         #         future_motion_pred_fk['global_translation_extend'])
@@ -779,14 +779,14 @@ class MVAEManager(BaseManager, GeometryLoss):
             )
         else:
             quantize = (self.loss_weight['quantize_rot'] > 0.0 or self.loss_weight['quantize_trans'] > 0.0)
-            drift = (self.loss_weight['drift_xy'] > 0.0 or self.loss_weight['drift_yaw'] > 0.0)
+            endpoint = (self.loss_weight['endpoint_xy'] > 0.0 or self.loss_weight['endpoint_yaw'] > 0.0)
             geometry_terms, geometry_extras = self.calc_geometry_loss(
                 future_motion_pred,
                 future_motion_gt,
                 history_motion,
                 smooth=self.loss_weight['smooth'] > 0.0,
                 quantize=quantize,
-                drift=drift,
+                endpoint=endpoint,
                 sliding_mask=sliding_mask,
             )
 
@@ -997,14 +997,14 @@ class DARManager(BaseManager, GeometryLoss):
             )
         else:
             quantize = (self.loss_weight['quantize_rot'] > 0.0 or self.loss_weight['quantize_trans'] > 0.0)
-            drift = (self.loss_weight['drift_xy'] > 0.0 or self.loss_weight['drift_yaw'] > 0.0)
+            endpoint = (self.loss_weight['endpoint_xy'] > 0.0 or self.loss_weight['endpoint_yaw'] > 0.0)
             geometry_terms, geometry_extras = self.calc_geometry_loss(
                 future_motion_pred,
                 future_motion_gt,
                 history_motion,
                 smooth=self.loss_weight['smooth'] > 0.0,
                 quantize=quantize,
-                drift=drift,
+                endpoint=endpoint,
                 sliding_mask=sliding_mask,
             )
 
