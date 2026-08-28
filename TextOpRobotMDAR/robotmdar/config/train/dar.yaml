@@ -43,8 +43,7 @@ manager:
     dof_pos: 0.03
     dof_vel: 1e-5
     foot_contact: 0.01
-    goal_direction: 0.01
-    goal_position: 0.5
+    goal_root_position: 0.5
 
     fk_joints_rec: 1.0
     joints_consistency: 1.0
@@ -58,8 +57,8 @@ manager:
     quantize_rot: 0.0
     quantize_trans: 0.0
     
-    drift_yaw: 0.0
-    drift_xy: 0.0
+    endpoint_yaw: 0.0
+    endpoint_xy: 0.0
 
   ckpt: ${...ckpt}
 

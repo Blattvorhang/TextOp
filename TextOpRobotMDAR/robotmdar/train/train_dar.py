@@ -947,10 +947,10 @@ def _validate_batch(batch, cfg) -> None:
                 )
 
 
-def _validate_goal_position_contract(cfg) -> None:
-    """Validate the goal-position loss timing contract."""
+def _validate_goal_root_position_contract(cfg) -> None:
+    """Validate the goal root-position loss timing contract."""
     weight = float(
-        cfg.train.manager.loss_weight.get('goal_position', 0.0))
+        cfg.train.manager.loss_weight.get('goal_root_position', 0.0))
     if weight <= 0.0:
         return
 
@@ -966,23 +966,23 @@ def _validate_goal_position_contract(cfg) -> None:
     if offsets != (0, 0):
         if not goal_type.uses_arrival_time:
             raise ValueError(
-                "goal_position loss with randomized offsets requires "
+                "goal_root_position loss with randomized offsets requires "
                 "a goal type with explicit arrival time"
             )
         if goal_timestep_mode != 'relative':
             raise ValueError(
-                "goal_position loss with randomized offsets requires "
+                "goal_root_position loss with randomized offsets requires "
                 "goal_timestep_mode=relative"
             )
     if not bool(cfg.data.goal_per_primitive):
         if not goal_type.uses_arrival_time:
             raise ValueError(
-                "goal_position loss with goal_per_primitive=false requires "
+                "goal_root_position loss with goal_per_primitive=false requires "
                 "a goal type with explicit arrival time"
             )
         if goal_timestep_mode != 'relative':
             raise ValueError(
-                "goal_position loss with goal_per_primitive=false requires "
+                "goal_root_position loss with goal_per_primitive=false requires "
                 "goal_timestep_mode=relative"
             )
 
@@ -1043,7 +1043,7 @@ def main(cfg: DictConfig):
         goal_stats=getattr(train_data, 'goal_stats', None),
     )
     _validate_joint_state_contract(cfg)
-    _validate_goal_position_contract(cfg)
+    _validate_goal_root_position_contract(cfg)
     if cfg.train.manager.use_static_pose:
         raise ValueError(
             "Static-pose replacement has no world reference pose and is not "
@@ -1357,17 +1357,8 @@ def main(cfg: DictConfig):
                             sample_future, history_motion,
                             goal_time_frame=goal_time_frame)
                         goal_keep_mask = y.get('goal_condition_keep_mask')
-                        extras['sample_goal_position'] = (
-                            manager.calc_goal_position_loss(
-                                sample_future,
-                                y['ego_goal_raw'],
-                                goal_keep_mask,
-                                history_motion=history_motion,
-                                goal_time_frame=goal_time_frame,
-                            )
-                        )
-                        extras['sample_goal_direction'] = (
-                            manager.calc_goal_direction_loss(
+                        extras['sample_goal_root_position'] = (
+                            manager.calc_goal_root_position_loss(
                                 sample_future,
                                 y['ego_goal_raw'],
                                 goal_keep_mask,

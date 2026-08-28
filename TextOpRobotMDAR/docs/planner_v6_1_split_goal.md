@@ -346,10 +346,10 @@ Loss targets are unchanged in semantics — they compare generated motion at the
 selected goal frame against the raw physical targets from
 `ego_goal_raw` / primitive fields. Changes:
 
-- Re-enable `goal_position` (nonzero weight): the whole point of V6.1 is
+- Re-enable `goal_root_position` (nonzero weight): the whole point of V6.1 is
   recovering "walk to the position".
-- Keep `goal_joint_position` but at a weight that no longer dominates.
-- `goal_position` / `goal_direction` supervise horizontal position only
+- Keep `goal_joint_angle` but at a weight that no longer dominates.
+- `goal_root_position` supervises horizontal position only
   (`ego_goal[..., :2]`); root `z` is conditioned through the translation
   token but has no direct objective — the crawl/sit validation checks cover
   it qualitatively. Add a root-z loss only if those checks fail.
@@ -385,9 +385,9 @@ denoiser:
 train:
   manager:
     loss_weight:
-      goal_position: 1.0
-      goal_direction: 0.0
-      goal_joint_position: 0.5
+      goal_root_position: 1.0
+      goal_root_orientation: 0.5
+      goal_joint_angle: 0.5
       goal_root_velocity: 0.0
 ```
 
