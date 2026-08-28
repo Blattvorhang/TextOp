@@ -36,16 +36,18 @@ denoiser:
   goal_dim: 45
   cond_goal_root_mask_prob: 0.1
   cond_goal_orientation_mask_prob: 0.1
-  cond_goal_joint_mask_prob: 0.1
+  cond_goal_joint_mask_prob: 0.4
   cond_goal_velocity_mask_prob: 0.0
-  cond_goal_time_mask_prob: 0.1
+  cond_goal_time_mask_prob: 0.2
 
 train:
   manager:
     loss_weight:
-      foot_contact: 0.01
-      goal_direction: 0.0
-      goal_position: 0.0
+      foot_contact: 0.05
+      goal_direction: 0.2
+      goal_position: 1.0
+      goal_joint_position: 0.2
+      goal_root_orientation: 0.2
 
 ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF
