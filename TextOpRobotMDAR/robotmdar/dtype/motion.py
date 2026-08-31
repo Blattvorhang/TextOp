@@ -886,43 +886,53 @@ def motion_feature_to_dict_v6(
     dof = motion_feature[..., 13:13 + dof_dim]
     contact = motion_feature[..., 13 + dof_dim:13 + dof_dim + CONTACT_MASK_DIM]
 
-    rot_matrix = torch.zeros(
-        B, T, 3, 3, device=motion_feature.device, dtype=motion_feature.dtype
-    )
-    trans = torch.zeros(
-        B, T, 3, device=motion_feature.device, dtype=motion_feature.dtype
-    )
-
     init_rot = quaternion_to_matrix(xyzw_to_wxyz(abs_pose['root_rot']))
     init_gravity = torch.matmul(
         init_rot.transpose(-1, -2),
         _world_gravity_like(abs_pose['root_trans_offset']).unsqueeze(-1),
     ).squeeze(-1)
     init_correction = _shortest_arc_right_correction(init_gravity, gravity[:, 0])
-    rot_matrix[:, 0] = torch.matmul(init_rot, init_correction)
-    trans[:, 0] = abs_pose['root_trans_offset']
-    trans[:, 0, 2] = height[:, 0]
+    rot_frames = [torch.matmul(init_rot, init_correction)]
+    trans_frames = [
+        torch.cat(
+            (
+                abs_pose['root_trans_offset'][..., :2],
+                height[:, 0:1],
+            ),
+            dim=-1,
+        )
+    ]
 
     for t in range(T - 1):
-        provisional_rot = torch.matmul(rot_matrix[:, t], rel_rot[:, t])
+        prev_rot = rot_frames[-1]
+        prev_trans = trans_frames[-1]
+        provisional_rot = torch.matmul(prev_rot, rel_rot[:, t])
         integrated_gravity = torch.matmul(
             provisional_rot.transpose(-1, -2),
-            _world_gravity_like(trans[:, t]).unsqueeze(-1),
+            _world_gravity_like(prev_trans).unsqueeze(-1),
         ).squeeze(-1)
         correction = _shortest_arc_right_correction(
             integrated_gravity,
             gravity[:, t + 1],
         )
-        rot_matrix[:, t + 1] = torch.matmul(provisional_rot, correction)
+        next_rot = torch.matmul(provisional_rot, correction)
 
         delta_height = height[:, t + 1] - height[:, t]
         delta_local = delta_hor[:, t] - delta_height.unsqueeze(-1) * gravity[:, t]
         delta_world = torch.matmul(
-            rot_matrix[:, t],
+            prev_rot,
             delta_local.unsqueeze(-1),
         ).squeeze(-1)
-        trans[:, t + 1] = trans[:, t] + delta_world
-        trans[:, t + 1, 2] = height[:, t + 1]
+        next_trans = prev_trans + delta_world
+        next_trans = torch.cat(
+            (next_trans[..., :2], height[:, t + 1:t + 2]),
+            dim=-1,
+        )
+        rot_frames.append(next_rot)
+        trans_frames.append(next_trans)
+
+    rot_matrix = torch.stack(rot_frames, dim=1)
+    trans = torch.stack(trans_frames, dim=1)
 
     root_rot = wxyz_to_xyzw(matrix_to_quaternion(rot_matrix))
 
