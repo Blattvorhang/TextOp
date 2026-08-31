@@ -8,6 +8,7 @@ from robotmdar.dtype.rotation import (
     xyzw_to_wxyz, wxyz_to_xyzw, matrix_to_rot6d, rot6d_to_matrix, quat_apply
 )
 import torch
+import torch.nn.functional as F
 import joblib
 
 # Define the dimensions of each component (change if needed)
@@ -72,23 +73,62 @@ assert G1_WRIST_DOF_INDICES == (19, 20, 21, 26, 27, 28)
 assert len(G1_CORE_DOF_INDICES) == 23
 
 
-def motion_feature_dim_for_dof(dof_dim: int) -> int:
-    """Return the FeatureVersion 3 width for a supported G1 contract."""
+def motion_feature_dim_for_dof(
+    dof_dim: int,
+    feature_version: Optional[int] = None,
+) -> int:
+    """Return the motion-feature width for a supported G1 contract."""
     dof_dim = int(dof_dim)
     if dof_dim not in SUPPORTED_DOF_DIMS:
         raise ValueError(
             f"G1 training supports dof_dim 23 or 29, got {dof_dim}"
         )
-    return 11 + 2 * dof_dim
+    version = FeatureVersion if feature_version is None else int(feature_version)
+    if version == 0:
+        return ROOT_TRANS_OFFSET_DIM + ROOT_ROT_DIM + dof_dim + CONTACT_MASK_DIM
+    if version in (2, 3):
+        return 11 + 2 * dof_dim
+    if version == 6:
+        return 13 + dof_dim + CONTACT_MASK_DIM
+    if version == 1:
+        return 11 + dof_dim
+    if version == 4:
+        return (
+            3 + 6 + dof_dim + 3 + 6
+            + (dof_dim + 4) * 3 * 2 + CONTACT_MASK_DIM
+        )
+    if version == 5:
+        return 4 + 1 + 2 + 3 + 3 + (dof_dim + 4) * 3 * 2 + 1 + dof_dim * 2
+    raise ValueError(f"Unsupported FeatureVersion: {version}")
 
 
 def infer_feature_v3_dof_dim(feature_dim: int) -> int:
     """Infer the G1 DoF count from a FeatureVersion 3 tensor width."""
     for dof_dim in SUPPORTED_DOF_DIMS:
-        if int(feature_dim) == motion_feature_dim_for_dof(dof_dim):
+        if int(feature_dim) == motion_feature_dim_for_dof(
+            dof_dim, feature_version=3
+        ):
             return dof_dim
     raise ValueError(
         f"FeatureVersion 3 expects 57 or 69 features, got {feature_dim}"
+    )
+
+
+def infer_feature_dof_dim(
+    feature_dim: int,
+    feature_version: Optional[int] = None,
+) -> int:
+    """Infer the G1 DoF count from a feature width and feature version."""
+    version = FeatureVersion if feature_version is None else int(feature_version)
+    if version == 3:
+        return infer_feature_v3_dof_dim(feature_dim)
+    for dof_dim in SUPPORTED_DOF_DIMS:
+        if int(feature_dim) == motion_feature_dim_for_dof(dof_dim, version):
+            return dof_dim
+    raise ValueError(
+        f"FeatureVersion {version} expects one of "
+        f"{[motion_feature_dim_for_dof(d, version) for d in SUPPORTED_DOF_DIMS]} "
+        f"features, got {feature_dim}"
     )
 
 
@@ -140,6 +180,7 @@ MotionFeatureV2 = torch.Tensor
 # delta dof (t+1 - t): 29
 
 MotionFeatureV3 = torch.Tensor
+MotionFeatureV6 = torch.Tensor
 
 
 def motion_dict_to_abs_pose(motion_dict: MotionDict, idx: int = -1) -> AbsolutePose:
@@ -587,7 +628,7 @@ def motion_feature_to_dict_v3(motion_feature: MotionFeatureV3, abs_pose: Optiona
     delta_trans_local = motion_feature[..., 7:10]  # (t+1) - t
     height = motion_feature[..., 10]  #+ 0.8  # 高度
     dof_dim = infer_feature_v3_dof_dim(motion_feature.shape[-1])
-    expected_dim = motion_feature_dim_for_dof(dof_dim)
+    expected_dim = motion_feature_dim_for_dof(dof_dim, feature_version=3)
     dof = motion_feature[..., 11:11 + dof_dim]
     delta_dof = motion_feature[..., 11 + dof_dim:expected_dim]
 
@@ -639,6 +680,263 @@ def motion_feature_to_dict_v3(motion_feature: MotionFeatureV3, abs_pose: Optiona
         contact = contact[0]
         abs_pose = {'root_trans_offset': abs_pose['root_trans_offset'][0], 'root_rot': abs_pose['root_rot'][0]}
     return {'root_trans_offset': trans, 'root_rot': rot, 'dof': dof_out, 'contact_mask': contact}
+
+
+def _world_gravity_like(tensor: torch.Tensor) -> torch.Tensor:
+    gravity = torch.zeros(
+        tensor.shape[:-1] + (3, ),
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    gravity[..., 2] = -1.0
+    return gravity
+
+
+def _batched_identity_matrix(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return (
+        torch.eye(3, device=device, dtype=dtype)
+        .unsqueeze(0)
+        .expand(batch_size, 3, 3)
+        .clone()
+    )
+
+
+def _skew_matrix(vec: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros_like(vec[..., 0])
+    x, y, z = vec.unbind(-1)
+    return torch.stack(
+        (
+            torch.stack((zeros, -z, y), dim=-1),
+            torch.stack((z, zeros, -x), dim=-1),
+            torch.stack((-y, x, zeros), dim=-1),
+        ),
+        dim=-2,
+    )
+
+
+def _canonical_axis_perpendicular_to(vec: torch.Tensor) -> torch.Tensor:
+    """Pick a deterministic unit axis perpendicular to ``vec``."""
+    abs_vec = vec.abs()
+    basis_index = abs_vec.argmin(dim=-1)
+    basis = torch.zeros_like(vec)
+    basis.scatter_(-1, basis_index.unsqueeze(-1), 1.0)
+    return F.normalize(torch.cross(vec, basis, dim=-1), dim=-1, eps=1e-8)
+
+
+def _shortest_arc_right_correction(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Return S such that S.T @ a == b, equivalently S maps b onto a."""
+    a = F.normalize(a, dim=-1, eps=1e-8)
+    b = F.normalize(b, dim=-1, eps=1e-8)
+    batch_size = a.shape[0]
+    eye = _batched_identity_matrix(batch_size, a.device, a.dtype)
+
+    v = torch.cross(b, a, dim=-1)
+    s = v.norm(dim=-1, keepdim=True)
+    c = (b * a).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+
+    k = _skew_matrix(v)
+    factor = (1.0 - c).view(batch_size, 1, 1) / (
+        s.square().view(batch_size, 1, 1).clamp(min=1e-16)
+    )
+    rodrigues = eye + k + torch.matmul(k, k) * factor
+
+    axis = _canonical_axis_perpendicular_to(a)
+    fallback = 2.0 * axis.unsqueeze(-1) * axis.unsqueeze(-2) - eye
+
+    parallel = s.squeeze(-1) < 1e-7
+    antiparallel = parallel & (c.squeeze(-1) < 0.0)
+    result = torch.where(parallel.view(batch_size, 1, 1), eye, rodrigues)
+    result = torch.where(antiparallel.view(batch_size, 1, 1), fallback, result)
+    return result
+
+
+def _project_feature_v6_components(motion_feature: torch.Tensor):
+    gravity = F.normalize(motion_feature[..., 1:4], dim=-1, eps=1e-8)
+    delta_hor_raw = motion_feature[..., 4:7]
+    delta_hor = (
+        delta_hor_raw
+        - (delta_hor_raw * gravity).sum(dim=-1, keepdim=True) * gravity
+    )
+    rel_rot = rot6d_to_matrix(motion_feature[..., 7:13])
+    return gravity, delta_hor, rel_rot
+
+
+def __jitable_motion_dict_to_feature_v6__(
+    trans: torch.Tensor,
+    rot: torch.Tensor,
+    dof: torch.Tensor,
+    contact: torch.Tensor,
+) -> MotionFeatureV6:
+    B, T_plus_1, _ = trans.shape
+    T = T_plus_1 - 1
+
+    height = trans[:, :T, 2].unsqueeze(-1)
+    rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(rot))
+    rot_t = rot_matrix[:, :T]
+    rot_next = rot_matrix[:, 1:T + 1]
+
+    gravity_world = _world_gravity_like(trans[:, :T])
+    gravity = torch.matmul(
+        rot_t.transpose(-1, -2),
+        gravity_world.unsqueeze(-1),
+    ).squeeze(-1)
+
+    delta_world = trans[:, 1:T + 1] - trans[:, :T]
+    delta_local = torch.matmul(
+        rot_t.transpose(-1, -2),
+        delta_world.unsqueeze(-1),
+    ).squeeze(-1)
+    delta_hor = (
+        delta_local
+        - (delta_local * gravity).sum(dim=-1, keepdim=True) * gravity
+    )
+
+    rel_rot = torch.matmul(rot_t.transpose(-1, -2), rot_next)
+    rel_rot_6d = matrix_to_rot6d(rel_rot)
+
+    feature = torch.cat(
+        [
+            height,
+            gravity,
+            delta_hor,
+            rel_rot_6d,
+            dof[:, :T],
+            contact[:, :T],
+        ],
+        dim=-1,
+    )
+    return feature
+
+
+def motion_dict_to_feature_v6(
+    motion_dict: MotionDict,
+    skeleton: None = None,
+) -> Tuple[MotionFeatureV6, AbsolutePose]:
+    trans = motion_dict['root_trans_offset']
+    rot = motion_dict['root_rot']
+    dof = motion_dict['dof']
+    contact = motion_dict['contact_mask']
+    if dof.shape[-1] not in SUPPORTED_DOF_DIMS:
+        raise ValueError(
+            f"FeatureVersion 6 expects 23 or 29 DoFs, got {dof.shape[-1]}"
+        )
+    if len(trans.shape) == 2:
+        expanded = True
+        trans = trans.unsqueeze(0)
+        rot = rot.unsqueeze(0)
+        dof = dof.unsqueeze(0)
+        contact = contact.unsqueeze(0)
+    else:
+        expanded = False
+
+    abs_pose = {'root_trans_offset': trans[:, 0], 'root_rot': rot[:, 0]}
+    feature = __jitable_motion_dict_to_feature_v6__(trans, rot, dof, contact)
+
+    if expanded:
+        feature = feature[0]
+        abs_pose = {
+            'root_trans_offset': abs_pose['root_trans_offset'][0],
+            'root_rot': abs_pose['root_rot'][0],
+        }
+    return feature, abs_pose
+
+
+def motion_feature_to_dict_v6(
+    motion_feature: MotionFeatureV6,
+    abs_pose: Optional[AbsolutePose] = None,
+) -> MotionDict:
+    if len(motion_feature.shape) == 2:
+        expanded = True
+        motion_feature = motion_feature.unsqueeze(0)
+        if abs_pose:
+            abs_pose = {
+                'root_trans_offset': abs_pose['root_trans_offset'].unsqueeze(0),
+                'root_rot': abs_pose['root_rot'].unsqueeze(0)
+            }
+    else:
+        expanded = False
+
+    B, T = motion_feature.shape[:2]
+    if not abs_pose:
+        root_rot = torch.zeros(
+            B, 4, device=motion_feature.device, dtype=motion_feature.dtype
+        )
+        root_rot[..., 3] = 1.0
+        abs_pose = {
+            'root_trans_offset': torch.zeros(
+                B, 3, device=motion_feature.device, dtype=motion_feature.dtype
+            ),
+            'root_rot': root_rot,
+        }
+
+    dof_dim = infer_feature_dof_dim(motion_feature.shape[-1], feature_version=6)
+    expected_dim = motion_feature_dim_for_dof(dof_dim, feature_version=6)
+    if motion_feature.shape[-1] != expected_dim:
+        raise ValueError(
+            f"FeatureVersion 6 expects {expected_dim} features for "
+            f"dof_dim={dof_dim}, got {motion_feature.shape[-1]}"
+        )
+
+    height = motion_feature[..., 0]
+    gravity, delta_hor, rel_rot = _project_feature_v6_components(motion_feature)
+    dof = motion_feature[..., 13:13 + dof_dim]
+    contact = motion_feature[..., 13 + dof_dim:13 + dof_dim + CONTACT_MASK_DIM]
+
+    rot_matrix = torch.zeros(
+        B, T, 3, 3, device=motion_feature.device, dtype=motion_feature.dtype
+    )
+    trans = torch.zeros(
+        B, T, 3, device=motion_feature.device, dtype=motion_feature.dtype
+    )
+
+    init_rot = quaternion_to_matrix(xyzw_to_wxyz(abs_pose['root_rot']))
+    init_gravity = torch.matmul(
+        init_rot.transpose(-1, -2),
+        _world_gravity_like(abs_pose['root_trans_offset']).unsqueeze(-1),
+    ).squeeze(-1)
+    init_correction = _shortest_arc_right_correction(init_gravity, gravity[:, 0])
+    rot_matrix[:, 0] = torch.matmul(init_rot, init_correction)
+    trans[:, 0] = abs_pose['root_trans_offset']
+    trans[:, 0, 2] = height[:, 0]
+
+    for t in range(T - 1):
+        provisional_rot = torch.matmul(rot_matrix[:, t], rel_rot[:, t])
+        integrated_gravity = torch.matmul(
+            provisional_rot.transpose(-1, -2),
+            _world_gravity_like(trans[:, t]).unsqueeze(-1),
+        ).squeeze(-1)
+        correction = _shortest_arc_right_correction(
+            integrated_gravity,
+            gravity[:, t + 1],
+        )
+        rot_matrix[:, t + 1] = torch.matmul(provisional_rot, correction)
+
+        delta_height = height[:, t + 1] - height[:, t]
+        delta_local = delta_hor[:, t] - delta_height.unsqueeze(-1) * gravity[:, t]
+        delta_world = torch.matmul(
+            rot_matrix[:, t],
+            delta_local.unsqueeze(-1),
+        ).squeeze(-1)
+        trans[:, t + 1] = trans[:, t] + delta_world
+        trans[:, t + 1, 2] = height[:, t + 1]
+
+    root_rot = wxyz_to_xyzw(matrix_to_quaternion(rot_matrix))
+
+    if expanded:
+        trans = trans[0]
+        root_rot = root_rot[0]
+        dof = dof[0]
+        contact = contact[0]
+    return {
+        'root_trans_offset': trans,
+        'root_rot': root_rot,
+        'dof': dof,
+        'contact_mask': contact,
+    }
 
 
 def get_new_coordinate(jts):
@@ -1259,6 +1557,7 @@ motion_feature_dim_v2 = (4 + 1 + 2 + 3 + 1 + DOF_DIM + DOF_DIM)
 motion_feature_dim_v3 = (4 + 1 + 2 + 3 + 1 + DOF_DIM + DOF_DIM)
 motion_feature_dim_v4 = (3 + 6 + DOF_DIM + 3 + 6 + (DOF_DIM + 4) * 3 + (DOF_DIM + 4) * 3 + 2)  # 247
 motion_feature_dim_v5 = (4 + 1 + 2 + 3 + 3 + (DOF_DIM + 4) * 3 + (DOF_DIM + 4) * 3 + 1 + DOF_DIM + DOF_DIM)  # 270
+motion_feature_dim_v6 = (1 + 3 + 3 + 6 + DOF_DIM + CONTACT_MASK_DIM)
 
 
 def get_zero_abs_pose(batch_shape: Tuple[int, ...], device: str = 'cuda') -> AbsolutePose:
@@ -1286,7 +1585,7 @@ def get_zero_feature_v2(dof_dim: int = DOF_DIM) -> MotionFeatureV2:
     """
     Returns a zero-initialized motion feature tensor for v2.
     """
-    feature_dim = motion_feature_dim_for_dof(dof_dim)
+    feature_dim = motion_feature_dim_for_dof(dof_dim, feature_version=3)
     feat = torch.zeros((1, feature_dim), dtype=torch.float32)
     feat[0, 5:7] = 1.0  # contact mask
     feat[0, 10] = 0.75  # Set height
@@ -1330,6 +1629,24 @@ def get_zero_feature_v5():
     raise NotImplementedError
 
 
+def get_zero_feature_v6(dof_dim: int = DOF_DIM) -> MotionFeatureV6:
+    """
+    Returns a zero-initialized legal motion feature tensor for v6.
+    """
+    feature_dim = motion_feature_dim_for_dof(dof_dim, feature_version=6)
+    feat = torch.zeros((1, feature_dim), dtype=torch.float32)
+    feat[0, 0] = G1_ROOT_HEIGHT
+    feat[0, 1:4] = torch.tensor([0.0, 0.0, -1.0])
+    identity_6d = matrix_to_rot6d(torch.eye(3, dtype=torch.float32))
+    feat[0, 7:13] = identity_6d
+    default_dof = torch.tensor(G1_DEFAULT_DOF)
+    if dof_dim == 23:
+        default_dof = default_dof[list(G1_23DOF_FROM_29DOF_INDICES)]
+    feat[0, 13:13 + dof_dim] = default_dof
+    feat[0, 13 + dof_dim:13 + dof_dim + CONTACT_MASK_DIM] = 1.0
+    return feat
+
+
 def perturb_feature_v3(motion_feature: MotionFeatureV3, scale: float) -> MotionFeatureV3:
     """
     Add random perturbation to motion features with component-specific strategies.
@@ -1368,36 +1685,84 @@ def perturb_feature_v3(motion_feature: MotionFeatureV3, scale: float) -> MotionF
     return perturbed
 
 
-motion_dict_to_feature: Callable[[MotionDict, Optional[Any]], Any]
-if FeatureVersion == 0:
-    motion_dict_to_feature = motion_dict_to_feature_v0
-    motion_feature_to_dict = motion_feature_to_dict_v0
-    motion_feature_dim = ROOT_TRANS_OFFSET_DIM + ROOT_ROT_DIM + DOF_DIM + CONTACT_MASK_DIM
-elif FeatureVersion == 1:
-    motion_dict_to_feature = motion_dict_to_feature_v1
-    motion_feature_to_dict = motion_feature_to_dict_v1
-    motion_feature_dim = motion_feature_dim_v1
-elif FeatureVersion == 2:
-    motion_dict_to_feature = motion_dict_to_feature_v2
-    motion_feature_to_dict = motion_feature_to_dict_v2
-    motion_feature_dim = motion_feature_dim_v2
-elif FeatureVersion == 3:
-    motion_dict_to_feature = motion_dict_to_feature_v3
-    motion_feature_to_dict = motion_feature_to_dict_v3
-    motion_feature_dim = motion_feature_dim_v3
-    get_zero_feature = get_zero_feature_v3
-elif FeatureVersion == 4:
-    motion_dict_to_feature = motion_dict_to_feature_v4
-    motion_feature_to_dict = motion_feature_to_dict_v4
-    motion_feature_dim = motion_feature_dim_v4
-    get_zero_feature = get_zero_feature_v4
-elif FeatureVersion == 5:
-    motion_dict_to_feature = motion_dict_to_feature_v5
-    motion_feature_to_dict = motion_feature_to_dict_v5
-    motion_feature_dim = motion_feature_dim_v5
-    get_zero_feature = get_zero_feature_v5
-else:
+def set_feature_version(feature_version: int) -> int:
+    """Set the active motion-feature version used by dispatch wrappers."""
+    global FeatureVersion, motion_feature_dim
+    version = int(feature_version)
+    if version not in (0, 1, 2, 3, 4, 5, 6):
+        raise ValueError(f"Unsupported FeatureVersion: {version}")
+    FeatureVersion = version
+    motion_feature_dim = motion_feature_dim_for_dof(DOF_DIM, feature_version=version)
+    return FeatureVersion
+
+
+def motion_dict_to_feature(
+    motion_dict: MotionDict,
+    skeleton: Optional[Any] = None,
+) -> Any:
+    if FeatureVersion == 0:
+        return motion_dict_to_feature_v0(motion_dict)
+    if FeatureVersion == 1:
+        return motion_dict_to_feature_v1(motion_dict)
+    if FeatureVersion == 2:
+        return motion_dict_to_feature_v2(motion_dict)
+    if FeatureVersion == 3:
+        return motion_dict_to_feature_v3(motion_dict, skeleton)
+    if FeatureVersion == 4:
+        return motion_dict_to_feature_v4(motion_dict, skeleton)
+    if FeatureVersion == 5:
+        return motion_dict_to_feature_v5(motion_dict, skeleton)
+    if FeatureVersion == 6:
+        return motion_dict_to_feature_v6(motion_dict, skeleton)
     raise ValueError(f"Unsupported FeatureVersion: {FeatureVersion}")
+
+
+def motion_feature_to_dict(
+    motion_feature: torch.Tensor,
+    abs_pose: Optional[AbsolutePose] = None,
+    skeleton: Optional[Any] = None,
+) -> MotionDict:
+    if FeatureVersion == 0:
+        return motion_feature_to_dict_v0(motion_feature)
+    if FeatureVersion == 1:
+        return motion_feature_to_dict_v1(motion_feature, abs_pose)
+    if FeatureVersion == 2:
+        return motion_feature_to_dict_v2(motion_feature, abs_pose)
+    if FeatureVersion == 3:
+        return motion_feature_to_dict_v3(motion_feature, abs_pose)
+    if FeatureVersion == 4:
+        return motion_feature_to_dict_v4(motion_feature, abs_pose)
+    if FeatureVersion == 5:
+        return motion_feature_to_dict_v5(motion_feature, abs_pose)
+    if FeatureVersion == 6:
+        return motion_feature_to_dict_v6(motion_feature, abs_pose)
+    raise ValueError(f"Unsupported FeatureVersion: {FeatureVersion}")
+
+
+def get_zero_feature(*args, **kwargs) -> torch.Tensor:
+    if FeatureVersion == 1:
+        return get_zero_feature_v1()
+    if FeatureVersion in (2, 3):
+        dof_dim = kwargs.get('dof_dim', DOF_DIM)
+        if args and isinstance(args[0], int):
+            dof_dim = args[0]
+        return get_zero_feature_v3(dof_dim)
+    if FeatureVersion == 4:
+        skeleton = kwargs.get('skeleton', args[0] if args else None)
+        if skeleton is None:
+            raise ValueError("FeatureVersion 4 zero feature requires skeleton")
+        return get_zero_feature_v4(skeleton)
+    if FeatureVersion == 5:
+        return get_zero_feature_v5()
+    if FeatureVersion == 6:
+        dof_dim = kwargs.get('dof_dim', DOF_DIM)
+        if args and isinstance(args[0], int):
+            dof_dim = args[0]
+        return get_zero_feature_v6(dof_dim)
+    raise ValueError(f"Unsupported FeatureVersion for zero feature: {FeatureVersion}")
+
+
+motion_feature_dim = motion_feature_dim_for_dof(DOF_DIM, feature_version=FeatureVersion)
 
 if __name__ == "__main__":
     # Example usage

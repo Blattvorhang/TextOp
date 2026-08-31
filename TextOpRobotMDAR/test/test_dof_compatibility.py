@@ -11,6 +11,7 @@ from robotmdar.dtype.motion import (
     G1_WRIST_DOF_INDICES,
     motion_dict_to_feature_v3,
     motion_feature_to_dict_v3,
+    set_feature_version,
 )
 from robotmdar.skeleton.robot import RobotSkeleton
 from robotmdar.utils.dof_contract import expected_g1_names
@@ -109,9 +110,26 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
         configure_dof_contract(legacy_23)
         planner = compose(config_name='planner_dar')
         configure_dof_contract(planner)
+        rotmat_v6 = compose(
+            config_name='train_mvae',
+            overrides=[
+                'feature_version=6',
+                'data.dof_dim=29',
+            ],
+        )
+        configure_dof_contract(rotmat_v6)
+        rotmat_v6_data_override = compose(
+            config_name='train_mvae',
+            overrides=[
+                'data.feature_version=6',
+                'data.dof_dim=29',
+            ],
+        )
+        configure_dof_contract(rotmat_v6_data_override)
 
     assert int(v6.data.dof_dim) == 29
     assert int(v6.data.nfeats) == 69
+    assert int(v6.feature_version) == 3
     assert v6.data.goal_type == 'joint_state'
     assert int(v6.denoiser.goal_dim) == 45
     assert v6.skeleton.asset.assetFileName == 'g1_29dof.xml'
@@ -126,3 +144,11 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
     assert planner.data.goal_type == 'joint_state'
     assert int(planner.denoiser.goal_dim) == 45
     assert planner.skeleton.asset.assetFileName == 'g1_29dof.xml'
+    assert int(rotmat_v6.feature_version) == 6
+    assert int(rotmat_v6.data.feature_version) == 6
+    assert int(rotmat_v6.data.nfeats) == 44
+    assert int(rotmat_v6.nfeats) == 44
+    assert int(rotmat_v6.vae.nfeats) == 44
+    assert int(rotmat_v6_data_override.feature_version) == 6
+    assert int(rotmat_v6_data_override.data.nfeats) == 44
+    set_feature_version(3)

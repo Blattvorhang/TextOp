@@ -2,13 +2,13 @@
 
 from pathlib import Path
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import (
     G1_23DOF_FROM_29DOF_INDICES,
     G1_MUJOCO_DOF_JOINT_NAMES,
     G1_MUJOCO_DOF_LINK_NAMES,
-    motion_feature_dim_for_dof,
 )
 
 
@@ -22,19 +22,31 @@ def expected_g1_names(dof_dim: int):
             tuple(G1_MUJOCO_DOF_JOINT_NAMES[index] for index in indices),
             tuple(G1_MUJOCO_DOF_LINK_NAMES[index] for index in indices),
         )
-    motion_feature_dim_for_dof(dof_dim)
+    motion_dtype.motion_feature_dim_for_dof(dof_dim)
     raise AssertionError("unreachable")
 
 
+def _configured_feature_version(cfg: DictConfig) -> int:
+    if 'data' in cfg and 'feature_version' in cfg.data:
+        return int(cfg.data.feature_version)
+    if 'feature_version' in cfg:
+        return int(cfg.feature_version)
+    return 3
+
+
 def configure_dof_contract(cfg: DictConfig) -> int:
-    """Select feature width and the matching locked/full-wrist skeleton."""
+    """Select feature width/version and the matching G1 skeleton."""
+    feature_version = _configured_feature_version(cfg)
+    motion_dtype.set_feature_version(feature_version)
     dof_dim = int(cfg.data.dof_dim)
-    expected_nfeats = motion_feature_dim_for_dof(dof_dim)
-    if int(cfg.data.nfeats) != expected_nfeats:
-        raise ValueError(
-            f"dof_dim={dof_dim} requires data.nfeats={expected_nfeats}, "
-            f"got {cfg.data.nfeats}"
-        )
+    expected_nfeats = motion_dtype.motion_feature_dim_for_dof(
+        dof_dim, feature_version=feature_version
+    )
+    with open_dict(cfg):
+        cfg.feature_version = feature_version
+        cfg.nfeats = expected_nfeats
+        cfg.data.feature_version = feature_version
+        cfg.data.nfeats = expected_nfeats
 
     if dof_dim == 23:
         variant_path = (
@@ -50,8 +62,11 @@ def configure_dof_contract(cfg: DictConfig) -> int:
 
 def validate_training_contract(cfg, datasets, vae, denoiser=None) -> None:
     """Fail early if data, FK, normalization, and models disagree."""
+    feature_version = _configured_feature_version(cfg)
     dof_dim = int(cfg.data.dof_dim)
-    nfeats = motion_feature_dim_for_dof(dof_dim)
+    nfeats = motion_dtype.motion_feature_dim_for_dof(
+        dof_dim, feature_version=feature_version
+    )
     expected_joint_names, expected_link_names = expected_g1_names(dof_dim)
     if int(cfg.data.nfeats) != nfeats:
         raise ValueError(
@@ -61,7 +76,10 @@ def validate_training_contract(cfg, datasets, vae, denoiser=None) -> None:
 
     for split, dataset in datasets:
         source_dof_dim = int(dataset.source_dof_dim)
-        source_nfeats = motion_feature_dim_for_dof(source_dof_dim)
+        source_feature_version = int(getattr(dataset, 'source_feature_version', 3))
+        source_nfeats = motion_dtype.motion_feature_dim_for_dof(
+            source_dof_dim, feature_version=source_feature_version
+        )
         stats = dataset.statistics
         stats_dof = int(stats.get('dof_dim', source_dof_dim))
         stats_nfeats = int(stats.get('nfeats', source_nfeats))

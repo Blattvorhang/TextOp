@@ -15,6 +15,7 @@ from robotmdar.dtype.device import tree_to_numpy
 from robotmdar.dtype.abc import Dataset, VAE, Optimizer, Distribution
 from robotmdar.train.manager import MVAEManager
 from robotmdar.dtype.vis_mjc import mjc_load_everything, VisState, get_keycb_fn, mjc_autoloop_mdar
+from robotmdar.utils.dof_contract import configure_dof_contract
 
 
 def add_batch_fn(motion_buff, val_dataiter, vae, val_data, num_primitive,
@@ -95,6 +96,7 @@ def add_batch_fn(motion_buff, val_dataiter, vae, val_data, num_primitive,
 
 
 def main(cfg: DictConfig):
+    configure_dof_contract(cfg)
     logger.set(cfg)
     seed.set(cfg.seed)
 

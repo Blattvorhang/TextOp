@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - train_dar
+  - _self_
+
+task: refresh-goal-stats
+
+# Recompute goal_stats.pkl (including the goal-clamp quantile tables) from
+# the training split and write it to target_dir/goal_stats.pkl. Point
+# target_dir at the checkpoint directory the planner loads its frozen stats
+# from (e.g. logs/pretrained/0827_goal_reaching).
+target_dir: null  # required
+
+data:
+  dof_dim: 29
+  goal_type: joint_state
+  goal_encoding: split
+  goal_per_primitive: true
+  goal_offset_range: [-63, 0]
+  goal_timestep_mode: relative
+  # The task recomputes the stats explicitly; keep the dataset init from
+  # loading (or silently caching) the datadir copy.
+  load_goal_stats: false

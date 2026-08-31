@@ -14,6 +14,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from robotmdar.dtype.debug import pdb_decorator
+from robotmdar.utils.dof_contract import configure_dof_contract
 
 
 @hydra.main(
@@ -25,6 +26,8 @@ def main(cfg: DictConfig):
 
     # Get the task from config
     task = cfg.task
+    if "data" in cfg and "dof_dim" in cfg.data:
+        configure_dof_contract(cfg)
 
     print("-=-" * 30)
     print(OmegaConf.to_yaml(cfg))
@@ -40,6 +43,7 @@ def main(cfg: DictConfig):
         "freq-dar": "eval.freq_dar",
         "export-dar": "export.export_dar_onnx",
         "noise-opt": "opt.noise_opt",
+        "refresh-goal-stats": "dataloader.refresh_goal_stats",
     }
 
     if task in task_modules:

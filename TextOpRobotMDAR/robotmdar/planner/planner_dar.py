@@ -15,13 +15,15 @@ from omegaconf import DictConfig, OmegaConf
 from robotmdar.dtype import logger as dtype_logger
 from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
-from robotmdar.dtype.motion import FeatureVersion, infer_feature_v3_dof_dim
+import robotmdar.dtype.motion as motion_dtype
+from robotmdar.dtype.motion import infer_feature_v3_dof_dim
 from robotmdar.eval.generate_dar import generate_next_motion, encode_motion_lib_initial_noise
 from robotmdar.utils.dof_contract import (
     configure_dof_contract,
     validate_training_contract,
 )
 from robotmdar.utils.goal import (
+    GoalClamp,
     GoalEncoding,
     GoalType,
     validate_goal_config,
@@ -210,9 +212,9 @@ def main(cfg: DictConfig) -> None:
             "{} planner expects goal_keypoints_world from the controller; "
             "no reference pose is configured", goal_type.value)
 
-    if FeatureVersion != 3:
+    if motion_dtype.FeatureVersion != 3:
         raise ValueError(
-            f"planner_dar requires FeatureVersion 3, got {FeatureVersion}")
+            f"planner_dar requires FeatureVersion 3, got {motion_dtype.FeatureVersion}")
 
     _model_cfg_path, _model_cfg = _checkpoint_config(cfg)
     logger.info(
@@ -265,6 +267,35 @@ def main(cfg: DictConfig) -> None:
     if abs(float(val_data.fps) - motion_fps) > 1e-6:
         raise ValueError(
             f"Dataset fps ({val_data.fps}) must match motion_fps ({motion_fps})")
+
+    # Clamp the controller goal back into the training distribution before
+    # encoding: r_max(T) = clip(speed_max * clip(T, 1/fps, time_max),
+    # r_min, r_max), with x,y scaled proportionally (direction preserved).
+    # The same time cap feeds the arrival-time PE and the goal urgency.
+    # The envelope is DERIVED from the frozen goal_stats.pkl shipped with the
+    # checkpoint (per-window ego goal distance and implied speed r/T
+    # quantiles): goal_clamp.quantile selects the training-distribution
+    # percentile to admit — lower is stricter. r_min = speed_max/fps and
+    # time_max = future_len/fps are derived as well. goal_clamp_enabled is
+    # the runtime switch; without it the goal_clamp block (or a null
+    # override) leaves the planner unclamped.
+    goal_clamp = None
+    _goal_clamp_cfg = cfg.get("goal_clamp")
+    if _goal_clamp_cfg is not None and bool(
+            cfg.get("goal_clamp_enabled", False)):
+        if goal_stats is None:
+            raise ValueError(
+                "goal_clamp_enabled requires frozen goal statistics; it is "
+                "only supported for the split goal encoding")
+        _clamp_quantile = float(_goal_clamp_cfg.get("quantile", 99.0))
+        goal_clamp = GoalClamp.from_stats(goal_stats, _clamp_quantile)
+        logger.info(
+            "Goal clamp enabled from frozen stats at percentile {:.1f}: "
+            "r_max(T)=clip({:.3f}*T, {:.3f}, {:.3f}) m with T<= {:.2f} s",
+            _clamp_quantile, goal_clamp.speed_max, goal_clamp.r_min,
+            goal_clamp.r_max, goal_clamp.time_max)
+    elif _goal_clamp_cfg is not None:
+        logger.info("Goal clamp disabled (goal_clamp_enabled=false)")
 
     period = float(cfg.infer_period_ms) / 1000.0
     if period <= 0:
@@ -379,7 +410,8 @@ def main(cfg: DictConfig) -> None:
                             goal_reference_rot, cfg.device,
                             goal_type=goal_type,
                             goal_reference_path=goal_reference_path,
-                            goal_encoding=GoalEncoding.LEGACY40)
+                            goal_encoding=GoalEncoding.LEGACY40,
+                            goal_clamp=goal_clamp, fps=motion_fps)
                         ego_goal = (
                             ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
                             else state_goal_from_reference(
@@ -388,7 +420,8 @@ def main(cfg: DictConfig) -> None:
                                 goal_type=goal_type,
                                 goal_reference_path=goal_reference_path,
                                 goal_encoding=goal_encoding,
-                                goal_stats=goal_stats)
+                                goal_stats=goal_stats,
+                                goal_clamp=goal_clamp, fps=motion_fps)
                         )
                     else:
                         abs_pose = {
@@ -401,7 +434,8 @@ def main(cfg: DictConfig) -> None:
                             generated_reference_rot, cfg.device,
                             goal_type=goal_type,
                             goal_reference_path=goal_reference_path,
-                            goal_encoding=GoalEncoding.LEGACY40)
+                            goal_encoding=GoalEncoding.LEGACY40,
+                            goal_clamp=goal_clamp, fps=motion_fps)
                         ego_goal = (
                             ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
                             else state_goal_from_reference(
@@ -410,7 +444,8 @@ def main(cfg: DictConfig) -> None:
                                 goal_type=goal_type,
                                 goal_reference_path=goal_reference_path,
                                 goal_encoding=goal_encoding,
-                                goal_stats=goal_stats)
+                                goal_stats=goal_stats,
+                                goal_clamp=goal_clamp, fps=motion_fps)
                         )
                 else:
                     tracked_frame = None
@@ -427,14 +462,16 @@ def main(cfg: DictConfig) -> None:
                     ego_goal_raw = state_to_ego_goal(
                         latest_state, cfg.device, goal_type=goal_type,
                         goal_reference_path=goal_reference_path,
-                        goal_encoding=GoalEncoding.LEGACY40)
+                        goal_encoding=GoalEncoding.LEGACY40,
+                        goal_clamp=goal_clamp, fps=motion_fps)
                     ego_goal = (
                         ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
                         else state_to_ego_goal(
                             latest_state, cfg.device, goal_type=goal_type,
                             goal_reference_path=goal_reference_path,
                             goal_encoding=goal_encoding,
-                            goal_stats=goal_stats)
+                            goal_stats=goal_stats,
+                            goal_clamp=goal_clamp, fps=motion_fps)
                     )
                     history_translation = None
 
@@ -455,6 +492,15 @@ def main(cfg: DictConfig) -> None:
                     _goal_world_z = float(_world_goal[2])
                 else:
                     _goal_world_x = _goal_world_y = _goal_world_z = float('nan')
+
+                # Radius before/after the goal clamp (world frame: controller
+                # goal vs measured root; ego frame: as fed to the model).
+                _meas_root = np.asarray(
+                    latest_state.raw["g1_pos"][-1], dtype=np.float64)
+                _goal_r_world = math.hypot(
+                    _goal_world_x - float(_meas_root[0]),
+                    _goal_world_y - float(_meas_root[1]))
+                _goal_r_ego = math.hypot(_goal_ego_x, _goal_ego_y)
 
                 _world_vel = getattr(latest_state, 'goal_root_velocity_world', None)
                 if _world_vel is not None:
@@ -497,6 +543,11 @@ def main(cfg: DictConfig) -> None:
                     time_to_arrival_s, time_to_arrival_frame = (
                         _time_to_arrival_from_state(
                             latest_state, motion_fps, cfg.device))
+                    if goal_clamp is not None:
+                        # Keep the arrival PE inside the training horizon
+                        # (same cap the goal builder applies to urgency).
+                        time_to_arrival_frame = time_to_arrival_frame.clamp(
+                            max=int(round(goal_clamp.time_max * motion_fps)))
 
                 _cuda_synchronize(str(cfg.device))
                 infer_start = time.perf_counter()
@@ -658,7 +709,8 @@ def main(cfg: DictConfig) -> None:
                         "plan={} state={} motion={} frames infer={:.1f} ms "
                         "(avg20={:.1f} ms) "
                         "history={} tracked_plan={} frame={} shift={:.3f} m "
-                        "seam=({:.4f} m, {:.2f} deg, {:.4f} rad)",
+                        "seam=({:.4f} m, {:.2f} deg, {:.4f} rad) "
+                        "goal_r=({:.3f}->{:.3f}) m",
                         published_seq, state_seq, motion.num_frames, infer_ms, avg_ms,
                         "generated" if using_generated_history else "controller",
                         (latest_state.tracked_plan_seq
@@ -666,7 +718,8 @@ def main(cfg: DictConfig) -> None:
                         tracked_frame if tracked_frame is not None else -1,
                         (float(torch.linalg.vector_norm(history_translation))
                          if history_translation is not None else 0.0),
-                        seam_root_error, seam_root_angle_deg, seam_joint_error)
+                        seam_root_error, seam_root_angle_deg, seam_joint_error,
+                        _goal_r_world, _goal_r_ego)
             except Exception:
                 logger.exception("Failed to process controller state {}", state_seq)
 

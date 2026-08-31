@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from robotmdar.utils.goal import GoalEncoding, GoalType, build_ego_goal
+from robotmdar.utils.goal import GoalClamp, GoalEncoding, GoalType, build_ego_goal
 from robotmdar.dtype.motion import (
     G1_23DOF_FROM_29DOF_INDICES,
     G1_MUJOCO_DOF_JOINT_NAMES,
@@ -164,7 +164,9 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
             (1, history_len + 1, 2), dtype=torch.float32, device=device),
     }
     feature, abs_pose = motion_dict_to_feature_v3(motion_dict)
-    expected_nfeats = motion_feature_dim_for_dof(model_dof_dim)
+    expected_nfeats = motion_feature_dim_for_dof(
+        model_dof_dim, feature_version=3
+    )
     if feature.shape != (1, history_len, expected_nfeats):
         raise ValueError(
             f"Unexpected FeatureVersion 3 shape {tuple(feature.shape)}; "
@@ -205,6 +207,8 @@ def state_to_ego_goal(state_msg: Any,
                       goal_reference_path: str | Path | None = None,
                       goal_encoding: GoalEncoding | str | None = None,
                       goal_stats: dict | None = None,
+                      goal_clamp: GoalClamp | None = None,
+                      fps: float | None = None,
                       ) -> torch.Tensor:
     """Convert the root goal relative to the current history-feature pose."""
     reference_pos = torch.tensor(
@@ -217,7 +221,8 @@ def state_to_ego_goal(state_msg: Any,
     return state_goal_from_reference(
         state_msg, reference_pos, reference_rot, device,
         goal_type=goal_type, goal_reference_path=goal_reference_path,
-        goal_encoding=goal_encoding, goal_stats=goal_stats)
+        goal_encoding=goal_encoding, goal_stats=goal_stats,
+        goal_clamp=goal_clamp, fps=fps)
 
 
 def _state_field(state_msg: Any, name: str):
@@ -290,6 +295,8 @@ def state_goal_from_reference(state_msg: Any,
                               goal_reference_path: str | Path | None = None,
                               goal_encoding: GoalEncoding | str | None = None,
                               goal_stats: dict | None = None,
+                              goal_clamp: GoalClamp | None = None,
+                              fps: float | None = None,
                               ) -> torch.Tensor:
     """Convert the state goal relative to an explicit generated-history pose."""
     goal_type = GoalType.parse(goal_type)
@@ -441,7 +448,8 @@ def state_goal_from_reference(state_msg: Any,
         world_goal_keypoints=goal_keypoints_world,
         world_root_velocity=world_root_velocity, timestep=timestep,
         time_to_arrival_seconds=timestep,
-        world_goal_rot=world_goal_rot, world_goal_dof=world_goal_dof)
+        world_goal_rot=world_goal_rot, world_goal_dof=world_goal_dof,
+        fps=fps, goal_clamp=goal_clamp)
 
 
 def align_generated_history_pose(abs_pose: dict,
