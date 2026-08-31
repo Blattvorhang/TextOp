@@ -214,8 +214,8 @@ def load_bones_csv(csv_path: str) -> dict:
         / 100.0
     )  # cm → m
 
-    # Root rotation: Euler xyz (intrinsic) degrees → quaternion (xyzw scipy convention)
-    # Reference: gear_sonic/data_process/process_bones_to_motionlib.py uses "xyz" (intrinsic)
+    # Root rotation: Euler xyz (extrinsic) degrees → quaternion (xyzw scipy convention)
+    # SciPy convention: lowercase 'xyz' = extrinsic (R = Rz·Ry·Rx); uppercase = intrinsic.
     euler_deg = np.stack(
         [
             data["root_rotateX"].values,  # noqa: PD011
