@@ -25,6 +25,7 @@ from tqdm import tqdm
 # from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
 from robotmdar.utils.goal import (
+    GOAL_CLAMP_QUANTILE_LEVELS,
     GoalEncoding,
     GoalType,
     build_ego_split_goal,
@@ -651,13 +652,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'dof_dim': int(self.dof_dim),
         }
 
-    def _goal_stats_from_batch(self, batch_data: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def _goal_stats_from_batch(self, batch_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         pos_terms = []
         log_terms = []
         urgency_terms = []
         velocity_terms = []
         orientation_terms = []
         pose_terms = []
+        # Raw per-window clamp distribution: the ego goal XY radius at the
+        # window start (the goal as issued) and the implied speed r/T.
+        clamp_dist_terms = []
+        clamp_speed_terms = []
 
         for primitive in batch_data:
             goal = build_ego_split_goal(
@@ -681,6 +686,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             orientation_terms.append(orientation)
             pose_terms.append(pose)
             velocity_terms.append(velocity)
+
+            goal_root = goal.reshape(-1, SPLIT_GOAL_DIM)[0, 0:2]
+            goal_radius = torch.linalg.vector_norm(goal_root).reshape(1)
+            clamp_dist_terms.append(goal_radius)
+            clamp_speed_terms.append(goal_radius / max(
+                float(primitive['time_to_arrival']), 1.0 / float(self.fps)))
 
         if not pos_terms:
             raise ValueError("Unable to compute goal statistics from empty batch")
@@ -741,6 +752,20 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             velocity_p50, velocity_p99, orientation_p50, orientation_p99,
             pose_p50, pose_p99,
         )
+        clamp_dist = torch.cat(clamp_dist_terms, dim=0)
+        clamp_speed = torch.cat(clamp_speed_terms, dim=0)
+        clamp_levels = torch.as_tensor(GOAL_CLAMP_QUANTILE_LEVELS)
+        clamp_dist_quantiles = torch.quantile(clamp_dist, clamp_levels)
+        clamp_speed_quantiles = torch.quantile(clamp_speed, clamp_levels)
+        clamp_levels_percent = clamp_levels * 100.0
+        logger.info(
+            "Goal stats (split45) clamp distribution over {} windows: "
+            "dist quantiles {} m / speed quantiles {} m/s at percentiles {}",
+            int(clamp_dist.numel()),
+            [round(float(v), 3) for v in clamp_dist_quantiles],
+            [round(float(v), 3) for v in clamp_speed_quantiles],
+            [round(float(v), 1) for v in clamp_levels_percent],
+        )
         return {
             's_p': torch.as_tensor(float(s_p)),
             's_l': torch.as_tensor(float(s_l)),
@@ -748,10 +773,16 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             's_o': s_o.detach().cpu(),
             'q_mean': q_mean,
             'q_std': q_std,
+            'goal_clamp': {
+                'quantile_levels': [float(v) for v in clamp_levels_percent],
+                'dist_quantiles': [float(v) for v in clamp_dist_quantiles],
+                'speed_quantiles': [float(v) for v in clamp_speed_quantiles],
+                'n_samples': int(clamp_dist.numel()),
+            },
             'meta': self._goal_stats_meta(),
         }
 
-    def _compute_goal_stats(self) -> Dict[str, torch.Tensor]:
+    def _compute_goal_stats(self) -> Dict[str, Any]:
         if self.goal_type is not GoalType.JOINT_STATE:
             raise ValueError("goal statistics are only defined for joint_state goals")
         if self.goal_encoding is GoalEncoding.LEGACY40:
@@ -805,6 +836,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 logger.warning(
                     "Cached goal stats at {} do not match the active train "
                     "config; recomputing",
+                    goal_stats_path,
+                )
+                goal_stats = self._compute_goal_stats()
+                torch.save(goal_stats, goal_stats_path)
+            if self.split == 'train' and 'goal_clamp' not in goal_stats:
+                logger.warning(
+                    "Cached goal stats at {} predate the goal-clamp "
+                    "quantile tables; recomputing",
                     goal_stats_path,
                 )
                 goal_stats = self._compute_goal_stats()

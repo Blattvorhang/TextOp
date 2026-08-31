@@ -40,6 +40,7 @@ def main(cfg: DictConfig):
         "freq-dar": "eval.freq_dar",
         "export-dar": "export.export_dar_onnx",
         "noise-opt": "opt.noise_opt",
+        "refresh-goal-stats": "dataloader.refresh_goal_stats",
     }
 
     if task in task_modules:

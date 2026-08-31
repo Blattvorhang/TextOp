@@ -1,5 +1,6 @@
 """Goal condition building: goal type definitions, validation, and ego-centric goal transform."""
 
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,13 @@ JOINT_STATE_GOAL_DOF_DIM = 29
 JOINT_STATE_GOAL_DIM = 40
 SPLIT_GOAL_DIM = 45
 EXTENDED_BODY_GOAL_DIM = 21
+
+# Percentiles of the training goal distribution stored in goal_stats.pkl.
+# The dataset statistics pipeline quantizes the per-window ego goal distance
+# and implied speed (r / time_to_arrival) at these levels (fractions for
+# torch.quantile; stored in the pkl as percent). GoalClamp.from_stats
+# interpolates between them for the configured clamp percentile.
+GOAL_CLAMP_QUANTILE_LEVELS = (0.5, 0.8, 0.9, 0.95, 0.99, 0.995)
 
 
 class GoalType(str, Enum):
@@ -227,6 +235,164 @@ def _world_to_ego(world_delta: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
     return torch.stack((ego_x, ego_y, z), dim=-1)
 
 
+@dataclass(frozen=True)
+class GoalClamp:
+    """Clamp a controller goal into the training distribution envelope.
+
+    The XY radius bound scales with the arrival-time budget:
+
+        r_max(T) = clip(speed_max * clip(T, 1/fps, time_max), r_min, r_max)
+
+    x, y are scaled by r_max(T)/r when r exceeds the bound (direction is
+    preserved and z is untouched). Without an arrival time, the fixed
+    ``r_max`` cap applies. ``time_max=None`` leaves the upper time bound
+    unlimited. Units are meters, seconds and m/s.
+    """
+    speed_max: float
+    r_min: float = 0.0
+    r_max: float = float("inf")
+    time_max: Optional[float] = None
+
+    def __post_init__(self):
+        if not self.speed_max > 0:
+            raise ValueError(
+                f"goal_clamp.speed_max must be positive, got {self.speed_max}")
+        if not self.r_min >= 0:
+            raise ValueError(
+                f"goal_clamp.r_min must be >= 0, got {self.r_min}")
+        if not self.r_max >= self.r_min:
+            raise ValueError(
+                f"goal_clamp.r_max ({self.r_max}) must be >= r_min "
+                f"({self.r_min})")
+        if self.time_max is not None and not self.time_max > 0:
+            raise ValueError(
+                f"goal_clamp.time_max must be positive, got {self.time_max}")
+
+    @classmethod
+    def from_stats(
+        cls, goal_stats: dict, quantile: float
+    ) -> "GoalClamp":
+        """Derive the clamp envelope from the frozen dataset statistics.
+
+        ``goal_stats`` must carry the ``goal_clamp`` quantile tables written
+        by the dataset statistics pipeline (per-window ego goal distance and
+        implied speed r/T at GOAL_CLAMP_QUANTILE_LEVELS). ``quantile`` is the
+        percentile of the training distribution to admit (e.g. 99); values
+        between stored levels are linearly interpolated. The envelope is
+        fully derived: speed_max = speed quantile, r_max = distance
+        quantile, r_min = speed_max / fps (one-frame travel), and
+        time_max = future_len / fps (the training horizon).
+        """
+        meta = goal_stats.get("meta", {}) if goal_stats else {}
+        clamp_stats = (goal_stats or {}).get("goal_clamp")
+        if not clamp_stats:
+            raise ValueError(
+                "goal_stats carries no 'goal_clamp' quantile tables: the "
+                "cached statistics predate the data-driven goal clamp. "
+                "Recompute them with the refresh-goal-stats task and "
+                "re-deploy goal_stats.pkl next to the checkpoint.")
+        speed_max = _quantile_at(clamp_stats, "speed_quantiles", quantile)
+        r_max = _quantile_at(clamp_stats, "dist_quantiles", quantile)
+        fps = float(meta.get("fps", 0.0))
+        future_len = int(meta.get("future_len", 0))
+        if not fps > 0 or future_len <= 0:
+            raise ValueError(
+                "goal_stats meta lacks valid fps/future_len required by the "
+                f"goal clamp, got fps={fps!r} future_len={future_len!r}")
+        return cls(
+            speed_max=speed_max,
+            r_min=speed_max / fps,
+            r_max=r_max,
+            time_max=future_len / fps,
+        )
+
+
+def _quantile_at(clamp_stats: dict, key: str, level: float) -> float:
+    """Value at ``level`` (percent, 0-100) from a stored quantile table.
+
+    ``clamp_stats`` holds aligned ``quantile_levels`` and ``<key>`` lists.
+    Values between stored levels are linearly interpolated; levels outside
+    the stored range clamp to the endpoints.
+    """
+    levels = clamp_stats.get("quantile_levels")
+    values = clamp_stats.get(key)
+    if (not levels or not values or len(levels) != len(values)
+            or len(levels) < 2):
+        raise ValueError(
+            f"goal_stats['goal_clamp'] is corrupt: expected aligned "
+            f"'quantile_levels' and {key!r} tables")
+    if not 0.0 < level < 100.0:
+        raise ValueError(
+            f"goal clamp quantile must be in (0, 100), got {level}")
+    level = float(level)
+    lo_level, lo_value = float(levels[0]), float(values[0])
+    if level <= lo_level:
+        return lo_value
+    for i in range(1, len(levels)):
+        hi_level, hi_value = float(levels[i]), float(values[i])
+        if hi_level < lo_level:
+            raise ValueError(
+                "goal_stats['goal_clamp'] quantile_levels must be "
+                f"monotonically increasing, got {levels}")
+        if level <= hi_level:
+            frac = (level - lo_level) / (hi_level - lo_level)
+            return lo_value + frac * (hi_value - lo_value)
+        lo_level, lo_value = hi_level, hi_value
+    return float(values[-1])
+
+
+def _goal_time_budget(
+    time_to_arrival_seconds: torch.Tensor,
+    fps: float,
+    goal_clamp: Optional[GoalClamp] = None,
+) -> torch.Tensor:
+    """Arrival-time budget with the encoding's 1/fps floor and the optional
+    goal_clamp.time_max distribution cap."""
+    budget = torch.clamp(time_to_arrival_seconds, min=1.0 / float(fps))
+    if goal_clamp is not None and goal_clamp.time_max is not None:
+        budget = budget.clamp(max=goal_clamp.time_max)
+    return budget
+
+
+def _clamp_goal_root_xy(
+    ego_root: torch.Tensor,
+    time_to_arrival_seconds: Optional[torch.Tensor],
+    fps: Optional[float],
+    goal_clamp: GoalClamp,
+) -> torch.Tensor:
+    """Clamp the XY root offset into the GoalClamp radius envelope.
+
+    The radius bound scales with the arrival-time budget (see GoalClamp).
+    x, y are scaled proportionally so the goal direction is preserved and
+    z is untouched. With no arrival time, the fixed r_max cap applies.
+    """
+    if time_to_arrival_seconds is None:
+        radius_max = goal_clamp.r_max
+    else:
+        if fps is None or fps <= 0:
+            raise ValueError(
+                "fps is required to clamp a timed goal radius, got "
+                f"{fps!r}")
+        budget = _goal_time_budget(
+            time_to_arrival_seconds, fps, goal_clamp)
+        budget = budget.reshape(ego_root.shape[:-1])
+        radius_max = torch.clamp(
+            goal_clamp.speed_max * budget[..., None],
+            min=goal_clamp.r_min,
+            max=goal_clamp.r_max,
+        )
+    radius = torch.linalg.vector_norm(
+        ego_root[..., :2], dim=-1, keepdim=True)
+    scale = torch.where(
+        radius > radius_max,
+        radius_max / radius.clamp_min(1e-12),
+        torch.ones_like(radius),
+    )
+    clamped = ego_root.clone()
+    clamped[..., :2] = clamped[..., :2] * scale
+    return clamped
+
+
 def _require_shape(name: str, value: Optional[torch.Tensor],
                    expected_shape: tuple[int, ...]) -> torch.Tensor:
     if value is None:
@@ -260,6 +426,9 @@ def _build_ego_joint_state_components(
     world_root_velocity: torch.Tensor,
     reference_pos: torch.Tensor,
     reference_rot: torch.Tensor,
+    time_to_arrival_seconds: Optional[torch.Tensor] = None,
+    fps: Optional[float] = None,
+    goal_clamp: Optional[GoalClamp] = None,
 ):
     if world_goal_pos.shape[-1:] != (3,):
         raise ValueError(
@@ -309,6 +478,9 @@ def _build_ego_joint_state_components(
     current_yaw = quaternion_yaw(reference_rot)
 
     ego_root = _world_to_ego(world_goal_pos - reference_pos, current_yaw)
+    if goal_clamp is not None:
+        ego_root = _clamp_goal_root_xy(
+            ego_root, time_to_arrival_seconds, fps, goal_clamp)
     ego_velocity = _world_to_ego(world_root_velocity, current_yaw)
 
     zeros = torch.zeros_like(current_yaw)
@@ -339,6 +511,9 @@ def build_ego_joint_state_goal(
     world_root_velocity: torch.Tensor,
     reference_pos: torch.Tensor,
     reference_rot: torch.Tensor,
+    time_to_arrival_seconds: Optional[torch.Tensor] = None,
+    fps: Optional[float] = None,
+    goal_clamp: Optional[GoalClamp] = None,
 ) -> torch.Tensor:
     """Express a GT-frame 29-DOF goal state in the reference ego frame.
 
@@ -356,6 +531,9 @@ def build_ego_joint_state_goal(
             world_root_velocity=world_root_velocity,
             reference_pos=reference_pos,
             reference_rot=reference_rot,
+            time_to_arrival_seconds=time_to_arrival_seconds,
+            fps=fps,
+            goal_clamp=goal_clamp,
         )
     )
     return torch.cat(
@@ -371,6 +549,7 @@ def build_ego_split_goal(
     reference_rot: torch.Tensor,
     time_to_arrival_seconds: torch.Tensor,
     fps: float,
+    goal_clamp: Optional[GoalClamp] = None,
 ) -> torch.Tensor:
     """Express a GT-frame joint_state goal as the 45-D split feature vector."""
     if fps <= 0:
@@ -383,6 +562,9 @@ def build_ego_split_goal(
             world_root_velocity=world_root_velocity,
             reference_pos=reference_pos,
             reference_rot=reference_rot,
+            time_to_arrival_seconds=time_to_arrival_seconds,
+            fps=fps,
+            goal_clamp=goal_clamp,
         )
     )
     if time_to_arrival_seconds is None:
@@ -402,7 +584,10 @@ def build_ego_split_goal(
     root_xy = ego_root[..., :2]
     r_xy = torch.linalg.vector_norm(root_xy, dim=-1, keepdim=True)
     log_r_xy = torch.log1p(r_xy)
-    T_eff = torch.clamp(time_to_arrival_seconds, min=1.0 / float(fps))
+    # With a goal clamp the urgency budget is capped at time_max so the
+    # urgency magnitude stays inside the training speed envelope; without
+    # one this reduces to the plain 1/fps floor.
+    T_eff = _goal_time_budget(time_to_arrival_seconds, fps, goal_clamp)
     urgency = torch.where(
         time_to_arrival_seconds[..., None] > 0.0,
         ego_root / T_eff[..., None],
@@ -536,7 +721,8 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
                    timestep: Optional[torch.Tensor] = None,
                    time_to_arrival_seconds: Optional[torch.Tensor] = None,
                    world_goal_rot: Optional[torch.Tensor] = None,
-                   world_goal_dof: Optional[torch.Tensor] = None) -> torch.Tensor:
+                   world_goal_dof: Optional[torch.Tensor] = None,
+                   goal_clamp: Optional[GoalClamp] = None) -> torch.Tensor:
     """Express a world-space root or body goal in the local X-forward frame."""
     goal_type = GoalType.parse(goal_type)
     parsed_encoding = (
@@ -555,6 +741,11 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
                 world_root_velocity=world_root_velocity,
                 reference_pos=reference_pos,
                 reference_rot=reference_rot,
+                time_to_arrival_seconds=(
+                    time_to_arrival_seconds
+                    if time_to_arrival_seconds is not None else timestep),
+                fps=fps,
+                goal_clamp=goal_clamp,
             )
         if goal_stats is None:
             raise ValueError(
@@ -583,11 +774,15 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
             reference_rot=reference_rot,
             time_to_arrival_seconds=time_to_arrival_seconds,
             fps=resolved_fps,
+            goal_clamp=goal_clamp,
         )
         return scale_goal(split_goal, goal_stats)
 
     if goal_type is GoalType.ROOT:
         ego_root = _world_to_ego(world_goal_pos - reference_pos, current_yaw)
+        if goal_clamp is not None:
+            # ROOT has no arrival time, so the fixed r_max cap applies.
+            ego_root = _clamp_goal_root_xy(ego_root, None, fps, goal_clamp)
         delta_yaw = world_goal_yaw - current_yaw
         return torch.cat(
             (ego_root, torch.stack((torch.cos(delta_yaw), torch.sin(delta_yaw)),
@@ -637,6 +832,8 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
         )
 
     ego_root = _world_to_ego(world_goal_pos - reference_pos, current_yaw)
+    if goal_clamp is not None:
+        ego_root = _clamp_goal_root_xy(ego_root, timestep, fps, goal_clamp)
     delta_yaw = world_goal_yaw - current_yaw
     ego_yaw = torch.stack((torch.cos(delta_yaw), torch.sin(delta_yaw)), dim=-1)
     ego_velocity = _world_to_ego(world_root_velocity, current_yaw)

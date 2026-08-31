@@ -8,7 +8,7 @@ task: planner-dar
 # Let SONIC consume the complete generated segment before replacing it.
 # Resetting its frame-index cursor faster than the 8-frame / 50 Hz horizon
 # repeatedly discards most of every reference and destabilizes tracking.
-infer_period_ms: 800
+infer_period_ms: 500
 motion_fps: 50.0
 state_timeout_ms: 1
 log_every: 20
@@ -69,6 +69,23 @@ force_drop_goal_velocity: false
 
 # V6 arrival time is a separate positional encoding.
 force_drop_goal_time: false
+
+# Clamp the controller goal back into the training distribution before it is
+# encoded: r_max(T) = clip(speed_max * clip(T, 1/fps, time_max), r_min, r_max).
+# x, y are scaled proportionally when r exceeds the bound (direction preserved,
+# z untouched); the same time cap feeds the urgency channels and the arrival
+# PE. The envelope is DERIVED from the frozen goal_stats.pkl shipped with the
+# checkpoint (quantile tables of the per-window ego goal distance and implied
+# speed r/T): `quantile` is the training-distribution percentile to admit —
+# lower is stricter. Derived: speed_max = speed quantile, r_max = distance
+# quantile, r_min = speed_max/fps, time_max = future_len/fps. The stats must
+# be written by the current dataset statistics pipeline; older goal_stats.pkl
+# files without the quantile tables raise an error when enabled (refresh them
+# with the refresh-goal-stats task). Disable at runtime with
+# `goal_clamp_enabled=false` (or `goal_clamp=null`).
+goal_clamp_enabled: false
+goal_clamp:
+  quantile: 99
 
 # joint_state requires protocol-v5+ root pose, 29-DOF joint position, root
 # velocity, and timestamp. No FK keypoint reference is needed.
