@@ -25,6 +25,7 @@ from robotmdar.dtype.motion import (motion_dict_to_abs_pose, get_zero_abs_pose,
                                     get_zero_feature_v3)
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 from robotmdar.train.manager import DARManager
+from robotmdar.utils.dof_contract import configure_dof_contract
 import clip
 import torch_tensorrt
 
@@ -241,6 +242,7 @@ def display_statistics(timings: Dict[str, List[float]], total_time: float,
 
 def main(cfg: DictConfig):
     """Main function to run the frequency benchmark."""
+    configure_dof_contract(cfg)
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
 

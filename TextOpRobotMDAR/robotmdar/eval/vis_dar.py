@@ -18,6 +18,7 @@ from robotmdar.train.manager import DARManager
 from robotmdar.dtype.vis_mjc import VisState, get_keycb_fn, mjc_autoloop_mdar
 from robotmdar.dtype.motion import get_zero_feature_v3
 from robotmdar.eval.generate_dar import generate_next_motion
+from robotmdar.utils.dof_contract import configure_dof_contract
 
 
 def _time_to_arrival_frame(time_to_arrival: torch.Tensor,
@@ -169,6 +170,7 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
 
 
 def main(cfg: DictConfig):
+    configure_dof_contract(cfg)
     dtypelogger.set(cfg)
     seed.set(cfg.seed)
 

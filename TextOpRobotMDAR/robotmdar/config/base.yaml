@@ -13,6 +13,7 @@ expname: TEST
 task: ???
 seed: 0
 device: "cuda"
+feature_version: 3
 timestamp: ${now:%Y%m%d_%H%M%S}
 base_dir: ${hydra:runtime.cwd}/logs
 experiment_dir: ${base_dir}/${project_name}/${expname}/${task}-${timestamp}

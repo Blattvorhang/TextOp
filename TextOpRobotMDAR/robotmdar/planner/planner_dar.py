@@ -15,7 +15,8 @@ from omegaconf import DictConfig, OmegaConf
 from robotmdar.dtype import logger as dtype_logger
 from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
-from robotmdar.dtype.motion import FeatureVersion, infer_feature_v3_dof_dim
+import robotmdar.dtype.motion as motion_dtype
+from robotmdar.dtype.motion import infer_feature_v3_dof_dim
 from robotmdar.eval.generate_dar import generate_next_motion, encode_motion_lib_initial_noise
 from robotmdar.utils.dof_contract import (
     configure_dof_contract,
@@ -211,9 +212,9 @@ def main(cfg: DictConfig) -> None:
             "{} planner expects goal_keypoints_world from the controller; "
             "no reference pose is configured", goal_type.value)
 
-    if FeatureVersion != 3:
+    if motion_dtype.FeatureVersion != 3:
         raise ValueError(
-            f"planner_dar requires FeatureVersion 3, got {FeatureVersion}")
+            f"planner_dar requires FeatureVersion 3, got {motion_dtype.FeatureVersion}")
 
     _model_cfg_path, _model_cfg = _checkpoint_config(cfg)
     logger.info(

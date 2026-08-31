@@ -12,11 +12,10 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 import copy
 
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import (
-    FeatureVersion,
     G1_CORE_DOF_INDICES,
     G1_WRIST_DOF_INDICES,
-    get_zero_feature,
     perturb_feature_v3,
 )
 from robotmdar.dtype.rotation import rot6d_to_matrix, matrix_to_rot6d, quaternion_to_matrix, xyzw_to_wxyz
@@ -102,6 +101,7 @@ class BaseManager(ABC):
         self.extra['stage'] = self.stage_idx
         self.extra['scene_active'] = float(self.should_use_scene())
         self.extra['augmentation_active'] = float(self.should_use_augmentation())
+        self.extra['feature_version'] = float(motion_dtype.FeatureVersion)
 
         if not self._tqdm:
             self._tqdm = tqdm(total=self.max_steps, initial=self.step, ncols=120, desc="Training")
@@ -366,7 +366,7 @@ class BaseManager(ABC):
 
         # 2. 检查是否使用static pose
         if self.should_static_pose():
-            zero_feature = get_zero_feature(
+            zero_feature = motion_dtype.get_zero_feature(
                 self.dataset.dof_dim
             ).expand_as(history_motion).to(history_motion.device)
             # 添加扰动
@@ -588,6 +588,228 @@ class GeometryLoss:
 
         return terms, extras
 
+    def _feature_v6_components(self, motion_feature):
+        denorm = self.dataset.denormalize(motion_feature)
+        dof_dim = int(self.dataset.dof_dim)
+        gravity_raw = denorm[..., 1:4]
+        gravity = torch.nn.functional.normalize(gravity_raw, dim=-1, eps=1e-8)
+        delta_hor_raw = denorm[..., 4:7]
+        delta_hor = (
+            delta_hor_raw
+            - (delta_hor_raw * gravity).sum(dim=-1, keepdim=True) * gravity
+        )
+        rel_rot6d = denorm[..., 7:13]
+        rel_rot = rot6d_to_matrix(rel_rot6d)
+        return {
+            'denorm': denorm,
+            'height': denorm[..., 0],
+            'gravity_raw': gravity_raw,
+            'gravity': gravity,
+            'delta_hor_raw': delta_hor_raw,
+            'delta_hor': delta_hor,
+            'rel_rot6d': rel_rot6d,
+            'rel_rot': rel_rot,
+            'dof': denorm[..., 13:13 + dof_dim],
+        }
+
+    @staticmethod
+    def _transport_gravity(prev_g, rel_rot):
+        return torch.matmul(
+            rel_rot.transpose(-1, -2),
+            prev_g.unsqueeze(-1),
+        ).squeeze(-1)
+
+    @staticmethod
+    def _quat_chordal_loss(q_pred, q_gt):
+        pred_R = quaternion_to_matrix(xyzw_to_wxyz(q_pred))
+        gt_R = quaternion_to_matrix(xyzw_to_wxyz(q_gt))
+        return (pred_R - gt_R).square().sum(dim=(-1, -2)).mean()
+
+    def calc_geometry_loss_v6(
+        self,
+        future_motion_pred,
+        future_motion_gt,
+        history_motion=None,
+        smooth=False,
+        sliding_mask=None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Geometry losses for the gravity + relative-rotation v6 feature."""
+        terms = {}
+        extras = {}
+
+        if smooth and history_motion is not None:
+            motion_tensor = torch.cat([history_motion, future_motion_pred], dim=1)
+            diff = motion_tensor[:, 1:, :] - motion_tensor[:, :-1, :]
+            terms['smooth'] = torch.abs(diff).mean()
+
+        future_motion_pred_fk = self.dataset.reconstruct_motion(
+            future_motion_pred, need_denormalize=True, ret_fk=True
+        )
+        with torch.no_grad():
+            future_motion_gt_fk = self.dataset.reconstruct_motion(
+                future_motion_gt, need_denormalize=True, ret_fk=True,
+                sliding_mask=sliding_mask,
+            )
+
+        body_trans_loss = self.rec_criterion(
+            future_motion_pred_fk['global_translation_extend'],
+            future_motion_gt_fk['global_translation_extend'],
+        )
+        body_rot_loss = self._quat_chordal_loss(
+            future_motion_pred_fk['global_rotation'],
+            future_motion_gt_fk['global_rotation'],
+        )
+
+        dof_dim = int(self.dataset.dof_dim)
+        for label, fk_result in (
+            ('prediction', future_motion_pred_fk),
+            ('ground truth', future_motion_gt_fk),
+        ):
+            expected_shape = (*fk_result['dof_pos'].shape[:-1], dof_dim)
+            if tuple(fk_result['dof_pos'].shape) != expected_shape:
+                raise RuntimeError(
+                    f"{label} dof_pos must be [B, T, {dof_dim}], got "
+                    f"{tuple(fk_result['dof_pos'].shape)}"
+                )
+            if tuple(fk_result['dof_vel'].shape) != expected_shape:
+                raise RuntimeError(
+                    f"{label} dof_vel must match dof_pos shape "
+                    f"{expected_shape}, got {tuple(fk_result['dof_vel'].shape)}"
+                )
+        dof_pos_loss = self.rec_criterion(
+            future_motion_pred_fk['dof_pos'], future_motion_gt_fk['dof_pos']
+        )
+        dof_vel_loss = self.rec_criterion(
+            future_motion_pred_fk['dof_vel'], future_motion_gt_fk['dof_vel']
+        )
+
+        if dof_dim == 29:
+            core_ids = torch.as_tensor(
+                G1_CORE_DOF_INDICES,
+                device=future_motion_pred_fk['dof_pos'].device,
+            )
+            wrist_ids = torch.as_tensor(
+                G1_WRIST_DOF_INDICES,
+                device=future_motion_pred_fk['dof_pos'].device,
+            )
+            extras['dof_pos_core'] = self.rec_criterion(
+                future_motion_pred_fk['dof_pos'].index_select(-1, core_ids),
+                future_motion_gt_fk['dof_pos'].index_select(-1, core_ids),
+            )
+            extras['dof_pos_wrist'] = self.rec_criterion(
+                future_motion_pred_fk['dof_pos'].index_select(-1, wrist_ids),
+                future_motion_gt_fk['dof_pos'].index_select(-1, wrist_ids),
+            )
+            extras['dof_vel_core'] = self.rec_criterion(
+                future_motion_pred_fk['dof_vel'].index_select(-1, core_ids),
+                future_motion_gt_fk['dof_vel'].index_select(-1, core_ids),
+            )
+            extras['dof_vel_wrist'] = self.rec_criterion(
+                future_motion_pred_fk['dof_vel'].index_select(-1, wrist_ids),
+                future_motion_gt_fk['dof_vel'].index_select(-1, wrist_ids),
+            )
+
+        extras['hand_translation'] = self.rec_criterion(
+            future_motion_pred_fk['global_translation_extend'][
+                :, :, self.dataset.skeleton.hand_id, :
+            ],
+            future_motion_gt_fk['global_translation_extend'][
+                :, :, self.dataset.skeleton.hand_id, :
+            ],
+        )
+
+        foot_trans_pred = future_motion_pred_fk['global_translation_extend'][
+            :, :, self.dataset.skeleton.foot_id, :
+        ]
+        foot_contact_loss = self.calc_foot_sliding_loss(
+            foot_trans_pred,
+            future_motion_gt_fk['contact_mask'],
+            fps=self.dataset.fps,
+            sliding_mask=future_motion_gt_fk.get('sliding_mask'),
+        )
+        extras['sliding_ratio'] = self.calc_sliding_ratio(
+            future_motion_gt_fk['contact_mask'],
+            future_motion_gt_fk.get('sliding_mask'),
+        )
+
+        pred = self._feature_v6_components(future_motion_pred)
+        with torch.no_grad():
+            gt = self._feature_v6_components(future_motion_gt)
+
+        terms['rot_chord'] = (
+            pred['rel_rot'] - gt['rel_rot']
+        ).square().sum(dim=(-1, -2)).mean()
+
+        zero = future_motion_pred.sum() * 0.0
+        residuals = []
+        if history_motion is not None:
+            hist = self._feature_v6_components(history_motion[:, -1:])
+            boundary = (
+                pred['gravity'][:, 0]
+                - self._transport_gravity(hist['gravity'][:, 0], hist['rel_rot'][:, 0])
+            )
+            residuals.append(boundary.unsqueeze(1))
+            extras['e_g_boundary'] = boundary.norm(dim=-1).mean()
+        if pred['gravity'].shape[1] > 1:
+            interior = (
+                pred['gravity'][:, 1:]
+                - self._transport_gravity(
+                    pred['gravity'][:, :-1],
+                    pred['rel_rot'][:, :-1],
+                )
+            )
+            residuals.append(interior)
+            extras['e_g_cons'] = interior.norm(dim=-1).mean()
+        else:
+            extras['e_g_cons'] = zero
+        terms['g_cons'] = (
+            torch.cat(residuals, dim=1).square().sum(dim=-1).mean()
+            if residuals else zero
+        )
+
+        if pred['height'].shape[1] > 1:
+            fps = float(self.dataset.fps)
+            pred_h_vel = (pred['height'][:, 1:] - pred['height'][:, :-1]) * fps
+            gt_h_vel = (gt['height'][:, 1:] - gt['height'][:, :-1]) * fps
+            terms['h_vel'] = self.rec_criterion(pred_h_vel, gt_h_vel)
+            extras['e_h_vel'] = (pred_h_vel - gt_h_vel).abs().mean()
+
+            pred_q_vel = (pred['dof'][:, 1:] - pred['dof'][:, :-1]) * fps
+            gt_q_vel = (gt['dof'][:, 1:] - gt['dof'][:, :-1]) * fps
+            extras['e_q_vel'] = (pred_q_vel - gt_q_vel).norm(dim=-1).mean()
+        else:
+            terms['h_vel'] = zero
+            extras['e_h_vel'] = zero
+            extras['e_q_vel'] = zero
+
+        extras['e_g_proj'] = (
+            pred['gravity_raw'] - pred['gravity']
+        ).norm(dim=-1).mean()
+        extras['e_R_proj'] = (
+            pred['rel_rot6d'] - matrix_to_rot6d(pred['rel_rot'])
+        ).norm(dim=-1).mean()
+        extras['e_p_proj'] = (
+            pred['delta_hor_raw'] * pred['gravity']
+        ).sum(dim=-1).abs().mean()
+
+        endpoint_xy_loss = self.rec_criterion(
+            future_motion_pred_fk['global_translation_extend'][:, -1, 0, :2],
+            future_motion_gt_fk['global_translation_extend'][:, -1, 0, :2],
+        )
+        extras['endpoint_xy'] = endpoint_xy_loss
+        extras['e_R_endpoint'] = self._quat_chordal_loss(
+            future_motion_pred_fk['global_rotation'][:, -1:, 0],
+            future_motion_gt_fk['global_rotation'][:, -1:, 0],
+        )
+
+        terms['body_trans'] = body_trans_loss
+        terms['body_rot'] = body_rot_loss
+        terms['dof_pos'] = dof_pos_loss
+        terms['dof_vel'] = dof_vel_loss
+        terms['foot_contact'] = foot_contact_loss
+
+        return terms, extras
+
     def calc_geometry_loss_v2(self,
                               future_motion_pred,
                               future_motion_gt,
@@ -768,23 +990,31 @@ class MVAEManager(BaseManager, GeometryLoss):
         terms['kl'] = kl_loss
 
         # 使用继承的几何损失计算方法
-        if FeatureVersion == 4:
+        if motion_dtype.FeatureVersion == 4:
             geometry_terms, geometry_extras = self.calc_geometry_loss_v2(
                 future_motion_pred, future_motion_gt, history_motion
             )
-        elif FeatureVersion == 5:
+        elif motion_dtype.FeatureVersion == 5:
             geometry_terms, geometry_extras = self.calc_geometry_loss_v3(
                 future_motion_pred, future_motion_gt, history_motion,
                 sliding_mask=sliding_mask,
             )
+        elif motion_dtype.FeatureVersion == 6:
+            geometry_terms, geometry_extras = self.calc_geometry_loss_v6(
+                future_motion_pred,
+                future_motion_gt,
+                history_motion,
+                smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
+                sliding_mask=sliding_mask,
+            )
         else:
-            quantize = (self.loss_weight['quantize_rot'] > 0.0 or self.loss_weight['quantize_trans'] > 0.0)
-            endpoint = (self.loss_weight['endpoint_xy'] > 0.0 or self.loss_weight['endpoint_yaw'] > 0.0)
+            quantize = (self.loss_weight.get('quantize_rot', 0.0) > 0.0 or self.loss_weight.get('quantize_trans', 0.0) > 0.0)
+            endpoint = (self.loss_weight.get('endpoint_xy', 0.0) > 0.0 or self.loss_weight.get('endpoint_yaw', 0.0) > 0.0)
             geometry_terms, geometry_extras = self.calc_geometry_loss(
                 future_motion_pred,
                 future_motion_gt,
                 history_motion,
-                smooth=self.loss_weight['smooth'] > 0.0,
+                smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
                 quantize=quantize,
                 endpoint=endpoint,
                 sliding_mask=sliding_mask,
@@ -794,7 +1024,7 @@ class MVAEManager(BaseManager, GeometryLoss):
         terms.update(geometry_terms)
         extras.update(geometry_extras)
 
-        total_loss = sum(self.loss_weight[k] * v for k, v in terms.items())
+        total_loss = sum(self.loss_weight.get(k, 0.0) * v for k, v in terms.items())
         terms['total'] = total_loss
         return terms, extras
 
@@ -806,6 +1036,9 @@ class MVAEManager(BaseManager, GeometryLoss):
             'vae': self.vae.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'step': self.step,
+            'feature_version': motion_dtype.FeatureVersion,
+            'dof_dim': int(getattr(self.dataset, 'dof_dim', 29)),
+            'nfeats': int(getattr(self.dataset, 'nfeats', 69)),
         }
 
         # 保存EMA模型
@@ -818,6 +1051,12 @@ class MVAEManager(BaseManager, GeometryLoss):
 
     def load_model(self, ckpt_path: Path):
         state_dict = torch.load(ckpt_path)
+        ckpt_feature_version = state_dict.get('feature_version')
+        if ckpt_feature_version is not None and int(ckpt_feature_version) != motion_dtype.FeatureVersion:
+            raise ValueError(
+                f"Checkpoint FeatureVersion {ckpt_feature_version} does not "
+                f"match active FeatureVersion {motion_dtype.FeatureVersion}"
+            )
         self.vae.load_state_dict(state_dict['vae'])
         if self.optimizer is not None:
             self.optimizer.load_state_dict(state_dict['optimizer'])
@@ -920,6 +1159,12 @@ class DARManager(BaseManager, GeometryLoss):
     def _load_vae_from_checkpoint(self, ckpt_path: Path):
         """Load VAE from checkpoint following DART's approach"""
         checkpoint = torch.load(ckpt_path, map_location=self.device)
+        ckpt_feature_version = checkpoint.get('feature_version')
+        if ckpt_feature_version is not None and int(ckpt_feature_version) != motion_dtype.FeatureVersion:
+            raise ValueError(
+                f"VAE checkpoint FeatureVersion {ckpt_feature_version} does not "
+                f"match active FeatureVersion {motion_dtype.FeatureVersion}"
+            )
         vae_state_dict = checkpoint['vae']
 
         if 'latent_mean' not in vae_state_dict:
@@ -986,23 +1231,31 @@ class DARManager(BaseManager, GeometryLoss):
             terms['latent_rec'] = latent_rec_loss
 
         # 几何损失
-        if FeatureVersion == 4:
+        if motion_dtype.FeatureVersion == 4:
             geometry_terms, geometry_extras = self.calc_geometry_loss_v2(
                 future_motion_pred, future_motion_gt, history_motion
             )
-        elif FeatureVersion == 5:
+        elif motion_dtype.FeatureVersion == 5:
             geometry_terms, geometry_extras = self.calc_geometry_loss_v3(
                 future_motion_pred, future_motion_gt, history_motion,
                 sliding_mask=sliding_mask,
             )
+        elif motion_dtype.FeatureVersion == 6:
+            geometry_terms, geometry_extras = self.calc_geometry_loss_v6(
+                future_motion_pred,
+                future_motion_gt,
+                history_motion,
+                smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
+                sliding_mask=sliding_mask,
+            )
         else:
-            quantize = (self.loss_weight['quantize_rot'] > 0.0 or self.loss_weight['quantize_trans'] > 0.0)
-            endpoint = (self.loss_weight['endpoint_xy'] > 0.0 or self.loss_weight['endpoint_yaw'] > 0.0)
+            quantize = (self.loss_weight.get('quantize_rot', 0.0) > 0.0 or self.loss_weight.get('quantize_trans', 0.0) > 0.0)
+            endpoint = (self.loss_weight.get('endpoint_xy', 0.0) > 0.0 or self.loss_weight.get('endpoint_yaw', 0.0) > 0.0)
             geometry_terms, geometry_extras = self.calc_geometry_loss(
                 future_motion_pred,
                 future_motion_gt,
                 history_motion,
-                smooth=self.loss_weight['smooth'] > 0.0,
+                smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
                 quantize=quantize,
                 endpoint=endpoint,
                 sliding_mask=sliding_mask,
@@ -1248,7 +1501,7 @@ class DARManager(BaseManager, GeometryLoss):
 
     def root_trajectory_ego(self, future_motion_pred, history_motion):
         """Integrate root XY positions in the reference ego frame."""
-        if FeatureVersion != 3:
+        if motion_dtype.FeatureVersion != 3:
             raise NotImplementedError(
                 "root trajectory integration currently supports FeatureVersion 3 only"
             )
@@ -1294,7 +1547,7 @@ class DARManager(BaseManager, GeometryLoss):
             Tensor [B, history_len, 2] — ego XY positions of history
             frames.  The last frame (reference) is always (0, 0).
         """
-        if FeatureVersion != 3:
+        if motion_dtype.FeatureVersion != 3:
             raise NotImplementedError(
                 "history trajectory integration currently supports "
                 "FeatureVersion 3 only"
@@ -1360,6 +1613,9 @@ class DARManager(BaseManager, GeometryLoss):
             'denoiser': self.denoiser.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'step': self.step,
+            'feature_version': motion_dtype.FeatureVersion,
+            'dof_dim': int(getattr(self.dataset, 'dof_dim', 29)),
+            'nfeats': int(getattr(self.dataset, 'nfeats', 69)),
         }
 
         # 保存EMA模型
@@ -1405,6 +1661,12 @@ class DARManager(BaseManager, GeometryLoss):
 
     def load_model(self, ckpt_path: Path):
         state_dict = torch.load(ckpt_path, map_location=self.device)
+        ckpt_feature_version = state_dict.get('feature_version')
+        if ckpt_feature_version is not None and int(ckpt_feature_version) != motion_dtype.FeatureVersion:
+            raise ValueError(
+                f"DAR checkpoint FeatureVersion {ckpt_feature_version} does not "
+                f"match active FeatureVersion {motion_dtype.FeatureVersion}"
+            )
         denoiser_state, initialized_arrival = (
             self._fill_missing_arrival_embedder_state(
                 self.denoiser, state_dict['denoiser'], ckpt_path))

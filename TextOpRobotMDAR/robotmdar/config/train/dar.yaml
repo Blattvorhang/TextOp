@@ -54,6 +54,10 @@ manager:
     dof_delta: 1.0
     smooth: 0.0
 
+    rot_chord: 0.02
+    g_cons: 0.05
+    h_vel: 0.001
+
     quantize_rot: 0.0
     quantize_trans: 0.0
     

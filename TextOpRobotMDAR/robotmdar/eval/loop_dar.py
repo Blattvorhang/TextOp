@@ -40,12 +40,17 @@ from robotmdar.utils.planner_convert import (
 )
 from robotmdar.dtype import seed, logger as dtype_logger
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
-from robotmdar.dtype.motion import (G1_ROOT_HEIGHT, motion_dict_to_qpos,
-                                    get_zero_abs_pose, motion_dict_to_abs_pose,
-                                    get_zero_feature, FeatureVersion)
+import robotmdar.dtype.motion as motion_dtype
+from robotmdar.dtype.motion import (
+    G1_ROOT_HEIGHT,
+    get_zero_abs_pose,
+    motion_dict_to_abs_pose,
+    motion_dict_to_qpos,
+)
 from robotmdar.dtype.vis_mjc import mjc_load_everything
 from robotmdar.eval.generate_dar import generate_next_motion
 from robotmdar.train.manager import DARManager
+from robotmdar.utils.dof_contract import configure_dof_contract
 
 from robotmdar.wrapper.vae_decode import DecoderWrapper
 from robotmdar.dtype.debug import pdb_decorator
@@ -264,6 +269,7 @@ def _update_goal_vis(viewer, world_goal: list, goal_received: bool):
 
 @pdb_decorator
 def main(cfg: DictConfig):
+    configure_dof_contract(cfg)
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
     goal_encoding = GoalEncoding.parse(
@@ -332,14 +338,14 @@ def main(cfg: DictConfig):
     loop_state = LoopState()
 
     # Initialize motion generation state
-    if FeatureVersion == 4:
-        init_motion = get_zero_feature(val_data.skeleton)
+    if motion_dtype.FeatureVersion == 4:
+        init_motion = motion_dtype.get_zero_feature(val_data.skeleton)
         history_motion = val_data.normalize(
             init_motion.unsqueeze(0).expand(1, history_len, -1).to(cfg.device))
     else:
         history_motion = val_data.normalize(
-            get_zero_feature().unsqueeze(0).expand(1, history_len,
-                                                   -1).to(cfg.device))
+            motion_dtype.get_zero_feature().unsqueeze(0).expand(1, history_len,
+                                                                -1).to(cfg.device))
     abs_pose = get_zero_abs_pose((1, ), device=cfg.device)
 
     # Setup visualization with keyboard callback

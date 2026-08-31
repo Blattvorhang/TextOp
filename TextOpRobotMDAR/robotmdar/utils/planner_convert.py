@@ -164,7 +164,9 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
             (1, history_len + 1, 2), dtype=torch.float32, device=device),
     }
     feature, abs_pose = motion_dict_to_feature_v3(motion_dict)
-    expected_nfeats = motion_feature_dim_for_dof(model_dof_dim)
+    expected_nfeats = motion_feature_dim_for_dof(
+        model_dof_dim, feature_version=3
+    )
     if feature.shape != (1, history_len, expected_nfeats):
         raise ValueError(
             f"Unexpected FeatureVersion 3 shape {tuple(feature.shape)}; "

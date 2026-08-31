@@ -33,15 +33,12 @@ from robotmdar.utils.goal import (
     quaternion_yaw,
     validate_goal_stats,
 )
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import (
     AbsolutePose,
     G1_23DOF_FROM_29DOF_INDICES,
     MotionDict,
     MotionKeys,
-    infer_feature_v3_dof_dim,
-    motion_dict_to_feature,
-    motion_feature_dim_for_dof,
-    motion_feature_to_dict,
 )
 import json
 
@@ -97,11 +94,15 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         split: str = 'train',
         device: str = 'cuda',
         dof_dim: Optional[int] = None,
+        feature_version: Optional[int] = None,
         normalization_path: Optional[str] = None,
         load_goal_stats: bool = True,
+        std_floor: float = 0.0,
         **kwargs: Any
     ):
         super().__init__()
+        if feature_version is not None:
+            motion_dtype.set_feature_version(int(feature_version))
         # Store parameters
         self.batch_size = batch_size
         self.history_len = history_len
@@ -110,10 +111,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         self.nfeats = int(nfeats)
         self.dof_dim = (
-            infer_feature_v3_dof_dim(self.nfeats)
+            motion_dtype.infer_feature_dof_dim(self.nfeats)
             if dof_dim is None else int(dof_dim)
         )
-        expected_nfeats = motion_feature_dim_for_dof(self.dof_dim)
+        expected_nfeats = motion_dtype.motion_feature_dim_for_dof(self.dof_dim)
         if self.nfeats != expected_nfeats:
             raise ValueError(
                 f"dof_dim={self.dof_dim} requires nfeats={expected_nfeats}, "
@@ -185,6 +186,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.normalization_path = (
             Path(normalization_path) if normalization_path else None
         )
+        self.std_floor = float(std_floor)
         self.split = split
         self.device = "cpu"  # Keep embeddings on CPU initially
         self.sample_cache_size = max(0, int(kwargs.get('sample_cache_size', 8)))
@@ -416,6 +418,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self.statistics = yaml.safe_load(f)
         self.fps = self.statistics['fps']
         source_nfeats = int(self.statistics.get('nfeats', self.nfeats))
+        self.source_feature_version = int(
+            self.statistics.get('feature_version', 3)
+        )
         self.source_dof_dim = int(
             self.statistics.get('dof_dim', (source_nfeats - 11) // 2)
         )
@@ -484,7 +489,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
     def _augment_raw_motion(self, motion: Dict[str, torch.Tensor],
                             recovery: bool,
                             generator: Optional[torch.Generator]) -> bool:
-        """Perturb raw 29-DoF motion before FeatureVersion 3 extraction."""
+        """Perturb raw motion before FeatureVersion 3 extraction."""
+        if motion_dtype.FeatureVersion != 3:
+            return False
         augmentation_enabled = bool(getattr(self, 'augmentation_enabled', False))
         training_step = int(getattr(self, 'training_step', 0))
         augmentation_start_step = int(
@@ -594,7 +601,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         meanstd_cache_path = (
             self.normalization_path
             if self.normalization_path is not None
-            else self.datadir / 'meanstd.pkl'
+            else self._default_meanstd_path(weighted=False)
         )
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
@@ -610,14 +617,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             torch.save(meanstd, meanstd_cache_path)
             logger.info(f" Saved mean/std to {meanstd_cache_path}")
 
-        self.mean, self.std = meanstd
+        self._set_meanstd(meanstd, meanstd_cache_path)
 
     def _load_weighted_meanstd(self) -> None:
         """Load or compute mean/std for normalization"""
         meanstd_cache_path = (
             self.normalization_path
             if self.normalization_path is not None
-            else self.datadir / 'weighted_meanstd.pkl'
+            else self._default_meanstd_path(weighted=True)
         )
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
@@ -633,7 +640,28 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             torch.save(meanstd, meanstd_cache_path)
             logger.info(f" Saved mean/std to {meanstd_cache_path}")
 
-        self.mean, self.std = meanstd
+        self._set_meanstd(meanstd, meanstd_cache_path)
+
+    def _default_meanstd_path(self, weighted: bool) -> Path:
+        stem = 'weighted_meanstd' if weighted else 'meanstd'
+        if motion_dtype.FeatureVersion == 3:
+            return self.datadir / f'{stem}.pkl'
+        return self.datadir / (
+            f'{stem}_v{motion_dtype.FeatureVersion}_dof{self.dof_dim}.pkl'
+        )
+
+    def _set_meanstd(self, meanstd, source_path: Path) -> None:
+        mean, std = meanstd
+        if mean.shape[-1] != self.nfeats or std.shape[-1] != self.nfeats:
+            raise ValueError(
+                f"Mean/std at {source_path} has shape "
+                f"mean={tuple(mean.shape)}, std={tuple(std.shape)}; "
+                f"expected last dim {self.nfeats} for "
+                f"FeatureVersion {motion_dtype.FeatureVersion}"
+            )
+        if self.std_floor > 0.0:
+            std = torch.clamp(std, min=self.std_floor)
+        self.mean, self.std = mean, std
 
     def _goal_stats_meta(self) -> Dict[str, Any]:
         return {
@@ -907,7 +935,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 batch_end_idx = min(batch_start_idx + self.batch_size, len(primitive_dict['root_trans_offset']))
                 # breakpoint()
                 batch_primitive_dict = {key: primitive_dict[key][batch_start_idx:batch_end_idx] for key in MotionKeys}
-                motion_tensor = motion_dict_to_feature(batch_primitive_dict)[0]
+                motion_tensor = motion_dtype.motion_dict_to_feature(batch_primitive_dict, self.skeleton)[0]
                 all_mp_data.append(motion_tensor)
                 batch_start_idx = batch_end_idx
 
@@ -940,10 +968,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if need_denormalize:
             motion_feature = self.denormalize(motion_feature)
 
-        if motion_feature_to_dict.__name__ == 'motion_dict_to_feature_v4':
-            motion_dict = motion_feature_to_dict(motion_feature, abs_pose, self.skeleton)
-        else:
-            motion_dict = motion_feature_to_dict(motion_feature, abs_pose)
+        motion_dict = motion_dtype.motion_feature_to_dict(
+            motion_feature, abs_pose, self.skeleton
+        )
 
         if sliding_mask is not None:
             if sliding_mask.shape != motion_dict['contact_mask'].shape:
@@ -1317,7 +1344,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         for k in MotionKeys:
             motion_tensors[k] = torch.stack([m[k] for m in motion_batch])
 
-        motion_features, _ = motion_dict_to_feature(motion_tensors, self.skeleton)
+        motion_features, _ = motion_dtype.motion_dict_to_feature(motion_tensors, self.skeleton)
 
         return motion_features
 
