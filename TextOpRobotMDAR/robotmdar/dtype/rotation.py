@@ -183,7 +183,7 @@ def quat_to_angle_axis(q):
 @torch.jit.script
 def slerp(q0, q1, t):
     # type: (Tensor, Tensor, Tensor) -> Tensor
-    # 这个code对xyzw和wxyz都适用, 只要 q0和q1的顺序一致
+    # Works for both xyzw and wxyz as long as q0 and q1 use the same order
     cos_half_theta = torch.sum(q0 * q1, dim=-1)
 
     neg_mask = cos_half_theta < 0
@@ -569,53 +569,52 @@ def xyzw_to_wxyz(quat):
 def matrix_to_rot6d(matrix: torch.Tensor) -> torch.Tensor:
     """
     Convert rotation matrix to 6D rotation representation.
+
+    Convention: the 6D vector is the row-major flattening of the
+    first-two-COLUMNS submatrix, i.e. ``R[..., :, :2]`` flattened as
+    [r11, r12, r21, r22, r31, r32]. Equivalently, reshaping the 6D vector to
+    (..., 3, 2) yields the two rotation-matrix columns as its two columns.
+
     Args:
-        rotmat (B x T x 3 x 3): Batch of rotation matrices with temporal dimension.
+        matrix: Rotation matrices as tensor of shape (..., 3, 3).
     Returns:
-        6D Rotations (B x T x 6).
+        6D rotations as tensor of shape (..., 6).
     """
-    # 保存原始形状
-    original_shape = matrix.shape
-    batch_size, seq_len = original_shape[0], original_shape[1]
-    
-    # 重塑为 (B*T, 3, 3) 并取前两列
-    rotmat_flat = matrix.reshape(-1, 3, 3)
-    rot_6d_flat = rotmat_flat[:, :, :2]
-    
-    # 重塑为 (B*T, 6) 并恢复原始形状
-    rot_6d = rot_6d_flat.reshape(batch_size, seq_len, 6)
-    
-    return rot_6d
+    # Take the first two columns and flatten row-major: (..., 3, 2) -> (..., 6)
+    return matrix[..., :, :2].flatten(start_dim=-2)
 
 def rot6d_to_matrix(rot_6d: torch.Tensor) -> torch.Tensor:
     """
     Convert 6D rotation representation to 3x3 rotation matrix.
+
+    Inverse of :func:`matrix_to_rot6d` (same convention): the 6D vector
+    reshaped to (..., 3, 2) provides the first two columns, which are
+    orthonormalized by Gram-Schmidt, and the third column is their cross
+    product, so the result lies in SO(3) for any non-degenerate input.
+
     Reference: Zhou et al., "On the Continuity of Rotation Representations in Neural
     Networks", CVPR 2019
+
     Args:
-        rot_6d (B x T x 6): Batch of 6D Rotation representation with temporal dimension.
+        rot_6d: 6D rotations as tensor of shape (..., 6).
     Returns:
-        Rotation matrices (B x T x 3 x 3).
+        Rotation matrices as tensor of shape (..., 3, 3).
     """
-    # 保存原始形状
-    original_shape = rot_6d.shape
-    batch_size, seq_len = original_shape[0], original_shape[1]
-    
-    # 重塑为 (B*T, 3, 2) 进行处理
-    rot_6d_flat = rot_6d.reshape(-1, 3, 2)
-    a1 = rot_6d_flat[:, :, 0]
-    a2 = rot_6d_flat[:, :, 1]
-    
-    # Gram-Schmidt 过程
-    b1 = F.normalize(a1, dim=-1)
-    b2 = F.normalize(a2 - torch.einsum("bi,bi->b", b1, a2).unsqueeze(-1) * b1, dim=-1)
+    # 6D -> the two columns of (..., 3, 2), i.e. the first two matrix columns
+    a1 = rot_6d[..., 0::2]
+    a2 = rot_6d[..., 1::2]
+
+    # Gram-Schmidt orthonormalization of the columns.
+    # F.normalize divides by max(norm, eps): eps bounds the gradient (1/eps) and sets
+    # the recovery threshold; with any eps > 0 a zero vector yields 0, never NaN.
+    # 1e-8 suffices for FP32; raise to 1e-6 for AMP/fp16 training.
+    b1 = F.normalize(a1, dim=-1, eps=1e-8)
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = F.normalize(b2, dim=-1, eps=1e-8)
     b3 = torch.cross(b1, b2, dim=-1)
-    
-    # 组合旋转矩阵并恢复原始形状
-    rotmat_flat = torch.stack((b1, b2, b3), dim=-1)
-    rotmat = rotmat_flat.reshape(batch_size, seq_len, 3, 3)
-    
-    return rotmat
+
+    # The three orthonormal columns form the rotation matrix: (..., 3, 3)
+    return torch.stack((b1, b2, b3), dim=-1)
 
 def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
     """
