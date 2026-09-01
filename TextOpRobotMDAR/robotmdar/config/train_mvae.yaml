@@ -7,4 +7,5 @@ expname: VAE
 task: train-mvae
 
 data:
-  dof_dim: 23
+  dof_dim: 29
+  load_goal_stats: false

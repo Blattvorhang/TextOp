@@ -1065,6 +1065,8 @@ def main(cfg: DictConfig):
                 goal_velocity_condition_keep_mask=y.get(
                     'goal_velocity_condition_keep_mask'),
                 goal_time_frame=goal_time_frame,
+                action_label=batch[pidx].get('action_label'),
+                is_recovery=batch[pidx].get('is_recovery'),
             )
             loss = loss_dict['total']
 
@@ -1185,7 +1187,9 @@ def main(cfg: DictConfig):
                         goal_velocity_condition_keep_mask=y.get(
                             'goal_velocity_condition_keep_mask'),
                         goal_time_frame=goal_time_frame,
-                        is_eval=True)
+                        is_eval=True,
+                        action_label=batch[pidx].get('action_label'),
+                        is_recovery=batch[pidx].get('is_recovery'))
 
                     if getattr(manager, 'eval_full_sample', False):
                         sample_latent = diffusion.p_sample_loop(

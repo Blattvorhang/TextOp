@@ -22,6 +22,69 @@ from robotmdar.dtype.rotation import rot6d_to_matrix, matrix_to_rot6d, quaternio
 from robotmdar.utils.goal import JOINT_STATE_GOAL_DIM
 from isaac_utils.rotations import get_euler_xyz
 
+# Coarse motion classes for per-class diagnostics (doc §4.3.4/§4.3.6).
+# The dataset's verb vocabulary is small and fixed (see data/g1_textop_29dof
+# frame_ann); verbs outside these sets fall into 'unknown'.
+_FAST_LOCOMOTION_VERBS = frozenset({'jog', 'run', 'sprint', 'jump', 'sport'})
+_WALKING_SPEED_VERBS = frozenset(
+    {'walk', 'step_over', 'carry', 'turn', 'push', 'injured'})
+MOTION_CLASSES = ('walk', 'run', 'fall', 'getup', 'unknown')
+
+
+def _motion_class_labels(action_label, is_recovery=None) -> List[str]:
+    """Map per-sample BABEL verbs to coarse motion classes (doc §4.3.6).
+
+    ``is_recovery`` marks dataset recovery-boosted segments (get-up
+    dynamics), refining the get-up split regardless of the verb.
+    """
+    classes = []
+    for i, verb in enumerate(action_label):
+        if is_recovery is not None and bool(is_recovery[i]):
+            classes.append('getup')
+        else:
+            verb = str(verb).lower()
+            if verb == 'fall':
+                classes.append('fall')
+            elif verb in _FAST_LOCOMOTION_VERBS:
+                classes.append('run')
+            elif verb in _WALKING_SPEED_VERBS:
+                classes.append('walk')
+            else:
+                classes.append('unknown')
+    return classes
+
+
+def _add_per_class_extras(extras, action_label, is_recovery, per_sample):
+    """Log-only per-class masked means with a class suffix (doc §4.3.6).
+
+    Per-sample error tensors are detached first: these extras never add
+    graph nodes or gradient work (the cost is a handful of masked means
+    per batch). Classes absent from the batch simply get no tag for that
+    step.
+    """
+    if not per_sample:
+        return
+    values = [v for v in per_sample.values() if v is not None]
+    if not values:
+        return
+    labels = _motion_class_labels(action_label, is_recovery)
+    device = values[0].device
+    for key, err in per_sample.items():
+        if err is None:
+            continue
+        err = err.detach()  # [B]
+        if err.ndim != 1 or err.shape[0] != len(labels):
+            raise ValueError(
+                f'per-sample {key} must be [B] with B={len(labels)}, '
+                f'got {tuple(err.shape)}'
+            )
+        for cls in MOTION_CLASSES:
+            mask = torch.as_tensor(
+                [label == cls for label in labels],
+                dtype=torch.bool, device=device)
+            if mask.any():
+                extras[f'{key}__{cls}'] = err[mask].mean()
+
 
 class BaseManager(ABC):
     """
@@ -632,6 +695,8 @@ class GeometryLoss:
         history_motion=None,
         smooth=False,
         sliding_mask=None,
+        action_label=None,
+        is_recovery=None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Geometry losses for the gravity + relative-rotation v6 feature."""
         terms = {}
@@ -746,10 +811,11 @@ class GeometryLoss:
             hist = self._feature_v6_components(history_motion[:, -1:])
             boundary = (
                 pred['gravity'][:, 0]
-                - self._transport_gravity(hist['gravity'][:, 0], hist['rel_rot'][:, 0])
+                - self._transport_gravity(hist['gravity'][:, 0], pred['rel_rot'][:, 0])
             )
             residuals.append(boundary.unsqueeze(1))
             extras['e_g_boundary'] = boundary.norm(dim=-1).mean()
+        per_sample = {}
         if pred['gravity'].shape[1] > 1:
             interior = (
                 pred['gravity'][:, 1:]
@@ -759,7 +825,9 @@ class GeometryLoss:
                 )
             )
             residuals.append(interior)
-            extras['e_g_cons'] = interior.norm(dim=-1).mean()
+            interior_norm = interior.norm(dim=-1)  # [B, T-1]
+            extras['e_g_cons'] = interior_norm.mean()
+            per_sample['e_g_cons'] = interior_norm.mean(dim=1)  # [B]
         else:
             extras['e_g_cons'] = zero
         terms['g_cons'] = (
@@ -772,11 +840,16 @@ class GeometryLoss:
             pred_h_vel = (pred['height'][:, 1:] - pred['height'][:, :-1]) * fps
             gt_h_vel = (gt['height'][:, 1:] - gt['height'][:, :-1]) * fps
             terms['h_vel'] = self.rec_criterion(pred_h_vel, gt_h_vel)
-            extras['e_h_vel'] = (pred_h_vel - gt_h_vel).abs().mean()
+            per_h = (pred_h_vel - gt_h_vel).abs().mean(dim=1)  # [B]
+            extras['e_h_vel'] = per_h.mean()
 
             pred_q_vel = (pred['dof'][:, 1:] - pred['dof'][:, :-1]) * fps
             gt_q_vel = (gt['dof'][:, 1:] - gt['dof'][:, :-1]) * fps
-            extras['e_q_vel'] = (pred_q_vel - gt_q_vel).norm(dim=-1).mean()
+            per_q = (pred_q_vel - gt_q_vel).norm(dim=-1).mean(dim=1)  # [B]
+            extras['e_q_vel'] = per_q.mean()
+
+            per_sample['e_h_vel'] = per_h
+            per_sample['e_q_vel'] = per_q
         else:
             terms['h_vel'] = zero
             extras['e_h_vel'] = zero
@@ -788,8 +861,18 @@ class GeometryLoss:
         extras['e_R_proj'] = (
             pred['rel_rot6d'] - matrix_to_rot6d(pred['rel_rot'])
         ).norm(dim=-1).mean()
+        if history_motion is not None:
+            dep_gravity = torch.cat(
+                [hist['gravity'][:, -1:], pred['gravity'][:, :-1]],
+                dim=1,
+            )
+        else:
+            dep_gravity = torch.cat(
+                [pred['gravity'][:, :1], pred['gravity'][:, :-1]],
+                dim=1,
+            )
         extras['e_p_proj'] = (
-            pred['delta_hor_raw'] * pred['gravity']
+            pred['delta_hor_raw'] * dep_gravity
         ).sum(dim=-1).abs().mean()
 
         endpoint_xy_loss = self.rec_criterion(
@@ -801,6 +884,10 @@ class GeometryLoss:
             future_motion_pred_fk['global_rotation'][:, -1:, 0],
             future_motion_gt_fk['global_rotation'][:, -1:, 0],
         )
+
+        if action_label is not None:
+            _add_per_class_extras(
+                extras, action_label, is_recovery, per_sample)
 
         terms['body_trans'] = body_trans_loss
         terms['body_rot'] = body_rot_loss
@@ -968,7 +1055,9 @@ class MVAEManager(BaseManager, GeometryLoss):
                   future_motion_pred,
                   dist,
                   history_motion=None,
-                  sliding_mask=None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+                  sliding_mask=None,
+                  action_label=None,
+                  is_recovery=None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         terms = {}
         extras = {}
 
@@ -1006,6 +1095,8 @@ class MVAEManager(BaseManager, GeometryLoss):
                 history_motion,
                 smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
                 sliding_mask=sliding_mask,
+                action_label=action_label,
+                is_recovery=is_recovery,
             )
         else:
             quantize = (self.loss_weight.get('quantize_rot', 0.0) > 0.0 or self.loss_weight.get('quantize_trans', 0.0) > 0.0)
@@ -1202,6 +1293,8 @@ class DARManager(BaseManager, GeometryLoss):
         goal_velocity_condition_keep_mask=None,
         goal_time_frame=None,
         is_eval: bool = False,
+        action_label=None,
+        is_recovery=None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         terms = {}
         extras = {}
@@ -1247,6 +1340,8 @@ class DARManager(BaseManager, GeometryLoss):
                 history_motion,
                 smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
                 sliding_mask=sliding_mask,
+                action_label=action_label,
+                is_recovery=is_recovery,
             )
         else:
             quantize = (self.loss_weight.get('quantize_rot', 0.0) > 0.0 or self.loss_weight.get('quantize_trans', 0.0) > 0.0)

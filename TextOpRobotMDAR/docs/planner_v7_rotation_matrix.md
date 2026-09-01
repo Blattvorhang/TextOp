@@ -1,4 +1,4 @@
-# planner_v7: Rotation-Matrix Motion Representation (Drop RPY and redundant increments)
+# planner_v7: Rotation-Matrix Motion Representation (Drop RPY and redundant increments; arrival-state alignment)
 
 ## 1. Motivation
 
@@ -23,9 +23,18 @@ abandons RPY entirely**. In the same pass it removes the `Δq`/`Δh`
 increment channels that v3 carried but whose information is fully
 redundant given the authoritative absolute state (§2.6, §4).
 
+To serve the LDM goal interface, v7 also changes the feature's **time
+alignment** (§4): from the departure-state convention (state at `t` plus
+outgoing transition `t → t+1`) to the **arrival-state** convention
+(incoming transition `t−1 → t` plus state at `t`, backward differences).
+The final history feature then carries the current state `s_t` itself —
+the unique egocentric reference for all planner goals — so no separate
+current-state condition is needed (§2.8, §4, §7).
+
 **Naming note:** "v7" is the serial number of this *planner design doc* —
 the motion-feature version is a separate numbering, the `FeatureVersion`
-constant in `robotmdar/dtype/motion.py` (active value: 3). In code, 4 and 5
+constant in `robotmdar/dtype/motion.py` (active value: 6, set from
+`config/base.yaml`). In code, 4 and 5
 are already occupied by dead experiments (see §8), so the feature described
 here is introduced as **FeatureVersion 6**, not 7.
 
@@ -33,8 +42,9 @@ here is introduced as **FeatureVersion 6**, not 7.
 
 1. **No Euler angles, no yaw.** The feature contains no yaw channel and no
    trigonometric Euler encoding. Egocentric quantities are defined with
-   respect to the *current* root frame `E_t`, not with respect to a yaw-only
-   heading frame.
+   respect to root frames — `E_t` for the absolute-state channels and the
+   departure frame `E_{t−1}` for the incoming transition (§4) — not with
+   respect to a yaw-only heading frame.
 2. **Rotation is carried by a rotation matrix.** Throughout this doc the
    root orientation matrix denotes the rotation **from the ego frame to
    the world frame**:
@@ -80,15 +90,18 @@ here is introduced as **FeatureVersion 6**, not 7.
    freedom has no absolute channel: vertical position has `h_t` → no
    `Δh_t`; joint configuration has `q_t` → no `Δq_t`; the yaw-like
    rotational DoF has no absolute channel (`g_t` covers only 2 of 3
-   rotational DoF) → keep `^{E_t}R_{E_{t+1}}`; horizontal position is deliberately
-   removed (SE(2) invariance, principle 3) → keep `Δp_t^hor`. The result
+   rotational DoF) → keep `^{E_{t-1}}R_{E_t}`; horizontal position is deliberately
+   removed (SE(2) invariance, principle 3) → keep `Δp_{t-1}^hor`. The result
    is a minimal representation in which every transition channel
    transports a degree of freedom the absolute channels cannot observe.
+   Which channels stay absolute is decided by the gauge criterion
+   (principle 9); the time alignment of the transitions is the
+   arrival-state convention (principle 8).
 7. **State predicted once; dynamics derived, never re-predicted.** Every
    explicitly represented state or dynamic quantity enters the feature
    exactly once — with the single deliberate exception of the overlap
    between the absolute gravity tilt `g_t` and the full relative
-   rotation `^{E_t}R_{E_{t+1}}` (§4.1), which is enforced as
+   rotation `^{E_{t-1}}R_{E_t}` (§4.1), which is enforced as
    consistency rather than stored twice. Velocity- and
    acceleration-like quantities are derived deterministically from the
    authoritative state sequences at use time (`q̇ = 50(q_{t+1} − q_t)`,
@@ -96,6 +109,33 @@ here is introduced as **FeatureVersion 6**, not 7.
    dynamics supervision it incidentally carried — dynamics supervision
    moves to losses on the derived quantities (§4.3.5), not to extra
    channels.
+8. **Arrival-state time alignment (backward differences).** Feature `m_t`
+   carries the partial absolute state **at** `t` together with the
+   **incoming** transition `t−1 → t`. A history window of states
+   `s_{t−H:t}` therefore maps to features `m_{t−H+1:t}`: the final
+   history feature `m_t` makes the current state `s_t` directly
+   available to the planner, and every planner goal is expressed
+   relative to `s_t` — the unique egocentric reference frame `E_t` — so
+   no separate current-state conditioning input is needed. The earliest
+   raw state `s_{t−H}` is used only to construct `m_{t−H+1}` and is
+   intentionally discarded afterward: exact reconstruction of the
+   earliest historical state is neither required nor desired — the
+   representation preserves historical motion transitions while
+   anchoring the current state.
+9. **Absolute vs. relative: the gauge criterion.** Absolute channels are
+   used for locally observable, physically anchored quantities whose
+   magnitudes remain bounded over time (`h_t`, `g_t`, `q_t`, `c_t`);
+   relative channels are used for spatial degrees of freedom whose
+   absolute values depend on arbitrary global gauge choices (world
+   origin, global heading) or can grow unbounded with trajectory extent
+   (`Δp^hor`, `^{E_{t-1}}R_{E_t}`). This removes global SE(2) nuisance
+   variation while avoiding the long-horizon drift of pure integration:
+   an all-relative encoding must integrate to recover state and
+   accumulates error every step, so stable local anchors stay absolute;
+   an all-absolute encoding of global quantities forces the network to
+   model a gauge choice that carries no physical information, so those
+   become local changes. The absolute channels answer *where I am now*,
+   the transition channels answer *how I moved here* (§4).
 
 ## 3. Original v3 representation (code-verified)
 
@@ -149,13 +189,17 @@ $$
 \left[
 h_t,\,
 \mathbf g_t,\,
-{}^{E_t}\Delta\mathbf p_t^{\mathrm{hor}},\,
-\rho_6({}^{E_t}\mathbf R_{E_{t+1}}),\,
+{}^{E_{t-1}}\Delta\mathbf p_{t-1}^{\mathrm{hor}},\,
+\rho_6({}^{E_{t-1}}\mathbf R_{E_t}),\,
 \mathbf q_t,\,
 \mathbf c_t
 \right]
 }
 $$
+
+The absolute-state channels are indexed by their own frame `t`; the
+transition channels carry the **incoming** step `t−1 → t`, expressed in
+the departure frame `E_{t−1}` (arrival-state alignment, §2.8).
 
 **Gravity tilt.** `g = [0, 0, −1]^⊤` is the world gravity direction. Its
 expression in the current root frame,
@@ -168,10 +212,11 @@ is the root's tilt relative to gravity (a unit vector, 2 DoF). It replaces
 the roll/pitch sincos pair of v3 and is singularity-free for all
 orientations.
 
-**Relative rotation.** The frame-to-frame rotation is
+**Relative rotation.** The incoming frame-to-frame rotation (backward
+difference) is
 
 $$
-{}^{E_t}\mathbf R_{E_{t+1}} = \mathbf R_t^\top \mathbf R_{t+1},
+{}^{E_{t-1}}\mathbf R_{E_t} = \mathbf R_{t-1}^\top \mathbf R_t,
 $$
 
 encoded with the 6D rotation representation `ρ_6` (Zhou et al., 2019): the
@@ -183,47 +228,48 @@ canonical SO(3) object, and `ρ_6` is only the form in which rotations
 enter/leave the model. See §4.2 for the convention and implementation
 details.
 
-**Translation.** The full local increment is
+**Translation.** The full incoming local increment is
 
 $$
-{}^{E_t}\Delta\mathbf p_t = \mathbf R_t^\top ({}^{W}\mathbf p_{t+1} - {}^{W}\mathbf p_t).
+{}^{E_{t-1}}\Delta\mathbf p_{t-1} = \mathbf R_{t-1}^\top ({}^{W}\mathbf p_t - {}^{W}\mathbf p_{t-1}).
 $$
 
-Because `E_t` may be arbitrarily tilted, its three coordinates can no longer
+Because `E_{t−1}` may be arbitrarily tilted, its three coordinates can no
+longer
 be interpreted as x/y = horizontal, z = vertical. We therefore split it with
 the local gravity direction. Define the horizontal projector
 
 $$
-P_t^{\mathrm{hor}} = I - \mathbf g_t \mathbf g_t^\top
+P_{t-1}^{\mathrm{hor}} = I - \mathbf g_{t-1} \mathbf g_{t-1}^\top
 $$
 
 and decompose
 
 $$
-{}^{E_t}\Delta\mathbf p_t^{\mathrm{hor}} = (I - \mathbf g_t \mathbf g_t^\top)\,{}^{E_t}\Delta\mathbf p_t,
+{}^{E_{t-1}}\Delta\mathbf p_{t-1}^{\mathrm{hor}} = (I - \mathbf g_{t-1} \mathbf g_{t-1}^\top)\,{}^{E_{t-1}}\Delta\mathbf p_{t-1},
 \qquad
-g_t^\top \Delta\mathbf p_t^{\mathrm{hor}} = 0,
+g_{t-1}^\top \Delta\mathbf p_{t-1}^{\mathrm{hor}} = 0,
 $$
 
 a 2D tangent-plane vector embedded in `R^3` — **no tangent-plane basis is
 chosen**. The vertical increment is the scalar
 
 $$
-\Delta h_t = -\mathbf g_t^\top {}^{E_t}\Delta\mathbf p_t = h_{t+1} - h_t,
+\Delta h_{t-1} = -\mathbf g_{t-1}^\top {}^{E_{t-1}}\Delta\mathbf p_{t-1} = h_t - h_{t-1},
 $$
 
 which is **not stored as a channel**: it is derivable from the
 authoritative absolute heights of consecutive frames (with
-`^Wg = [0,0,−1]`, `−g^⊤(p_{t+1} − p_t) = (p_{t+1} − p_t)_z`). The full
+`^Wg = [0,0,−1]`, `−g^⊤(p_t − p_{t−1}) = (p_t − p_{t−1})_z`). The full
 displacement is recovered exactly:
 
 $$
-{}^{E_t}\Delta\mathbf p_t
+{}^{E_{t-1}}\Delta\mathbf p_{t-1}
 =
-{}^{E_t}\Delta\mathbf p_t^{\mathrm{hor}} - (h_{t+1} - h_t)\,\mathbf g_t,
+{}^{E_{t-1}}\Delta\mathbf p_{t-1}^{\mathrm{hor}} - (h_t - h_{t-1})\,\mathbf g_{t-1},
 $$
 
-so `Δp_t^hor` together with the absolute `h` sequence is
+so `Δp_{t−1}^hor` together with the absolute `h` sequence is
 information-equivalent to the original 3D increment, with the vertical
 part re-anchored to the authoritative heights.
 
@@ -249,7 +295,7 @@ two roles inherited from v3:
 $$
 \boxed{\text{absolute state: } (h_t,\; \mathbf g_t,\; \mathbf q_t,\; \mathbf c_t)}
 \qquad
-\boxed{\text{transition: } (^{E_t}\Delta\mathbf p_t^{\mathrm{hor}},\; {}^{E_t}\mathbf R_{E_{t+1}})}
+\boxed{\text{transition: } (^{E_{t-1}}\Delta\mathbf p_{t-1}^{\mathrm{hor}},\; {}^{E_{t-1}}\mathbf R_{E_t})}
 $$
 
 Reconstruction is therefore **neither pure integration nor pure per-frame
@@ -258,7 +304,40 @@ that integration accumulates, while the two increment channels transport
 exactly the degrees of freedom the absolute state cannot observe — the
 horizontal SE(2) position (principle 3) and the yaw-like rotational DoF
 (`g_t` covers only 2 of 3 rotational DoF, §2.6). At reconstruction the
-absolute state is **authoritative** (§4.1).
+absolute state is **authoritative** (§4.1). The absolute channels answer
+*where I am now*; the incoming transition answers *how I moved here*
+(§2.9).
+
+**Time alignment: arrival state (backward differences).** The absolute
+channels sit at the transition's *endpoint*: feature `m_t` bundles the
+incoming transition `t−1 → t` with the partial absolute state `s_t`.
+Contrast the earlier departure-state draft, `m_t = (s_t, t → t+1)`: there
+the last history feature stops one transition short of the current state —
+`{m_0, …, m_{t−1}}` does not determine `s_t`, so the planner would need a
+separate current-state condition or a one-frame-delayed goal reference.
+The arrival-state alignment removes that asymmetry. For a history window
+`s_{t−H:t}`, motion features are constructed as `m_{t−H+1:t}` using
+backward differences. Each feature `m_k` contains the partial absolute
+state at time `k` together with the incoming transition `k−1 → k`. The
+earliest raw state `s_{t−H}` is used only to construct `m_{t−H+1}` and is
+intentionally discarded afterward. Exact reconstruction of the earliest
+historical state is neither required nor desired; the representation is
+designed to preserve historical motion transitions while making the
+current state `s_t` directly available through the final feature `m_t`.
+All planner goals are therefore expressed relative to `s_t`, which serves
+as the unique egocentric reference state `E_t` — no separate current-state
+condition is needed (§2.8, §7). The future window is `m_{t+1:t+F}`: the
+first predicted feature describes the outgoing transition from the
+current state together with the arrival state `s_{t+1}`, which is exactly
+what the planner predicts — *given `s_t`, predict the next transition and
+the next state*.
+
+The alignment also completes the window endpoint: states `s_{0:T}`
+produce features `m_{1:T}`, and `m_T` carries the full authoritative
+state of `s_T` — the final state of a window is fully reconstructed
+(§4.1), where the departure-state draft left it unrecoverable. In one
+line: **history transitions explain how we arrived here; `m_t` tells us
+where we are now; the goal tells us where to go from here.**
 
 Because the dataset/control rate is fixed at **50 Hz**, the increment
 channels carry a fixed, known time scale (`Δt = 20 ms`), so no explicit
@@ -268,107 +347,118 @@ channels carry a fixed, known time scale (`Δt = 20 ms`), so no explicit
 downstream consumers are derived at use time, never stored:
 `q̇_t = 50(q̂_{t+1} − q̂_t)` from the authoritative `q` sequence,
 `v_t^vert = 50(ĥ_{t+1} − ĥ_t)` from the authoritative `h`, and
-`v_t^hor = 50·Δp̂_t^hor` from the horizontal increment — the only place
-horizontal velocity can come from, since absolute horizontal position is
-deliberately absent. (Hats mark denormalized — and, where applicable,
+`^{E_{t-1}}v̂^hor_{t-1→t} = 50·Δp̂^hor_{t-1}` from the horizontal
+increment channel — the velocity of the interval `[t−1, t]` in its
+departure frame `E_{t−1}` (the arrival-frame reading, if ever needed, is
+`^{E_t}v̂^{hor,in}_t = 50·(^{E_{t-1}}R̂_{E_t})^⊤ Δp̂^hor_{t-1}` — §4.6's
+goal velocity generalizes this to the full displacement) — the only
+place horizontal velocity can come from, since absolute horizontal
+position is deliberately absent. (Hats mark denormalized — and, where applicable,
 projected — predictions; notation in §4.3.1.) Two v3 conventions exist and are kept distinct:
 the Δ channels and the `dof_delta`-style consistency terms compare
 **raw per-frame differences** (no fps factor — the rate only enters
-implicitly through the fixed 50 Hz sampling), while the FK path and the
-controller divide the difference by `dt = 1/fps` to get true physical
-velocities
-([forward_kinematics.py:307-308](../../TextOpRobotMDAR/robotmdar/skeleton/forward_kinematics.py#L307-L308),
-[planner_convert.py:668-675](../../TextOpRobotMDAR/robotmdar/utils/planner_convert.py#L668-L675)).
-The `×50` quantities above follow the FK/controller convention (m/s and
+implicitly through the fixed 50 Hz sampling), while the FK path divides
+the difference by `dt = 1/fps` to get true physical velocities
+([forward_kinematics.py:307-308](../../TextOpRobotMDAR/robotmdar/skeleton/forward_kinematics.py#L307-L308)).
+The controller receives no TextOp-derived velocities at all: the plan
+payload is the authoritative state trajectory, and SONIC derives
+velocities with its own convention (§4.6).
+The `×50` quantities above follow the FK convention (m/s and
 rad/s); with no Δ channels left, the raw-difference convention survives
-only as the source of `v_t^hor`, the `Δp̂_t^hor` channel itself.
+only as the source of `^{E_{t-1}}v̂^hor_{t-1→t}`, the `Δp̂_{t-1}^hor`
+channel itself.
+All velocities of the reconstructed *state sequence* remain forward
+differences of that sequence (`q̂_{t+1} − q̂_t` etc.) — the feature's
+backward-difference alignment does not change them; only
+`^{E_{t-1}}v̂^hor_{t-1→t}` is read off the increment channel, which now
+carries the step `t−1 → t`.
 Supervision of these derived quantities is covered in §4.3.5.
 
 ### 4.1 Inverse algorithm (sketch): authoritative channels
 
-Given the initial pose `(p_init, R_init)` and the **denormalized**
-predicted features `{m̄_t}_{t=0..T−1}` (§4.3.1), first deterministically
-project: `ĝ_t`, `^{E_t}R̂_{E_{t+1}} = GS(r̄_t^6D)`, `Δp̂_t^hor` (the
-denormalized 6D slice `r̄_t^6D` encodes the relative rotation
-`^{E_t}R_{E_{t+1}}`, §4.2). Then:
+Given the initial pose `(p_0, R_0)` and the **denormalized**
+predicted features `{m̄_t}_{t=1..T}` (§4.3.1), first deterministically
+project: `ĝ_t`, `^{E_{t-1}}R̂_{E_t} = GS(r̄_t^6D)`, `Δp̂_{t-1}^hor` (the
+denormalized 6D slice `r̄_t^6D` encodes the incoming relative rotation
+`^{E_{t-1}}R_{E_t}`, §4.2). Then:
 
-**Role of the initial pose.** As in TextOp v3 (Algorithm 2), the
-supplied initial pose is **not** authoritative for degrees of freedom
-represented by absolute feature channels — it only fixes the *gauge
-freedoms intentionally absent from the representation*. The initial
-position supplies the global horizontal origin, while `ĥ_0` supplies
-the authoritative vertical position; the initial orientation supplies
-only the one-dimensional rotation about gravity that `ĝ_0` cannot
-determine, and its tilt is re-aligned to the authoritative `ĝ_0`
-**before** reconstruction begins. TextOp v3 does exactly this:
-`R_init` is used for `yaw_0` only, with roll/pitch overwritten by the
-feature; `p_init` keeps only its x/y, with z overwritten by `h_0`. The
-correspondence:
+**Role of the initial pose.** The supplied initial pose is the
+**complete initial state `s_0`**. No feature channels exist for frame 0
+— features start at `m_1` — so there is nothing to re-anchor: `(p_0,
+R_0)` supplies the root position and orientation of frame 0 outright,
+including its height and tilt, which the departure-state draft had
+overwritten with `ĥ_0`/`ĝ_0` from a feature `m_0` that no longer
+exists. Frame 0's joint configuration `q_0` and contact `c_0` are
+equally absent from the features: reconstruction produces states
+`1..T`, and the initial joint state is taken from the observed context
+alongside the initial pose by any consumer that needs it (evaluation
+geometry, controller warm-start) rather than reconstructed — the
+earliest state is context, not a prediction target (§2.8). The initial
+state's only role in the features is as the departure state of the
+first transition `m_1`. Compared with TextOp v3 (Algorithm 2), which
+uses the supplied pose only for the gauge freedoms and overwrites the
+rest from feature channels:
 
 | TextOp v3 | v7 |
 |---|---|
-| `p_init,xy` | initial horizontal gauge |
-| `h_0` (feature) | `ĥ_0`, authoritative height |
-| `yaw_init` | initial residual rotation about gravity |
-| roll/pitch (feature) | `ĝ_0`, authoritative tilt |
+| `p_init,xy` | `p_0` — the complete initial position (x/y **and** z) |
+| `h_0` (feature) | — (no feature: `(p_0)_z` is the authoritative initial height) |
+| `yaw_init` | `R_0` — the complete initial orientation (residual yaw **and** tilt) |
+| roll/pitch (feature) | — (no feature: `R_0`'s tilt is authoritative) |
 | `Δp^local` | `Δp̂^hor` |
-| `Δψ` | `^{E_t}R̂_{E_{t+1}}` |
+| `Δψ` | `^{E_{t-1}}R̂_{E_t}` |
 
-**Step 0 (re-anchor the initial state).** Compute
-`a_0 = R_init^⊤ g_W` and `b_0 = ĝ_0`; apply the minimal rotation
-`S_0` with `S_0^⊤ a_0 = b_0` — axis `b_0 × a_0`, angle
-`atan2(‖b_0 × a_0‖, b_0^⊤ a_0)` — and set `R_0 = R_init · S_0`, so
-that `R_0^⊤ g_W = ĝ_0` strictly. Position: `p_0 = p_init` with its
-gravity-normal component re-anchored to the authoritative `ĥ_0` — with
-`^Wg = [0,0,−1]` and ground at `z = 0`, simply `p_0[..., 2] = ĥ_0`;
-coordinate-free, the gravity-tangent (horizontal) part of `p_init` is
-preserved. For legal forward-encoded trajectories the re-anchor is the
-identity (`S_0 = I`, `ĥ_0 = (p_init)_z`), so round-trip exactness
-(§4.5) is unaffected; it only bites on inconsistent model output.
+There is no re-anchoring step: frame 0 has no feature channels, so the
+supplied initial pose is authoritative by construction, and for legal
+forward-encoded trajectories it is exactly the ground-truth initial
+state.
 
-Then for `t = 0..T−2`:
+Then for `t = 1..T`:
 
-1. `R'_{t+1} = R_t · ^{E_t}R̂_{E_{t+1}}` (integration);
-2. re-align `R'_{t+1}` to the **authoritative** tilt: with
-   `a = (R'_{t+1})^⊤ g` (integrated gravity) and `b = ĝ_{t+1}`
-   (authoritative gravity), apply the minimal rotation `S` mapping `b`
+1. `R'_t = R_{t−1} · ^{E_{t−1}}R̂_{E_t}` (integration);
+2. re-align `R'_t` to the **authoritative** tilt: with
+   `a = (R'_t)^⊤ g` (integrated gravity) and `b = ĝ_t`
+   (authoritative gravity, read from feature `t`), apply the minimal
+   rotation `S` mapping `b`
    onto `a` (axis `b × a`, angle `atan2(‖b × a‖, b^⊤ a)` — more
    stable than `acos`, see the fallback below) and set
-   `R_{t+1} = R'_{t+1} · S` — the gravity direction comes from the
+   `R_t = R'_t · S` — the gravity direction comes from the
    absolute channel, the remaining (yaw-like) DoF from integration.
-   Equivalently, `R_{t+1} = Π_{M(ĝ_{t+1})}(R'_{t+1})`, the projection
-   onto the fiber `M(g) = {R ∈ SO(3) : R^⊤ g_W = g}`. Step 0 above is
-   the same operation with `R_init` in the role of the provisional
-   orientation, so the whole trajectory obeys one principle:
+   Equivalently, `R_t = Π_{M(ĝ_t)}(R'_t)`, the projection
+   onto the fiber `M(g) = {R ∈ SO(3) : R^⊤ g_W = g}`. The supplied
+   `R_0` plays the role of the provisional orientation at the first
+   step (`t = 1`), so the whole trajectory obeys one principle:
 
    $$
    \boxed{\text{absolute gravity defines the fiber; initial/incremental rotation selects a member within it.}}
    $$
 
    The anti-parallel case uses the deterministic fallback below;
-3. `Δp_t = Δp̂_t^hor − (ĥ_{t+1} − ĥ_t)·ĝ_t` — the full increment in the ego
-   frame `E_t`; the vertical part comes from the authoritative heights of
+3. `Δp_{t−1} = Δp̂_{t−1}^hor − (ĥ_t − ĥ_{t−1})·ĝ_{t−1}` — the full increment in the ego
+   frame `E_{t−1}`; the vertical part comes from the authoritative heights of
    the two states being connected, not from any stored channel (§4).
    Integrate **in world coordinates**:
 
    $$
-   \boxed{{}^W p'_{t+1} = {}^W p'_t + R_t\,\left(\widehat{\Delta\mathbf p}_t^{\mathrm{hor}} - (\hat h_{t+1} - \hat h_t)\,\hat{\mathbf g}_t\right)}
+   \boxed{{}^W p'_t = {}^W p_{t−1} + R_{t−1}\,\left(\widehat{\Delta\mathbf p}_{t−1}^{\mathrm{hor}} - (\hat h_t - \hat h_{t−1})\,\hat{\mathbf g}_{t−1}\right)}
    $$
 
-   (the factor `R_t` is essential: the local vector must be rotated into
+   (the factor `R_{t−1}` is essential: the local vector must be rotated into
    the world frame before accumulation). Then re-anchor the result along
    the gravity direction so that its ground-relative height equals the
-   authoritative `ĥ_{t+1}` — the height of the state being constructed,
-   read from feature `t+1` (v3 precedent: Algorithm 2 anchors state `t`
-   to `h_t`; here the constructed state is `t+1`, so the anchor index
-   shifts by one). The re-anchoring also removes any residual vertical
-   component in `Δp̂_t^hor`. With the world convention `^Wg = [0,0,−1]`
-   and ground at `z = 0` this is simply `p'_{t+1}[..., 2] = ĥ_{t+1}`; the
+   authoritative `ĥ_t` — the height of the state being constructed,
+   read from feature `t`, the state's own feature index (the
+   departure-state draft had to read ahead to feature `t+1` and shift
+   the anchor index by one; the arrival-state alignment removes that
+   shift). The re-anchoring also removes any residual vertical
+   component in `Δp̂_{t−1}^hor`. With the world convention `^Wg = [0,0,−1]`
+   and ground at `z = 0` this is simply `p'_t[..., 2] = ĥ_t`; the
    method itself is defined by gravity, not by the world-axis convention.
-   For the last feature index `T−1` no displacement is computed: the
-   inverse produces states `1..T−1` only (endpoint semantics below), so
-   the loop runs over `t = 0..T−2` and `ĥ_{t+1}` is always available.
-4. `q̂_{t+1}`, `ĉ_{t+1}` read directly from feature `t+1` (denormalized;
+   The loop runs over `t = 1..T`: the last feature `m_T` reconstructs
+   the final state completely (endpoint semantics below), and at the
+   first step `ĥ_0 = (p_0)_z` comes from the supplied initial pose, so
+   `ĥ_{t−1}` is always available.
+4. `q̂_t`, `ĉ_t` read directly from feature `t` (denormalized;
    no projection — `q` is unconstrained continuous). `c` is read as
    **continuous contact scores**: the decoder regresses them like any
    other channel, and binarization (if a downstream consumer needs
@@ -387,8 +477,14 @@ normalize the axis reliably **and** `b^⊤ a ≈ −1`. Using a π-rotation
 while `b × a` is still resolvable would leave a residual gravity
 mismatch and break the strict `R_t^⊤ g_W = ĝ_t` guarantee. The
 `a ≈ −b` case can only arise from a model output that contradicts
-itself — at 50 Hz a true 180° frame-to-frame rotation is physically
-impossible, so legal features satisfy `a^⊤ b = 1` exactly. The absolute
+itself (or numerical corruption): for any legal forward-encoded
+trajectory `a = b` exactly up to numerical precision, **regardless of
+the physical magnitude of the frame-to-frame rotation** — no rate or
+small-angle assumption. Algebraically, `a = (R_{t−1}·^{E_{t−1}}R_{E_t})^⊤ g_W
+= (^{E_{t−1}}R_{E_t})^⊤ g_{t−1}`, and forward encoding satisfies
+`g_t = (^{E_{t−1}}R_{E_t})^⊤ g_{t−1}` by construction, so the integrated
+gravity and the authoritative gravity coincide (`a^⊤ b = 1`) even if a
+synthetic trajectory really did rotate 180° in one frame. The absolute
 channel still wins even here: any π-rotation about an axis `u ⊥ a` maps
 `a` onto `−a`, so the authoritative tilt is satisfied by a whole
 one-parameter family of `S`, and the fallback merely selects one member
@@ -428,42 +524,39 @@ the absolute channels re-anchor the trajectory wherever they are
 available.
 
 **Endpoint semantics.** States `t = 0..T` produce features
-`m_0..m_{T−1}` — frame `t` carries the absolute state at `t` plus the
-transition `t → t+1`. The inverse above therefore produces states
-`1..T−1` (plus the re-anchored initial state `0`, step 0); state `T` is **not produced
-at all**. This matches TextOp's Algorithm 2, which outputs states
-`0..T−1` from `T` features and never promises the `T`-th state. The
-final state's absolute channels `q_T` and `h_T` are unrecoverable: no
-feature carries them, and no increment channel exists to integrate
-toward them. `R_T` (and with it `g_T`) is recoverable from the last
-transition `^{E_{T−1}}R̂_{E_T}`, and `Δp̂_{T−1}^hor` carries the
-horizontal part of `p_T` — but its vertical part has no source.
-Precisely: the absolute state is authoritative **whenever an absolute
-channel is available** — every feature-indexed state `1..T−1`. This is
-harmless inside a fixed training window (the final state serves only
-as the endpoint of the last forward difference) and the LDM rollout
-re-anchors at the next window's history — but the inverse algorithm
-and the temporal-consistency sums must not implicitly assume an
-absolute anchor at the final index. Note also the deliberate
-asymmetry: the last transition channel gets reconstruction supervision
-(`L_rec` on `m_{T−1}`) but no reconstruction-geometry endpoint effect —
-this inherits TextOp's indexing exactly and is intentional, not an
-oversight.
+`m_1..m_T` — feature `t` carries the absolute state at `t` plus the
+incoming transition `t−1 → t`. The inverse above therefore produces
+**every** state `1..T`: the final feature `m_T` carries the full
+authoritative state of `s_T` (`h_T`, `g_T`, `q_T`, `c_T`), so the
+window endpoint is completely reconstructed — no state's absolute
+channels are unrecoverable. The only state not reconstructed from
+features is the initial state `0`, which is supplied as the initial
+pose and intentionally not recoverable from the features alone (§2.8).
+This is the mirror image of the departure-state draft, which
+reconstructed `1..T−1` and left `s_T` unrecoverable; it also stitches
+windows cleanly — the final state of window `k` serves as the initial
+pose of window `k+1`, so a rollout concatenates at the boundary with
+no re-anchoring. The inverse algorithm and the temporal-consistency
+sums can therefore rely on an absolute anchor at **every** feature
+index `1..T`. One deliberate asymmetry remains, at the other end: the
+initial pose receives no reconstruction supervision (`L_rec` on `m_1`
+supervises the transition that *uses* `s_0`, not `s_0` itself) — the
+initial state is observed context, not a prediction target.
 
 One asymmetry by design: there is **no absolute 3-DoF orientation
 channel** (yaw-free principle), so the yaw-like DoF is carried by
-`^{E_t}R̂_{E_{t+1}}` alone via integration; `g_t` anchors only the
+`^{E_{t−1}}R̂_{E_t}` alone via integration; `g_t` anchors only the
 2-DoF tilt (step 2). (`g_t` is a drift-correction anchor, not mere
 conditioning.)
 
 Internal redundancy (the one that remains): `g_t` is an absolute,
 drift-free 2-DoF tilt reference, while `R_t` is reconstructed by
-*integrating* `ρ_6`; consistency requires the transition to carry the
-authoritative gravity of frame `t` forward into frame `t+1`
-(`g_{t+1} = R_{t+1}^⊤ g_W = (^{E_t}R_{E_{t+1}})^⊤ R_t^⊤ g_W`):
+*integrating* `ρ_6`; consistency requires the incoming transition to
+transport the authoritative gravity of frame `t−1` forward into frame
+`t` (`g_t = R_t^⊤ g_W = (^{E_{t−1}}R_{E_t})^⊤ R_{t−1}^⊤ g_W`):
 
 $$
-\boxed{\mathbf g_{t+1} = \left({}^{E_t}\mathbf R_{E_{t+1}}\right)^\top \mathbf g_t}
+\boxed{\mathbf g_t = \left({}^{E_{t-1}}\mathbf R_{E_t}\right)^\top \mathbf g_{t-1}}
 $$
 
 Every other redundancy was removed by design: the `q_t`/`Δq_t` pair
@@ -606,7 +699,7 @@ term §4.3.2, the consistency term, and the use-time reconstruction).
 **normalized** feature space — the only object `L_rec` ever sees;
 `m̄_t` is its **denormalized** slice (per-channel inverse mean/std);
 `x̂_t` is the **denormalized + projected** legal quantity (`ĝ_t`,
-`^{E_t}R̂_{E_{t+1}}`, `Δp̂_t^hor`); for channels without a projection (`h`, `q`,
+`^{E_{t-1}}R̂_{E_t}`, `Δp̂_{t-1}^hor`); for channels without a projection (`h`, `q`,
 `c`) the hat marks the denormalized prediction only. GT quantities are
 unadorned.
 
@@ -620,9 +713,9 @@ nonlinear, so they must see physical values (see §4.3.2). In this order:
 $$
 \boxed{\hat{\mathbf g}_t = \frac{\bar{\mathbf g}_t}{\|\bar{\mathbf g}_t\| + \epsilon}},
 \qquad
-\boxed{{}^{E_t}\hat{\mathbf R}_{E_{t+1}} = \mathrm{GS}(\bar{\mathbf r}_t^{\mathrm{6D}}) \in SO(3)},
+\boxed{{}^{E_{t-1}}\hat{\mathbf R}_{E_t} = \mathrm{GS}(\bar{\mathbf r}_t^{\mathrm{6D}}) \in SO(3)},
 \qquad
-\boxed{\widehat{\Delta\mathbf p}_t^{\mathrm{hor}} = (I - \hat{\mathbf g}_t \hat{\mathbf g}_t^\top)\,\overline{\Delta\mathbf p}_t^{\mathrm{hor}}}
+\boxed{\widehat{\Delta\mathbf p}_{t-1}^{\mathrm{hor}} = (I - \hat{\mathbf g}_{t-1} \hat{\mathbf g}_{t-1}^\top)\,\overline{\Delta\mathbf p}_{t-1}^{\mathrm{hor}}}
 $$
 
 so that
@@ -630,14 +723,23 @@ so that
 $$
 \|\hat{\mathbf g}_t\| = 1,
 \qquad
-{}^{E_t}\hat{\mathbf R}_{E_{t+1}} \in SO(3),
+{}^{E_{t-1}}\hat{\mathbf R}_{E_t} \in SO(3),
 \qquad
-\hat{\mathbf g}_t^\top \widehat{\Delta\mathbf p}_t^{\mathrm{hor}} = 0
+\hat{\mathbf g}_{t-1}^\top \widehat{\Delta\mathbf p}_{t-1}^{\mathrm{hor}} = 0
 $$
 
 hold **strictly** — they are not "learned" by the VAE. The horizontal
-projection uses the *projected* gravity `ĝ_t`, so `ĝ_t` must be projected
-first; `ε` is a numerical guard only (`F.normalize(..., eps=1e-8)`
+projection uses the *projected* gravity `ĝ_{t−1}` of the transition's
+departure frame, so the projection order is sequential **across
+tokens**: (1) project every `ĝ_t` (history and future); (2) Gram–Schmidt
+every 6D slice (per-token, independent); (3) project each incoming
+`Δp̄^hor` with the departure frame's gravity. The horizontal projection
+is therefore a cross-token operation — feature `m_t` carries `g_t`, not
+`g_{t−1}`. Boundary cases: for `m_1` the departure gravity is
+`g_0 = R_0^⊤ g_W`, computed from the supplied initial pose (§4.1); for
+the first predicted token `m_{t+1}` it is the history endpoint's `g_t`
+— the current state's tilt, measured (deployment) or GT (training),
+never a predicted quantity (§4.6). `ε` is a numerical guard only (`F.normalize(..., eps=1e-8)`
 implements exactly this division, matching the eps used in
 `rot6d_to_matrix`, §4.2). The 4.3.2 chordal term likewise operates on the
 projected `R̂` built from the denormalized 6D (§4.3.2), consistent with
@@ -660,11 +762,11 @@ $$
 and the projected matrix receives a small-weight chordal loss,
 
 $$
-{}^{E_t}\hat{\mathbf R}_{E_{t+1}} = \mathrm{GS}(\bar{\mathbf r}^{\mathrm{6D}}),
+{}^{E_{t-1}}\hat{\mathbf R}_{E_t} = \mathrm{GS}(\bar{\mathbf r}^{\mathrm{6D}}),
 \qquad
 \bar{\mathbf r}^{\mathrm{6D}} = \mathrm{denorm}(\tilde{\mathbf r}^{\mathrm{6D}}),
 \qquad
-L_{\mathrm{rot,chord}} = \|{}^{E_t}\hat{\mathbf R}_{E_{t+1}} - {}^{E_t}\mathbf R_{E_{t+1}}\|_F^2,
+L_{\mathrm{rot,chord}} = \|{}^{E_{t-1}}\hat{\mathbf R}_{E_t} - {}^{E_{t-1}}\mathbf R_{E_t}\|_F^2,
 $$
 
 combined as
@@ -687,7 +789,7 @@ therefore redundant; only the chordal term needs to be added:
 
 ```python
 # the 6D channels are already supervised inside L_rec — no separate L_rot,6D
-# (code-level short names for ^{E_t}R_{E_{t+1}}: rel_rot / rel_rot_6d / pred_rel_R)
+# (code-level short names for ^{E_{t-1}}R_{E_t}: rel_rot / rel_rot_6d / pred_rel_R)
 rel_rot_6d = denormalize(rot6d_slice(model_output))    # per-channel inverse mean/std
 pred_rel_R = rot6d_to_matrix(rel_rot_6d)               # GS -> valid SO(3)
 loss_chordal = ((pred_rel_R - gt_rel_R) ** 2).sum(dim=(-1, -2)).mean()   # ||.||_F^2
@@ -696,7 +798,7 @@ loss_rot = lambda_chord * loss_chordal                 # lambda_chord << 1 (star
 
 **Denormalize before Gram–Schmidt.** GS must see the denormalized 6D
 vector, not the normalized feature. At 50 Hz the relative rotation
-`^{E_t}R_{E_{t+1}}` is close to the identity, so the per-channel means are
+`^{E_{t-1}}R_{E_t}` is close to the identity, so the per-channel means are
 far from zero (three channels ≈ 1, three ≈ 0); the per-channel affine
 normalization adds constant offsets that distort the column directions,
 and GS would orthonormalize the wrong columns. The chordal term must
@@ -729,11 +831,11 @@ term set and weights are listed in §7.
 A legal motion feature satisfies **one** temporal constraint:
 
 $$
-\boxed{\mathbf g_{t+1} = ({}^{E_t}\mathbf R_{E_{t+1}})^\top \mathbf g_t}
+\boxed{\mathbf g_t = ({}^{E_{t-1}}\mathbf R_{E_t})^\top \mathbf g_{t-1}}
 $$
 
 It is the SO(3) analogue of "absolute state advances by the local
-transition" and follows from `R_{t+1} = R_t · ^{E_t}R_{E_{t+1}}` and
+transition" and follows from `R_t = R_{t−1} · ^{E_{t−1}}R_{E_t}` and
 `g_t = R_t^⊤ g`. It is also the **only** constraint the representation
 can violate: the `q`/`h` self-consistency constraints of the earlier
 draft (`q_{t+1} = q_t + Δq_t`, `h_{t+1} = h_t + Δh_t`) disappeared
@@ -741,9 +843,9 @@ together with the `Δq`/`Δh` channels — with no increment channel there
 is no second estimate of the same quantity that could disagree. And it
 is the one redundancy that *cannot* be removed by pruning: the absolute
 channel `g_t` covers only 2 of the 3 rotational DoF while the
-transition `^{E_t}R_{E_{t+1}}` covers all 3 (§2.6), so the transition's
-rotation must transport the authoritative gravity of frame `t` forward
-into frame `t+1` (§4.1). The representation can therefore be summarized as:
+transition `^{E_{t−1}}R_{E_t}` covers all 3 (§2.6), so the incoming
+transition's rotation must transport the authoritative gravity of frame
+`t−1` forward into frame `t` (§4.1). The representation can therefore be summarized as:
 
 **absolute state + local transition + temporal self-consistency.**
 
@@ -760,7 +862,7 @@ code already follows it: its temporal-delta terms are computed on
 $$
 L_{\mathrm{temp}} = \lambda_g\, L_{g\mathrm{-cons}},
 \qquad
-L_{g\mathrm{-cons}} = \sum_t \left\| \hat{\mathbf g}_{t+1} - \left({}^{E_t}\hat{\mathbf R}_{E_{t+1}}\right)^\top \hat{\mathbf g}_t \right\|^2,
+L_{g\mathrm{-cons}} = \sum_t \left\| \hat{\mathbf g}_t - \left({}^{E_{t-1}}\hat{\mathbf R}_{E_t}\right)^\top \hat{\mathbf g}_{t-1} \right\|^2,
 $$
 
 with `λ_g = 0.05–0.1` (tune from the unweighted magnitude, not the
@@ -781,46 +883,80 @@ both sides predicted.
 temporal-delta pattern —
 `pred_motion_tensor = cat([history_motion[:, −1:], predictions])`
 ([manager.py:694](../../TextOpRobotMDAR/robotmdar/train/manager.py#L694))
-— the consistency sum includes one boundary pair at `H → F` (last
-history feature to first predicted feature). The last history feature
-`m_{H−1}` carries the observed transition `^{E_{H−1}}R_{E_H}` and the
-observed gravity `g_{H−1}` — denormalized GT, since history features
-are ground truth, not model output; their product
-`(^{E_{H−1}}R_{E_H})^⊤ g_{H−1}` equals the gravity of the current state
-`g_now` — an *observed* quantity at both
-training and inference (the current gravity is always measurable, and
-the history features are always real). The first predicted feature
-`m̂_H` carries the model's prediction `ĝ_H` for that same
-current-state gravity — the primitive window is `H` history features
-covering states `0..H`, so `m̂_H`'s absolute channels describe the
-current state itself (code-verified: the clean-history delta in
-[data.py:1099-1102](../../TextOpRobotMDAR/robotmdar/dataloader/data.py#L1099-L1102)
-is `q_now − q_{H−1}`, exactly the delta stored in `m_{H−1}`). The
+— the consistency sum includes one boundary pair between the last
+history feature and the first predicted feature. The last history
+feature `m_t` (history is `m_{t−H+1:t}`, covering states `t−H+1..t`)
+carries the observed current state `s_t` — its gravity `g_t` is an
+*observed* quantity at both training and inference (the current state
+is always measurable, and the history features are always real; under
+the arrival-state alignment the current state is never predicted — it
+sits in the history). The first predicted feature `m̂_{t+1}` carries
+the model's predictions for the outgoing transition
+`^{E_t}R̂_{E_{t+1}}` and the next state's gravity `ĝ_{t+1}`. The
 boundary pair is therefore:
 
 $$
 L_{g\mathrm{-cons}}^{\mathrm{boundary}}
 =
-\left\| \hat{\mathbf g}_H - \left({}^{E_{H-1}}\mathbf R_{E_H}\right)^\top \mathbf g_{H-1} \right\|^2
-=
-\left\| \hat{\mathbf g}_H - \mathbf g_{now} \right\|^2,
+\left\| \hat{\mathbf g}_{t+1} - \left({}^{E_t}\hat{\mathbf R}_{E_{t+1}}\right)^\top \mathbf g_t \right\|^2,
 $$
 
-comparing a prediction against an *observed* transition, in identical
-form at training and inference, for the VAE and the LDM planner alike.
-No masking or special convention is needed. (It also anchors the
-consistency sum at the window edge: the interior pairs are
-prediction-vs-prediction, so this is the only place where the
-consistency constraint touches observed data.)
+comparing the predicted next-state gravity against the gravity implied
+by the predicted outgoing transition applied to the *observed* current
+gravity — a prediction-vs-prediction consistency check anchored on
+observed data, in identical form at training and inference, for the
+VAE and the LDM planner alike. No masking or special convention is
+needed. (It also anchors the consistency sum at the window edge: the
+interior pairs are prediction-vs-prediction on both sides, so this is
+the only place where the consistency constraint touches observed
+data.)
+
+Under the arrival-state alignment the boundary pair's role shifts
+compared with the departure-state draft: there, the first predicted
+feature carried the current state itself, so the boundary pair was a
+direct prediction-vs-observation check on `ĝ_now`; here the current
+state is in the history (observed, never predicted), and the boundary
+pair instead checks that the first *predicted* step is consistent with
+the observed current gravity.
+
+**Seam velocity continuity (optional).** The gravity pair is the only
+seam constraint the representation strictly requires. Whether the
+predicted *outgoing* step should also continue the observed *arriving*
+velocity — the MPC initial-condition consistency — is a separate, soft
+design choice, deliberately not enforced as a hard projection: a new
+goal may legitimately demand immediate redirection (turn, stop) away
+from the current velocity. If seam smoothing proves necessary in
+deployment, add small-weight Huber terms comparing the first predicted
+feature against the observed last history feature. For the horizontal
+increment:
+
+$$
+{}^{E_t}\widehat{\Delta\mathbf p}_{t}^{\mathrm{hor}}
+\;\approx\;
+({}^{E_{t-1}}\mathbf R_{E_t})^\top\,
+{}^{E_{t-1}}\Delta\mathbf p_{t-1}^{\mathrm{hor}},
+$$
+
+the observed arriving increment rotated from `E_{t−1}` into `E_t` by the
+transpose of the observed last relative rotation; for joints and height
+use the derived-velocity form of §4.3.5 —
+`Huber(q̂_{t+1} − q_t, q_t − q_{t−1})`,
+`Huber(ĥ_{t+1} − h_t, h_t − h_{t−1})` — the authoritative sequences on
+both sides. In training the GT seam is always continuous (a window cut
+inside continuous motion), so `L_rec` already supervises this
+implicitly; the explicit term only hardens inference-time consistency.
+The observed last-history increment is also a target of the §7.5
+perturbation — if that perturbation is applied, the continuity target
+moves with it.
 
 Why keep the boundary pair at all, given that `L_rec` already
-supervises `ĝ_H` against the ground-truth `g_now` in normalized feature
-space? The boundary pair re-imposes the transport relation in physical
-units on the variables the inverse algorithm actually uses — it is the
-same rationale as the chordal term of §4.3.2: `L_rec` alone sees
-per-channel normalized numbers, while the boundary pair sees the
-projected, denormalized `ĝ_H` and the observed transition they must
-satisfy.
+supervises `ĝ_{t+1}` against the ground-truth `g_{t+1}` in normalized
+feature space? The boundary pair re-imposes the transport relation in
+physical units on the variables the inverse algorithm actually uses —
+it is the same rationale as the chordal term of §4.3.2: `L_rec` alone
+sees per-channel normalized numbers, while the boundary pair sees the
+projected, denormalized `ĝ_{t+1}`, the predicted transition and the
+observed current gravity they must satisfy.
 
 #### 4.3.4 Training diagnostics (log-only, not loss)
 
@@ -829,9 +965,9 @@ the total VAE loss. Consistency residuals (physical units, denormalized
 + projected variables):
 
 $$
-e_g^{\mathrm{cons}} = \| \hat{\mathbf g}_{t+1} - \left({}^{E_t}\hat{\mathbf R}_{E_{t+1}}\right)^\top\hat{\mathbf g}_t \|,
+e_g^{\mathrm{cons}} = \| \hat{\mathbf g}_t - \left({}^{E_{t-1}}\hat{\mathbf R}_{E_t}\right)^\top\hat{\mathbf g}_{t-1} \|,
 \qquad
-e_g^{\mathrm{boundary}} = \| \hat{\mathbf g}_H - \left({}^{E_{H-1}}\mathbf R_{E_H}\right)^\top \mathbf g_{H-1} \|,
+e_g^{\mathrm{boundary}} = \| \hat{\mathbf g}_{t+1} - \left({}^{E_t}\hat{\mathbf R}_{E_{t+1}}\right)^\top \mathbf g_t \|,
 $$
 
 (`e_g^boundary` additionally separates *where* the residual lives:
@@ -849,7 +985,7 @@ e_{p,\mathrm{proj}} = | \hat{\mathbf g}^\top \overline{\Delta\mathbf p}^{\mathrm
 $$
 
 (`e_p,proj` measures the residual vertical component of the denormalized
-`Δp̄_t^hor` — how far the raw displacement leaks out of the tangent
+`Δp̄_{t−1}^hor` — how far the raw displacement leaks out of the tangent
 plane. All three use denormalized inputs, per the notation of §4.3.1.)
 
 Expected behavior: as `L_rec` decreases, the projection corrections go
@@ -923,9 +1059,11 @@ convention the deleted channels used (§4).
 
 The same principle covers the other degrees of freedom:
 
-- **Horizontal**: `v_t^hor = 50·Δp̂_t^hor` — already supervised by
-  `L_rec` on the `Δp_t^hor` channel itself, because that channel *is*
-  the per-frame horizontal displacement (supervised in normalized space
+- **Horizontal**: `^{E_{t−1}}v̂^hor_{t−1→t} = 50·Δp̂^hor_{t−1}` — already
+  supervised by `L_rec` on the `Δp_{t−1}^hor` channel itself, because
+  that channel *is* the per-frame horizontal displacement of the step
+  arriving at `t`, expressed in its departure frame `E_{t−1}` (§4)
+  (supervised in normalized space
   as `Δp̃`, consumed in physical space as `Δp̂`; §4.3.1). No extra term
   needed.
 - **Vertical**: `v_t^vert = 50(ĥ_{t+1} − ĥ_t)` — a small physical-space
@@ -935,7 +1073,7 @@ The same principle covers the other degrees of freedom:
   supervision previously rode on the **vertical component of
   `Δp_t^local`** — v3's full 3-D local translation increment (v3 has no
   `Δh` channel; `Δh` existed only in the earlier 74-D draft). v7 keeps
-  only `Δp_t^hor`, so that supervision disappears and must be
+  only `Δp_{t−1}^hor`, so that supervision disappears and must be
   compensated here.
   Its weight follows the **same procedure** as `λ_dof_vel` — unweighted
   magnitude and gradient ratio against the `h` position supervision
@@ -1013,7 +1151,9 @@ set, one tag each, plus the global mean under the bare name):
 - `e_g_proj`, `e_R_proj`, `e_p_proj` (projection corrections);
 - `e_q_vel`, `e_h_vel` (derived-velocity errors);
 - `e_R_endpoint` — chordal endpoint orientation error on the last
-  **reconstructed** state (the inverse produces states `0..T−1`, §4.1),
+  **reconstructed** state (the inverse produces states `1..T`, so under
+  the arrival-state alignment the final state is fully reconstructed
+  with complete authoritative channels, §4.1),
   replacing `endpoint_yaw`.
 
 **Per-class reporting.** `e_q_vel`, `e_h_vel` (and `e_g_cons`, if it
@@ -1068,7 +1208,7 @@ at the true mean (`x − 1`) without dividing by a tiny std — it neither
 amplifies numerical/noise variation nor introduces an artificial DC
 offset, and the inverse normalization stays natural. `σ_min` is **not**
 fixed a priori: first inspect the per-dim std distribution of
-`ρ_6(R_t^⊤ R_{t+1})` at 50 Hz and pick the floor from the percentiles. The
+`ρ_6(R_{t−1}^⊤ R_t)` at 50 Hz and pick the floor from the percentiles. The
 std floor is a **numerical safeguard, not a feature-weighting device**;
 relative importance of rotation/translation/joint channels should be
 controlled explicitly by group loss weights. (The 6D identity layout
@@ -1088,13 +1228,16 @@ Two property tests on random GT trajectories must pass before VAE
 training starts:
 
 1. **Round-trip.** For random GT trajectories `X` (states `0..T`):
-   encode `m = F(X)`, decode `X' = I(m, (p_init, R_init))`, and check
+   encode `m = F(X)` (features `m_{1:T}`), decode
+   `X' = I(m, (p_0, R_0))`, and check
    `max|p − p'|`, `d_SO(3)(R_t, R'_t)` and `max|q − q'|` at
-   near-floating-point precision (≤ 1e-5) — **over states `0..T−1`
-   only**: the inverse produces `1..T−1` (plus the given initial `0`),
-   and state `T` has no absolute channels by design (endpoint
+   near-floating-point precision (≤ 1e-5) — **over states `1..T`
+   only**: the inverse reconstructs `1..T` from the supplied initial
+   pose, and state `0` has no feature channels by design — it is the
+   initial condition, not a reconstruction target (endpoint
    semantics, §4.1). The comparison window is the forward-encode window
-   minus its final state.
+   minus its initial state; the final state **is** covered — under the
+   arrival-state alignment the endpoint is complete.
 2. **Horizontal SE(2) invariance.** Apply a random horizontal world
    transform `R_t' = Rz(θ)·R_t`, `p_t' = Rz(θ)·p_t + t_xy` and check
    `m(X') ≈ m(X)`.
@@ -1111,6 +1254,254 @@ and must not leak into these tests — if the implementation applies
 normalization internally, the tests unwrap it explicitly, so that a
 normalization bug surfaces as a round-trip failure instead of being
 silently absorbed.
+
+### 4.6 Goal reference convention (LDM planner interface)
+
+This subsection settles, at the convention level, the goal part of §7.7:
+which dataset frames carry the planner's reference and the goal under the
+arrival-state alignment, how every goal channel is derived and supervised
+by the LDM losses, and what changes in the closed-loop controller path.
+The concrete goal-encoding layout is deliberately deferred to a later
+design pass — this subsection pins the conventions that layout must
+satisfy (the `(h_g, Δp_g^hor)` position split, the
+reconstructed-trajectory goal orientation, the full arriving velocity);
+the SONIC integration check remains for the LDM integration phase.
+
+**Window and reference indices.** The dataset window is raw states
+`s_{t−H:t+F}` (indices `p..p+C`, `C = H+F`) producing features
+`m_{t−H+1:t+F}`. The planner reference is the window state `s_t` at
+
+$$
+\boxed{\mathrm{reference\_frame} = p + H,}
+$$
+
+the state-part of the final history feature `m_t` — the measured current
+state in closed loop and the unique egocentric frame `E_t`. The goal is
+the window state `s_{t+t*}` at
+
+$$
+\boxed{\mathrm{goal\_frame} = p + H + t^*},\qquad t^* \in [1, F],
+$$
+
+default `t* = F` for `goal_per_primitive` — the window's **last** state.
+The arrival-offset window is therefore `t* ∈ [1, F]`, i.e. goal states
+`s_{t+1:t+F}` carried by future features `m_{t+1:t+F}` (`t` = the last
+history frame). The existing dataset config already realizes exactly this
+window: `goal_offset_range = [-63, 0]` with `t* = F + goal_offset`
+([train_dar.yaml:23](../../TextOpRobotMDAR/robotmdar/config/train_dar.yaml#L23)),
+so the future feature index is `t*−1 = F − 1 + goal_offset` ∈ `[0, F−1]`
+— the `_future_step_from_goal_time` clamp never binds for legal offsets.
+The primitive window formula does not change
+(`prim_end = prim_start + F + H + 1`): the one extra raw state beyond the
+`H+F` features is now the departure context `s_{t−H}` of the first
+history feature `m_{t−H+1}` (§2.8), not a forward-difference velocity
+frame. Time-to-arrival keeps its formula
+`(goal_frame − reference_frame)/fps`
+([data.py:1062](../../TextOpRobotMDAR/robotmdar/dataloader/data.py#L1062)),
+the arrival-time PE keeps the same value range, and the planner-side
+conversion relative to the last measurement timestamp is untouched.
+
+**One feature carries the goal.** Future feature `k` (`k = 0..F−1`) is the
+absolute feature `m_{t+1+k}`, whose state-part is `s_{t+1+k}` and whose
+increment channels are the incoming transition `t+k → t+1+k`. The goal
+state `s_{t+t*}` is therefore the state-part of future feature index
+`t*−1`, and the step **arriving** at the goal is the increment of the
+**same** feature:
+
+$$
+\boxed{\text{goal feature index} = t^* - 1.}
+$$
+
+`_future_step_from_goal_time(t*) = t*−1`
+([manager.py:1445](../../TextOpRobotMDAR/robotmdar/train/manager.py#L1445))
+survives numerically unchanged, with an upgraded meaning: under the
+departure-state draft the same index carried the goal's state-part but its
+delta was the *leaving* step, which forced the trajectory integrator to
+borrow the arriving step from feature `t*−2`; under the arrival-state
+alignment the goal's absolute channels and its arriving displacement's
+horizontal part live in one feature slot (the vertical part of the
+arriving step is recovered from the authoritative heights of the two
+endpoint features, §4). (The leaving displacement, if ever needed, is the
+increment of feature index `t*` — representable only for `t* < F`.)
+
+**Goal channels: derivation and supervision.** With
+`goal_frame = p + H + t*`, every channel is representable inside the
+window — the departure-state draft's goal-boundary dilemma (goal one frame
+short of the window end, or partially unsupervised) does not arise:
+
+- *Root position.* The goal position is carried as the pair
+  `(h_g, ^{E_t}Δp_g^hor)` — the same absolute/transition split as the
+  representation itself (§4), not as one full 3D displacement:
+
+  - `h_g = ĥ_{t+t*}` — the authoritative height, a direct state-part read
+    of feature `t*−1` (§4.1), supervised exactly like the joint angle
+    below.
+  - `^{E_t}Δp̂_g^hor` — the accumulated horizontal displacement: the sum of
+    the future increments rotated into `E_t`, projected onto `E_t`'s own
+    tangent plane,
+
+    $$
+    {}^{E_t}\widehat{\Delta\mathbf p}_g^{\mathrm{hor}}
+    = \left(I - \hat{\mathbf g}_t \hat{\mathbf g}_t^\top\right)
+      \sum_{k=1}^{t^*} {}^{E_t}\hat{\mathbf R}_{E_{t+k-1}}\,
+      \widehat{\Delta\mathbf p}_{t+k-1}^{\mathrm{hor}},
+    $$
+
+    with `^{E_t}R̂_{E_{t+k−1}}` the **reconstructed** orientation chain
+    (orientation bullet below), not the raw `ρ_6` product. The full 3D
+    displacement, if ever needed, is
+
+    $$
+    {}^{E_t}\widehat{\Delta\mathbf p}_g
+    = \sum_{k=1}^{t^*} {}^{E_t}\hat{\mathbf R}_{E_{t+k-1}}
+      \left[ \widehat{\Delta\mathbf p}_{t+k-1}^{\mathrm{hor}}
+      - \left(\hat h_{t+k} - \hat h_{t+k-1}\right)\hat{\mathbf g}_{t+k-1} \right]
+    = \sum_{k=1}^{t^*} {}^{E_t}\hat{\mathbf R}_{E_{t+k-1}}\,
+      \widehat{\Delta\mathbf p}_{t+k-1}^{\mathrm{hor}}
+      - \left(\hat h_g - h_t\right)\hat{\mathbf g}_t,
+    $$
+
+    — the vertical corrections collapse onto `E_t`'s own gravity axis
+    (each `R̂_{t+k−1}ĝ_{t+k−1}` equals `g_W` by construction, §4.1), which
+    is exactly why the horizontal channel above is the increment sum
+    alone and why the pair `(h_g, Δp̂_g^hor)` carries no vertical term.
+  Supervised against the reconstructed trajectory point `s_{t+t*}` (§4.1)
+  — the same pair read off the reconstruction. The v3
+  `root_trajectory_ego` history bridge
+  ([manager.py:1587](../../TextOpRobotMDAR/robotmdar/train/manager.py#L1587))
+  is dropped: integration starts at `s_t` and uses future increments only.
+- *Root orientation.* The goal orientation is read from the
+  **reconstructed trajectory**, not from a raw product of predicted
+  relative rotations:
+
+  $$
+  {}^{E_t}\hat{\mathbf R}_{E_{\mathrm{goal}}} = \mathbf R_t^\top\, \hat{\mathbf R}_{\mathrm{goal}},
+  $$
+
+  where `R̂_goal` is the reconstructed orientation at the goal frame — the
+  full §4.1 inverse: relative-rotation integration *plus* the
+  authoritative-gravity re-alignment at every step (`R_t` is the supplied
+  initial pose — the measured current orientation — not a prediction).
+  Only for legal forward-encoded trajectories, where every re-alignment
+  correction is the identity, does this reduce to the raw product
+  `Π_{k=1..t*} ^{E_{t+k−1}}R̂_{E_{t+k}}`; for model predictions the
+  re-alignment is active, so the goal loss compares the **reconstructed**
+  orientation — the same object the planner output actually uses —
+  against the GT `^{E_t}R_{E_goal}`, chordal and invariant to the common
+  world rotation by the §4.3.2 argument. The goal's tilt is authoritative
+  from `ĝ_{t+t*}` (state-part of feature `t*−1`), the yaw-like DoF from
+  the reconstructed integration. The v3 yaw-integrator
+  `_future_yaw_ego_at_goal`
+  ([manager.py:1471](../../TextOpRobotMDAR/robotmdar/train/manager.py#L1471))
+  disappears together with the `Δψ` channel.
+- *Joint angle / contact.* `q̂_{t+t*}`, `ĉ_{t+t*}` — direct state-part
+  reads of feature `t*−1` (§4.1 item 4: contact as continuous scores).
+- *Root velocity.* The **arriving** velocity at the goal is the full
+  displacement of the incoming step, not its horizontal part alone. In the
+  departure frame `E_{g−1}`:
+
+  $$
+  {}^{E_{g-1}}\widehat{\Delta\mathbf p}_{g-1\to g}
+  = \widehat{\Delta\mathbf p}_{t+t^*-1}^{\mathrm{hor}}
+  - \left(\hat h_{t+t^*} - \hat h_{t+t^*-1}\right)\hat{\mathbf g}_{t+t^*-1},
+  $$
+
+  the goal feature's own increment channel plus the vertical part
+  recovered from the authoritative heights (§4). Rotated into the goal's
+  reference frame `E_t`:
+
+  $$
+  {}^{E_t}\hat{\mathbf v}_g^{\mathrm{in}}
+  = 50 \cdot {}^{E_t}\hat{\mathbf R}_{E_{g-1}}\,
+    {}^{E_{g-1}}\widehat{\Delta\mathbf p}_{g-1\to g},
+  $$
+
+  with `^{E_t}R̂_{E_{g−1}}` the reconstructed orientation chain
+  (orientation bullet above). If the interface wants the
+  horizontal/vertical split, it applies it in `E_t` at use time:
+  `v̂^hor_g = (I − ĝ_t ĝ_t^⊤) ^{E_t}v̂^in_g`,
+  `v̂^vert_g = −ĝ_t^⊤ ^{E_t}v̂^in_g`. Ground truth is the backward
+  difference at `goal_frame` — `50·R_{g−1}^⊤(p_g − p_{g−1})`, the full
+  displacement, both endpoints inside the window. This flips the semantic
+  from v3's leaving velocity:
+  `_world_goal_velocity` switches to the backward difference
+  ([data.py:1049](../../TextOpRobotMDAR/robotmdar/dataloader/data.py#L1049))
+  and the `required_last_frame = goal_frame + 1` guard
+  ([data.py:1187](../../TextOpRobotMDAR/robotmdar/dataloader/data.py#L1187))
+  is deleted. The goal arriving velocity is an input conditioning
+  channel, not a published payload quantity; the `E_t`-frame form above
+  is a use-time conversion, not a separate supervision target.
+
+**Closed-loop construction.** `H+1` measurements `s_{t−H:t}` build the
+history features `m_{t−H+1:t}` directly; the final feature's increment has
+both endpoints inside the measurement sequence. The last-frame duplication
+and constant-velocity override in `state_to_model_input`
+([planner_convert.py:108](../../TextOpRobotMDAR/robotmdar/utils/planner_convert.py#L108),
+lines 139-198) and its docstring rationale are **deleted** — no future
+motion is needed to construct the model input, and the input always
+carries the full absolute state of `s_t` (`h_t`, `g_t`, `q_t`, `c_t`), so
+no separate current-state condition is needed (§2.8). The goal is built
+from the controller target with reference = measured `s_t`
+(`state_goal_from_reference` already anchors to the last measurement —
+mechanism unchanged). The `Δψ` wrap handling disappears with the channel.
+
+**Reconstruction, seam and rollout.** The future is reconstructed from the
+initial pose (the complete `s_t`, §4.1) plus `m_{t+1:t+F}` — no
+`cat(history, future)` needed for reconstruction, since v3 only needed the
+history for the integration bridge. The published plan keeps its shape:
+65 frames, frame 0 = the measured `s_t` itself (the model never touches
+the current state), frames `1..64` = `s_{t+1:t+F}`; the goal sits at
+frame `t*` — the final frame only when `t* = F` — and every published
+frame carries its full authoritative channels; `skip_history = H−1`
+unchanged, so the sequence sent to the controller is isomorphic to v3's.
+Rollout stitching uses the §4.1 clean-boundary property — the next
+window's initial pose is the previous window's final state (the goal when
+`t* = F`): the eval anchor becomes `motion_dict_to_abs_pose(...,
+idx=-1)` ([generate_dar.py:348](../../TextOpRobotMDAR/robotmdar/eval/generate_dar.py#L348),
+[freq_dar.py:119](../../TextOpRobotMDAR/robotmdar/eval/freq_dar.py#L119),
+`vis_dar.py` / `vis_mvae.py` likewise), replacing the H-dependent index
+(the current `idx=-2` is correct only for `H = 2`). Joint velocities are
+**not published by the planner** (see the interface note below) — the
+feature alignment does not change them because they are not part of the
+plan payload (§4, derived velocities).
+
+**Migration checklist (v3 → v6, goal-related code).**
+
+| Site | Change |
+|---|---|
+| `data.py:1108` | `reference_frame = prim_start + H` (was `− 1`) |
+| `data.py:1173-1176` | `goal_frame = prim_start + F + H + goal_offset` (was `− 1`); `t* = F + goal_offset` keeps the existing `[-63, 0]` offset window (arrival offsets `1..64`); the order check at `:1182` compares against the new reference |
+| `data.py:1049-1060` | `_world_goal_velocity` → backward difference at `goal_frame`: full displacement `R_{g−1}^⊤(p_g − p_{g−1})`, both endpoints in-window (no `^hor` truncation — the vertical part belongs to the arriving velocity) |
+| `data.py:1187-1194` | `required_last_frame = goal_frame + uses_arrival_time` → deleted |
+| `manager.py:1445-1460` | `_future_step_from_goal_time` — unchanged numerically |
+| `manager.py:1471-1485` | `_future_yaw_ego_at_goal` → deleted (yaw-free; goal orientation read from the reconstructed trajectory, §4.6 — not the raw `ρ_6` product) |
+| `manager.py:1587-1605` | `root_trajectory_ego` — drop the history bridge, integrate future increments from `s_t` (the v3-only guard at `:1589` is replaced by the v6 path) |
+| `manager.py:1536-1565` | `calc_goal_root_velocity_loss` — full arriving displacement: goal feature's increment channel + vertical part from the authoritative heights (§4.6), no goal-yaw rotation; GT backward difference |
+| `planner_convert.py` `state_to_model_input` | delete last-frame duplication + constant-velocity override (`:139-198`); build H features from H+1 measurements |
+| `generate_dar.py:348`, `freq_dar.py:119` | eval anchor `idx −2` → `idx −1`; reconstruct future-only with initial pose = `s_t` |
+| goal statistics | re-frozen after the feature migration (v6 normalization recompute, §4.4) |
+| plan payload | drop `joint_vel` from the published G1 plan (see the interface note below); `_forward_velocity` and its repeat-last fallback disappear |
+
+**Plan payload: authoritative state only — velocity derivation is the
+consumer's business.** Whether a frame-to-frame increment is a forward or
+backward difference is a TextOp-internal convention of the feature
+representation (§4); it must not leak into the payload. The planner
+therefore publishes only the authoritative state trajectory (`joint_pos`,
+`root_pos`, `root_ori`, timestamps) and no derived velocity. The SONIC
+policy *consumes* plan joint velocities — its 1762D encoder observation
+includes future 10-frame (step-5) velocity blocks, full 29-joint (290D)
+and lower-body (120D)
+([sonic_trackingmode.py:258-264](../../occHIPC/pretrain/sonic_trackingmode.py#L258-L264))
+— and its motion loader already re-derives `joint_vel` from `joint_pos`
+with `np.gradient` whenever the source carries positions only
+([g1_motion_loader.py:128-133](../../occHIPC/utils/g1_motion_loader.py#L128-L133)):
+SONIC's own convention, and the same one the policy was trained on
+(planner-side forward differences with a repeat-last fallback would be a
+third, TextOp-imposed convention). Dropping the field from
+`G1MotionData` (`joint_vel` becomes optional in `sonicmsg/messages.py`)
+removes the last-frame fallback question entirely and saves the payload.
+This is the §2.7 principle applied to the interface: dynamics derived at
+use time, by whoever consumes it.
 
 ## 5. Dataset rotation convention (verified)
 
@@ -1162,7 +1553,7 @@ ablation studies:
   Add `FeatureVersion 6` with `motion_dict_to_feature_v6` /
   `motion_feature_to_dict_v6` and `motion_feature_dim_v6 = 13 + n_q + n_c`
   (identifier 6, because 4 and 5 are taken by the dead experiments in §8).
-- Add a config key (e.g. `feature_version: 3` in `train/mvae.yaml`,
+- Add a config key (e.g. `feature_version: 6` in `base.yaml`,
   `train/dar.yaml`, `planner_dar.yaml`) that selects the dispatch before
   dataset/model construction. The current mechanism is a module-level
   constant; the config key should be resolved at startup.
@@ -1218,11 +1609,14 @@ ablation studies:
    LDM training it serves the **self-rollout** scenario only, matching
    the v3 DAR-dataloader pattern (`data.py`: augmented history, goals
    stay clean, ego-centric conditioning reset to the perturbed latest
-   history state, final history delta kept clean because it references
-   the first future pose, which lies outside the perturbed window). The
+   history state — which under the arrival-state alignment is the
+   absolute channels of the final history feature `m_t` itself). The
    concrete v7 perturbation operator for the rotation channels (must
-   not be applied in RPY form) is still to be supplied; non-rotation
-   channels keep the v3-style perturbation. This no longer blocks VAE
+   not be applied in RPY form) is still to be supplied, together with
+   how the final history feature's incoming transition is perturbed —
+   unlike the departure-state draft, its two endpoints both lie inside
+   the history window; non-rotation channels keep the v3-style
+   perturbation. This no longer blocks VAE
    training.
 6. **Weights — starting points set.** `λ_chord = 0.01–0.05`,
    `λ_g = 0.05–0.1` (the only consistency term; no Huber deltas
@@ -1236,12 +1630,32 @@ ablation studies:
    via `e_h,vel`; in practice it lands below `λ_dof_vel` (1-dim vs.
    `n_q`-dim channel). Final values from unweighted loss magnitudes
    and gradient magnitudes.
-7. **LDM planner, goal encoding, controller interface — deferred** until
-   the VAE is trained.
+7. **LDM planner, goal encoding, controller interface — resolved at the
+   convention level (§4.6).** The feature alignment (§2.8, §4) fixes the
+   interface anchor: history features `m_{t−H+1:t}` end with the current
+   state `s_t`, the goal sits at `goal_frame = p + H + t*` with its
+   absolute channels and arriving displacement's horizontal part in the
+   single feature slot `t*−1` (vertical part from the authoritative
+   heights, §4), and no separate current-state condition is needed. What
+   remains for the LDM integration phase: the goal-loss weight set and the
+   SONIC interface verification (§4.2). The concrete goal-encoding layout
+   is deliberately deferred to a later design pass — §4.6 pins the
+   conventions it must satisfy (the `(h_g, Δp_g^hor)` position split, the
+   reconstructed-trajectory goal orientation, the full arriving velocity),
+   but the layout itself is not part of this version.
 8. **BONES-SEED CSV Euler convention — resolved.** Extrinsic xyz,
    verified against the official SEED G1 CSV spec and a synthetic SciPy
    test; the conversion code's computation is correct, only its comment
    was mislabeled "intrinsic" (§5).
+9. **Time alignment — resolved.** Arrival-state / backward-difference
+   convention: `m_t` = incoming transition `t−1 → t` + partial absolute
+   state at `t` (§2.8, §4), replacing the departure-state draft. The
+   in-code v6 forward/inverse (`motion_dict_to_feature_v6` /
+   `motion_feature_to_dict_v6`), the decode path, the normalization
+   statistics (`meanstd_v6_dof29.pkl`) and the §4.5 tests still
+   implement the departure-state draft and must be migrated before the
+   first VAE run; the goal-related part of that migration is itemized in
+   §4.6.
 
 ## 8. Relationship to the in-code FeatureVersion 4 and 5
 
@@ -1270,10 +1684,19 @@ transl(3) | rot6d_abs(6) | dof(29) | transl_delta(3) | rot_delta_6d(6)
   (`extract_yaw_from_rotation`, ZYX with explicit gimbal-lock branches)
   to align the predicted sequence with `abs_pose` — v4 removes RPY from
   the feature but reintroduces Euler decomposition at reconstruction.
-- v4's relative rotation is computed as `R_{t+1} R_t^T`, the **transpose**
-  of this design's `^{E_t}R_{E_{t+1}} = R_t^T R_{t+1}` (§4.1). The delta
-  code must not be reused without transposing.
-- Status: never wired in — `FeatureVersion = 3` is the active dispatch;
+- v4's relative rotation is computed as `R_{t+1} R_t^T` — the same
+  physical relative rotation as this design's `^{E_{t−1}}R_{E_t} =
+  R_{t−1}^T R_t` (§4.1), but expressed in a different frame. With
+  `R_k = ^W R_{E_k}`, v4's quantity is the **world-frame** expression
+  (the conjugate `R_t (R_t^T R_{t+1}) R_t^T`) of the ego-frame map
+  `E_t → E_{t+1}`, forward-indexed; this design's is the
+  **departure-ego-frame** expression `R_{t−1}^T R_t` of the map
+  `E_{t−1} → E_t`, backward-indexed. It is *not* the transpose — the
+  transpose `R_t^T R_{t−1}` is the inverse rotation (`E_t → E_{t−1}`).
+  The delta code must not be reused without the full conversion (frame
+  conjugation + time reversal), not merely a transpose.
+- Status: never wired in — the module-level default dispatch is
+  `FeatureVersion = 3`, overridden to 6 by `config/base.yaml`;
   the only consumers are a v4 branch in `reconstruct_motion`
   (`dataloader/data.py:943`) and commented-out blending code in
   `eval/vis_mvae.py` (a ported MDM/DART blending pipeline).
