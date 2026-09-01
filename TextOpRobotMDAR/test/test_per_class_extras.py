@@ -95,7 +95,7 @@ def test_per_class_extras_masked_means_are_detached():
     assert extras['e_q_vel__run'].item() == 3.5
     assert extras['e_q_vel__fall'].item() == 5.0
     assert extras['e_q_vel__unknown'].item() == 6.0
-    assert 'e_q_vel__getup' not in extras  # absent class -> no tag
+    assert extras['e_q_vel__getup'].item() == 0.0  # absent class -> zero, key always emitted
     for value in extras.values():
         assert value.grad_fn is None  # log-only, detached
 
@@ -140,7 +140,7 @@ def test_calc_geometry_loss_v6_reports_per_class_and_keeps_gradient():
             action_label=labels, is_recovery=recovery,
         )
 
-        # Every class present in the batch gets all three suffixed tags.
+        # All three metrics emit every class suffix; absent classes are zero.
         for key in ('e_q_vel', 'e_h_vel', 'e_g_cons'):
             assert key in extras
             for cls in MOTION_CLASSES:

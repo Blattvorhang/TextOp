@@ -1181,7 +1181,11 @@ the geometry extras map verbs to the coarse classes with a small lookup
 table (`is_recovery` can refine the get-up split) and compute masked
 means per class. The mask is per-primitive — no loss or gradient
 plumbing is touched; the labels only need to reach `calc_loss` (or the
-train loop) alongside the batch.
+train loop) alongside the batch. Every class key is emitted on every
+batch — classes absent from the batch contribute 0 — so per-rank key
+sets are identical and the DDP eval all-reduce (`ddp_reduce_mean`,
+which gathers the key union and reduces it in canonical order) never
+diverges across ranks.
 
 **Version tag.** Log `feature_version` as a constant extra (alongside
 `stage`/`lr`, from `pre_step` under the `meta` group,

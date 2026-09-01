@@ -60,8 +60,10 @@ def _add_per_class_extras(extras, action_label, is_recovery, per_sample):
 
     Per-sample error tensors are detached first: these extras never add
     graph nodes or gradient work (the cost is a handful of masked means
-    per batch). Classes absent from the batch simply get no tag for that
-    step.
+    per batch). Every class gets a key — classes absent from the batch
+    log a zero — so the key set is deterministic per rank and the DDP
+    eval-metrics all-reduce (ddp_reduce_mean) never diverges across
+    ranks.
     """
     if not per_sample:
         return
@@ -83,8 +85,10 @@ def _add_per_class_extras(extras, action_label, is_recovery, per_sample):
             mask = torch.as_tensor(
                 [label == cls for label in labels],
                 dtype=torch.bool, device=device)
-            if mask.any():
-                extras[f'{key}__{cls}'] = err[mask].mean()
+            extras[f'{key}__{cls}'] = (
+                err[mask].mean() if mask.any()
+                else torch.zeros((), device=device, dtype=err.dtype)
+            )
 
 
 # Tensorboard tag routing (doc §4.3.6). Log-only scalars are classified into
@@ -130,9 +134,15 @@ def get_ddp_model(model):
 def ddp_reduce_mean(tensor_dict: dict) -> dict:
     """All-reduce mean across all DDP ranks for each tensor in the dict.
 
-    Returns a new dict where every tensor value is the average across all ranks.
-    Skips non-tensor values unchanged.
-    Handles both CPU and CUDA tensors (NCCL requires CUDA tensors).
+    Returns a new dict where every tensor value is the average across all
+    ranks. Key sets may differ across ranks (data-dependent extras such as
+    per-class tags): the union of all ranks' tensor keys is gathered once
+    and each union key is reduced in canonical sorted order, so every rank
+    issues the identical sequence of collectives and the NCCL streams never
+    diverge. A key missing (or non-tensor) on a rank contributes zeros of
+    the gathered shape/dtype; inconsistent shapes across ranks raise
+    instead of deadlocking. Handles both CPU and CUDA tensors (NCCL
+    requires CUDA tensors).
     """
     if not (dist.is_available() and dist.is_initialized()):
         return tensor_dict
@@ -141,20 +151,56 @@ def ddp_reduce_mean(tensor_dict: dict) -> dict:
     if world_size <= 1:
         return tensor_dict
 
+    # Gather each rank's tensor shape/dtype spec to build the union and
+    # verify cross-rank consistency (a genuine bug would otherwise present
+    # as an NCCL timeout).
+    local_spec = {
+        k: (tuple(v.shape), str(v.dtype))
+        for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)
+    }
+    gathered_specs = [None] * world_size
+    dist.all_gather_object(gathered_specs, local_spec)
+
+    spec = {}
+    for rank_spec in gathered_specs:
+        for k, shape_dtype in rank_spec.items():
+            if k in spec and spec[k] != shape_dtype:
+                raise ValueError(
+                    f'ddp_reduce_mean: key {k!r} has inconsistent '
+                    f'shape/dtype across ranks: {spec[k]} vs {shape_dtype}')
+            spec[k] = shape_dtype
+
+    union_keys = sorted(
+        set(spec) | {k for k, v in tensor_dict.items()
+                     if not isinstance(v, torch.Tensor)})
+
     reduced = {}
-    for k, v in tensor_dict.items():
+    for k in union_keys:
+        v = tensor_dict.get(k)
+        if k not in spec:
+            # Non-tensor on every rank: pass through (no collective).
+            reduced[k] = v
+            continue
         if isinstance(v, torch.Tensor):
             was_cpu = v.device.type == 'cpu'
-            if was_cpu:
+            if was_cpu and dist.get_backend() == 'nccl':
+                # NCCL requires CUDA tensors; other backends stay on CPU.
                 v = v.cuda()
             v_reduced = v.clone().detach()
-            dist.all_reduce(v_reduced, op=dist.ReduceOp.SUM)
-            v_reduced = v_reduced / world_size
-            if was_cpu:
-                v_reduced = v_reduced.cpu()
-            reduced[k] = v_reduced
         else:
-            reduced[k] = v
+            # Missing (or non-tensor) on this rank: join the collective
+            # with zeros of the gathered shape/dtype.
+            shape, dtype_str = spec[k]
+            device = 'cuda' if dist.get_backend() == 'nccl' else 'cpu'
+            # str(v.dtype) is 'torch.float32' — strip the module prefix.
+            dtype = getattr(torch, dtype_str.split('.')[-1])
+            v_reduced = torch.zeros(shape, dtype=dtype, device=device)
+            was_cpu = False
+        dist.all_reduce(v_reduced, op=dist.ReduceOp.SUM)
+        v_reduced = v_reduced / world_size
+        if was_cpu:
+            v_reduced = v_reduced.cpu()
+        reduced[k] = v_reduced
     return reduced
 
 
