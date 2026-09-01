@@ -16,10 +16,10 @@ echo "Working directory: $(pwd)"
 #   export CUDA_VISIBLE_DEVICES=0,1,2,3    # use GPU 0-3, master is GPU 0
 #   export CUDA_VISIBLE_DEVICES=4,5,6,7    # use GPU 4-7, master is GPU 4
 #   export CUDA_VISIBLE_DEVICES=2,5        # use GPU 2 and 5, master is GPU 2
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,0,1,2,3,5,6,7}
+CUDA_VISIBLE_DEVICES=0,1,3,7  # 0,1,2,3,4,5,6,7
 
 # Number of GPUs to use (can be overridden via environment variable)
-NUM_GPUS=${NUM_GPUS:-8}
+NUM_GPUS=4
 
 # Count actually visible GPUs
 NUM_GPUS_AVAILABLE=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
@@ -46,7 +46,7 @@ echo "Master port: ${MASTER_PORT}"
 # Scale stages by NUM_GPUS: DDP sees NUM_GPUS × batch_size samples per step,
 # so each step is equivalent to NUM_GPUS single-GPU steps.
 # Original: [100000, 50000, 50000] → scaled: ÷ NUM_GPUS
-SCALE_FACTOR=4
+SCALE_FACTOR=2
 STAGE0=$((100000 / NUM_GPUS * SCALE_FACTOR))
 STAGE1=$((50000 / NUM_GPUS * SCALE_FACTOR))
 STAGE2=$((50000 / NUM_GPUS * SCALE_FACTOR))
