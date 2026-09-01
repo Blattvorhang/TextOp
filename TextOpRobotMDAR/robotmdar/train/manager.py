@@ -87,6 +87,32 @@ def _add_per_class_extras(extras, action_label, is_recovery, per_sample):
                 extras[f'{key}__{cls}'] = err[mask].mean()
 
 
+# Tensorboard tag routing (doc §4.3.6). Log-only scalars are classified into
+# four groups instead of the former flat loss/extras split:
+#   loss          -> loss/{train,eval}/<k>            (objective terms)
+#   metric        -> metric/{train,eval}/<k>          (unweighted diagnostics)
+#   metric_class  -> metric_class/{train,eval}/<base>/<cls>  (per-class means)
+#   meta          -> meta/<k>                         (schedule state, no phase)
+_META_KEYS = frozenset(
+    {'stage', 'scene_active', 'augmentation_active', 'feature_version',
+     'lr', 'grad_norm'})
+
+
+def _classify_extra(name: str, phase: str) -> Tuple[str, str]:
+    """Route a log-only scalar key to a (group, tag) pair.
+
+    ``phase`` is 'train' or 'eval'; meta keys ignore it (no per-phase
+    split). Per-class extras use the ``base__cls`` key layout and become
+    nested ``base/cls`` tags.
+    """
+    if name in _META_KEYS:
+        return 'meta', name
+    if '__' in name:
+        base, cls = name.split('__', 1)
+        return 'metric_class', f'{phase}/{base}/{cls}'
+    return 'metric', f'{phase}/{name}'
+
+
 def is_main_process():
     """Check if current process is the main (rank 0) process."""
     if dist.is_available() and dist.is_initialized():
@@ -251,14 +277,15 @@ class BaseManager(ABC):
                 if is_main_process():
                     for k, v in reduced_loss.items():
                         self.platform.report_scalar(
-                            "eval_" + k, v.cpu().numpy() / self.eval_steps, self.step, group_name="loss"
+                            "eval/" + k, v.cpu().numpy() / self.eval_steps, self.step, group_name="loss"
                         )
                     for k, v in reduced_extras.items():
+                        group, tag = _classify_extra(k, 'eval')
                         self.platform.report_scalar(
-                            "eval_" + k, (v.cpu().numpy() / self.eval_steps) if isinstance(v, torch.Tensor) else
+                            tag, (v.cpu().numpy() / self.eval_steps) if isinstance(v, torch.Tensor) else
                             (v / self.eval_steps),
                             self.step,
-                            group_name="extras"
+                            group_name=group
                         )
                     tqdm.write(
                         f"Eval finished at step {self.step} with loss * {self.eval_steps}: {dict(reduced_loss)}"
@@ -283,13 +310,15 @@ class BaseManager(ABC):
         # all-reduce on every step would add ~50ms NCCL overhead per 10+ scalar keys.
         if is_main_process():
             for k, v in loss_dict.items():
-                self.platform.report_scalar("train_" + k, v.cpu().numpy(), self.step, group_name="loss")
+                self.platform.report_scalar("train/" + k, v.cpu().numpy(), self.step, group_name="loss")
             for k, v in extras.items():
+                group, tag = _classify_extra(k, 'train')
                 self.platform.report_scalar(
-                    "train_" + k, v.cpu().numpy() if isinstance(v, torch.Tensor) else v, self.step, group_name="extras"
+                    tag, v.cpu().numpy() if isinstance(v, torch.Tensor) else v, self.step, group_name=group
                 )
             for k, v in self.extra.items():
-                self.platform.report_scalar(k, v, self.step, group_name="extras")
+                group, tag = _classify_extra(k, 'train')
+                self.platform.report_scalar(tag, v, self.step, group_name=group)
 
         # 更新EMA模型
         self.update_ema_models()

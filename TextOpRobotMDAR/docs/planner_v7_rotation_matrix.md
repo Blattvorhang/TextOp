@@ -1108,15 +1108,24 @@ fall/recovery dynamics).
 ### 4.3.6 Tensorboard logging — tags that change with the representation
 
 **Mechanism (code-verified).** `MVAEManager.calc_loss` returns
-`(terms, extras)` ([train/manager.py:744](../../TextOpRobotMDAR/robotmdar/train/manager.py#L744));
-`train_mvae.py` passes both to `post_step`, which logs every `terms`
-key under the `loss` group as `train_<k>` / `eval_<k>` and every
-`extras` key under the `extras` group
-([train/manager.py:118-175](../../TextOpRobotMDAR/robotmdar/train/manager.py#L118-L175));
-`self.extra` (stage, lr, …) is logged under `extras` too. **Every
-individually logged term is the unweighted raw loss** — the weights
-enter only `total` (`Σ_k loss_weight[k]·v`,
-[train/manager.py:797](../../TextOpRobotMDAR/robotmdar/train/manager.py#L797)).
+`(terms, extras)` ([train/manager.py:1139](../../TextOpRobotMDAR/robotmdar/train/manager.py#L1139));
+`train_mvae.py` passes both to `post_step`, which routes every scalar
+into one of four tensorboard groups via `_classify_extra`
+([train/manager.py:101-118](../../TextOpRobotMDAR/robotmdar/train/manager.py#L101-L118)):
+
+- `loss/{train,eval}/<k>` — every `terms` key (objective terms);
+- `metric/{train,eval}/<k>` — log-only diagnostics (the §4.3.4 set and
+  the FK splits below);
+- `metric_class/{train,eval}/<base>/<cls>` — per-class masked means
+  (the `e_q_vel__walk` extras-dict keys become nested
+  `metric_class/train/e_q_vel/walk` tags);
+- `meta/<k>` — schedule state (`stage`, `lr`, `feature_version`,
+  `grad_norm`, `scene_active`, `augmentation_active`; no per-phase
+  split).
+
+**Every individually logged term is the unweighted raw loss** — the
+weights enter only `total` (`Σ_k loss_weight[k]·v`,
+[train/manager.py:1204](../../TextOpRobotMDAR/robotmdar/train/manager.py#L1204)).
 The unweighted magnitudes the §4.3.5 weight-setting procedure needs are
 therefore already in tensorboard; no extra machinery is required for
 them.
@@ -1142,10 +1151,11 @@ them.
 - **New**: `rot_chord` (L_rot,chord, §4.3.2), `g_cons` (L_g-cons
   including the boundary pair, §4.3.3), `h_vel` (L_h-vel, §4.3.5).
 
-**Extras group.** Unchanged: `dof_pos_core` / `dof_pos_wrist` /
-`dof_vel_core` / `dof_vel_wrist`, `hand_translation`, `sliding_ratio`,
-`endpoint_xy`. New diagnostics (log-only, physical units — the §4.3.4
-set, one tag each, plus the global mean under the bare name):
+**Metric group** (`metric/{train,eval}/<k>`). Unchanged: `dof_pos_core` /
+`dof_pos_wrist` / `dof_vel_core` / `dof_vel_wrist`, `hand_translation`,
+`sliding_ratio`, `endpoint_xy`. New diagnostics (log-only, physical
+units — the §4.3.4 set, one tag each, plus the global mean under the
+bare name):
 
 - `e_g_cons`, `e_g_boundary` (consistency residuals, §4.3.4);
 - `e_g_proj`, `e_R_proj`, `e_p_proj` (projection corrections);
@@ -1159,7 +1169,10 @@ set, one tag each, plus the global mean under the bare name):
 **Per-class reporting.** `e_q_vel`, `e_h_vel` (and `e_g_cons`, if it
 costs nothing) are reported per coarse motion class with a class suffix
 (`e_q_vel__walk`, `e_q_vel__run`, `e_q_vel__fall`, `e_q_vel__getup`,
-`e_q_vel__unknown`). The dataloader already carries the label: each
+`e_q_vel__unknown`); the extras dict keeps the flat `base__cls` keys and
+tensorboard nests them as `metric_class/{train,eval}/<base>/<cls>`
+(e.g. `metric_class/train/e_q_vel/walk`). The dataloader already carries
+the label: each
 primitive stores the best-overlap BABEL verb as `action_label`
 ([data.py:971-988](../../TextOpRobotMDAR/robotmdar/dataloader/data.py#L971-L988))
 and the collator puts it into the batch
@@ -1171,20 +1184,20 @@ plumbing is touched; the labels only need to reach `calc_loss` (or the
 train loop) alongside the batch.
 
 **Version tag.** Log `feature_version` as a constant extra (alongside
-`stage`/`lr`,
-[train/manager.py:96-104](../../TextOpRobotMDAR/robotmdar/train/manager.py#L96-L104))
+`stage`/`lr`, from `pre_step` under the `meta` group,
+[train/manager.py:232-255](../../TextOpRobotMDAR/robotmdar/train/manager.py#L232-L255))
 so v3/v6 runs in the same tensorboard directory stay distinguishable;
 checkpoints already must record it (§6).
 
 **Weight-setting support.** Unweighted magnitudes of the new terms come
-directly from the `train_<k>` tags above. Gradient magnitudes are not
+directly from the `loss/train/<k>` tags above. Gradient magnitudes are not
 logged per step (per-term `autograd.grad` with `retain_graph` costs an
 extra backward pass each); measure them once per term in a first-run
 probe and set the weights from the two ratios (§4.3.5).
 
 **Eval mirror and visualization.** The eval path calls the same
-`calc_loss`, so the `eval_<k>` tags change identically with no extra
-work. The eval visualization (reconstructed-motion videos) is not a
+`calc_loss`, so the `loss/eval/<k>` and `metric/eval/<k>` tags change
+identically with no extra work. The eval visualization (reconstructed-motion videos) is not a
 loss tag but switches representations at the same dispatch point — it
 must use the §4.1 inverse (denormalize → project → reconstruct), never
 the v3 Algorithm 2 path.
