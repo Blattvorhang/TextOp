@@ -4,3 +4,6 @@
 [submodule "TextOpDeploy/src/unitree_ros2"]
 	path = TextOpDeploy/src/unitree_ros2
 	url = git@github.com:unitreerobotics/unitree_ros2.git
+[submodule "occHIPC"]
+	path = occHIPC
+	url = git@github.com:Cybercal/occHIPC.git
