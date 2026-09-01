@@ -1,13 +1,7 @@
 #!/bin/bash
 #
-# DDP (Distributed Data Parallel) training script for RobotMDAR MVAE
-# Uses torchrun to launch training across 8 GPUs.
-#
-# Usage:
-#   bash scripts/run_training_ddp.sh
-#
-# All training hyperparameters are preserved from the original single-GPU script.
-# Effective batch size = batch_size (512) x 8 GPUs = 4096.
+# DDP training script for the RobotMDAR MVAE preset.
+# Static run values live in `robotmdar/config/train_mvae.yaml`.
 
 set -e
 
@@ -45,7 +39,7 @@ echo "Master GPU (rank 0): $(echo ${CUDA_VISIBLE_DEVICES} | cut -d',' -f1)"
 echo "Experiment timestamp: ${TIMESTAMP}"
 echo "Master port: ${MASTER_PORT}"
 
-# Optional: Resume from a checkpoint (uncomment and set the path)
+# Optional: resume from a checkpoint
 # CKPT_PATH="./logs/RobotMDAR/BONES-SEED-VAE/train-mvae-20260715_120000/ckpt_20000.pth"
 # CKPT_OVERRIDE="ckpt.vae=${CKPT_PATH}"
 
@@ -67,26 +61,14 @@ echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
 echo "  save_every:  ${SAVE_EVERY}"
 echo "  eval_every:  ${EVAL_EVERY}"
 
-DATADIR=BONES-SEED-29dof-FULL-50fps
-
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 torchrun \
     --nproc_per_node=${NUM_GPUS} \
     --master_port=${MASTER_PORT} \
     -m robotmdar.cli \
     --config-name=train_mvae \
-    expname=BONES-SEED-FUTURE-64-29DOF-RECOVERY \
     timestamp="'${TIMESTAMP}'" \
-    data.datadir=./dataset/${DATADIR} \
-    data.history_len=16 \
-    data.future_len=64 \
-    data.num_primitive=3 \
-    data.batch_size=256 \
-    data.weighted_sample=true \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \
     train.manager.save_every=${SAVE_EVERY} \
     train.manager.eval_every=${EVAL_EVERY} \
-    train.manager.use_rollout=true \
-    train.manager.learning_rate=0.0001 \
-    skeleton.asset.assetRoot=./description/robots/g1/ \
     ${CKPT_OVERRIDE}

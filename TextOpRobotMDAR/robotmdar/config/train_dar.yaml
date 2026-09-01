@@ -4,17 +4,20 @@ defaults:
   - train/dar
   - _self_
 
-expname: DAR-JOINT-STATE-GOAL
+expname: BONES-SEED-FUTURE-64-ROT-MAT
 task: train-dar
 
 data:
+  datadir: ./dataset/BONES-SEED-29dof-FULL-50fps
   # V6 joint_state targets the full-wrist G1 model directly.
   dof_dim: 29
   history_len: 16
   future_len: 64
-  num_primitive: 4
+  num_primitive: 3
   batch_size: 256
+  weighted_sample: true
   preload_ram: true
+  load_scene: false
   goal_type: joint_state
   goal_encoding: split
   goal_per_primitive: true
@@ -53,3 +56,7 @@ ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF
   # variant intentionally requires an explicit checkpoint override.
   vae: ${oc.select:data.dof_variants.dof${data.dof_dim}.vae_ckpt}
+
+skeleton:
+  asset:
+    assetRoot: ./description/robots/g1/
