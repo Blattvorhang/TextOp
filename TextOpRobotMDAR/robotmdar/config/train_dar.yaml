@@ -14,6 +14,7 @@ data:
   future_len: 64
   num_primitive: 4
   batch_size: 256
+  preload_ram: true
   goal_type: joint_state
   goal_encoding: split
   goal_per_primitive: true

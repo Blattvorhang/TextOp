@@ -8,6 +8,7 @@ This is a clean, well-structured implementation with:
 """
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 import joblib
@@ -251,6 +252,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.split = split
         self.device = "cpu"  # Keep embeddings on CPU initially
         self.sample_cache_size = max(0, int(kwargs.get('sample_cache_size', 8)))
+        self.preload_ram = bool(kwargs.get('preload_ram', False))
+        self.preload_num_workers = max(
+            1, int(kwargs.get('preload_num_workers', 8)))
+        self.preload_show_progress = bool(
+            kwargs.get('preload_show_progress', _is_goal_stats_writer()))
+        self.load_scene = bool(kwargs.get('load_scene', True))
         # Planner-side DR is disabled by default: augmentation_enabled must be
         # explicitly set to true (LDM configs only — VAE training stays clean).
         # Once enabled, augmentation activates from augmentation_start_step
@@ -329,11 +336,81 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if self.weighted_sample:
             self._cal_sample_weight()
 
+        if not self.load_scene:
+            for item in all_data:
+                item.pop('scene', None)
+
+        if self.preload_ram:
+            self._preload_manifest_samples()
+
         logger.info(f" Found {len(self.valid_indices)} valid samples out of {len(self.raw_data)}")
 
         # Load text embeddings
         # DEPRECATED: text embeddings no longer used (goal+scene conditioning).
         # self._load_text_embeddings()
+
+    def _strip_scene_if_needed(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        if self.load_scene or 'scene' not in sample:
+            return sample
+        sample = dict(sample)
+        sample.pop('scene', None)
+        return sample
+
+    def _load_manifest_sample(self, sample_path: Path) -> Dict[str, Any]:
+        if not sample_path.exists():
+            raise FileNotFoundError(
+                f"Manifest sample does not exist: {sample_path}"
+            )
+        stored = joblib.load(sample_path)
+        if not isinstance(stored, dict) or 'motion' not in stored:
+            raise ValueError(f"Invalid manifest sample: {sample_path}")
+        return self._strip_scene_if_needed(stored)
+
+    def _preload_manifest_samples(self) -> None:
+        """Hydrate manifest-backed samples once so training does no joblib I/O."""
+        sample_paths = []
+        seen = set()
+        for sample_idx in self.valid_indices:
+            relpath = self.raw_data[sample_idx].get('_data_path')
+            if relpath is None:
+                continue
+            sample_path = self.datadir / relpath
+            cache_key = str(sample_path)
+            if cache_key in seen:
+                continue
+            seen.add(cache_key)
+            sample_paths.append(sample_path)
+
+        if not sample_paths:
+            return
+
+        num_workers = min(self.preload_num_workers, len(sample_paths))
+        logger.info(
+            " Preloading {} {} samples into RAM with {} threads"
+            " (load_scene={})...",
+            len(sample_paths),
+            self.split,
+            num_workers,
+            self.load_scene,
+        )
+        preloaded = {}
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            loaded_iter = executor.map(self._load_manifest_sample, sample_paths)
+            iterator = tqdm(
+                zip(sample_paths, loaded_iter),
+                total=len(sample_paths),
+                desc=f"preload {self.split}",
+                disable=not self.preload_show_progress,
+            )
+            for sample_path, stored in iterator:
+                preloaded[str(sample_path)] = stored
+        self._preloaded_samples = preloaded
+        self._sample_cache.clear()
+        logger.info(
+            " Preloaded {} {} samples into RAM",
+            len(self._preloaded_samples),
+            self.split,
+        )
 
     def _hydrate_sample(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Load a manifest-backed sample, with a small per-worker LRU cache."""
@@ -342,22 +419,29 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             return record
 
         sample_path = self.datadir / relpath
+        cache_key = str(sample_path)
+        preloaded = getattr(self, '_preloaded_samples', None)
+        if preloaded is not None:
+            try:
+                stored = preloaded[cache_key]
+            except KeyError as exc:
+                raise FileNotFoundError(
+                    f"Manifest sample was not preloaded: {sample_path}"
+                ) from exc
+            sample = dict(stored)
+            sample.update({key: value for key, value in record.items()
+                           if key != '_data_path'})
+            return sample
+
         cache = getattr(self, '_sample_cache', None)
         if cache is None:
             cache = self._sample_cache = OrderedDict()
 
-        cache_key = str(sample_path)
         if cache_key in cache:
             stored = cache.pop(cache_key)
             cache[cache_key] = stored
         else:
-            if not sample_path.exists():
-                raise FileNotFoundError(
-                    f"Manifest sample does not exist: {sample_path}"
-                )
-            stored = joblib.load(sample_path)
-            if not isinstance(stored, dict) or 'motion' not in stored:
-                raise ValueError(f"Invalid manifest sample: {sample_path}")
+            stored = self._load_manifest_sample(sample_path)
             cache[cache_key] = stored
             cache_size = getattr(self, 'sample_cache_size', 8)
             while len(cache) > cache_size:

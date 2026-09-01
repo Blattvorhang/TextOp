@@ -26,6 +26,9 @@ weighted_sample: false
 frame_weight: false
 use_weighted_meanstd: false
 load_goal_stats: true
+preload_ram: false
+preload_num_workers: 8
+load_scene: true
 goal_offset: 0
 goal_offset_range: null
 goal_type: joint_state
@@ -77,6 +80,9 @@ common: &common
   frame_weight: ${..frame_weight}
   use_weighted_meanstd: ${..use_weighted_meanstd}
   load_goal_stats: ${..load_goal_stats}
+  preload_ram: ${..preload_ram}
+  preload_num_workers: ${..preload_num_workers}
+  load_scene: ${..load_scene}
   goal_offset: ${..goal_offset}
   goal_offset_range: ${..goal_offset_range}
   goal_type: ${..goal_type}

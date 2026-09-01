@@ -9,3 +9,5 @@ task: train-mvae
 data:
   dof_dim: 29
   load_goal_stats: false
+  preload_ram: true
+  load_scene: false

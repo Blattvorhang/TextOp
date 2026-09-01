@@ -1021,6 +1021,10 @@ def main(cfg: DictConfig):
     configure_dof_contract(cfg)
     seed.set(cfg.seed + rank)
     logger.set(cfg)
+
+    # Override device in config for downstream components.
+    cfg.device = str(device)
+
     train_data: Dataset = instantiate(cfg.data.train)
     goal_encoding = GoalEncoding.parse(
         cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
@@ -1055,10 +1059,6 @@ def main(cfg: DictConfig):
     # - BODY: ego_goal[..., :2] is the first body keypoint (root joint, index 0)
     # - BODY_EXT: ego_goal[..., :2] is [ego_root_x, ego_root_y] (prepended)
 
-    # Override device in config for downstream components
-    cfg.device = str(device)
-
-    train_data: Dataset = instantiate(cfg.data.train)
     val_data: Dataset = instantiate(cfg.data.val)
 
     # Set rank/world_size on datasets for distributed data sharding
