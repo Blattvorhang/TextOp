@@ -1,5 +1,6 @@
 """Local scene-occupancy sampling and 3D voxel morphology utilities."""
 
+from functools import lru_cache
 from typing import Any, Dict, Sequence
 
 import numpy as np
@@ -54,19 +55,23 @@ _EROSION_COUNTS = {6: 7, 10: 11, 26: 27}
 
 
 def _erode_torch(occupancy: torch.Tensor, mode: int) -> torch.Tensor:
-    """Erode a 3D bool tensor; the grid boundary is padded with occupied (1).
+    """Erode 3D or batched 3D bool tensors with occupied boundary padding.
 
     A voxel survives only when the centre and every required neighbour are
     occupied, counted by a 3×3×3 convolution against the mode's kernel.
     """
-    if occupancy.ndim != 3:
+    if occupancy.ndim not in (3, 4):
         raise ValueError(
-            f"Expected a 3-D occupancy tensor, got shape {tuple(occupancy.shape)}"
+            f"Expected a 3-D or batched 4-D occupancy tensor, got "
+            f"shape {tuple(occupancy.shape)}"
         )
     x = occupancy.to(dtype=torch.float32)
     padded = F.pad(x, (1, 1, 1, 1, 1, 1), mode="constant", value=1.0)
     kernel = _EROSION_KERNELS[mode].to(device=x.device)
-    counts = F.conv3d(padded[None, None], kernel)[0, 0]
+    if occupancy.ndim == 3:
+        counts = F.conv3d(padded[None, None], kernel)[0, 0]
+    else:
+        counts = F.conv3d(padded[:, None], kernel)[:, 0]
     return counts >= _EROSION_COUNTS[mode]
 
 
@@ -223,6 +228,53 @@ def compute_scene_surface(
     return surface.cpu().numpy() if was_numpy else surface
 
 
+def compute_scene_surface_batch(
+    occupancy,
+    thicknesses,
+    erosion_mode: int = 26,
+) -> torch.Tensor | np.ndarray:
+    """Batched equivalent of compute_scene_surface with per-sample thickness."""
+    tensor, was_numpy = _prepare_occupancy(occupancy)
+    if tensor.ndim != 4:
+        raise ValueError(
+            f"Expected a batched 4-D occupancy array, got "
+            f"shape {tuple(tensor.shape)}"
+        )
+    if erosion_mode not in _EROSION_COUNTS:
+        raise ValueError(
+            f"erosion_mode must be one of {sorted(_EROSION_COUNTS)}, "
+            f"got {erosion_mode!r}"
+        )
+    if isinstance(thicknesses, (int, np.integer)):
+        thickness_list = [int(thicknesses)] * tensor.shape[0]
+    else:
+        thickness_list = [int(value) for value in thicknesses]
+    if len(thickness_list) != tensor.shape[0]:
+        raise ValueError(
+            f"Expected {tensor.shape[0]} thicknesses, got "
+            f"{len(thickness_list)}"
+        )
+    if any(value < 0 for value in thickness_list):
+        raise ValueError(f"thicknesses must be non-negative, got {thicknesses!r}")
+
+    surface = torch.zeros_like(tensor, dtype=torch.bool)
+    for thickness in sorted(set(thickness_list)):
+        if thickness == 0:
+            continue
+        indices = [
+            idx for idx, value in enumerate(thickness_list)
+            if value == thickness
+        ]
+        index = torch.as_tensor(indices, device=tensor.device, dtype=torch.long)
+        selected = tensor.index_select(0, index)
+        eroded = selected.clone()
+        for _ in range(thickness):
+            eroded = _erode_torch(eroded, erosion_mode)
+        surface.index_copy_(0, index, torch.logical_xor(eroded, selected))
+    return surface.cpu().numpy() if was_numpy else surface
+
+
+@lru_cache(maxsize=16)
 def _local_grid_offsets(grid_size: int, grid_unit: float) -> np.ndarray:
     if grid_size <= 0 or grid_size % 2 == 0:
         raise ValueError(f"grid_size must be a positive odd number, got {grid_size}")

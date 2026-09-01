@@ -131,6 +131,24 @@ def get_ddp_model(model):
     return model
 
 
+def _accumulate_metric(total: dict, key: str, value) -> None:
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        total[key] = total[key] + value if key in total else value.clone()
+    elif isinstance(value, (int, float)):
+        total[key] = total.get(key, 0.0) + value
+    else:
+        total[key] = value
+
+
+def _report_value(value, divisor: float = 1.0):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, (int, float)):
+        return value / divisor
+    return value / divisor if divisor != 1.0 else value
+
+
 def ddp_reduce_mean(tensor_dict: dict) -> dict:
     """All-reduce mean across all DDP ranks for each tensor in the dict.
 
@@ -174,33 +192,40 @@ def ddp_reduce_mean(tensor_dict: dict) -> dict:
         set(spec) | {k for k, v in tensor_dict.items()
                      if not isinstance(v, torch.Tensor)})
 
-    reduced = {}
+    reduced = {
+        k: tensor_dict.get(k)
+        for k in union_keys
+        if k not in spec
+    }
+    tensor_groups = defaultdict(list)
     for k in union_keys:
-        v = tensor_dict.get(k)
-        if k not in spec:
-            # Non-tensor on every rank: pass through (no collective).
-            reduced[k] = v
-            continue
-        if isinstance(v, torch.Tensor):
-            was_cpu = v.device.type == 'cpu'
-            if was_cpu and dist.get_backend() == 'nccl':
-                # NCCL requires CUDA tensors; other backends stay on CPU.
-                v = v.cuda()
-            v_reduced = v.clone().detach()
-        else:
-            # Missing (or non-tensor) on this rank: join the collective
-            # with zeros of the gathered shape/dtype.
+        if k in spec:
             shape, dtype_str = spec[k]
-            device = 'cuda' if dist.get_backend() == 'nccl' else 'cpu'
-            # str(v.dtype) is 'torch.float32' — strip the module prefix.
-            dtype = getattr(torch, dtype_str.split('.')[-1])
-            v_reduced = torch.zeros(shape, dtype=dtype, device=device)
-            was_cpu = False
-        dist.all_reduce(v_reduced, op=dist.ReduceOp.SUM)
-        v_reduced = v_reduced / world_size
-        if was_cpu:
-            v_reduced = v_reduced.cpu()
-        reduced[k] = v_reduced
+            tensor_groups[(shape, dtype_str)].append(k)
+
+    backend = dist.get_backend()
+    reduce_device = torch.device('cuda' if backend == 'nccl' else 'cpu')
+    for (shape, dtype_str), keys in tensor_groups.items():
+        dtype = getattr(torch, dtype_str.split('.')[-1])
+        packed_values = []
+        was_cpu = {}
+        for k in keys:
+            v = tensor_dict.get(k)
+            if isinstance(v, torch.Tensor):
+                was_cpu[k] = v.device.type == 'cpu'
+                value = v.detach().to(device=reduce_device, dtype=dtype)
+            else:
+                was_cpu[k] = False
+                value = torch.zeros(shape, dtype=dtype, device=reduce_device)
+            packed_values.append(value.reshape(-1))
+        packed = torch.stack(packed_values, dim=0)
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        packed = packed / world_size
+        for row, k in zip(packed, keys):
+            value = row.reshape(shape)
+            if was_cpu[k]:
+                value = value.cpu()
+            reduced[k] = value
     return reduced
 
 
@@ -259,8 +284,8 @@ class BaseManager(ABC):
         self.step = 0
 
         self._to_eval_steps = 0
-        self._total_eval_loss_dict = defaultdict(lambda: torch.tensor(0.0))
-        self._total_eval_extras_dict = defaultdict(lambda: torch.tensor(0.0))
+        self._total_eval_loss_dict = {}
+        self._total_eval_extras_dict = {}
         self.rec_criterion = nn.HuberLoss(reduction='mean', delta=1.0)
 
         self.save_dir = Path(self.save_dir)
@@ -313,9 +338,9 @@ class BaseManager(ABC):
         if is_eval:
             self._to_eval_steps -= 1
             for k, v in loss_dict.items():
-                self._total_eval_loss_dict[k] += v
+                _accumulate_metric(self._total_eval_loss_dict, k, v)
             for k, v in extras.items():
-                self._total_eval_extras_dict[k] += v
+                _accumulate_metric(self._total_eval_extras_dict, k, v)
             if self._to_eval_steps == 0:
                 # All-reduce accumulated eval metrics across all DDP ranks
                 reduced_loss = ddp_reduce_mean(self._total_eval_loss_dict)
@@ -323,13 +348,13 @@ class BaseManager(ABC):
                 if is_main_process():
                     for k, v in reduced_loss.items():
                         self.platform.report_scalar(
-                            "eval/" + k, v.cpu().numpy() / self.eval_steps, self.step, group_name="loss"
+                            "eval/" + k, _report_value(v, self.eval_steps),
+                            self.step, group_name="loss"
                         )
                     for k, v in reduced_extras.items():
                         group, tag = _classify_extra(k, 'eval')
                         self.platform.report_scalar(
-                            tag, (v.cpu().numpy() / self.eval_steps) if isinstance(v, torch.Tensor) else
-                            (v / self.eval_steps),
+                            tag, _report_value(v, self.eval_steps),
                             self.step,
                             group_name=group
                         )
@@ -338,8 +363,8 @@ class BaseManager(ABC):
                     )
                     if self._total_eval_extras_dict:
                         tqdm.write(f"Eval extras * {self.eval_steps}: {dict(reduced_extras)}")
-                self._total_eval_loss_dict = defaultdict(lambda: torch.tensor(0.0))
-                self._total_eval_extras_dict = defaultdict(lambda: torch.tensor(0.0))
+                self._total_eval_loss_dict = {}
+                self._total_eval_extras_dict = {}
             return
 
         self.step += 1
@@ -347,7 +372,11 @@ class BaseManager(ABC):
         if is_main_process():
             assert self._tqdm is not None
             self._tqdm.update(1)
-            self._tqdm.set_postfix({'stage': self.stage_idx, 'loss': loss_dict["total"].item(), 'lr': self.extra['lr']})
+            self._tqdm.set_postfix({
+                'stage': self.stage_idx,
+                'loss': _report_value(loss_dict["total"]),
+                'lr': self.extra['lr'],
+            })
         if self.step >= self.max_steps and self._tqdm is not None:
             self._tqdm.close()
 
@@ -356,11 +385,13 @@ class BaseManager(ABC):
         # all-reduce on every step would add ~50ms NCCL overhead per 10+ scalar keys.
         if is_main_process():
             for k, v in loss_dict.items():
-                self.platform.report_scalar("train/" + k, v.cpu().numpy(), self.step, group_name="loss")
+                self.platform.report_scalar(
+                    "train/" + k, _report_value(v),
+                    self.step, group_name="loss")
             for k, v in extras.items():
                 group, tag = _classify_extra(k, 'train')
                 self.platform.report_scalar(
-                    tag, v.cpu().numpy() if isinstance(v, torch.Tensor) else v, self.step, group_name=group
+                    tag, _report_value(v), self.step, group_name=group
                 )
             for k, v in self.extra.items():
                 group, tag = _classify_extra(k, 'train')
@@ -374,8 +405,17 @@ class BaseManager(ABC):
 
         if (self.step % self.eval_every == 0 or self.step == self.max_steps):
             self._to_eval_steps = self.eval_steps
-            self._total_eval_loss_dict = defaultdict(lambda: torch.tensor(0.0))
-            self._total_eval_extras_dict = defaultdict(lambda: torch.tensor(0.0))
+            self._total_eval_loss_dict = {}
+            self._total_eval_extras_dict = {}
+            if is_main_process():
+                details = []
+                if hasattr(self, 'eval_full_sample'):
+                    details.append(f"eval_full_sample={self.eval_full_sample}")
+                tqdm.write(
+                    f"Eval starting at step {self.step}: "
+                    f"{self.eval_steps} primitive steps"
+                    + (f" ({', '.join(details)})" if details else "")
+                )
 
     def should_eval(self) -> bool:
         """是否需要评估"""
@@ -395,9 +435,30 @@ class BaseManager(ABC):
         Args:
             model: PyTorch model to clip gradients for
         """
+        self.clip_grad_and_check(model)
+
+    def clip_grad_and_check(self, model) -> bool:
+        """Clip gradients once and return whether all grads are finite."""
+        params = [p for p in model.parameters() if p.grad is not None]
+        if not params:
+            self.extra['grad_norm'] = torch.tensor(0.0)
+            return True
+
         if self.max_grad_norm > 0:
-            norm = nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
-            self.extra['grad_norm'] = norm.detach().cpu().numpy()
+            norm = nn.utils.clip_grad_norm_(
+                params, self.max_grad_norm, error_if_nonfinite=False)
+        else:
+            grad_norms = [
+                torch.linalg.vector_norm(p.grad.detach(), ord=2)
+                for p in params
+            ]
+            device = grad_norms[0].device
+            norm = torch.linalg.vector_norm(
+                torch.stack([value.to(device) for value in grad_norms]),
+                ord=2,
+            )
+        self.extra['grad_norm'] = norm.detach()
+        return bool(torch.isfinite(norm).item())
 
     def __bool__(self):
         """Check if training should continue."""

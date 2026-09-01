@@ -15,7 +15,10 @@ from robotmdar.utils.goal import (
     build_ego_goal,
     validate_goal_config,
 )
-from robotmdar.utils.occupancy import compute_scene_surface, query_local_occupancy
+from robotmdar.utils.occupancy import (
+    compute_scene_surface_batch,
+    query_local_occupancy,
+)
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
 from robotmdar.utils.dof_contract import (
@@ -375,18 +378,11 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             # eval and rollout all consume the same representation.
             grid_size = int(cfg.denoiser.grid_size)
             grid = voxel.view(voxel.shape[0], grid_size, grid_size, grid_size)
-            # torch input -> torch output, so as_tensor is a no-op that only
-            # satisfies the static union type of compute_scene_surface
-            surfaces = [
-                torch.as_tensor(
-                    compute_scene_surface(grid[i], thickness=random.choice(
-                        (1, 2, 3))),
-                    dtype=torch.bool,
-                )
-                for i in range(grid.shape[0])
-            ]
-            voxel = torch.stack(surfaces).view(voxel.shape[0], -1).to(
-                dtype=voxel.dtype)
+            thicknesses = [random.choice((1, 2, 3))
+                           for _ in range(grid.shape[0])]
+            voxel = compute_scene_surface_batch(
+                grid, thicknesses=thicknesses).view(voxel.shape[0], -1).to(
+                    dtype=voxel.dtype)
     else:
         # Pre-scene curriculum phase (step < manager.scene_start_step): the
         # denoiser learns basic goal-driven motion on a blank occupancy grid.
@@ -777,13 +773,6 @@ def _build_segment_figure(batch, dataset, vae, denoiser, diffusion,
         viz_data, world_goal_pos, labels=labels,
         stage_idx=manager.stage_idx, max_samples=max_samples,
         scenes=scenes)
-
-
-def _detach_mapping(values):
-    return {
-        key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
-        for key, value in values.items()
-    }
 
 
 def ddp_setup():
@@ -1218,17 +1207,7 @@ def main(cfg: DictConfig):
 
             optimizer.zero_grad()
             loss.backward()
-            has_nan_grad = False
-            raw_model = get_ddp_model(denoiser)
-            for param in raw_model.parameters():
-                if param.grad is not None:
-                    # 检查 NaN 和 Inf
-                    if torch.isnan(param.grad).any() or torch.isinf(
-                            param.grad).any():
-                        has_nan_grad = True
-
-            if not has_nan_grad:
-                manager.grad_clip(denoiser)
+            if manager.clip_grad_and_check(denoiser):
                 optimizer.step()
 
             # 更新prev_motion，如果启用full sample则使用更高质量的采样
@@ -1262,8 +1241,8 @@ def main(cfg: DictConfig):
 
             manager.post_step(
                 is_eval=False,
-                loss_dict=_detach_mapping(loss_dict),
-                extras=_detach_mapping(extras),
+                loss_dict=loss_dict,
+                extras=extras,
             )
 
         # Validation loop
@@ -1274,6 +1253,8 @@ def main(cfg: DictConfig):
                 _validate_batch(batch, cfg)
                 val_batch_validated = True
             for pidx in range(num_primitive):
+                if not manager.should_eval():
+                    break
                 manager.pre_step(is_eval=True)
                 primitive = batch[pidx]
                 motion = primitive['motion'].to(cfg.device)
@@ -1309,7 +1290,7 @@ def main(cfg: DictConfig):
                                              t=t,
                                              noise=torch.randn_like(x_start))
 
-                    x_start_pred = denoiser(
+                    x_start_pred = denoiser_raw(
                         x_t=x_t, timesteps=diffusion._scale_timesteps(t), y=y)
 
                     latent_pred = x_start_pred.permute(1, 0, 2)
@@ -1343,7 +1324,7 @@ def main(cfg: DictConfig):
 
                     if getattr(manager, 'eval_full_sample', False):
                         sample_latent = diffusion.p_sample_loop(
-                            denoiser,
+                            denoiser_raw,
                             x_start.shape,
                             clip_denoised=False,
                             model_kwargs={'y': y},
@@ -1429,7 +1410,7 @@ def main(cfg: DictConfig):
                             # does not feed eval metrics. RNG state is
                             # preserved so later eval steps are unaffected.
                             segment_figure = _build_segment_figure(
-                                batch, val_data, vae, denoiser, diffusion,
+                                batch, val_data, vae, denoiser_raw, diffusion,
                                 manager, cfg)
                             manager.platform.report_figure(
                                 'segment_rollout_trajectory',
@@ -1440,8 +1421,8 @@ def main(cfg: DictConfig):
 
                 manager.post_step(
                     is_eval=True,
-                    loss_dict=_detach_mapping(loss_dict),
-                    extras=_detach_mapping(extras),
+                    loss_dict=loss_dict,
+                    extras=extras,
                 )
 
     # Clean up DDP resources

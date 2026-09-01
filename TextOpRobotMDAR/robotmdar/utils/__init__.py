@@ -9,6 +9,7 @@ from robotmdar.utils.goal import (
     validate_goal_config,
 )
 from robotmdar.utils.occupancy import (
+    compute_scene_surface_batch,
     erode_voxel_26,
     query_local_occupancy,
 )

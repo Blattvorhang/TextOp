@@ -68,7 +68,8 @@ SAVE_EVERY=$((20000 / NUM_GPUS * SCALE_FACTOR))
 EVAL_EVERY=$((2000 / NUM_GPUS * SCALE_FACTOR))
 
 AUGMENTATION_START_STEP=$((80000 / NUM_GPUS * SCALE_FACTOR))
-SCENE_START_STEP=$((120000 / NUM_GPUS * SCALE_FACTOR))
+# SCENE_START_STEP=$((120000 / NUM_GPUS * SCALE_FACTOR))
+SCENE_START_STEP=$((TOTAL_STEPS + 1))  # disable scene occupancy
 
 echo "Scaled for ${NUM_GPUS} GPUs:"
 echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
@@ -99,6 +100,7 @@ torchrun \
     data.augmentation_prob=0.5 \
     data.scene_start_step=${SCENE_START_STEP} \
     data.use_scene_surface=true \
+    data.load_scene=false \
     data.action_statistics_path=./dataset/${DATADIR}/action_statistics.json \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \
     train.manager.save_every=${SAVE_EVERY} \

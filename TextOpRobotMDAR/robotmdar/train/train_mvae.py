@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.distributed as dist
-import toolz
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
@@ -177,27 +176,13 @@ def main(cfg: DictConfig):
             optimizer.zero_grad()
             loss.backward()
 
-            has_nan_grad = False
-            for param in vae_raw.parameters():
-                if param.grad is not None:
-                    # 检查 NaN 和 Inf
-                    if torch.isnan(param.grad).any() or torch.isinf(
-                            param.grad).any():
-                        has_nan_grad = True
-
-            if not has_nan_grad:
-                manager.grad_clip(vae)
+            if manager.clip_grad_and_check(vae):
                 optimizer.step()
 
             prev_motion = future_motion_pred.detach()
 
-            manager.post_step(is_eval=False,
-                              loss_dict=toolz.valmap(
-                                  lambda x: x.detach().cpu(), loss_dict),
-                              extras=toolz.valmap(
-                                  lambda x: x.detach().cpu()
-                                  if isinstance(x, torch.Tensor) else x,
-                                  extras))
+            manager.post_step(is_eval=False, loss_dict=loss_dict,
+                              extras=extras)
 
         vae.eval()
         while manager.should_eval():
@@ -209,6 +194,8 @@ def main(cfg: DictConfig):
                 )
                 val_batch_validated = True
             for pidx in range(num_primitive):
+                if not manager.should_eval():
+                    break
                 manager.pre_step(is_eval=True)
                 motion = batch[pidx]['motion'].to(cfg.device)
 
@@ -234,13 +221,8 @@ def main(cfg: DictConfig):
                         action_label=batch[pidx].get('action_label'),
                         is_recovery=batch[pidx].get('is_recovery'),
                     )
-                manager.post_step(is_eval=True,
-                                  loss_dict=toolz.valmap(
-                                      lambda x: x.detach().cpu(), loss_dict),
-                                  extras=toolz.valmap(
-                                      lambda x: x.detach().cpu()
-                                      if isinstance(x, torch.Tensor) else x,
-                                      extras))
+                manager.post_step(is_eval=True, loss_dict=loss_dict,
+                                  extras=extras)
 
     # Clean up DDP resources
     if dist.is_initialized():
