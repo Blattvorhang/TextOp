@@ -102,6 +102,7 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
         legacy_23 = compose(
             config_name='train_dar',
             overrides=[
+                'feature_version=3',
                 'data.dof_dim=23',
                 'data.goal_type=root',
                 'denoiser.goal_dim=5',
@@ -128,8 +129,8 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
         configure_dof_contract(rotmat_v6_data_override)
 
     assert int(v6.data.dof_dim) == 29
-    assert int(v6.data.nfeats) == 69
-    assert int(v6.feature_version) == 3
+    assert int(v6.data.nfeats) == 44  # base.yaml now defaults to v6
+    assert int(v6.feature_version) == 6
     assert v6.data.goal_type == 'joint_state'
     assert int(v6.denoiser.goal_dim) == 45
     assert v6.skeleton.asset.assetFileName == 'g1_29dof.xml'
@@ -140,7 +141,7 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
     )
     assert legacy_23.ckpt.vae == 'logs/pretrained/long_horizon_64/vae.pth'
     assert int(planner.data.dof_dim) == 29
-    assert int(planner.data.nfeats) == 69
+    assert int(planner.data.nfeats) == 44  # base.yaml now defaults to v6
     assert planner.data.goal_type == 'joint_state'
     assert int(planner.denoiser.goal_dim) == 45
     assert planner.skeleton.asset.assetFileName == 'g1_29dof.xml'

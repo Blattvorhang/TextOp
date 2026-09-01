@@ -671,6 +671,18 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
             meanstd = torch.load(meanstd_cache_path, map_location="cpu")
+            if not self._meanstd_cache_is_current(meanstd):
+                logger.warning(
+                    " Cached mean/std at {} is stale for FeatureVersion {} "
+                    "(arrival-state v6 caches are stored with metadata); "
+                    "recomputing",
+                    meanstd_cache_path, motion_dtype.FeatureVersion,
+                )
+                meanstd = self._compute_meanstd()
+                torch.save(
+                    self._meanstd_cache_payload(meanstd),
+                    meanstd_cache_path,
+                )
         else:
             logger.info(f" Computing mean/std..")
             assert self.split == 'train', "Compute mean and std from 'train' set"
@@ -679,10 +691,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             meanstd = self._compute_meanstd()
             # meanstd = self._compute_meanstd_V2()
 
-            torch.save(meanstd, meanstd_cache_path)
+            torch.save(
+                self._meanstd_cache_payload(meanstd),
+                meanstd_cache_path,
+            )
             logger.info(f" Saved mean/std to {meanstd_cache_path}")
 
-        self._set_meanstd(meanstd, meanstd_cache_path)
+        self._set_meanstd(self._meanstd_cache_tuple(meanstd), meanstd_cache_path)
 
     def _load_weighted_meanstd(self) -> None:
         """Load or compute mean/std for normalization"""
@@ -694,6 +709,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
             meanstd = torch.load(meanstd_cache_path, map_location="cpu")
+            if not self._meanstd_cache_is_current(meanstd):
+                logger.warning(
+                    " Cached weighted mean/std at {} is stale for "
+                    "FeatureVersion {}; recomputing",
+                    meanstd_cache_path, motion_dtype.FeatureVersion,
+                )
+                meanstd = self._compute_meanstd()
+                torch.save(
+                    self._meanstd_cache_payload(meanstd),
+                    meanstd_cache_path,
+                )
         else:
             logger.info(f" Computing mean/std..")
             assert self.split == 'train', "Compute mean and std from 'train' set"
@@ -702,10 +728,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             meanstd = self._compute_meanstd()
             # meanstd = self._compute_meanstd_V2()
 
-            torch.save(meanstd, meanstd_cache_path)
+            torch.save(
+                self._meanstd_cache_payload(meanstd),
+                meanstd_cache_path,
+            )
             logger.info(f" Saved mean/std to {meanstd_cache_path}")
 
-        self._set_meanstd(meanstd, meanstd_cache_path)
+        self._set_meanstd(self._meanstd_cache_tuple(meanstd), meanstd_cache_path)
 
     def _default_meanstd_path(self, weighted: bool) -> Path:
         stem = 'weighted_meanstd' if weighted else 'meanstd'
@@ -714,6 +743,33 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         return self.datadir / (
             f'{stem}_v{motion_dtype.FeatureVersion}_dof{self.dof_dim}.pkl'
         )
+
+    def _meanstd_cache_payload(self, meanstd):
+        if motion_dtype.FeatureVersion == 6:
+            mean, std = meanstd
+            return {
+                'mean': mean,
+                'std': std,
+                'feature_version': 6,
+                'feature_alignment': 'arrival',
+            }
+        return meanstd
+
+    def _meanstd_cache_is_current(self, meanstd) -> bool:
+        if motion_dtype.FeatureVersion == 6:
+            return (
+                isinstance(meanstd, dict)
+                and int(meanstd.get('feature_version', -1)) == 6
+                and meanstd.get('feature_alignment') == 'arrival'
+                and 'mean' in meanstd
+                and 'std' in meanstd
+            )
+        return isinstance(meanstd, tuple) and len(meanstd) == 2
+
+    def _meanstd_cache_tuple(self, meanstd):
+        if isinstance(meanstd, dict):
+            return meanstd['mean'], meanstd['std']
+        return meanstd
 
     def _set_meanstd(self, meanstd, source_path: Path) -> None:
         mean, std = meanstd

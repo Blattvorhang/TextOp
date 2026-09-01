@@ -36,7 +36,9 @@ manager:
     body_trans: 0.05    # 0.05
     body_rot: 1e-2   # 1e-2
     dof_pos: 0.03     # 0.03
-    dof_vel: 1e-5     # 1e-5
+    dof_vel: 3e-3     # v6: sole joint-velocity supervision; doc §4.3.5 re-tune range
+                      # is 1e-4~1e-2 above v3's 1e-5. Start value; confirm from
+                      # first-run unweighted ratio vs rec/dof_pos
     foot_contact: 0.01     # 0.01
 
     fk_joints_rec: 1.0
@@ -50,7 +52,7 @@ manager:
 
     rot_chord: 0.02
     g_cons: 0.05
-    h_vel: 0.001
+    h_vel: 0.001    # v6 (doc §4.3.5): final value must land below dof_vel
 
     quantize_rot: 0.0
     quantize_trans: 0.0

@@ -41,7 +41,8 @@ manager:
     body_trans: 0.05
     body_rot: 1e-2
     dof_pos: 0.03
-    dof_vel: 1e-5
+    dof_vel: 3e-3  # shared with mvae v6 (doc §4.3.5); live under feature_version=3
+                   # DAR too — override back to 1e-5 for v3 experiments
     foot_contact: 0.01
     goal_root_position: 0.5
 
@@ -56,7 +57,7 @@ manager:
 
     rot_chord: 0.02
     g_cons: 0.05
-    h_vel: 0.001
+    h_vel: 0.001  # shared with mvae v6 (doc §4.3.5)
 
     quantize_rot: 0.0
     quantize_trans: 0.0

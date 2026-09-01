@@ -757,12 +757,8 @@ def _shortest_arc_right_correction(a: torch.Tensor, b: torch.Tensor) -> torch.Te
 def _project_feature_v6_components(motion_feature: torch.Tensor):
     gravity = F.normalize(motion_feature[..., 1:4], dim=-1, eps=1e-8)
     delta_hor_raw = motion_feature[..., 4:7]
-    delta_hor = (
-        delta_hor_raw
-        - (delta_hor_raw * gravity).sum(dim=-1, keepdim=True) * gravity
-    )
     rel_rot = rot6d_to_matrix(motion_feature[..., 7:13])
-    return gravity, delta_hor, rel_rot
+    return gravity, delta_hor_raw, rel_rot
 
 
 def __jitable_motion_dict_to_feature_v6__(
@@ -774,28 +770,32 @@ def __jitable_motion_dict_to_feature_v6__(
     B, T_plus_1, _ = trans.shape
     T = T_plus_1 - 1
 
-    height = trans[:, :T, 2].unsqueeze(-1)
+    height = trans[:, 1:, 2].unsqueeze(-1)
     rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(rot))
-    rot_t = rot_matrix[:, :T]
-    rot_next = rot_matrix[:, 1:T + 1]
+    rot_prev = rot_matrix[:, :T]
+    rot_curr = rot_matrix[:, 1:]
 
     gravity_world = _world_gravity_like(trans[:, :T])
+    gravity_prev = torch.matmul(
+        rot_prev.transpose(-1, -2),
+        gravity_world.unsqueeze(-1),
+    ).squeeze(-1)
     gravity = torch.matmul(
-        rot_t.transpose(-1, -2),
+        rot_curr.transpose(-1, -2),
         gravity_world.unsqueeze(-1),
     ).squeeze(-1)
 
     delta_world = trans[:, 1:T + 1] - trans[:, :T]
     delta_local = torch.matmul(
-        rot_t.transpose(-1, -2),
+        rot_prev.transpose(-1, -2),
         delta_world.unsqueeze(-1),
     ).squeeze(-1)
     delta_hor = (
         delta_local
-        - (delta_local * gravity).sum(dim=-1, keepdim=True) * gravity
+        - (delta_local * gravity_prev).sum(dim=-1, keepdim=True) * gravity_prev
     )
 
-    rel_rot = torch.matmul(rot_t.transpose(-1, -2), rot_next)
+    rel_rot = torch.matmul(rot_prev.transpose(-1, -2), rot_curr)
     rel_rot_6d = matrix_to_rot6d(rel_rot)
 
     feature = torch.cat(
@@ -804,8 +804,8 @@ def __jitable_motion_dict_to_feature_v6__(
             gravity,
             delta_hor,
             rel_rot_6d,
-            dof[:, :T],
-            contact[:, :T],
+            dof[:, 1:],
+            contact[:, 1:],
         ],
         dim=-1,
     )
@@ -882,47 +882,53 @@ def motion_feature_to_dict_v6(
         )
 
     height = motion_feature[..., 0]
-    gravity, delta_hor, rel_rot = _project_feature_v6_components(motion_feature)
+    gravity, delta_hor_raw, rel_rot = _project_feature_v6_components(motion_feature)
     dof = motion_feature[..., 13:13 + dof_dim]
     contact = motion_feature[..., 13 + dof_dim:13 + dof_dim + CONTACT_MASK_DIM]
 
-    rot_matrix = torch.zeros(
-        B, T, 3, 3, device=motion_feature.device, dtype=motion_feature.dtype
-    )
-    trans = torch.zeros(
-        B, T, 3, device=motion_feature.device, dtype=motion_feature.dtype
-    )
+    prev_rot = quaternion_to_matrix(xyzw_to_wxyz(abs_pose['root_rot']))
+    prev_trans = abs_pose['root_trans_offset']
+    rot_frames = []
+    trans_frames = []
 
-    init_rot = quaternion_to_matrix(xyzw_to_wxyz(abs_pose['root_rot']))
-    init_gravity = torch.matmul(
-        init_rot.transpose(-1, -2),
-        _world_gravity_like(abs_pose['root_trans_offset']).unsqueeze(-1),
-    ).squeeze(-1)
-    init_correction = _shortest_arc_right_correction(init_gravity, gravity[:, 0])
-    rot_matrix[:, 0] = torch.matmul(init_rot, init_correction)
-    trans[:, 0] = abs_pose['root_trans_offset']
-    trans[:, 0, 2] = height[:, 0]
-
-    for t in range(T - 1):
-        provisional_rot = torch.matmul(rot_matrix[:, t], rel_rot[:, t])
+    for t in range(T):
+        gravity_world = _world_gravity_like(prev_trans)
+        prev_gravity = torch.matmul(
+            prev_rot.transpose(-1, -2),
+            gravity_world.unsqueeze(-1),
+        ).squeeze(-1)
+        current_gravity = gravity[:, t]
+        provisional_rot = torch.matmul(prev_rot, rel_rot[:, t])
         integrated_gravity = torch.matmul(
             provisional_rot.transpose(-1, -2),
-            _world_gravity_like(trans[:, t]).unsqueeze(-1),
+            gravity_world.unsqueeze(-1),
         ).squeeze(-1)
         correction = _shortest_arc_right_correction(
             integrated_gravity,
-            gravity[:, t + 1],
+            current_gravity,
         )
-        rot_matrix[:, t + 1] = torch.matmul(provisional_rot, correction)
+        next_rot = torch.matmul(provisional_rot, correction)
 
-        delta_height = height[:, t + 1] - height[:, t]
-        delta_local = delta_hor[:, t] - delta_height.unsqueeze(-1) * gravity[:, t]
+        delta_height = height[:, t] - prev_trans[:, 2]
+        delta_hor = (
+            delta_hor_raw[:, t]
+            - (delta_hor_raw[:, t] * prev_gravity).sum(dim=-1, keepdim=True)
+            * prev_gravity
+        )
+        delta_local = delta_hor - delta_height.unsqueeze(-1) * prev_gravity
         delta_world = torch.matmul(
-            rot_matrix[:, t],
+            prev_rot,
             delta_local.unsqueeze(-1),
         ).squeeze(-1)
-        trans[:, t + 1] = trans[:, t] + delta_world
-        trans[:, t + 1, 2] = height[:, t + 1]
+        next_trans = prev_trans + delta_world
+        next_trans = torch.cat((next_trans[..., :2], height[:, t:t + 1]), dim=-1)
+        rot_frames.append(next_rot)
+        trans_frames.append(next_trans)
+        prev_rot = next_rot
+        prev_trans = next_trans
+
+    rot_matrix = torch.stack(rot_frames, dim=1)
+    trans = torch.stack(trans_frames, dim=1)
 
     root_rot = wxyz_to_xyzw(matrix_to_quaternion(rot_matrix))
 

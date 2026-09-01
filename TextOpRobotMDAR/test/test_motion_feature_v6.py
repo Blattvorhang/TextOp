@@ -69,21 +69,41 @@ def test_v6_round_trip_preserves_feature_indexed_states():
     assert feature.shape == (4, 8, 44)
     torch.testing.assert_close(
         reconstructed['root_trans_offset'],
-        motion['root_trans_offset'][:, :-1],
+        motion['root_trans_offset'][:, 1:],
         atol=1e-5,
         rtol=1e-5,
     )
     torch.testing.assert_close(
         _rotmat_xyzw(reconstructed['root_rot']),
-        _rotmat_xyzw(motion['root_rot'][:, :-1]),
+        _rotmat_xyzw(motion['root_rot'][:, 1:]),
         atol=1e-5,
         rtol=1e-5,
     )
-    torch.testing.assert_close(reconstructed['dof'], motion['dof'][:, :-1])
+    torch.testing.assert_close(reconstructed['dof'], motion['dof'][:, 1:])
     torch.testing.assert_close(
         reconstructed['contact_mask'],
-        motion['contact_mask'][:, :-1],
+        motion['contact_mask'][:, 1:],
     )
+
+
+def test_v6_reconstruction_backward_has_no_inplace_rollout_mutation():
+    base = get_zero_feature_v6(29).unsqueeze(0).repeat(2, 64, 1)
+    noise = torch.randn_like(base) * 0.01
+    feature = (base + noise).detach().requires_grad_(True)
+    abs_pose = {
+        'root_trans_offset': torch.zeros(2, 3),
+        'root_rot': torch.tensor([0.0, 0.0, 0.0, 1.0]).repeat(2, 1),
+    }
+
+    reconstructed = motion_feature_to_dict_v6(feature, abs_pose)
+    loss = (
+        reconstructed['root_trans_offset'].square().mean()
+        + _rotmat_xyzw(reconstructed['root_rot']).square().mean()
+    )
+    loss.backward()
+
+    assert feature.grad is not None
+    assert torch.isfinite(feature.grad).all()
 
 
 def test_v6_round_trip_supports_unbatched_23dof_motion():
@@ -97,17 +117,17 @@ def test_v6_round_trip_supports_unbatched_23dof_motion():
     assert feature.shape == (5, 38)
     torch.testing.assert_close(
         reconstructed['root_trans_offset'],
-        motion['root_trans_offset'][:-1],
+        motion['root_trans_offset'][1:],
         atol=1e-5,
         rtol=1e-5,
     )
     torch.testing.assert_close(
         _rotmat_xyzw(reconstructed['root_rot']),
-        _rotmat_xyzw(motion['root_rot'][:-1]),
+        _rotmat_xyzw(motion['root_rot'][1:]),
         atol=1e-5,
         rtol=1e-5,
     )
-    torch.testing.assert_close(reconstructed['dof'], motion['dof'][:-1])
+    torch.testing.assert_close(reconstructed['dof'], motion['dof'][1:])
 
 
 def test_v6_features_are_invariant_to_horizontal_world_se2_transform():

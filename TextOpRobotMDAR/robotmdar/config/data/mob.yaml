@@ -15,7 +15,8 @@ dof_variants:
     vae_ckpt: null
 nfeats: ${oc.select:data.dof_variants.dof${data.dof_dim}.nfeats}
 normalization_path: ${oc.select:data.dof_variants.dof${data.dof_dim}.normalization_path}
-std_floor: 0.0
+std_floor: 0.002  # doc §4.4: ~5th pct of v6 per-dim std (from meanstd_v6_dof29.pkl);
+                  # floors near-constant channels (rot6d identity cols ~9e-4, dp_z ~1.3e-3)
 history_len: 16
 future_len: 64
 num_primitive: 4

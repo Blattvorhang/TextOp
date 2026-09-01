@@ -169,7 +169,9 @@ def main(cfg: DictConfig):
                 future_motion_pred,
                 latent_dist,
                 history_motion=history_motion,
-                sliding_mask=sliding_mask)
+                sliding_mask=sliding_mask,
+                action_label=batch[pidx].get('action_label'),
+                is_recovery=batch[pidx].get('is_recovery'))
             loss = loss_dict['total']
 
             optimizer.zero_grad()
@@ -229,6 +231,8 @@ def main(cfg: DictConfig):
                         latent_dist,
                         history_motion=history_motion,
                         sliding_mask=sliding_mask,
+                        action_label=batch[pidx].get('action_label'),
+                        is_recovery=batch[pidx].get('is_recovery'),
                     )
                 manager.post_step(is_eval=True,
                                   loss_dict=toolz.valmap(
