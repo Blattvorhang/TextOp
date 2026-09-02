@@ -499,19 +499,20 @@ New script `dataset/data_process/augment_fall_recovery.py`
    success once succeeds in all 20 trials (deterministic policy), so a
    single trial is the acceptance test.
 3. **Save accepted clips** to a clearly-marked folder
-   `data/motion_lib_filtered/aug_fall_recovery/` — joblib pkls in the
+   `data/motion_lib_filtered/aug_fall_recovery/` — one joblib pkl per
+   augmented motion in the
    motion_lib entry schema (stage-1 output format: `root_trans_offset`
    [T,3] m, `root_rot` [T,4] xyzw, `dof` [T,29] rad in MJCF order,
    `contact_mask` [T,2], `fps`, optional `scene`), which stage 3 packs
    directly. **Naming**: trajectory name = original action name +
-   augmentation ordinal — file `aug_{k:03d}.pkl`, dict key
-   `{original_name}_aug{k:03d}` (e.g.
-   `stand_up_lying_R_002__A472_aug003`), so the packed `_source` reads
-   `aug_fall_recovery__aug_003__stand_up_lying_R_002__A472_aug003`.
+   augmentation ordinal — file
+   `{original_name}_aug_{k:03d}.pkl`, dict key
+   `{original_name}_aug_{k:03d}` (e.g.
+   `stand_up_lying_R_002__A472_aug_003.pkl`), so the packed `_source`
+   remains traceable to the original clip and the augmentation index.
    Verified against `_extract_action_name` / `classify_coarse` in
-   `pack_motion_lib_to_textop.py`: the trailing `_002__A472_aug003`
-   run is stripped to `…_stand_up_lying_R`, which still contains the
-   `stand_up_lying*` stem, so the coarse label (`fall`) and
+   `pack_motion_lib_to_textop.py`: names ending in `_aug_003` still
+   contain the `stand_up_lying*` stem, so the coarse label (`fall`) and
    `_is_flat_recovery` → `_recovery_boost` are preserved, hence the
    getup-class logging (§8) keeps working.
 4. **Batch per original clip** — generate `k` accepted clips from one
@@ -597,26 +598,26 @@ kept clips, which is exactly what this pipeline produces.
 ### 9.7 Environment (MuJoCo / ONNX Runtime) — resolved
 
 Decision: **unify on textop** (Option A), installed and verified
-2026-09-02: `onnxruntime-gpu 1.20.2` (CUDA + TensorRT providers) next to
-the existing `mujoco 3.2.3`. Full smoke test passed on the RTX 4070 Ti
-SUPER: CUDAExecutionProvider active, 5 headless control steps of
-`stand_up_lying_R_002__A472` tracked, pelvis z rising.
+2026-09-02: CPU-only `onnxruntime 1.20.1` next to the existing
+`mujoco 3.2.3`. Single-clip SONIC validation is small-batch inference,
+so CPU avoids CUDA provider startup, device-copy overhead, and CUDA
+12/13 shared-library churn. Verified providers:
+`AzureExecutionProvider`, `CPUExecutionProvider`; SONIC encoder loads
+with `CPUExecutionProvider`.
 
-One operational requirement: the pip nvidia packages keep their shared
-libraries under `lib/python*/site-packages/nvidia/*/lib`, which the
-dynamic loader does not search by default. The pipeline launcher must
-export them on `LD_LIBRARY_PATH` **before python starts** (exec-level;
-in-process `os.environ` mutation proved unreliable in testing), e.g.:
+GPU remains an explicit experiment path only: install a matching
+`onnxruntime-gpu` build, prepare the CUDA shared-library paths before
+Python starts, and pass `--device cuda` or `--device tensorrt`.
+Production augmentation defaults to CPU and does not carry CUDA
+environment setup.
 
-```bash
-export LD_LIBRARY_PATH=$(python -c "import glob;print(':'.join(sorted(
-    set(glob.glob('$CONDA_PREFIX/lib/python*/site-packages/nvidia/*/lib'))
-    | {'$CONDA_PREFIX/lib/python*/site-packages/onnxruntime/capi'})))"):$LD_LIBRARY_PATH
-```
-
-(Also extend `_setup_cuda_libs` in `eval_fall_recovery.py` with the
-`site-packages/nvidia/*/lib` glob — it currently only searches `env/lib`
-and `torch/lib`.)
+The augmentation script parallelizes across original clips with
+`--num-workers` (`0` = auto, capped at 8; `1` = serial). Random seeds are
+split per source, and single-motion output files are written in source
+order.
+The default candidate budget is `max(k*8, k+16)`; for `k=8`, this gives
+64 attempts per source and covers the harder `A475` clip observed to need
+18 candidates for 8 accepted samples.
 
 ### 9.8 Open decisions
 
@@ -628,7 +629,7 @@ and `torch/lib`.)
    (measured: one success ⇒ 20/20; §9.3 step 2).
 4. Timing of the `weighted_sample: false` switch — after the augmented
    pool is packed and getup diagnostics verified (§9.3 step 5).
-5. Environment — resolved: textop env with `onnxruntime-gpu` (§9.7).
+5. Environment — resolved: textop env with CPU `onnxruntime` (§9.7).
 6. The `faint_stand_up_lying*` family — resolved: kept as-is, sampled
    normally in training, **not augmented** (its start frame is not a
    flat-lying pose; §9.1, §9.5). Augmentation input = the 16
