@@ -6,7 +6,7 @@ defaults:
 data:
   dof_dim: 29
   goal_type: joint_state
-  goal_encoding: legacy40
+  goal_encoding: split
   goal_per_primitive: true
   goal_offset: 0
   goal_offset_range: [-63, 0]
@@ -16,7 +16,7 @@ data:
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
-  goal_dim: 40
+  goal_dim: 55
   cond_goal_root_mask_prob: 0.1
   cond_goal_orientation_mask_prob: 0.1
   cond_goal_joint_mask_prob: 0.1

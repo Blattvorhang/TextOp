@@ -58,7 +58,7 @@ data:
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
-  goal_dim: 45
+  goal_dim: 55
 
 # V6 uses the TextOp-style root orientation block. Dropping yaw is treated as
 # dropping the whole orientation block for joint_state.

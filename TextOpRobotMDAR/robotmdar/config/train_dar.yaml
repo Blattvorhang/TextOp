@@ -37,7 +37,7 @@ data:
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
-  goal_dim: 45
+  goal_dim: 55
   cond_goal_root_mask_prob: 0.1
   cond_goal_orientation_mask_prob: 0.1
   cond_goal_joint_mask_prob: 0.4

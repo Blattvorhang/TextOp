@@ -6,14 +6,16 @@ feature_version: ${..feature_version}
 dof_dim: 29
 dof_variants:
   dof23:
-    nfeats: 57
+    nfeats_v3: 57
+    nfeats_v6: 38
     normalization_path: dataset/BONES-SEED-23dof-FULL-50fps/meanstd.pkl
     vae_ckpt: logs/pretrained/long_horizon_64/vae.pth
   dof29:
-    nfeats: 69
+    nfeats_v3: 69
+    nfeats_v6: 44
     normalization_path: null
     vae_ckpt: null
-nfeats: ${oc.select:data.dof_variants.dof${data.dof_dim}.nfeats}
+nfeats: ${oc.select:data.dof_variants.dof${data.dof_dim}.nfeats_v${data.feature_version}}
 normalization_path: ${oc.select:data.dof_variants.dof${data.dof_dim}.normalization_path}
 std_floor: 0.002  # doc §4.4: ~5th pct of v6 per-dim std (from meanstd_v6_dof29.pkl);
                   # floors near-constant channels (rot6d identity cols ~9e-4, dp_z ~1.3e-3)
