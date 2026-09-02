@@ -9,15 +9,31 @@ import torch
 
 from robotmdar.dtype.rotation import (
     euler_angles_to_quaternion,
+    matrix_to_rot6d,
     quat_mul,
     quaternion_to_euler_angles,
+    quaternion_to_matrix,
+    xyzw_to_wxyz,
 )
 
 
 JOINT_STATE_GOAL_DOF_DIM = 29
 JOINT_STATE_GOAL_DIM = 40
-SPLIT_GOAL_DIM = 45
+ROT_MAT_JOINT_STATE_GOAL_DIM = 47
+SPLIT_GOAL_DIM = 55
 EXTENDED_BODY_GOAL_DIM = 21
+
+V6_RAW_POSITION_SLICE = slice(0, 4)
+V6_RAW_ORIENTATION_SLICE = slice(4, 13)
+V6_RAW_JOINT_SLICE = slice(13, 42)
+V6_RAW_VELOCITY_SLICE = slice(42, 46)
+V6_RAW_TIME_SLICE = slice(46, 47)
+
+SPLIT_POSITION_SLICE = slice(0, 12)
+SPLIT_ORIENTATION_SLICE = slice(12, 21)
+SPLIT_JOINT_SLICE = slice(21, 50)
+SPLIT_VELOCITY_SLICE = slice(50, 54)
+SPLIT_TIME_SLICE = slice(54, 55)
 
 # Percentiles of the training goal distribution stored in goal_stats.pkl.
 # The dataset statistics pipeline quantizes the per-window ego goal distance
@@ -95,7 +111,7 @@ class GoalEncoding(str, Enum):
 
     @property
     def token_count(self) -> int:
-        return 4 if self is GoalEncoding.SPLIT else 1
+        return 5 if self is GoalEncoding.SPLIT else 1
 
     @property
     def uses_split_statistics(self) -> bool:
@@ -151,11 +167,11 @@ def validate_goal_config(
             parsed_encoding = GoalEncoding.LEGACY40
         elif int(goal_dim) == SPLIT_GOAL_DIM:
             raise ValueError(
-                "goal_encoding is required when goal_dim=45")
+                f"goal_encoding is required when goal_dim={SPLIT_GOAL_DIM}")
         else:
             raise ValueError(
-                f"goal_type={parsed.value!r} requires goal_dim=40 or 45, "
-                f"got {goal_dim}"
+                f"goal_type={parsed.value!r} requires goal_dim="
+                f"{JOINT_STATE_GOAL_DIM} or {SPLIT_GOAL_DIM}, got {goal_dim}"
             )
 
     if parsed_encoding is GoalEncoding.LEGACY40:
@@ -393,6 +409,64 @@ def _clamp_goal_root_xy(
     return clamped
 
 
+def _world_gravity_like(tensor: torch.Tensor) -> torch.Tensor:
+    gravity = torch.zeros(
+        tensor.shape[:-1] + (3,), device=tensor.device, dtype=tensor.dtype)
+    gravity[..., 2] = -1.0
+    return gravity
+
+
+def _matrix_from_quaternion_xyzw(name: str,
+                                 quaternion_xyzw: torch.Tensor) -> torch.Tensor:
+    quaternion_xyzw = _normalize_quaternion_xyzw(name, quaternion_xyzw)
+    return quaternion_to_matrix(xyzw_to_wxyz(quaternion_xyzw))
+
+
+def _rotate_world_to_reference(
+    world_vector: torch.Tensor,
+    reference_matrix: torch.Tensor,
+) -> torch.Tensor:
+    return torch.matmul(
+        reference_matrix.transpose(-1, -2),
+        world_vector.unsqueeze(-1),
+    ).squeeze(-1)
+
+
+def _project_to_tangent(vector: torch.Tensor,
+                        gravity: torch.Tensor) -> torch.Tensor:
+    gravity = torch.nn.functional.normalize(gravity, dim=-1, eps=1e-8)
+    return vector - (vector * gravity).sum(dim=-1, keepdim=True) * gravity
+
+
+def _clamp_goal_delta_hor(
+    delta_hor: torch.Tensor,
+    time_to_arrival_seconds: Optional[torch.Tensor],
+    fps: Optional[float],
+    goal_clamp: GoalClamp,
+) -> torch.Tensor:
+    if time_to_arrival_seconds is None:
+        radius_max = goal_clamp.r_max
+    else:
+        if fps is None or fps <= 0:
+            raise ValueError(
+                "fps is required to clamp a timed goal radius, got "
+                f"{fps!r}")
+        budget = _goal_time_budget(time_to_arrival_seconds, fps, goal_clamp)
+        budget = budget.reshape(delta_hor.shape[:-1])
+        radius_max = torch.clamp(
+            goal_clamp.speed_max * budget[..., None],
+            min=goal_clamp.r_min,
+            max=goal_clamp.r_max,
+        )
+    radius = torch.linalg.vector_norm(delta_hor, dim=-1, keepdim=True)
+    scale = torch.where(
+        radius > radius_max,
+        radius_max / radius.clamp_min(1e-12),
+        torch.ones_like(radius),
+    )
+    return delta_hor * scale
+
+
 def _require_shape(name: str, value: Optional[torch.Tensor],
                    expected_shape: tuple[int, ...]) -> torch.Tensor:
     if value is None:
@@ -540,7 +614,7 @@ def build_ego_joint_state_goal(
         (ego_root, orientation, world_goal_dof, ego_velocity), dim=-1)
 
 
-def build_ego_split_goal(
+def build_ego_joint_state_goal_v6(
     world_goal_pos: torch.Tensor,
     world_goal_rot: torch.Tensor,
     world_goal_dof: torch.Tensor,
@@ -551,58 +625,168 @@ def build_ego_split_goal(
     fps: float,
     goal_clamp: Optional[GoalClamp] = None,
 ) -> torch.Tensor:
-    """Express a GT-frame joint_state goal as the 45-D split feature vector."""
+    """Express a 29-DOF arrival-state goal in the v6 rotation-matrix layout.
+
+    Layout:
+        h_goal(1) | delta_hor_t(3) |
+        g_goal(3) | rel_rot6d_t_to_goal(6) |
+        q_goal(29) | v_hor_t(3) | v_vert_t(1) | T_seconds(1)
+    """
     if fps <= 0:
         raise ValueError(f"fps must be positive, got {fps}")
-    ego_root, orientation, world_goal_dof, ego_velocity = (
-        _build_ego_joint_state_components(
-            world_goal_pos=world_goal_pos,
-            world_goal_rot=world_goal_rot,
-            world_goal_dof=world_goal_dof,
-            world_root_velocity=world_root_velocity,
-            reference_pos=reference_pos,
-            reference_rot=reference_rot,
-            time_to_arrival_seconds=time_to_arrival_seconds,
-            fps=fps,
-            goal_clamp=goal_clamp,
+    if world_goal_pos.shape[-1:] != (3,):
+        raise ValueError(
+            f"world_goal_pos must have shape [..., 3], got "
+            f"{tuple(world_goal_pos.shape)}"
         )
-    )
+    if reference_pos.shape != world_goal_pos.shape:
+        raise ValueError(
+            "reference_pos must match world_goal_pos shape, got "
+            f"{tuple(reference_pos.shape)} != {tuple(world_goal_pos.shape)}"
+        )
+    world_goal_rot = _require_shape("world_goal_rot", world_goal_rot, (4,))
+    reference_rot = _require_shape("reference_rot", reference_rot, (4,))
+    if world_goal_rot.shape[:-1] != world_goal_pos.shape[:-1]:
+        raise ValueError(
+            "world_goal_rot batch dimensions must match world_goal_pos, got "
+            f"{tuple(world_goal_rot.shape[:-1])} != "
+            f"{tuple(world_goal_pos.shape[:-1])}"
+        )
+    if reference_rot.shape[:-1] != world_goal_pos.shape[:-1]:
+        raise ValueError(
+            "reference_rot batch dimensions must match world_goal_pos, got "
+            f"{tuple(reference_rot.shape[:-1])} != "
+            f"{tuple(world_goal_pos.shape[:-1])}"
+        )
+    world_goal_dof = _require_shape(
+        "world_goal_dof", world_goal_dof, (JOINT_STATE_GOAL_DOF_DIM,))
+    if world_goal_dof.shape[:-1] != world_goal_pos.shape[:-1]:
+        raise ValueError(
+            "world_goal_dof batch dimensions must match world_goal_pos, got "
+            f"{tuple(world_goal_dof.shape[:-1])} != "
+            f"{tuple(world_goal_pos.shape[:-1])}"
+        )
+    world_root_velocity = _require_shape(
+        "world_root_velocity", world_root_velocity, (3,))
+    if world_root_velocity.shape != world_goal_pos.shape:
+        raise ValueError(
+            "world_root_velocity must match world_goal_pos shape, got "
+            f"{tuple(world_root_velocity.shape)} != "
+            f"{tuple(world_goal_pos.shape)}"
+        )
     if time_to_arrival_seconds is None:
         raise ValueError(
-            "time_to_arrival_seconds is required for split/single goals")
+            "time_to_arrival_seconds is required for v6 joint_state goals")
     if time_to_arrival_seconds.ndim > 1:
         time_to_arrival_seconds = time_to_arrival_seconds.squeeze(-1)
     time_to_arrival_seconds = time_to_arrival_seconds.to(
-        device=ego_root.device, dtype=ego_root.dtype
-    )
-    if time_to_arrival_seconds.shape != ego_root.shape[:-1]:
+        device=world_goal_pos.device, dtype=world_goal_pos.dtype)
+    if time_to_arrival_seconds.shape != world_goal_pos.shape[:-1]:
         raise ValueError(
             "time_to_arrival_seconds batch dimensions must match "
             f"world_goal_pos, got {tuple(time_to_arrival_seconds.shape)}"
         )
 
-    root_xy = ego_root[..., :2]
-    r_xy = torch.linalg.vector_norm(root_xy, dim=-1, keepdim=True)
-    log_r_xy = torch.log1p(r_xy)
-    # With a goal clamp the urgency budget is capped at time_max so the
-    # urgency magnitude stays inside the training speed envelope; without
-    # one this reduces to the plain 1/fps floor.
+    ref_R = _matrix_from_quaternion_xyzw("reference_rot", reference_rot)
+    goal_R = _matrix_from_quaternion_xyzw("world_goal_rot", world_goal_rot)
+    gravity_world = _world_gravity_like(world_goal_pos)
+    ref_g = torch.matmul(
+        ref_R.transpose(-1, -2),
+        gravity_world.unsqueeze(-1),
+    ).squeeze(-1)
+    goal_g = torch.matmul(
+        goal_R.transpose(-1, -2),
+        gravity_world.unsqueeze(-1),
+    ).squeeze(-1)
+
+    delta_ref = _rotate_world_to_reference(
+        world_goal_pos - reference_pos, ref_R)
+    delta_hor = _project_to_tangent(delta_ref, ref_g)
+    if goal_clamp is not None:
+        delta_hor = _clamp_goal_delta_hor(
+            delta_hor, time_to_arrival_seconds, fps, goal_clamp)
+
+    velocity_ref = _rotate_world_to_reference(world_root_velocity, ref_R)
+    v_hor = _project_to_tangent(velocity_ref, ref_g)
+    v_vert = -(velocity_ref * ref_g).sum(dim=-1, keepdim=True)
+
+    rel_rot = torch.matmul(ref_R.transpose(-1, -2), goal_R)
+    rel_rot6d = matrix_to_rot6d(rel_rot)
+    h_goal = world_goal_pos[..., 2:3]
+    T = time_to_arrival_seconds.unsqueeze(-1)
+    return torch.cat(
+        (
+            h_goal,
+            delta_hor,
+            goal_g,
+            rel_rot6d,
+            world_goal_dof,
+            v_hor,
+            v_vert,
+            T,
+        ),
+        dim=-1,
+    )
+
+
+def build_ego_split_goal(
+    world_goal_pos: torch.Tensor,
+    world_goal_rot: torch.Tensor,
+    world_goal_dof: torch.Tensor,
+    world_root_velocity: torch.Tensor,
+    reference_pos: torch.Tensor,
+    reference_rot: torch.Tensor,
+    time_to_arrival_seconds: torch.Tensor,
+    fps: float,
+    goal_clamp: Optional[GoalClamp] = None,
+    distance_scale: Optional[float | torch.Tensor] = None,
+) -> torch.Tensor:
+    """Express a GT-frame joint_state goal as the 55-D v7 split vector."""
+    raw = build_ego_joint_state_goal_v6(
+        world_goal_pos=world_goal_pos,
+        world_goal_rot=world_goal_rot,
+        world_goal_dof=world_goal_dof,
+        world_root_velocity=world_root_velocity,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+        time_to_arrival_seconds=time_to_arrival_seconds,
+        fps=fps,
+        goal_clamp=goal_clamp,
+    )
+
+    h_goal = raw[..., 0:1]
+    delta_hor = raw[..., 1:4]
+    orientation = raw[..., 4:13]
+    dof = raw[..., 13:42]
+    velocity = raw[..., 42:46]
+    time_to_arrival_seconds = raw[..., 46]
+
+    d_hor = torch.linalg.vector_norm(delta_hor, dim=-1, keepdim=True)
+    if distance_scale is None:
+        distance_scale_tensor = torch.as_tensor(
+            1.0, device=raw.device, dtype=raw.dtype)
+    else:
+        distance_scale_tensor = torch.as_tensor(
+            distance_scale, device=raw.device, dtype=raw.dtype)
+    log_d_hor = torch.log1p(
+        d_hor / distance_scale_tensor.clamp_min(1e-6))
+    delta_h = h_goal - reference_pos.to(
+        device=raw.device, dtype=raw.dtype)[..., 2:3]
     T_eff = _goal_time_budget(time_to_arrival_seconds, fps, goal_clamp)
     urgency = torch.where(
         time_to_arrival_seconds[..., None] > 0.0,
-        ego_root / T_eff[..., None],
-        torch.zeros_like(ego_root),
+        torch.cat((delta_hor, d_hor, delta_h), dim=-1) / T_eff[..., None],
+        torch.zeros_like(torch.cat((delta_hor, d_hor, delta_h), dim=-1)),
     )
     f_trans = torch.cat(
-        (ego_root, r_xy, log_r_xy, urgency),
+        (h_goal, delta_hor, d_hor, log_d_hor, delta_h, urgency),
         dim=-1,
     )
-    return torch.cat(
-        (f_trans, orientation, world_goal_dof, ego_velocity), dim=-1)
+    return torch.cat((f_trans, orientation, dof, velocity, raw[..., 46:47]), dim=-1)
 
 
 def scale_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
-    """Scale the 45-D split goal with frozen dataset factors."""
+    """Scale the 55-D split goal with frozen dataset factors."""
     if goal.shape[-1] != SPLIT_GOAL_DIM:
         raise ValueError(
             f"scale_goal expects {SPLIT_GOAL_DIM}-D split goals, got "
@@ -626,12 +810,19 @@ def scale_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
     q_mean = torch.as_tensor(goal_stats["q_mean"], device=goal.device, dtype=goal.dtype)
     q_std = torch.as_tensor(goal_stats["q_std"], device=goal.device, dtype=goal.dtype)
 
-    scaled[..., 0:4] = scaled[..., 0:4] * s_p
-    scaled[..., 4:5] = scaled[..., 4:5] * s_l
-    scaled[..., 5:8] = scaled[..., 5:8] * s_v
-    scaled[..., 8:13] = scaled[..., 8:13] * s_o
-    scaled[..., 13:42] = (scaled[..., 13:42] - q_mean) / q_std.clamp_min(1e-6)
-    scaled[..., 42:45] = scaled[..., 42:45] * s_v
+    if s_o.numel() != 9:
+        raise ValueError(
+            f"goal_stats['s_o'] must contain 9 orientation scales, got "
+            f"{s_o.numel()}"
+        )
+
+    scaled[..., 0:5] = scaled[..., 0:5] * s_p
+    scaled[..., 5:6] = scaled[..., 5:6] * s_l
+    scaled[..., 6:7] = scaled[..., 6:7] * s_p
+    scaled[..., 7:12] = scaled[..., 7:12] * s_v
+    scaled[..., 12:21] = scaled[..., 12:21] * s_o
+    scaled[..., 21:50] = (scaled[..., 21:50] - q_mean) / q_std.clamp_min(1e-6)
+    scaled[..., 50:54] = scaled[..., 50:54] * s_v
     return scaled
 
 
@@ -692,6 +883,13 @@ def validate_goal_stats(
         mismatches.append(
             f"encodings: expected {parsed_encoding.value!r} in {encodings!r}"
         )
+    if int(meta.get("goal_dim", -1)) != SPLIT_GOAL_DIM:
+        mismatches.append(
+            f"goal_dim: expected {SPLIT_GOAL_DIM}, got {meta.get('goal_dim')}"
+        )
+    for key in ("s_p", "s_l", "s_v", "s_o", "s_d", "q_mean", "q_std"):
+        if key not in goal_stats:
+            mismatches.append(f"missing {key!r}")
     if datadir is not None:
         stored_datadir = str(meta.get("dataset_path", ""))
         if stored_datadir:
@@ -775,6 +973,7 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
             time_to_arrival_seconds=time_to_arrival_seconds,
             fps=resolved_fps,
             goal_clamp=goal_clamp,
+            distance_scale=goal_stats.get("s_d", 1.0),
         )
         return scale_goal(split_goal, goal_stats)
 
