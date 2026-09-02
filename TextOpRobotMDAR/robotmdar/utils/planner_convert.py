@@ -9,7 +9,14 @@ from typing import Any
 import numpy as np
 import torch
 
-from robotmdar.utils.goal import GoalClamp, GoalEncoding, GoalType, build_ego_goal
+from robotmdar.utils.goal import (
+    GoalClamp,
+    GoalEncoding,
+    GoalType,
+    build_ego_goal,
+    build_ego_joint_state_goal_v6,
+)
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import (
     G1_23DOF_FROM_29DOF_INDICES,
     G1_MUJOCO_DOF_JOINT_NAMES,
@@ -109,17 +116,17 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
                          device: str | torch.device):
     """Build normalized DAR history from the latest physical controller states.
 
-    FeatureVersion 3 stores the absolute roll/pitch and joint pose at feature
-    frame ``t``, plus forward deltas from ``t`` to ``t + 1``.  The controller
-    cannot provide the future pose needed by the last history feature, so its
-    latest measured velocity is used as a constant-velocity estimate.  This
-    keeps the latest physical pose itself in history; otherwise its root
-    roll/pitch would be dropped at every replan.
+    FeatureVersion 6 is arrival-aligned: H model history features require
+    H + 1 physical states and end at the latest measured state.  FeatureVersion
+    3 keeps the legacy terminal extrapolation because its last feature stores
+    a forward delta from the latest measured pose.
     """
     if history_len < 2:
         raise ValueError(
             f"Controller history requires at least 2 features, got {history_len}")
-    required_states = history_len
+    required_states = (
+        history_len + 1 if motion_dtype.FeatureVersion == 6 else history_len
+    )
     raw = state_msg.raw
     positions = np.array(raw["g1_pos"], dtype=np.float32, copy=True)
     rotations = _normalized_quaternions_xyzw(raw["g1_root_rot"])
@@ -136,18 +143,40 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
             f"Need {required_states} physical states for {history_len} features, "
             f"got {len(positions)}")
 
-    # The model history must end at the current physical state. Append a copy
-    # only to satisfy the feature converter's N+1 input contract; terminal
-    # forward deltas are replaced below with a constant-velocity estimate.
-    positions = positions[-history_len:]
-    rotations = rotations[-history_len:]
-    joints_mujoco = isaaclab_to_mujoco_dof(joints[-history_len:])
+    positions = positions[-required_states:]
+    rotations = rotations[-required_states:]
+    joints_mujoco = isaaclab_to_mujoco_dof(joints[-required_states:])
     model_dof_dim = int(getattr(val_data, "dof_dim", 29))
     if model_dof_dim == 23:
         joints_mujoco = _reduce_mujoco_29_to_23(joints_mujoco)
     elif model_dof_dim != 29:
         raise ValueError(
             f"Planner supports model dof_dim 23 or 29, got {model_dof_dim}")
+
+    if motion_dtype.FeatureVersion == 6:
+        motion_dict = {
+            "root_trans_offset": torch.as_tensor(
+                positions, dtype=torch.float32, device=device).unsqueeze(0),
+            "root_rot": torch.as_tensor(
+                rotations, dtype=torch.float32, device=device).unsqueeze(0),
+            "dof": torch.as_tensor(
+                joints_mujoco, dtype=torch.float32, device=device).unsqueeze(0),
+            "contact_mask": torch.ones(
+                (1, history_len + 1, 2), dtype=torch.float32, device=device),
+        }
+        feature, abs_pose = motion_dtype.motion_dict_to_feature(motion_dict)
+        expected_nfeats = motion_feature_dim_for_dof(
+            model_dof_dim, feature_version=6
+        )
+        if feature.shape != (1, history_len, expected_nfeats):
+            raise ValueError(
+                f"Unexpected FeatureVersion 6 shape {tuple(feature.shape)}; "
+                f"expected (1, {history_len}, {expected_nfeats})")
+        return val_data.normalize(feature), abs_pose
+
+    # The model history must end at the current physical state. Append a copy
+    # only to satisfy the feature converter's N+1 input contract; terminal
+    # forward deltas are replaced below with a constant-velocity estimate.
     positions_with_terminal = np.concatenate((positions, positions[-1:]), axis=0)
     rotations_with_terminal = np.concatenate((rotations, rotations[-1:]), axis=0)
     joints_with_terminal = np.concatenate(
@@ -440,6 +469,23 @@ def state_goal_from_reference(state_msg: Any,
         world_goal_dof = torch.as_tensor(
             state_goal_dof, dtype=torch.float32, device=device).reshape(1, 29)
 
+    if (goal_type is GoalType.JOINT_STATE
+            and motion_dtype.FeatureVersion == 6
+            and (parsed_encoding is None
+                 or parsed_encoding is GoalEncoding.LEGACY40)):
+        resolved_fps = float(50.0 if fps is None else fps)
+        return build_ego_joint_state_goal_v6(
+            world_goal_pos=goal_pos_world,
+            world_goal_rot=world_goal_rot,
+            world_goal_dof=world_goal_dof,
+            world_root_velocity=world_root_velocity,
+            reference_pos=reference_pos.to(device),
+            reference_rot=reference_rot.to(device),
+            time_to_arrival_seconds=timestep,
+            fps=resolved_fps,
+            goal_clamp=goal_clamp,
+        )
+
     return build_ego_goal(
         goal_pos_world, goal_yaw_world, reference_pos.to(device),
         reference_rot.to(device), goal_type=goal_type,
@@ -512,7 +558,10 @@ def align_generated_history_pose(abs_pose: dict,
     # needs to be re-expressed after the rotation correction.
     # ------------------------------------------------------------------
     aligned_history_motion = history_motion
-    if history_motion is not None and val_data is not None:
+    if (motion_dtype.FeatureVersion == 6
+            and history_motion is not None and val_data is not None):
+        pass
+    elif history_motion is not None and val_data is not None:
         raw = val_data.denormalize(
             history_motion.to(device))          # (B, T, 57 or 69)
         B, T = raw.shape[:2]
@@ -660,9 +709,16 @@ def generated_history_at_frame(plan: dict, tracked_frame: int,
     if history.shape[1] != history_len:
         raise ValueError(
             f"Selected {history.shape[1]} history frames, expected {history_len}")
+    anchor_index = (
+        feature_start - 1 if motion_dtype.FeatureVersion == 6 else feature_start
+    )
+    if anchor_index < 0:
+        raise ValueError(
+            "FeatureVersion 6 generated history requires cached pose before "
+            f"feature_start={feature_start}")
     abs_pose = {
-        "root_trans_offset": root_pos[:, feature_start],
-        "root_rot": root_rot[:, feature_start],
+        "root_trans_offset": root_pos[:, anchor_index],
+        "root_rot": root_rot[:, anchor_index],
     }
     return history, abs_pose, root_pos[:, feature_end], root_rot[:, feature_end]
 

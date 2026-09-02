@@ -16,7 +16,6 @@ from robotmdar.dtype import logger as dtype_logger
 from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
 import robotmdar.dtype.motion as motion_dtype
-from robotmdar.dtype.motion import infer_feature_v3_dof_dim
 from robotmdar.eval.generate_dar import generate_next_motion, encode_motion_lib_initial_noise
 from robotmdar.utils.dof_contract import (
     configure_dof_contract,
@@ -26,6 +25,7 @@ from robotmdar.utils.goal import (
     GoalClamp,
     GoalEncoding,
     GoalType,
+    ROT_MAT_JOINT_STATE_GOAL_DIM,
     validate_goal_config,
     validate_goal_stats,
 )
@@ -83,6 +83,50 @@ def _time_to_arrival_from_state(
     return time_to_arrival_s, time_to_arrival_frame
 
 
+def _goal_log_components(ego_goal_raw: torch.Tensor,
+                         goal_type: GoalType) -> tuple[float, ...]:
+    if (goal_type is GoalType.JOINT_STATE
+            and motion_dtype.FeatureVersion == 6
+            and ego_goal_raw.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+        return (
+            float(ego_goal_raw[0, 1]),
+            float(ego_goal_raw[0, 2]),
+            float(ego_goal_raw[0, 0]),
+            float('nan'),
+            float(ego_goal_raw[0, 42]),
+            float(ego_goal_raw[0, 43]),
+            float(ego_goal_raw[0, 45]),
+        )
+    if goal_type in (GoalType.ROOT, GoalType.BODY_EXT):
+        yaw_deg = math.degrees(math.atan2(
+            float(ego_goal_raw[0, 4]), float(ego_goal_raw[0, 3])))
+    elif goal_type is GoalType.JOINT_STATE:
+        yaw_deg = math.degrees(float(ego_goal_raw[0, 7]))
+    else:
+        yaw_deg = float('nan')
+    if goal_type is GoalType.BODY_EXT:
+        vel = (
+            float(ego_goal_raw[0, 5]),
+            float(ego_goal_raw[0, 6]),
+            float(ego_goal_raw[0, 7]),
+        )
+    elif goal_type is GoalType.JOINT_STATE:
+        vel = (
+            float(ego_goal_raw[0, 37]),
+            float(ego_goal_raw[0, 38]),
+            float(ego_goal_raw[0, 39]),
+        )
+    else:
+        vel = (float('nan'), float('nan'), float('nan'))
+    return (
+        float(ego_goal_raw[0, 0]),
+        float(ego_goal_raw[0, 1]),
+        float(ego_goal_raw[0, 2]),
+        yaw_deg,
+        *vel,
+    )
+
+
 def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
     """Load and validate the config associated with the DAR checkpoint."""
     model_cfg_path = cfg.ckpt.get("load_cfg")
@@ -97,9 +141,17 @@ def _checkpoint_config(cfg: DictConfig) -> tuple[Path, DictConfig]:
 
     runtime_dof_dim = int(cfg.data.dof_dim)
     checkpoint_nfeats = int(model_cfg.data.nfeats)
+    checkpoint_feature_version = int(
+        model_cfg.data.get("feature_version", motion_dtype.FeatureVersion))
     checkpoint_dof_dim = int(
         model_cfg.data.get(
-            "dof_dim", infer_feature_v3_dof_dim(checkpoint_nfeats)))
+            "dof_dim",
+            motion_dtype.infer_feature_dof_dim(
+                checkpoint_nfeats,
+                feature_version=checkpoint_feature_version,
+            ),
+        )
+    )
     expected = {
         "dof_dim": (runtime_dof_dim, checkpoint_dof_dim),
         "nfeats": (int(cfg.data.nfeats), int(model_cfg.data.nfeats)),
@@ -212,9 +264,10 @@ def main(cfg: DictConfig) -> None:
             "{} planner expects goal_keypoints_world from the controller; "
             "no reference pose is configured", goal_type.value)
 
-    if motion_dtype.FeatureVersion != 3:
+    if motion_dtype.FeatureVersion not in (3, 6):
         raise ValueError(
-            f"planner_dar requires FeatureVersion 3, got {motion_dtype.FeatureVersion}")
+            "planner_dar requires FeatureVersion 3 or 6, got "
+            f"{motion_dtype.FeatureVersion}")
 
     _model_cfg_path, _model_cfg = _checkpoint_config(cfg)
     logger.info(
@@ -480,9 +533,10 @@ def main(cfg: DictConfig) -> None:
                 # ego_goal[0, 1] = 0.0
                 # ego_goal[0, 2] = 0.0
 
-                _goal_ego_x = float(ego_goal_raw[0, 0])
-                _goal_ego_y = float(ego_goal_raw[0, 1])
-                _goal_delta_z = float(ego_goal_raw[0, 2])
+                (_goal_ego_x, _goal_ego_y, _goal_delta_z,
+                 _goal_ego_yaw_raw_deg,
+                 _ego_vel_x, _ego_vel_y, _ego_vel_z) = _goal_log_components(
+                    ego_goal_raw, goal_type)
 
                 _world_goal = getattr(latest_state, 'goal_root_pos_world', None)
                 if _world_goal is not None:
@@ -526,14 +580,13 @@ def main(cfg: DictConfig) -> None:
                     if _force_drop_yaw:
                         _goal_ego_yaw_deg = 0.0  # mask_condition zeros the yaw channels
                     else:
-                        _goal_ego_yaw_deg = math.degrees(math.atan2(
-                            float(ego_goal_raw[0, 4]), float(ego_goal_raw[0, 3])))
+                        _goal_ego_yaw_deg = _goal_ego_yaw_raw_deg
                 elif goal_type is GoalType.JOINT_STATE:
                     if (_force_drop_yaw
                             or bool(cfg.get("force_drop_goal_orientation", False))):
                         _goal_ego_yaw_deg = 0.0
                     else:
-                        _goal_ego_yaw_deg = math.degrees(float(ego_goal_raw[0, 7]))
+                        _goal_ego_yaw_deg = _goal_ego_yaw_raw_deg
                 else:
                     _goal_ego_yaw_deg = float('nan')
 
@@ -637,8 +690,7 @@ def main(cfg: DictConfig) -> None:
                         _vel_world_x, _vel_world_y, _vel_world_z,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
-                        float(ego_goal_raw[0, 5]), float(ego_goal_raw[0, 6]),
-                        float(ego_goal_raw[0, 7]),
+                        _ego_vel_x, _ego_vel_y, _ego_vel_z,
                         0.0 if _force_drop_time else time_to_arrival_s,
                         occ_count, infer_ms, avg_ms)
                 else:
@@ -653,8 +705,7 @@ def main(cfg: DictConfig) -> None:
                         _vel_world_x, _vel_world_y, _vel_world_z,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
-                        float(ego_goal_raw[0, 37]), float(ego_goal_raw[0, 38]),
-                        float(ego_goal_raw[0, 39]),
+                        _ego_vel_x, _ego_vel_y, _ego_vel_z,
                         0.0 if _force_drop_time else time_to_arrival_s,
                         occ_count, infer_ms, avg_ms)
 
