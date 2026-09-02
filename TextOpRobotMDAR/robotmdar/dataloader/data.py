@@ -1007,10 +1007,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             pose_terms.append(pose)
             velocity_terms.append(velocity)
 
-            goal_radius = trans.reshape(-1, 12)[0, 4:5]
+            goal_radius = trans[..., 4:5]
+            time_budget = torch.as_tensor(
+                primitive['time_to_arrival'],
+                device=goal_radius.device,
+                dtype=goal_radius.dtype,
+            ).reshape(goal_radius.shape).clamp_min(1.0 / float(self.fps))
             clamp_dist_terms.append(goal_radius)
-            clamp_speed_terms.append(goal_radius / max(
-                float(primitive['time_to_arrival']), 1.0 / float(self.fps)))
+            clamp_speed_terms.append(goal_radius / time_budget)
 
         if not pos_terms:
             raise ValueError("Unable to compute goal statistics from empty batch")
