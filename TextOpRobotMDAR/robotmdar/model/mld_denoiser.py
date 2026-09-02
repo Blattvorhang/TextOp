@@ -269,6 +269,12 @@ class DenoiserMLP(nn.Module):
         if force_mask:
             keep_mask = torch.zeros(cond.shape[0], dtype=torch.bool,
                                     device=cond.device)
+        elif (not self.training) or probability <= 0.:
+            keep_mask = torch.ones(cond.shape[0], dtype=torch.bool,
+                                   device=cond.device)
+            if return_keep_mask:
+                return cond, keep_mask
+            return cond
         elif self.training and probability > 0.:
             drop_mask = torch.bernoulli(
                 torch.full((cond.shape[0], 1), probability, device=cond.device)
@@ -477,6 +483,12 @@ class DenoiserTransformer(nn.Module):
         if force_mask:
             keep_mask = torch.zeros(cond.shape[0], dtype=torch.bool,
                                     device=cond.device)
+        elif (not self.training) or probability <= 0.:
+            keep_mask = torch.ones(cond.shape[0], dtype=torch.bool,
+                                   device=cond.device)
+            if return_keep_mask:
+                return cond, keep_mask
+            return cond
         elif self.training and probability > 0.:
             drop_mask = torch.bernoulli(
                 torch.full((cond.shape[0], 1), probability,

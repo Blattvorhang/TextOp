@@ -185,6 +185,7 @@ def main(cfg: DictConfig):
                               extras=extras)
 
         vae.eval()
+        manager.begin_eval_cycle()
         while manager.should_eval():
             batch = next(val_dataiter)
             if not val_batch_validated:

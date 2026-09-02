@@ -258,6 +258,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.preload_show_progress = bool(
             kwargs.get('preload_show_progress', _is_goal_stats_writer()))
         self.load_scene = bool(kwargs.get('load_scene', True))
+        self._stats_device_cache = {}
         # Planner-side DR is disabled by default: augmentation_enabled must be
         # explicitly set to true (LDM configs only — VAE training stays clean).
         # Once enabled, augmentation activates from augmentation_start_step
@@ -336,11 +337,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if self.weighted_sample:
             self._cal_sample_weight()
 
-        if not self.load_scene:
+        if not getattr(self, 'load_scene', True):
             for item in all_data:
                 item.pop('scene', None)
 
-        if self.preload_ram:
+        if getattr(self, 'preload_ram', False):
             self._preload_manifest_samples()
 
         logger.info(f" Found {len(self.valid_indices)} valid samples out of {len(self.raw_data)}")
@@ -350,7 +351,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # self._load_text_embeddings()
 
     def _strip_scene_if_needed(self, sample: Dict[str, Any]) -> Dict[str, Any]:
-        if self.load_scene or 'scene' not in sample:
+        if getattr(self, 'load_scene', True) or 'scene' not in sample:
             return sample
         sample = dict(sample)
         sample.pop('scene', None)
@@ -867,6 +868,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if self.std_floor > 0.0:
             std = torch.clamp(std, min=self.std_floor)
         self.mean, self.std = mean, std
+        self._stats_device_cache.clear()
 
     def _goal_stats_meta(self) -> Dict[str, Any]:
         return {
@@ -1035,6 +1037,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         finally:
             self.mean = saved_mean
             self.std = saved_std
+            self._stats_device_cache.clear()
         return stats
 
     def _load_goal_stats(self) -> None:
@@ -1109,6 +1112,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # fake a mean and std, so that we can call _generate_batch_optimized
         self.mean = torch.zeros(self.nfeats)
         self.std = torch.ones(self.nfeats)
+        self._stats_device_cache.clear()
         # for i in range(N):
         for i in tqdm(range(N)):
             batch_data = self._generate_batch_optimized(generator=torch.Generator().manual_seed(i))
@@ -1158,11 +1162,21 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def normalize(self, feat: torch.Tensor) -> torch.Tensor:
         """Normalize features"""
-        return (feat - self.mean.to(feat.device)) / self.std.to(feat.device)
+        mean, std = self._stats_for(feat)
+        return (feat - mean) / std
 
     def denormalize(self, feat: torch.Tensor) -> torch.Tensor:
         """Denormalize features"""
-        return feat * self.std.to(feat.device) + self.mean.to(feat.device)
+        mean, std = self._stats_for(feat)
+        return feat * std + mean
+
+    def _stats_for(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = (str(feat.device), self.mean.dtype, self.std.dtype)
+        cached = self._stats_device_cache.get(key)
+        if cached is None:
+            cached = (self.mean.to(feat.device), self.std.to(feat.device))
+            self._stats_device_cache[key] = cached
+        return cached
 
     def reconstruct_motion(
         self,

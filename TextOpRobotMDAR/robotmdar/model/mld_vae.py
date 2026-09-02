@@ -142,7 +142,7 @@ class AutoMldVae(nn.Module):
         x = x.permute(1, 0, 2)  # now it is [nframes, bs, h_dim]
 
         # Each batch has its own set of tokens
-        dist = torch.tile(self.global_motion_token[:, None, :], (1, bs, 1))
+        dist = self.global_motion_token[:, None, :].expand(-1, bs, -1)
 
         # adding the embedding token for all sequences
         xseq = torch.cat((dist, x), 0)
@@ -179,15 +179,13 @@ class AutoMldVae(nn.Module):
         # nfuture = 8
         bs = history_motion.shape[0]
 
-        device = next(self.parameters()).device
-
         if scale_latent:  # only used during denoiser training
             z = z * self.latent_std
         z = self.decoder_latent_proj(
-            z).to(device)  # [latent_size, bs, latent_dim] => [latent_size, bs, h_dim]
-        queries = torch.zeros(nfuture, bs, self.h_dim, device=z.device).to(device)
+            z)  # [latent_size, bs, latent_dim] => [latent_size, bs, h_dim]
+        queries = torch.zeros(nfuture, bs, self.h_dim, device=z.device)
         history_embedding = self.skel_embedding(history_motion).permute(
-            1, 0, 2).to(device)  # [nhistory, bs, h_dim]
+            1, 0, 2)  # [nhistory, bs, h_dim]
 
         # Pass through the transformer decoder
         # with the latent vector for memory

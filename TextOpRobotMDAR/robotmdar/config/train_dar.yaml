@@ -15,7 +15,7 @@ data:
   future_len: 64
   num_primitive: 3
   batch_size: 256
-  weighted_sample: true
+  weighted_sample: false
   preload_ram: true
   load_scene: false
   goal_type: joint_state
@@ -50,7 +50,7 @@ train:
       foot_contact: 0.05
       goal_root_position: 1.0
       goal_root_orientation: 0.2
-      goal_joint_position: 0.2
+      goal_joint_angle: 0.1
 
 ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF

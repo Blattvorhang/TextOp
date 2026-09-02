@@ -1,4 +1,5 @@
 import os
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -99,7 +100,7 @@ def _add_per_class_extras(extras, action_label, is_recovery, per_sample):
 #   meta          -> meta/<k>                         (schedule state, no phase)
 _META_KEYS = frozenset(
     {'stage', 'scene_active', 'augmentation_active', 'feature_version',
-     'lr', 'grad_norm'})
+     'lr', 'grad_norm', 'eval_time'})
 
 
 def _classify_extra(name: str, phase: str) -> Tuple[str, str]:
@@ -147,6 +148,14 @@ def _report_value(value, divisor: float = 1.0):
     if isinstance(value, (int, float)):
         return value / divisor
     return value / divisor if divisor != 1.0 else value
+
+
+def _standard_normal_kl_mean(dist) -> torch.Tensor:
+    """KL(N(loc, scale) || N(0, 1)) without building reference tensors."""
+    return 0.5 * (
+        dist.loc.square() + dist.scale.square()
+        - 1.0 - 2.0 * dist.scale.log()
+    ).mean()
 
 
 def ddp_reduce_mean(tensor_dict: dict) -> dict:
@@ -286,6 +295,7 @@ class BaseManager(ABC):
         self._to_eval_steps = 0
         self._total_eval_loss_dict = {}
         self._total_eval_extras_dict = {}
+        self._eval_t0 = None
         self.rec_criterion = nn.HuberLoss(reduction='mean', delta=1.0)
 
         self.save_dir = Path(self.save_dir)
@@ -313,6 +323,9 @@ class BaseManager(ABC):
         self.extra['augmentation_active'] = float(self.should_use_augmentation())
         self.extra['feature_version'] = float(motion_dtype.FeatureVersion)
 
+        if is_eval and self._eval_t0 is None:
+            self._eval_t0 = time.perf_counter()
+
         if not self._tqdm and is_main_process():
             self._tqdm = tqdm(total=self.max_steps, initial=self.step, ncols=120, desc="Training")
         if self.anneal_lr:
@@ -324,6 +337,10 @@ class BaseManager(ABC):
             lrnow = self.learning_rate
             self.extra['lr'] = lrnow
             self.optimizer.param_groups[0]["lr"] = lrnow
+
+    def begin_eval_cycle(self) -> None:
+        """Mark the start of a validation cycle for wall-clock timing."""
+        self._eval_t0 = time.perf_counter()
 
     def post_step(
         self,
@@ -342,6 +359,10 @@ class BaseManager(ABC):
             for k, v in extras.items():
                 _accumulate_metric(self._total_eval_extras_dict, k, v)
             if self._to_eval_steps == 0:
+                if self._eval_t0 is not None:
+                    self._total_eval_extras_dict['eval_time'] = (
+                        time.perf_counter() - self._eval_t0
+                    )
                 # All-reduce accumulated eval metrics across all DDP ranks
                 reduced_loss = ddp_reduce_mean(self._total_eval_loss_dict)
                 reduced_extras = ddp_reduce_mean(self._total_eval_extras_dict)
@@ -353,8 +374,9 @@ class BaseManager(ABC):
                         )
                     for k, v in reduced_extras.items():
                         group, tag = _classify_extra(k, 'eval')
+                        divisor = 1.0 if k == 'eval_time' else self.eval_steps
                         self.platform.report_scalar(
-                            tag, _report_value(v, self.eval_steps),
+                            tag, _report_value(v, divisor),
                             self.step,
                             group_name=group
                         )
@@ -365,6 +387,7 @@ class BaseManager(ABC):
                         tqdm.write(f"Eval extras * {self.eval_steps}: {dict(reduced_extras)}")
                 self._total_eval_loss_dict = {}
                 self._total_eval_extras_dict = {}
+                self._eval_t0 = None
             return
 
         self.step += 1
@@ -850,19 +873,13 @@ class GeometryLoss:
         gravity_raw = denorm[..., 1:4]
         gravity = torch.nn.functional.normalize(gravity_raw, dim=-1, eps=1e-8)
         delta_hor_raw = denorm[..., 4:7]
-        delta_hor = (
-            delta_hor_raw
-            - (delta_hor_raw * gravity).sum(dim=-1, keepdim=True) * gravity
-        )
         rel_rot6d = denorm[..., 7:13]
         rel_rot = rot6d_to_matrix(rel_rot6d)
         return {
-            'denorm': denorm,
             'height': denorm[..., 0],
             'gravity_raw': gravity_raw,
             'gravity': gravity,
             'delta_hor_raw': delta_hor_raw,
-            'delta_hor': delta_hor,
             'rel_rot6d': rel_rot6d,
             'rel_rot': rel_rot,
             'dof': denorm[..., 13:13 + dof_dim],
@@ -877,9 +894,10 @@ class GeometryLoss:
 
     @staticmethod
     def _quat_chordal_loss(q_pred, q_gt):
-        pred_R = quaternion_to_matrix(xyzw_to_wxyz(q_pred))
-        gt_R = quaternion_to_matrix(xyzw_to_wxyz(q_gt))
-        return (pred_R - gt_R).square().sum(dim=(-1, -2)).mean()
+        q_pred = torch.nn.functional.normalize(q_pred, dim=-1, eps=1e-8)
+        q_gt = torch.nn.functional.normalize(q_gt, dim=-1, eps=1e-8)
+        dot = (q_pred * q_gt).sum(dim=-1).clamp(-1.0, 1.0)
+        return (8.0 * (1.0 - dot.square())).mean()
 
     def calc_geometry_loss_v6(
         self,
@@ -950,31 +968,37 @@ class GeometryLoss:
                 G1_WRIST_DOF_INDICES,
                 device=future_motion_pred_fk['dof_pos'].device,
             )
-            extras['dof_pos_core'] = self.rec_criterion(
-                future_motion_pred_fk['dof_pos'].index_select(-1, core_ids),
-                future_motion_gt_fk['dof_pos'].index_select(-1, core_ids),
-            )
-            extras['dof_pos_wrist'] = self.rec_criterion(
-                future_motion_pred_fk['dof_pos'].index_select(-1, wrist_ids),
-                future_motion_gt_fk['dof_pos'].index_select(-1, wrist_ids),
-            )
-            extras['dof_vel_core'] = self.rec_criterion(
-                future_motion_pred_fk['dof_vel'].index_select(-1, core_ids),
-                future_motion_gt_fk['dof_vel'].index_select(-1, core_ids),
-            )
-            extras['dof_vel_wrist'] = self.rec_criterion(
-                future_motion_pred_fk['dof_vel'].index_select(-1, wrist_ids),
-                future_motion_gt_fk['dof_vel'].index_select(-1, wrist_ids),
-            )
+            with torch.no_grad():
+                pred_dof_pos = future_motion_pred_fk['dof_pos'].detach()
+                gt_dof_pos = future_motion_gt_fk['dof_pos']
+                pred_dof_vel = future_motion_pred_fk['dof_vel'].detach()
+                gt_dof_vel = future_motion_gt_fk['dof_vel']
+                extras['dof_pos_core'] = self.rec_criterion(
+                    pred_dof_pos.index_select(-1, core_ids),
+                    gt_dof_pos.index_select(-1, core_ids),
+                )
+                extras['dof_pos_wrist'] = self.rec_criterion(
+                    pred_dof_pos.index_select(-1, wrist_ids),
+                    gt_dof_pos.index_select(-1, wrist_ids),
+                )
+                extras['dof_vel_core'] = self.rec_criterion(
+                    pred_dof_vel.index_select(-1, core_ids),
+                    gt_dof_vel.index_select(-1, core_ids),
+                )
+                extras['dof_vel_wrist'] = self.rec_criterion(
+                    pred_dof_vel.index_select(-1, wrist_ids),
+                    gt_dof_vel.index_select(-1, wrist_ids),
+                )
 
-        extras['hand_translation'] = self.rec_criterion(
-            future_motion_pred_fk['global_translation_extend'][
-                :, :, self.dataset.skeleton.hand_id, :
-            ],
-            future_motion_gt_fk['global_translation_extend'][
-                :, :, self.dataset.skeleton.hand_id, :
-            ],
-        )
+        with torch.no_grad():
+            extras['hand_translation'] = self.rec_criterion(
+                future_motion_pred_fk['global_translation_extend'][
+                    :, :, self.dataset.skeleton.hand_id, :
+                ].detach(),
+                future_motion_gt_fk['global_translation_extend'][
+                    :, :, self.dataset.skeleton.hand_id, :
+                ],
+            )
 
         foot_trans_pred = future_motion_pred_fk['global_translation_extend'][
             :, :, self.dataset.skeleton.foot_id, :
@@ -999,6 +1023,7 @@ class GeometryLoss:
         ).square().sum(dim=(-1, -2)).mean()
 
         zero = future_motion_pred.sum() * 0.0
+        zero_metric = zero.detach()
         residuals = []
         if history_motion is not None:
             hist = self._feature_v6_components(history_motion[:, -1:])
@@ -1007,7 +1032,7 @@ class GeometryLoss:
                 - self._transport_gravity(hist['gravity'][:, 0], pred['rel_rot'][:, 0])
             )
             residuals.append(boundary.unsqueeze(1))
-            extras['e_g_boundary'] = boundary.norm(dim=-1).mean()
+            extras['e_g_boundary'] = boundary.detach().norm(dim=-1).mean()
         per_sample = {}
         if pred['gravity'].shape[1] > 1:
             interior = (
@@ -1018,11 +1043,11 @@ class GeometryLoss:
                 )
             )
             residuals.append(interior)
-            interior_norm = interior.norm(dim=-1)  # [B, T-1]
+            interior_norm = interior.detach().norm(dim=-1)  # [B, T-1]
             extras['e_g_cons'] = interior_norm.mean()
             per_sample['e_g_cons'] = interior_norm.mean(dim=1)  # [B]
         else:
-            extras['e_g_cons'] = zero
+            extras['e_g_cons'] = zero_metric
         terms['g_cons'] = (
             torch.cat(residuals, dim=1).square().sum(dim=-1).mean()
             if residuals else zero
@@ -1033,50 +1058,64 @@ class GeometryLoss:
             pred_h_vel = (pred['height'][:, 1:] - pred['height'][:, :-1]) * fps
             gt_h_vel = (gt['height'][:, 1:] - gt['height'][:, :-1]) * fps
             terms['h_vel'] = self.rec_criterion(pred_h_vel, gt_h_vel)
-            per_h = (pred_h_vel - gt_h_vel).abs().mean(dim=1)  # [B]
+            per_h = (
+                pred_h_vel.detach() - gt_h_vel
+            ).abs().mean(dim=1)  # [B]
             extras['e_h_vel'] = per_h.mean()
 
             pred_q_vel = (pred['dof'][:, 1:] - pred['dof'][:, :-1]) * fps
             gt_q_vel = (gt['dof'][:, 1:] - gt['dof'][:, :-1]) * fps
-            per_q = (pred_q_vel - gt_q_vel).norm(dim=-1).mean(dim=1)  # [B]
+            per_q = (
+                pred_q_vel.detach() - gt_q_vel
+            ).norm(dim=-1).mean(dim=1)  # [B]
             extras['e_q_vel'] = per_q.mean()
 
             per_sample['e_h_vel'] = per_h
             per_sample['e_q_vel'] = per_q
         else:
             terms['h_vel'] = zero
-            extras['e_h_vel'] = zero
-            extras['e_q_vel'] = zero
+            extras['e_h_vel'] = zero_metric
+            extras['e_q_vel'] = zero_metric
 
-        extras['e_g_proj'] = (
-            pred['gravity_raw'] - pred['gravity']
-        ).norm(dim=-1).mean()
-        extras['e_R_proj'] = (
-            pred['rel_rot6d'] - matrix_to_rot6d(pred['rel_rot'])
-        ).norm(dim=-1).mean()
-        if history_motion is not None:
-            dep_gravity = torch.cat(
-                [hist['gravity'][:, -1:], pred['gravity'][:, :-1]],
-                dim=1,
-            )
-        else:
-            dep_gravity = torch.cat(
-                [pred['gravity'][:, :1], pred['gravity'][:, :-1]],
-                dim=1,
-            )
-        extras['e_p_proj'] = (
-            pred['delta_hor_raw'] * dep_gravity
-        ).sum(dim=-1).abs().mean()
+        with torch.no_grad():
+            extras['e_g_proj'] = (
+                pred['gravity_raw'].detach() - pred['gravity'].detach()
+            ).norm(dim=-1).mean()
+            extras['e_R_proj'] = (
+                pred['rel_rot6d'].detach()
+                - matrix_to_rot6d(pred['rel_rot'].detach())
+            ).norm(dim=-1).mean()
+            if history_motion is not None:
+                dep_gravity = torch.cat(
+                    [
+                        hist['gravity'][:, -1:].detach(),
+                        pred['gravity'][:, :-1].detach(),
+                    ],
+                    dim=1,
+                )
+            else:
+                dep_gravity = torch.cat(
+                    [
+                        pred['gravity'][:, :1].detach(),
+                        pred['gravity'][:, :-1].detach(),
+                    ],
+                    dim=1,
+                )
+            extras['e_p_proj'] = (
+                pred['delta_hor_raw'].detach() * dep_gravity
+            ).sum(dim=-1).abs().mean()
 
-        endpoint_xy_loss = self.rec_criterion(
-            future_motion_pred_fk['global_translation_extend'][:, -1, 0, :2],
-            future_motion_gt_fk['global_translation_extend'][:, -1, 0, :2],
-        )
-        extras['endpoint_xy'] = endpoint_xy_loss
-        extras['e_R_endpoint'] = self._quat_chordal_loss(
-            future_motion_pred_fk['global_rotation'][:, -1:, 0],
-            future_motion_gt_fk['global_rotation'][:, -1:, 0],
-        )
+            endpoint_xy_loss = self.rec_criterion(
+                future_motion_pred_fk['global_translation_extend'][
+                    :, -1, 0, :2
+                ].detach(),
+                future_motion_gt_fk['global_translation_extend'][:, -1, 0, :2],
+            )
+            extras['endpoint_xy'] = endpoint_xy_loss
+            extras['e_R_endpoint'] = self._quat_chordal_loss(
+                future_motion_pred_fk['global_rotation'][:, -1:, 0].detach(),
+                future_motion_gt_fk['global_rotation'][:, -1:, 0],
+            )
 
         if action_label is not None:
             _add_per_class_extras(
@@ -1264,11 +1303,7 @@ class MVAEManager(BaseManager, GeometryLoss):
         #     terms['smooth'] = self.rec_criterion(recon_diff, true_diff)
 
         # KL损失
-        mu_ref = torch.zeros_like(dist.loc)
-        scale_ref = torch.ones_like(dist.scale)
-        dist_ref = torch.distributions.Normal(mu_ref, scale_ref)
-        kl_loss = torch.distributions.kl_divergence(dist, dist_ref)
-        kl_loss = kl_loss.mean()
+        kl_loss = _standard_normal_kl_mean(dist)
         terms['kl'] = kl_loss
 
         # 使用继承的几何损失计算方法
@@ -1507,11 +1542,7 @@ class DARManager(BaseManager, GeometryLoss):
 
         # KL损失
         if dist is not None:
-            mu_ref = torch.zeros_like(dist.loc)
-            scale_ref = torch.ones_like(dist.scale)
-            dist_ref = torch.distributions.Normal(mu_ref, scale_ref)
-            kl_loss = torch.distributions.kl_divergence(dist, dist_ref)
-            kl_loss = kl_loss.mean()
+            kl_loss = _standard_normal_kl_mean(dist)
             terms['kl'] = kl_loss
         else:
             kl_loss = torch.tensor(0.0, device=future_motion_gt.device)
@@ -1584,6 +1615,30 @@ class DARManager(BaseManager, GeometryLoss):
             )
 
         if ego_goal is not None and ego_goal.shape[-1] == JOINT_STATE_GOAL_DIM:
+            compute_goal_root_orientation = (
+                self.loss_weight.get('goal_root_orientation', 0.0) > 0.0
+                or is_eval
+            )
+            compute_goal_joint_angle = (
+                self.loss_weight.get('goal_joint_angle', 0.0) > 0.0
+                or is_eval
+            )
+            compute_goal_root_velocity = (
+                self.loss_weight.get('goal_root_velocity', 0.0) > 0.0
+                or is_eval
+            )
+            goal_state = None
+            if (compute_goal_root_orientation or compute_goal_joint_angle
+                    or compute_goal_root_velocity):
+                goal_state = self._future_goal_state(
+                    future_motion_pred,
+                    history_motion=history_motion,
+                    goal_time_frame=goal_time_frame,
+                    include_yaw=(
+                        compute_goal_root_orientation
+                        or compute_goal_root_velocity
+                    ),
+                )
             if (self.loss_weight.get('goal_root_orientation', 0.0) > 0.0
                     or is_eval):
                 terms['goal_root_orientation'] = (
@@ -1593,6 +1648,7 @@ class DARManager(BaseManager, GeometryLoss):
                         goal_orientation_condition_keep_mask,
                         history_motion=history_motion,
                         goal_time_frame=goal_time_frame,
+                        goal_state=goal_state,
                     )
                 )
             if (self.loss_weight.get('goal_joint_angle', 0.0) > 0.0
@@ -1603,6 +1659,7 @@ class DARManager(BaseManager, GeometryLoss):
                         ego_goal,
                         goal_joint_condition_keep_mask,
                         goal_time_frame=goal_time_frame,
+                        goal_state=goal_state,
                     )
                 )
             if (self.loss_weight.get('goal_root_velocity', 0.0) > 0.0
@@ -1614,6 +1671,7 @@ class DARManager(BaseManager, GeometryLoss):
                         goal_velocity_condition_keep_mask,
                         history_motion=history_motion,
                         goal_time_frame=goal_time_frame,
+                        goal_state=goal_state,
                     )
                 )
 
@@ -1672,8 +1730,35 @@ class DARManager(BaseManager, GeometryLoss):
         return (goal_step - 1).clamp(
             min=0, max=future_motion_pred.shape[1] - 1)
 
+    def _future_goal_state(self, future_motion_pred, history_motion=None,
+                           goal_time_frame=None, include_yaw=False):
+        future_motion = self.dataset.denormalize(future_motion_pred)
+        goal_step = self._future_step_from_goal_time(
+            future_motion, goal_time_frame)
+        batch_idx = torch.arange(
+            future_motion.shape[0], device=future_motion.device)
+        state = {
+            'future_motion': future_motion,
+            'goal_step': goal_step,
+            'batch_idx': batch_idx,
+            'selected': future_motion[batch_idx, goal_step],
+        }
+        if include_yaw:
+            if history_motion is None:
+                raise ValueError(
+                    "history_motion is required to integrate goal-frame yaw")
+            history_last = self.dataset.denormalize(history_motion[:, -1:])
+            delta_yaw = torch.cat(
+                (history_last[..., 4], future_motion[..., 4]), dim=1)
+            yaw_future = delta_yaw[:, :future_motion.shape[1]].cumsum(dim=1)
+            state['yaw_at_goal'] = yaw_future[batch_idx, goal_step]
+        return state
+
     def _future_feature_at_goal(self, future_motion_pred,
-                                goal_time_frame=None):
+                                goal_time_frame=None,
+                                goal_state=None):
+        if goal_state is not None:
+            return goal_state['selected']
         future_motion = self.dataset.denormalize(future_motion_pred)
         goal_step = self._future_step_from_goal_time(
             future_motion, goal_time_frame)
@@ -1682,7 +1767,10 @@ class DARManager(BaseManager, GeometryLoss):
         return future_motion[batch_idx, goal_step]
 
     def _future_yaw_ego_at_goal(self, future_motion_pred, history_motion,
-                                goal_time_frame=None):
+                                goal_time_frame=None,
+                                goal_state=None):
+        if goal_state is not None and 'yaw_at_goal' in goal_state:
+            return goal_state['yaw_at_goal']
         if history_motion is None:
             raise ValueError(
                 "history_motion is required to integrate goal-frame yaw")
@@ -1704,12 +1792,14 @@ class DARManager(BaseManager, GeometryLoss):
         goal_orientation_condition_keep_mask=None,
         history_motion=None,
         goal_time_frame=None,
+        goal_state=None,
     ):
         """Match TextOp-style root orientation at the selected goal frame."""
         selected = self._future_feature_at_goal(
-            future_motion_pred, goal_time_frame)
+            future_motion_pred, goal_time_frame, goal_state=goal_state)
         yaw = self._future_yaw_ego_at_goal(
-            future_motion_pred, history_motion, goal_time_frame)
+            future_motion_pred, history_motion, goal_time_frame,
+            goal_state=goal_state)
         predicted = torch.cat((selected[..., 0:4], yaw.unsqueeze(-1)), dim=-1)
         target = ego_goal[..., 3:8]
         error = predicted - target
@@ -1728,6 +1818,7 @@ class DARManager(BaseManager, GeometryLoss):
         ego_goal,
         goal_joint_condition_keep_mask=None,
         goal_time_frame=None,
+        goal_state=None,
     ):
         """Match the 29-DOF joint angles at the selected goal frame."""
         dof_dim = int(self.dataset.dof_dim)
@@ -1737,7 +1828,7 @@ class DARManager(BaseManager, GeometryLoss):
                 f"{dof_dim}"
             )
         selected = self._future_feature_at_goal(
-            future_motion_pred, goal_time_frame)
+            future_motion_pred, goal_time_frame, goal_state=goal_state)
         predicted = selected[..., 11:40]
         target = ego_goal[..., 8:37]
         valid = self._valid_goal_component_mask(
@@ -1753,12 +1844,14 @@ class DARManager(BaseManager, GeometryLoss):
         goal_velocity_condition_keep_mask=None,
         history_motion=None,
         goal_time_frame=None,
+        goal_state=None,
     ):
         """Match reference-ego root velocity at the selected goal frame."""
         selected = self._future_feature_at_goal(
-            future_motion_pred, goal_time_frame)
+            future_motion_pred, goal_time_frame, goal_state=goal_state)
         yaw = self._future_yaw_ego_at_goal(
-            future_motion_pred, history_motion, goal_time_frame)
+            future_motion_pred, history_motion, goal_time_frame,
+            goal_state=goal_state)
         delta = selected[..., 7:10] * float(self.dataset.fps)
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
