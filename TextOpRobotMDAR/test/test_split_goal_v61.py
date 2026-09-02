@@ -7,7 +7,10 @@ import torch
 from TextOpRobotMDAR.robotmdar.dataloader.data import SkeletonPrimitiveDataset
 from TextOpRobotMDAR.robotmdar.dtype.rotation import (
     euler_angles_to_quaternion,
+    matrix_to_rot6d,
     quat_mul,
+    quaternion_to_matrix,
+    xyzw_to_wxyz,
 )
 from TextOpRobotMDAR.robotmdar.model.mld_denoiser import _apply_arrival_channel_mask
 from TextOpRobotMDAR.robotmdar.utils.goal import (
@@ -31,7 +34,8 @@ def _split_goal_stats_fixture(tmp_path: Path) -> dict:
         "s_p": torch.tensor(2.0),
         "s_l": torch.tensor(3.0),
         "s_v": torch.tensor(4.0),
-        "s_o": torch.tensor([5.0, 6.0, 7.0, 8.0, 9.0]),
+        "s_d": torch.tensor(1.0),
+        "s_o": torch.linspace(5.0, 13.0, 9),
         "q_mean": torch.linspace(-1.0, 1.0, 29),
         "q_std": torch.linspace(1.0, 2.0, 29),
         "meta": {
@@ -109,23 +113,42 @@ def test_split_goal_layout_scaling_round_trip(tmp_path):
     )
     assert raw.shape == (1, SPLIT_GOAL_DIM)
     torch.testing.assert_close(
-        raw[:, 0:4],
-        torch.tensor([[1.0, -2.0, 0.5, math.sqrt(5.0)]], dtype=torch.float32),
+        raw[:, 0:7],
+        torch.tensor(
+            [[0.5, 1.0, -2.0, 0.0, math.sqrt(5.0),
+              math.log1p(math.sqrt(5.0)), 0.5]],
+            dtype=torch.float32,
+        ),
         atol=1e-6,
         rtol=0,
     )
     torch.testing.assert_close(
-        raw[:, 4:5],
-        torch.log1p(raw[:, 3:4]),
+        raw[:, 7:12],
+        torch.tensor(
+            [[0.25, -0.5, 0.0, math.sqrt(5.0) / 4.0, 0.125]],
+            dtype=torch.float32,
+        ),
         atol=1e-6,
         rtol=0,
     )
+    goal_R = quaternion_to_matrix(xyzw_to_wxyz(world_goal_rot))
+    gravity_world = torch.tensor([[[0.0], [0.0], [-1.0]]])
+    goal_g = (goal_R.transpose(-1, -2) @ gravity_world).squeeze(-1)
+    torch.testing.assert_close(raw[:, 12:15], goal_g, atol=1e-6, rtol=0)
     torch.testing.assert_close(
-        raw[:, 5:8],
-        torch.tensor([[0.25, -0.5, 0.125]], dtype=torch.float32),
+        raw[:, 15:21],
+        matrix_to_rot6d(goal_R),
         atol=1e-6,
         rtol=0,
     )
+    torch.testing.assert_close(raw[:, 21:50], world_goal_dof)
+    torch.testing.assert_close(
+        raw[:, 50:54],
+        torch.tensor([[4.0, -2.0, 0.0, 1.0]], dtype=torch.float32),
+        atol=1e-6,
+        rtol=0,
+    )
+    torch.testing.assert_close(raw[:, 54:55], time_to_arrival.reshape(1, 1))
 
     stats = _split_goal_stats_fixture(tmp_path)
     assert validate_goal_config(
@@ -140,14 +163,15 @@ def test_split_goal_layout_scaling_round_trip(tmp_path):
 
     scaled = scale_goal(raw, stats)
     expected = raw.clone()
-    expected[:, 0:4] = expected[:, 0:4] * stats["s_p"]
-    expected[:, 4:5] = expected[:, 4:5] * stats["s_l"]
-    expected[:, 5:8] = expected[:, 5:8] * stats["s_v"]
-    expected[:, 8:13] = expected[:, 8:13] * stats["s_o"]
-    expected[:, 13:42] = (
-        expected[:, 13:42] - stats["q_mean"]
+    expected[:, 0:5] = expected[:, 0:5] * stats["s_p"]
+    expected[:, 5:6] = expected[:, 5:6] * stats["s_l"]
+    expected[:, 6:7] = expected[:, 6:7] * stats["s_p"]
+    expected[:, 7:12] = expected[:, 7:12] * stats["s_v"]
+    expected[:, 12:21] = expected[:, 12:21] * stats["s_o"]
+    expected[:, 21:50] = (
+        expected[:, 21:50] - stats["q_mean"]
     ) / stats["q_std"].clamp_min(1e-6)
-    expected[:, 42:45] = expected[:, 42:45] * stats["s_v"]
+    expected[:, 50:54] = expected[:, 50:54] * stats["s_v"]
     torch.testing.assert_close(scaled, expected, atol=1e-6, rtol=0)
 
     dispatched = build_ego_goal(
@@ -179,7 +203,7 @@ def test_split_goal_zero_time_zeroes_urgency():
         fps=50.0,
     )
 
-    torch.testing.assert_close(raw[:, 5:8], torch.zeros((1, 3)), atol=1e-6, rtol=0)
+    torch.testing.assert_close(raw[:, 7:12], torch.zeros((1, 5)), atol=1e-6, rtol=0)
 
 
 def test_split_goal_time_mask_zeroes_f_trans():
@@ -190,9 +214,10 @@ def test_split_goal_time_mask_zeroes_f_trans():
         torch.zeros(1, dtype=torch.bool),
     )
 
-    torch.testing.assert_close(masked[:, 5:8], torch.zeros((1, 3)))
-    torch.testing.assert_close(masked[:, :5], goal[:, :5])
-    torch.testing.assert_close(masked[:, 8:], goal[:, 8:])
+    torch.testing.assert_close(masked[:, 7:12], torch.zeros((1, 5)))
+    torch.testing.assert_close(masked[:, 54:55], torch.zeros((1, 1)))
+    torch.testing.assert_close(masked[:, :7], goal[:, :7])
+    torch.testing.assert_close(masked[:, 12:54], goal[:, 12:54])
 
 
 def test_split_goal_stats_clip_outliers_before_std(tmp_path):
@@ -229,17 +254,21 @@ def test_split_goal_stats_clip_outliers_before_std(tmp_path):
         )
         for item in batch_data
     ]
-    pos = torch.cat([goal[:, 0:4] for goal in goals], dim=0).clamp(-3.0, 3.0)
-    urgency = torch.cat([goal[:, 5:8] for goal in goals], dim=0).clamp(-5.0, 5.0)
-    velocity = torch.cat([goal[:, 42:45] for goal in goals], dim=0).clamp(-5.0, 5.0)
+    trans = torch.cat([goal[:, 0:12] for goal in goals], dim=0)
+    pos = torch.cat((trans[:, 0:5], trans[:, 6:7]), dim=-1).clamp(-3.0, 3.0)
+    urgency = trans[:, 7:12].clamp(-5.0, 5.0)
+    velocity = torch.cat([goal[:, 50:54] for goal in goals], dim=0).clamp(-5.0, 5.0)
+    d_hor = trans[:, 4:5]
     expected_s_p = 1.0 / torch.clamp(pos.reshape(-1).std(unbiased=False), min=1e-6)
     expected_s_v = 1.0 / torch.clamp(
         torch.cat((urgency.reshape(-1), velocity.reshape(-1)), dim=0).std(unbiased=False),
         min=1e-6,
     )
+    expected_s_d = torch.quantile(d_hor.reshape(-1).float().clamp_min(0.0), 0.5)
 
     torch.testing.assert_close(stats["s_p"], expected_s_p)
     torch.testing.assert_close(stats["s_v"], expected_s_v)
+    torch.testing.assert_close(stats["s_d"], expected_s_d)
     assert stats["meta"]["goal_dim"] == SPLIT_GOAL_DIM
     assert stats["meta"]["encodings"] == [GoalEncoding.SINGLE.value, GoalEncoding.SPLIT.value]
 

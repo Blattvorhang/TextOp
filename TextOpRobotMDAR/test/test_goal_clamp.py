@@ -18,7 +18,7 @@ from test_split_goal_v61 import _identity_quaternion, _split_goal_stats_fixture
 
 
 def _split_inputs(time_to_arrival):
-    """world goal (3, 4, 0.5) from an identity reference: r=5, z=0.5."""
+    """world goal (3, 4, 0.5) from identity reference: d_hor=5, h=0.5."""
     return {
         "world_goal_pos": torch.tensor([[3.0, 4.0, 0.5]], dtype=torch.float32),
         "world_goal_rot": _identity_quaternion(),
@@ -36,20 +36,20 @@ def test_goal_clamp_direction_preserved_and_z_untouched():
     goal = build_ego_split_goal(**_split_inputs(1.0), fps=50.0,
                                 goal_clamp=clamp)
     assert goal.shape == (1, SPLIT_GOAL_DIM)
-    # r=5 > 2.0*1.0 → scaled by 2/5; direction and z preserved.
+    # d_hor=5 > 2.0*1.0 -> scaled by 2/5; height is separate.
     torch.testing.assert_close(
-        goal[:, 0:3],
-        torch.tensor([[1.2, 1.6, 0.5]], dtype=torch.float32),
+        goal[:, 0:5],
+        torch.tensor([[0.5, 1.2, 1.6, 0.0, 2.0]], dtype=torch.float32),
         atol=1e-6, rtol=0,
     )
-    # Derived channels follow the clamped root: r_xy, log_r_xy, urgency.
-    torch.testing.assert_close(goal[:, 3:4],
-                               torch.tensor([[2.0]]), atol=1e-6, rtol=0)
-    torch.testing.assert_close(goal[:, 4:5], torch.log1p(goal[:, 3:4]),
+    # Derived channels follow the clamped root: log_d_hor, delta_h, urgency.
+    torch.testing.assert_close(goal[:, 5:6], torch.log1p(goal[:, 4:5]),
                                atol=1e-6, rtol=0)
+    torch.testing.assert_close(goal[:, 6:7],
+                               torch.tensor([[0.5]]), atol=1e-6, rtol=0)
     torch.testing.assert_close(
-        goal[:, 5:8],
-        torch.tensor([[1.2, 1.6, 0.5]], dtype=torch.float32),
+        goal[:, 7:12],
+        torch.tensor([[1.2, 1.6, 0.0, 2.0, 0.5]], dtype=torch.float32),
         atol=1e-6, rtol=0,
     )
 
@@ -65,8 +65,12 @@ def test_goal_clamp_leaves_in_envelope_goal_untouched():
                                          goal_clamp=clamp)
     torch.testing.assert_close(clamped_small, plain, atol=1e-6, rtol=0)
     torch.testing.assert_close(
-        plain[:, 0:4],
-        torch.tensor([[1.0, 2.0, 0.5, math.sqrt(5.0)]], dtype=torch.float32),
+        plain[:, 0:7],
+        torch.tensor(
+            [[0.5, 1.0, 2.0, 0.0, math.sqrt(5.0),
+              math.log1p(math.sqrt(5.0)), 0.5]],
+            dtype=torch.float32,
+        ),
         atol=1e-6, rtol=0,
     )
 
@@ -80,14 +84,14 @@ def test_goal_clamp_time_cap_feeds_urgency():
                                 goal_clamp=clamp)
     # r_max = 2.0*1.28 = 2.56 → scale 2.56/5.
     torch.testing.assert_close(
-        goal[:, 0:3],
-        torch.tensor([[1.536, 2.048, 0.5]], dtype=torch.float32),
+        goal[:, 0:5],
+        torch.tensor([[0.5, 1.536, 2.048, 0.0, 2.56]], dtype=torch.float32),
         atol=1e-5, rtol=0,
     )
-    # urgency = clamped root / capped T (z: 0.5/1.28).
+    # urgency = clamped tangent position / capped T plus d_hor/T and delta_h/T.
     torch.testing.assert_close(
-        goal[:, 5:8],
-        torch.tensor([[1.2, 1.6, 0.5 / 1.28]], dtype=torch.float32),
+        goal[:, 7:12],
+        torch.tensor([[1.2, 1.6, 0.0, 2.0, 0.5 / 1.28]], dtype=torch.float32),
         atol=1e-5, rtol=0,
     )
 
@@ -99,14 +103,12 @@ def test_goal_clamp_r_min_floor_at_zero_arrival():
     goal = build_ego_split_goal(**_split_inputs(0.0), fps=50.0,
                                 goal_clamp=clamp)
     torch.testing.assert_close(
-        goal[:, 0:3],
-        torch.tensor([[0.06, 0.08, 0.5]], dtype=torch.float32),
+        goal[:, 0:5],
+        torch.tensor([[0.5, 0.06, 0.08, 0.0, 0.1]], dtype=torch.float32),
         atol=1e-5, rtol=0,
     )
-    torch.testing.assert_close(goal[:, 3:4],
-                               torch.tensor([[0.1]]), atol=1e-5, rtol=0)
     torch.testing.assert_close(
-        goal[:, 5:8], torch.zeros((1, 3)), atol=1e-6, rtol=0)
+        goal[:, 7:12], torch.zeros((1, 5)), atol=1e-6, rtol=0)
 
 
 def test_goal_clamp_fixed_cap_without_arrival_time():
@@ -150,17 +152,19 @@ def test_goal_clamp_end_to_end_scaled_split_goal(tmp_path):
         time_to_arrival_seconds=torch.tensor([1.0], dtype=torch.float32),
         goal_clamp=clamp,
     )
-    # Raw clamped root (1.2, 1.6, 0.5) scaled by s_p=2 → (2.4, 3.2, 1.0);
-    # r_xy = 2.0*2 = 4.0.
+    # Raw clamped position channels scaled by s_p=2.
     torch.testing.assert_close(
-        goal[:, 0:4],
-        torch.tensor([[2.4, 3.2, 1.0, 4.0]], dtype=torch.float32),
+        goal[:, 0:7],
+        torch.tensor(
+            [[1.0, 2.4, 3.2, 0.0, 4.0, 3.0 * math.log1p(2.0), 1.0]],
+            dtype=torch.float32,
+        ),
         atol=1e-5, rtol=0,
     )
-    # urgency = clamped root / T scaled by s_v=4 → (4.8, 6.4, 2.0).
+    # urgency channels scaled by s_v=4.
     torch.testing.assert_close(
-        goal[:, 5:8],
-        torch.tensor([[4.8, 6.4, 2.0]], dtype=torch.float32),
+        goal[:, 7:12],
+        torch.tensor([[4.8, 6.4, 0.0, 8.0, 2.0]], dtype=torch.float32),
         atol=1e-5, rtol=0,
     )
 
@@ -227,16 +231,20 @@ def test_goal_clamp_from_stats_end_to_end():
     goal = build_ego_split_goal(**_split_inputs(1.0), fps=50.0,
                                 goal_clamp=clamp)
     torch.testing.assert_close(
-        goal[:, 0:3],
-        torch.tensor([[3.0 * 1.72 / 5.0, 4.0 * 1.72 / 5.0, 0.5]],
-                     dtype=torch.float32),
+        goal[:, 0:5],
+        torch.tensor(
+            [[0.5, 3.0 * 1.72 / 5.0, 4.0 * 1.72 / 5.0, 0.0, 1.72]],
+            dtype=torch.float32,
+        ),
         atol=1e-6, rtol=0,
     )
-    # Derived urgency = clamped root / T.
+    # Derived urgency = clamped tangent root / T, d_hor/T, delta_h/T.
     torch.testing.assert_close(
-        goal[:, 5:8],
-        torch.tensor([[3.0 * 1.72 / 5.0, 4.0 * 1.72 / 5.0, 0.5]],
-                     dtype=torch.float32),
+        goal[:, 7:12],
+        torch.tensor(
+            [[3.0 * 1.72 / 5.0, 4.0 * 1.72 / 5.0, 0.0, 1.72, 0.5]],
+            dtype=torch.float32,
+        ),
         atol=1e-6, rtol=0,
     )
 
@@ -248,8 +256,11 @@ def test_goal_clamp_disabled_is_identity():
     with_clamp_disabled = build_ego_split_goal(**inputs, fps=50.0,
                                                goal_clamp=None)
     torch.testing.assert_close(with_clamp_disabled, plain, atol=0, rtol=0)
-    # The unclamped goal keeps r=5 and urgency=(3,4,0.5)/1.
-    torch.testing.assert_close(plain[:, 0:4],
-                               torch.tensor([[3.0, 4.0, 0.5, 5.0]],
-                                            dtype=torch.float32),
-                               atol=1e-6, rtol=0)
+    # The unclamped goal keeps d_hor=5 and urgency=(3,4,0,5,0.5)/1.
+    torch.testing.assert_close(
+        plain[:, 0:7],
+        torch.tensor(
+            [[0.5, 3.0, 4.0, 0.0, 5.0, math.log1p(5.0), 0.5]],
+            dtype=torch.float32,
+        ),
+        atol=1e-6, rtol=0)

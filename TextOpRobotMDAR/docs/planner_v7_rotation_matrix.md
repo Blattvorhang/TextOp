@@ -2217,11 +2217,11 @@ ablation studies:
    convention: `m_t` = incoming transition `t−1 → t` + partial absolute
    state at `t` (§2.8, §4), replacing the departure-state draft. The
    in-code v6 forward/inverse (`motion_dict_to_feature_v6` /
-   `motion_feature_to_dict_v6`), the decode path, the normalization
-   statistics (`meanstd_v6_dof29.pkl`) and the §4.5 tests still
-   implement the departure-state draft and must be migrated before the
-   first VAE run; the goal-related part of that migration is itemized in
-   §4.6.
+   `motion_feature_to_dict_v6`) were migrated to the arrival-state
+   convention and v6 enabled by default (commit `5909ef1`); what
+   remains before the first VAE run is the §4.5 test suite and the v6
+   normalization-statistics refresh; the goal-related part of the
+   migration is itemized in §4.6.
 
 ## 8. Relationship to the in-code FeatureVersion 4 and 5
 

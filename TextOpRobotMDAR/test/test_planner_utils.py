@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+import robotmdar.dtype.motion as runtime_motion_dtype
+import TextOpRobotMDAR.robotmdar.dtype.motion as package_motion_dtype
 from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
     G1_ISAACLAB_DOF_JOINT_NAMES,
     align_generated_history_pose,
@@ -39,6 +41,14 @@ class IdentityNormalization:
 
 class IdentityNormalization23(IdentityNormalization):
     dof_dim = 23
+
+
+def _set_both_feature_versions(version: int):
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(version)
+    package_motion_dtype.set_feature_version(version)
+    return old_runtime, old_package
 
 
 def test_fk_preserves_non_upright_root_quaternion():
@@ -227,6 +237,44 @@ def test_controller_29dof_history_builds_legacy_57d_model_input():
         mujoco[-1, core] - mujoco[-2, core])
 
 
+def test_controller_v6_history_consumes_h_plus_one_physical_states():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        positions = np.asarray([
+            [0.0, 0.0, 0.77],
+            [0.1, 0.0, 0.77],
+            [0.2, 0.0, 0.77],
+        ], dtype=np.float32)
+        rotations = np.asarray([
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=np.float32)
+        joints = np.zeros((3, 29), dtype=np.float32)
+        state = SimpleNamespace(raw={
+            "g1_pos": positions,
+            "g1_root_rot": rotations,
+            "g1_joint_pos": joints,
+        })
+
+        feature, abs_pose = state_to_model_input(
+            state, history_len=2, val_data=IdentityNormalization(),
+            device="cpu")
+
+        assert feature.shape == (1, 2, 44)
+        np.testing.assert_allclose(
+            abs_pose["root_trans_offset"].numpy(), positions[0:1])
+        torch.testing.assert_close(
+            feature[0, :, 4:7],
+            torch.tensor([[0.1, 0.0, 0.0], [0.1, 0.0, 0.0]]),
+            atol=1e-6,
+            rtol=0,
+        )
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
 def test_goal_uses_current_history_feature_reference():
     state = SimpleNamespace(
         goal_root_pos_world=np.asarray([2.0, 1.0, 0.77], dtype=np.float32),
@@ -376,6 +424,34 @@ def test_generated_history_ends_at_tracked_future_frame():
     torch.testing.assert_close(
         abs_pose["root_trans_offset"], torch.tensor([[4.0, 0.0, 0.0]]))
     torch.testing.assert_close(reference_pos, torch.tensor([[5.0, 0.0, 0.0]]))
+
+
+def test_generated_history_v6_anchor_is_state_before_selected_features():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        features = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
+        root_pos = torch.zeros((1, 10, 3), dtype=torch.float32)
+        root_pos[0, :, 0] = torch.arange(10, dtype=torch.float32)
+        root_rot = torch.zeros((1, 10, 4), dtype=torch.float32)
+        root_rot[..., 3] = 1.0
+        plan = {"features": features, "root_pos": root_pos, "root_rot": root_rot}
+
+        history, abs_pose, reference_pos, _ = generated_history_at_frame(
+            plan, tracked_frame=0, history_len=2)
+        torch.testing.assert_close(history.flatten(), torch.tensor([1.0, 2.0]))
+        torch.testing.assert_close(
+            abs_pose["root_trans_offset"], torch.tensor([[0.0, 0.0, 0.0]]))
+        torch.testing.assert_close(reference_pos, torch.tensor([[2.0, 0.0, 0.0]]))
+
+        history, abs_pose, reference_pos, _ = generated_history_at_frame(
+            plan, tracked_frame=3, history_len=2)
+        torch.testing.assert_close(history.flatten(), torch.tensor([4.0, 5.0]))
+        torch.testing.assert_close(
+            abs_pose["root_trans_offset"], torch.tensor([[3.0, 0.0, 0.0]]))
+        torch.testing.assert_close(reference_pos, torch.tensor([[5.0, 0.0, 0.0]]))
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
 
 
 def test_g1_packet_keeps_seam_and_maps_sonic_tracking_bodies():

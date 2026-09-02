@@ -132,7 +132,7 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
     assert int(v6.data.nfeats) == 44  # base.yaml now defaults to v6
     assert int(v6.feature_version) == 6
     assert v6.data.goal_type == 'joint_state'
-    assert int(v6.denoiser.goal_dim) == 45
+    assert int(v6.denoiser.goal_dim) == 55
     assert v6.skeleton.asset.assetFileName == 'g1_29dof.xml'
     assert v6.ckpt.vae is None
     assert int(legacy_23.data.nfeats) == 57
@@ -143,7 +143,7 @@ def test_train_config_selects_matching_features_skeleton_and_vae():
     assert int(planner.data.dof_dim) == 29
     assert int(planner.data.nfeats) == 44  # base.yaml now defaults to v6
     assert planner.data.goal_type == 'joint_state'
-    assert int(planner.denoiser.goal_dim) == 45
+    assert int(planner.denoiser.goal_dim) == 55
     assert planner.skeleton.asset.assetFileName == 'g1_29dof.xml'
     assert int(rotmat_v6.feature_version) == 6
     assert int(rotmat_v6.data.feature_version) == 6
