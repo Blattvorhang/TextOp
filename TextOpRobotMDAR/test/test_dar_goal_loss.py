@@ -4,6 +4,9 @@ import torch
 import pytest
 from omegaconf import OmegaConf
 
+import robotmdar.dtype.motion as runtime_motion_dtype
+import TextOpRobotMDAR.robotmdar.dtype.motion as package_motion_dtype
+from TextOpRobotMDAR.robotmdar.dtype.rotation import matrix_to_rot6d
 from TextOpRobotMDAR.robotmdar.train.manager import DARManager
 from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _make_root_xy_figure,
@@ -32,6 +35,14 @@ def _future(displacement_xy):
     future = torch.zeros((len(displacement_xy), 4, 69), dtype=torch.float32)
     future[:, :3, 7:9] = torch.as_tensor(displacement_xy)[:, None] / 4.0
     return future
+
+
+def _set_both_feature_versions(version: int):
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(version)
+    package_motion_dtype.set_feature_version(version)
+    return old_runtime, old_package
 
 
 def test_goal_root_position_loss_is_zero_for_matching_endpoint():
@@ -205,6 +216,72 @@ def test_joint_state_goal_losses_use_selected_goal_frame():
         atol=1e-6,
         rtol=0,
     )
+
+
+def test_v6_joint_state_goal_losses_use_arrival_rotmat_goal_frame():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.dataset.dof_dim = 29
+        manager.dataset.fps = 50
+
+        rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
+        history = torch.zeros((1, 2, 44), dtype=torch.float32)
+        future = torch.zeros((1, 4, 44), dtype=torch.float32)
+        for motion in (history, future):
+            motion[..., 0] = 0.77
+            motion[..., 1:4] = torch.tensor([0.0, 0.0, -1.0])
+            motion[..., 7:13] = rot6d_identity
+            motion[..., 42:44] = 1.0
+
+        future[0, 0:2, 4] = 0.25
+        q_goal = torch.linspace(-0.5, 0.5, 29)
+        future[0, 1, 13:42] = q_goal
+
+        goal = torch.zeros((1, 47), dtype=torch.float32)
+        goal[0, 0] = 0.77
+        goal[0, 1:4] = torch.tensor([0.5, 0.0, 0.0])
+        goal[0, 4:7] = torch.tensor([0.0, 0.0, -1.0])
+        goal[0, 7:13] = rot6d_identity
+        goal[0, 13:42] = q_goal
+        goal[0, 42:46] = torch.tensor([12.5, 0.0, 0.0, 0.0])
+        goal[0, 46] = 2.0 / 50.0
+        goal_time_frame = torch.tensor([2])
+
+        torch.testing.assert_close(
+            manager.calc_goal_root_position_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            manager.calc_goal_root_orientation_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            manager.calc_goal_joint_angle_loss(
+                future, goal, goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            manager.calc_goal_root_velocity_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
 
 
 def test_joint_state_goal_cache_matches_uncached_losses():

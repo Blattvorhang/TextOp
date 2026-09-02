@@ -14,7 +14,15 @@ from robotmdar.dtype.rotation import (
     rot6d_to_matrix,
     xyzw_to_wxyz,
 )
-from robotmdar.utils.goal import GoalType, JOINT_STATE_GOAL_DIM
+from robotmdar.utils.goal import (
+    GoalType,
+    JOINT_STATE_GOAL_DIM,
+    ROT_MAT_JOINT_STATE_GOAL_DIM,
+    V6_RAW_JOINT_SLICE,
+    V6_RAW_ORIENTATION_SLICE,
+    V6_RAW_POSITION_SLICE,
+    V6_RAW_VELOCITY_SLICE,
+)
 from isaac_utils.rotations import get_euler_xyz
 
 # Coarse motion classes for per-class diagnostics (doc §4.3.4/§4.3.6).
@@ -319,6 +327,134 @@ class GeometryLoss:
             rel_rot.transpose(-1, -2),
             prev_g.unsqueeze(-1),
         ).squeeze(-1)
+
+    @staticmethod
+    def _project_to_tangent(vector, gravity):
+        gravity = torch.nn.functional.normalize(gravity, dim=-1, eps=1e-8)
+        return vector - (vector * gravity).sum(dim=-1, keepdim=True) * gravity
+
+    @staticmethod
+    def _v6_identity(batch_size, device, dtype):
+        return torch.eye(3, device=device, dtype=dtype).expand(
+            batch_size, 3, 3).clone()
+
+    def _future_goal_state_v6(self, future_motion_pred, history_motion,
+                              goal_time_frame=None):
+        if history_motion is None:
+            raise ValueError(
+                "history_motion is required for v6 goal-state losses")
+        pred = self._feature_v6_components(future_motion_pred)
+        future_motion = self.dataset.denormalize(future_motion_pred)
+        hist = self._feature_v6_components(history_motion[:, -1:])
+
+        B, T = future_motion.shape[:2]
+        device, dtype = future_motion.device, future_motion.dtype
+        ref_g = hist['gravity'][:, 0]
+        ref_height = hist['height'][:, 0]
+        dep_gravity = torch.cat(
+            (ref_g[:, None], pred['gravity'][:, :-1]), dim=1)
+        delta_hor = self._project_to_tangent(
+            pred['delta_hor_raw'], dep_gravity)
+
+        prev_R = self._v6_identity(B, device, dtype)
+        prev_height = ref_height
+        displacement = torch.zeros(B, 3, device=device, dtype=dtype)
+        trajectory = [displacement]
+        rotations = []
+        velocities = []
+
+        for t in range(T):
+            dep_R = prev_R
+            step_delta_hor = delta_hor[:, t]
+            displacement = displacement + torch.matmul(
+                dep_R, step_delta_hor.unsqueeze(-1)).squeeze(-1)
+            trajectory.append(self._project_to_tangent(displacement, ref_g))
+
+            dh = pred['height'][:, t] - prev_height
+            delta_local = step_delta_hor - dh.unsqueeze(-1) * dep_gravity[:, t]
+            velocity_ref = torch.matmul(
+                dep_R, delta_local.unsqueeze(-1)).squeeze(-1)
+            velocity_ref = velocity_ref * float(self.dataset.fps)
+            velocity_hor = self._project_to_tangent(velocity_ref, ref_g)
+            velocity_vert = -(velocity_ref * ref_g).sum(dim=-1, keepdim=True)
+            velocities.append(torch.cat((velocity_hor, velocity_vert), dim=-1))
+
+            provisional_R = torch.matmul(dep_R, pred['rel_rot'][:, t])
+            integrated_gravity = torch.matmul(
+                provisional_R.transpose(-1, -2),
+                ref_g.unsqueeze(-1),
+            ).squeeze(-1)
+            correction = motion_dtype._shortest_arc_right_correction(
+                integrated_gravity, pred['gravity'][:, t])
+            prev_R = torch.matmul(provisional_R, correction)
+            rotations.append(prev_R)
+            prev_height = pred['height'][:, t]
+
+        trajectory = torch.stack(trajectory, dim=1)
+        rotations = torch.stack(rotations, dim=1)
+        velocities = torch.stack(velocities, dim=1)
+        goal_step = self._future_step_from_goal_time(
+            future_motion_pred, goal_time_frame)
+        batch_idx = torch.arange(B, device=device)
+        return {
+            'future_motion': future_motion,
+            'goal_step': goal_step,
+            'batch_idx': batch_idx,
+            'selected': future_motion[batch_idx, goal_step],
+            'height_at_goal': pred['height'][batch_idx, goal_step],
+            'trajectory': trajectory,
+            'displacement_at_goal': trajectory[
+                batch_idx, (goal_step + 1).clamp(max=trajectory.shape[1] - 1)],
+            'rel_rot_at_goal': rotations[batch_idx, goal_step],
+            'velocity_at_goal': velocities[batch_idx, goal_step],
+        }
+
+    def _history_trajectory_ego_v6(self, history_motion):
+        history = self._feature_v6_components(history_motion)
+        B, H = history_motion.shape[:2]
+        device, dtype = history_motion.device, history_motion.dtype
+        if H == 0:
+            return torch.zeros(B, 0, 3, device=device, dtype=dtype)
+
+        first_g = history['gravity'][:, 0]
+        prev_g = torch.matmul(
+            history['rel_rot'][:, 0],
+            first_g.unsqueeze(-1),
+        ).squeeze(-1)
+        prev_R = self._v6_identity(B, device, dtype)
+        delta_hor = self._project_to_tangent(
+            history['delta_hor_raw'],
+            torch.cat((prev_g[:, None], history['gravity'][:, :-1]), dim=1),
+        )
+
+        displacement = torch.zeros(B, 3, device=device, dtype=dtype)
+        positions = [displacement]
+        rotations = []
+        for t in range(H):
+            dep_R = prev_R
+            displacement = displacement + torch.matmul(
+                dep_R, delta_hor[:, t].unsqueeze(-1)).squeeze(-1)
+            positions.append(displacement)
+
+            provisional_R = torch.matmul(dep_R, history['rel_rot'][:, t])
+            integrated_gravity = torch.matmul(
+                provisional_R.transpose(-1, -2),
+                prev_g.unsqueeze(-1),
+            ).squeeze(-1)
+            correction = motion_dtype._shortest_arc_right_correction(
+                integrated_gravity, history['gravity'][:, t])
+            prev_R = torch.matmul(provisional_R, correction)
+            rotations.append(prev_R)
+
+        positions = torch.stack(positions, dim=1)
+        ref_R = torch.stack(rotations, dim=1)[:, -1]
+        d_pos = positions[:, 1:] - positions[:, -1:]
+        ego_pos = torch.matmul(
+            ref_R.transpose(-1, -2).unsqueeze(1),
+            d_pos.unsqueeze(-1),
+        ).squeeze(-1)
+        ref_g = history['gravity'][:, -1]
+        return self._project_to_tangent(ego_pos, ref_g.unsqueeze(1))
 
     @staticmethod
     def _quat_chordal_loss(q_pred, q_gt):
@@ -687,6 +823,28 @@ class GeometryLoss:
                                      history_motion=None,
                                      goal_time_frame=None):
         """Match generated horizontal root displacement to the goal endpoint."""
+        if (motion_dtype.FeatureVersion == 6
+                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+            goal_state = self._future_goal_state_v6(
+                future_motion_pred, history_motion,
+                goal_time_frame=goal_time_frame)
+            predicted = torch.cat(
+                (
+                    goal_state['height_at_goal'].unsqueeze(-1),
+                    goal_state['displacement_at_goal'],
+                ),
+                dim=-1,
+            )
+            target = ego_goal[..., V6_RAW_POSITION_SLICE]
+            valid = torch.ones(
+                target.shape[0], dtype=torch.bool, device=target.device)
+            if goal_condition_keep_mask is not None:
+                valid = valid & goal_condition_keep_mask.to(
+                    device=valid.device, dtype=torch.bool)
+            if not valid.any():
+                return future_motion_pred.sum() * 0.0
+            return self.rec_criterion(predicted[valid], target[valid])
+
         root_displacement = self.root_displacement_ego(
             future_motion_pred, history_motion,
             goal_time_frame=goal_time_frame)
@@ -728,6 +886,10 @@ class GeometryLoss:
 
     def _future_goal_state(self, future_motion_pred, history_motion=None,
                            goal_time_frame=None, include_yaw=False):
+        if motion_dtype.FeatureVersion == 6:
+            return self._future_goal_state_v6(
+                future_motion_pred, history_motion,
+                goal_time_frame=goal_time_frame)
         future_motion = self.dataset.denormalize(future_motion_pred)
         goal_step = self._future_step_from_goal_time(
             future_motion, goal_time_frame)
@@ -791,6 +953,23 @@ class GeometryLoss:
         goal_state=None,
     ):
         """Match TextOp-style root orientation at the selected goal frame."""
+        if (motion_dtype.FeatureVersion == 6
+                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+            if goal_state is None:
+                goal_state = self._future_goal_state_v6(
+                    future_motion_pred, history_motion,
+                    goal_time_frame=goal_time_frame)
+            predicted = goal_state['rel_rot_at_goal']
+            target = ego_goal[..., V6_RAW_ORIENTATION_SLICE]
+            target_R = rot6d_to_matrix(target[..., 3:9])
+            valid = self._valid_goal_component_mask(
+                target.shape[0], target.device,
+                goal_orientation_condition_keep_mask)
+            if not valid.any():
+                return future_motion_pred.sum() * 0.0
+            return (predicted[valid] - target_R[valid]).square().sum(
+                dim=(-1, -2)).mean()
+
         selected = self._future_feature_at_goal(
             future_motion_pred, goal_time_frame, goal_state=goal_state)
         yaw = self._future_yaw_ego_at_goal(
@@ -823,6 +1002,18 @@ class GeometryLoss:
                 "joint_state goal losses require dataset.dof_dim=29, got "
                 f"{dof_dim}"
             )
+        if (motion_dtype.FeatureVersion == 6
+                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+            selected = self._future_feature_at_goal(
+                future_motion_pred, goal_time_frame, goal_state=goal_state)
+            predicted = selected[..., 13:42]
+            target = ego_goal[..., V6_RAW_JOINT_SLICE]
+            valid = self._valid_goal_component_mask(
+                target.shape[0], target.device, goal_joint_condition_keep_mask)
+            if not valid.any():
+                return future_motion_pred.sum() * 0.0
+            return self.rec_criterion(predicted[valid], target[valid])
+
         selected = self._future_feature_at_goal(
             future_motion_pred, goal_time_frame, goal_state=goal_state)
         predicted = selected[..., 11:40]
@@ -843,6 +1034,21 @@ class GeometryLoss:
         goal_state=None,
     ):
         """Match reference-ego root velocity at the selected goal frame."""
+        if (motion_dtype.FeatureVersion == 6
+                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+            if goal_state is None:
+                goal_state = self._future_goal_state_v6(
+                    future_motion_pred, history_motion,
+                    goal_time_frame=goal_time_frame)
+            predicted = goal_state['velocity_at_goal']
+            target = ego_goal[..., V6_RAW_VELOCITY_SLICE]
+            valid = self._valid_goal_component_mask(
+                target.shape[0], target.device,
+                goal_velocity_condition_keep_mask)
+            if not valid.any():
+                return future_motion_pred.sum() * 0.0
+            return self.rec_criterion(predicted[valid], target[valid])
+
         selected = self._future_feature_at_goal(
             future_motion_pred, goal_time_frame, goal_state=goal_state)
         yaw = self._future_yaw_ego_at_goal(
@@ -888,6 +1094,9 @@ class GeometryLoss:
 
     def root_trajectory_ego(self, future_motion_pred, history_motion):
         """Integrate root XY positions in the reference ego frame."""
+        if motion_dtype.FeatureVersion == 6:
+            return self._future_goal_state_v6(
+                future_motion_pred, history_motion)['trajectory']
         if motion_dtype.FeatureVersion != 3:
             raise NotImplementedError(
                 "root trajectory integration currently supports FeatureVersion 3 only"
@@ -934,10 +1143,12 @@ class GeometryLoss:
             Tensor [B, history_len, 2] — ego XY positions of history
             frames.  The last frame (reference) is always (0, 0).
         """
+        if motion_dtype.FeatureVersion == 6:
+            return self._history_trajectory_ego_v6(history_motion)
         if motion_dtype.FeatureVersion != 3:
             raise NotImplementedError(
                 "history trajectory integration currently supports "
-                "FeatureVersion 3 only"
+                "FeatureVersion 3 or 6 only"
             )
         if history_motion is None:
             raise ValueError(
@@ -1161,7 +1372,8 @@ def calc_dar_loss(
             goal_time_frame=goal_time_frame,
         )
 
-    if ego_goal is not None and ego_goal.shape[-1] == JOINT_STATE_GOAL_DIM:
+    joint_goal_dims = (JOINT_STATE_GOAL_DIM, ROT_MAT_JOINT_STATE_GOAL_DIM)
+    if ego_goal is not None and ego_goal.shape[-1] in joint_goal_dims:
         compute_goal_root_orientation = (
             self.loss_weight.get('goal_root_orientation', 0.0) > 0.0
             or is_eval

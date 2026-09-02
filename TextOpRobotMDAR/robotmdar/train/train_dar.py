@@ -12,7 +12,9 @@ from hydra.utils import instantiate
 from robotmdar.utils.goal import (
     GoalEncoding,
     GoalType,
+    ROT_MAT_JOINT_STATE_GOAL_DIM,
     build_ego_goal,
+    build_ego_joint_state_goal_v6,
     validate_goal_config,
 )
 from robotmdar.utils.occupancy import (
@@ -26,6 +28,7 @@ from robotmdar.utils.dof_contract import (
     validate_training_contract,
 )
 from robotmdar.train.manager import DARManager, is_main_process, get_ddp_model
+import robotmdar.dtype.motion as motion_dtype
 
 
 # ── Default XY plot limit from 64-frame goal distribution analysis ──
@@ -47,6 +50,17 @@ def _compute_xy_limit(*trajectories, goals_xy, default=_DEFAULT_XY_LIMIT):
     # round up to nearest 0.1 m for clean axis labels
     limit = math.ceil(limit * 10) / 10
     return max(limit, default)
+
+
+def _raw_goal_root_target(ego_goal_raw: torch.Tensor) -> torch.Tensor:
+    if (motion_dtype.FeatureVersion == 6
+            and ego_goal_raw.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+        return ego_goal_raw[:, 1:4]
+    return ego_goal_raw[:, :2]
+
+
+def _raw_goal_xy(ego_goal_raw: torch.Tensor) -> torch.Tensor:
+    return _raw_goal_root_target(ego_goal_raw)[:, :2]
 
 
 def _make_root_xy_figure(
@@ -125,7 +139,7 @@ def _make_root_xy_figure(
     axes = figure.subplots(rows, cols, squeeze=False)
 
     for axis, sample_idx in zip(axes.flat, indices.tolist()):
-        generated_xy = generated[sample_idx].numpy()
+        generated_xy = generated[sample_idx, :, :2].numpy()
         goal = goals[sample_idx, :2].numpy()
         goal_idx = generated_xy.shape[0] - 1
         if goal_time is not None:
@@ -163,7 +177,7 @@ def _make_root_xy_figure(
 
         # ── history curve (reverse-integrated) ──
         if history is not None:
-            hist_xy = history[sample_idx].numpy()
+            hist_xy = history[sample_idx, :, :2].numpy()
             axis.plot(
                 hist_xy[:, 0], hist_xy[:, 1],
                 color='#56B4E9', linewidth=1.6, linestyle='--',
@@ -178,7 +192,7 @@ def _make_root_xy_figure(
 
         # ── ground truth ──
         if ground_truth is not None:
-            ground_truth_xy = ground_truth[sample_idx].numpy()
+            ground_truth_xy = ground_truth[sample_idx, :, :2].numpy()
             axis.plot(
                 ground_truth_xy[:, 0], ground_truth_xy[:, 1],
                 color='#666666', linewidth=1.5, linestyle='--',
@@ -302,31 +316,43 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         goal_time = time_to_arrival.to(cfg.device)
     else:
         goal_time = None
-    ego_goal_raw = build_ego_goal(
-        primitive['world_goal_pos'].to(cfg.device),
-        primitive['world_goal_yaw'].to(cfg.device),
-        reference_pos,
-        reference_rot,
-        goal_type=goal_type,
-        goal_encoding=GoalEncoding.LEGACY40,
-        world_goal_keypoints=(
-            primitive['world_goal_keypoints'].to(cfg.device)
-            if goal_type.uses_keypoints else None
-        ),
-        world_root_velocity=(
-            primitive['world_goal_vel'].to(cfg.device)
-            if goal_type.uses_arrival_time else None
-        ),
-        timestep=goal_time,
-        world_goal_rot=(
-            primitive['world_goal_rot'].to(cfg.device)
-            if goal_type is GoalType.JOINT_STATE else None
-        ),
-        world_goal_dof=(
-            primitive['world_goal_dof'].to(cfg.device)
-            if goal_type is GoalType.JOINT_STATE else None
-        ),
-    )
+    if goal_type is GoalType.JOINT_STATE and motion_dtype.FeatureVersion == 6:
+        ego_goal_raw = build_ego_joint_state_goal_v6(
+            world_goal_pos=primitive['world_goal_pos'].to(cfg.device),
+            world_goal_rot=primitive['world_goal_rot'].to(cfg.device),
+            world_goal_dof=primitive['world_goal_dof'].to(cfg.device),
+            world_root_velocity=primitive['world_goal_vel'].to(cfg.device),
+            reference_pos=reference_pos,
+            reference_rot=reference_rot,
+            time_to_arrival_seconds=goal_time,
+            fps=fps,
+        )
+    else:
+        ego_goal_raw = build_ego_goal(
+            primitive['world_goal_pos'].to(cfg.device),
+            primitive['world_goal_yaw'].to(cfg.device),
+            reference_pos,
+            reference_rot,
+            goal_type=goal_type,
+            goal_encoding=GoalEncoding.LEGACY40,
+            world_goal_keypoints=(
+                primitive['world_goal_keypoints'].to(cfg.device)
+                if goal_type.uses_keypoints else None
+            ),
+            world_root_velocity=(
+                primitive['world_goal_vel'].to(cfg.device)
+                if goal_type.uses_arrival_time else None
+            ),
+            timestep=goal_time,
+            world_goal_rot=(
+                primitive['world_goal_rot'].to(cfg.device)
+                if goal_type is GoalType.JOINT_STATE else None
+            ),
+            world_goal_dof=(
+                primitive['world_goal_dof'].to(cfg.device)
+                if goal_type is GoalType.JOINT_STATE else None
+            ),
+        )
     if goal_type is GoalType.JOINT_STATE and goal_encoding is not GoalEncoding.LEGACY40:
         if goal_stats is None:
             raise ValueError(
@@ -413,9 +439,12 @@ def _next_rollout_poses(dataset, motion, history_start_pos, history_start_rot, h
             abs_pose=_pose_dict(history_start_pos, history_start_rot),
             ret_fk=False,
         )
+    history_anchor_idx = (
+        -history_len - 1 if motion_dtype.FeatureVersion == 6 else -history_len
+    )
     return (
-        reconstructed['root_trans_offset'][:, -history_len].detach(),
-        reconstructed['root_rot'][:, -history_len].detach(),
+        reconstructed['root_trans_offset'][:, history_anchor_idx].detach(),
+        reconstructed['root_rot'][:, history_anchor_idx].detach(),
         reconstructed['root_trans_offset'][:, -1].detach(),
         reconstructed['root_rot'][:, -1].detach(),
     )
@@ -1352,11 +1381,12 @@ def main(cfg: DictConfig):
                                 goal_time_frame=goal_time_frame,
                             )
                         )
+                        goal_root_target = _raw_goal_root_target(y['ego_goal_raw'])
                         goal_error = torch.linalg.vector_norm(
-                            sample_goal_displacement - y['ego_goal_raw'][:, :2], dim=-1
+                            sample_goal_displacement - goal_root_target, dim=-1
                         )
                         primitive_end_error = torch.linalg.vector_norm(
-                            sample_displacement - y['ego_goal_raw'][:, :2], dim=-1
+                            sample_displacement - goal_root_target, dim=-1
                         )
                         if goal_keep_mask is not None:
                             goal_error = goal_error[
@@ -1378,7 +1408,7 @@ def main(cfg: DictConfig):
                             sample_goal_displacement.norm(dim=-1).mean()
                         )
                         extras['goal_root_displacement'] = (
-                            y['ego_goal_raw'][:, :2].norm(dim=-1).mean()
+                            goal_root_target.norm(dim=-1).mean()
                         )
                         extras['sample_latent_std'] = sample_latent.std()
                         if manager.should_report_eval_visualization():
@@ -1390,7 +1420,7 @@ def main(cfg: DictConfig):
                             )
                             figure = _make_root_xy_figure(
                                 sample_trajectory,
-                                y['ego_goal_raw'][:, :2],
+                                _raw_goal_xy(y['ego_goal_raw']),
                                 ground_truth_trajectory=ground_truth_trajectory,
                                 goal_time_frame=goal_time_frame,
                                 history_trajectory=hist_traj,
