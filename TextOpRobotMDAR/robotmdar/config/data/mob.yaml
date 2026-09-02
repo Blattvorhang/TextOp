@@ -37,7 +37,7 @@ goal_per_primitive: true
 goal_timestep_mode: relative
 occupancy_unit: 0.08
 
-# Planner V5 history augmentation (LDM-only). This explicit opt-in keeps VAE
+# Planner V7.1 history augmentation (LDM-only). This explicit opt-in keeps VAE
 # training clean even if a shared start-step override is supplied.
 augmentation_enabled: false
 augmentation_start_step: 50000

@@ -206,6 +206,11 @@ config parameter.
 
 ## 4. History Perturbation for Domain Randomization
 
+> Superseded for training-time augmentation by
+> `planner_v7_1_fall_recovery.md`: V7.1 removes the per-sample recovery
+> amplitude branch from the dataloader and moves recovery-scale perturbation to
+> offline preprocessing.
+
 > Design details: see `planner_v5_domain_randomization.md`. This section
 > summarizes the agreed conclusion; that document is authoritative on
 > ranges and implementation specifics.

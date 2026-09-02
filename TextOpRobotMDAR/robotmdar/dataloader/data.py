@@ -49,6 +49,17 @@ import json
 _GOAL_STATS_POSITION_CLIP = 3.0
 _GOAL_STATS_VELOCITY_CLIP = 5.0
 
+_HISTORY_JOINT_AUG_AMPS = (
+    ("shoulder", 0.30),
+    ("elbow", 0.10),
+    ("hip", 0.05),
+    ("knee", 0.05),
+    ("ankle", 0.05),
+    ("waist", 0.20),
+    ("wrist", 0.05),
+)
+_HISTORY_ROOT_AUG_AMPS = {"x": 0.20, "y": 0.20, "z": 0.05, "h": 0.01}
+
 
 def _abs_p50_p99(values: torch.Tensor) -> tuple[float, float]:
     values = values.detach().abs().reshape(-1).float()
@@ -636,12 +647,73 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             aw * bw - ax * bx - ay * by - az * bz,
         ), dim=-1)
 
+    @staticmethod
+    def _smoothstep(u: torch.Tensor) -> torch.Tensor:
+        return 3.0 * u * u - 2.0 * u * u * u
+
+    @staticmethod
+    def _history_aug_weight_schedule(
+        history_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        u = torch.linspace(0.0, 1.0, history_len + 1,
+                           device=device, dtype=dtype)
+        return 1.0 - SkeletonPrimitiveDataset._smoothstep(u)
+
+    def _history_aug_dof_names(self) -> List[str]:
+        names = list(self.skeleton.fk.dof_joint_names)
+        if len(names) == self.dof_dim:
+            return names
+        if len(names) == 29 and self.dof_dim == 23:
+            return [names[i] for i in G1_23DOF_FROM_29DOF_INDICES]
+        raise ValueError(
+            f"Cannot map {len(names)} skeleton joint names to "
+            f"dof_dim={self.dof_dim}"
+        )
+
+    def _history_aug_amp_vector(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        values = []
+        for name in self._history_aug_dof_names():
+            for prefix, amplitude in _HISTORY_JOINT_AUG_AMPS:
+                if prefix in name:
+                    values.append(amplitude)
+                    break
+            else:
+                raise ValueError(
+                    f"No history augmentation amplitude for joint {name!r}"
+                )
+        return torch.as_tensor(values, device=device, dtype=dtype)
+
+    def _history_aug_joint_limits(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        limits = self._joint_limit_tensor()
+        if limits is None:
+            return torch.as_tensor(
+                [[-np.pi, np.pi]] * self.dof_dim,
+                dtype=dtype,
+                device=device,
+            )
+        limits = limits.to(device=device, dtype=dtype)
+        if limits.shape[0] == self.dof_dim:
+            return limits
+        if limits.shape[0] == 29 and self.dof_dim == 23:
+            return limits[list(G1_23DOF_FROM_29DOF_INDICES)]
+        raise ValueError(
+            f"Cannot map joint-limit tensor with shape {tuple(limits.shape)} "
+            f"to dof_dim={self.dof_dim}"
+        )
+
     def _augment_raw_motion(self, motion: Dict[str, torch.Tensor],
-                            recovery: bool,
                             generator: Optional[torch.Generator]) -> bool:
-        """Perturb raw motion before FeatureVersion 3 extraction."""
-        if motion_dtype.FeatureVersion != 3:
-            return False
+        """Perturb raw history states before feature extraction."""
         augmentation_enabled = bool(getattr(self, 'augmentation_enabled', False))
         training_step = int(getattr(self, 'training_step', 0))
         augmentation_start_step = int(
@@ -652,48 +724,63 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if torch.rand((), generator=generator).item() >= self.augmentation_prob:
             return False
 
-        H = min(self.history_len, motion['dof'].shape[0] - 1)
-        if H <= 0:
+        history_count = min(self.history_len, motion['dof'].shape[0] - 1)
+        if history_count <= 0:
             return False
         device, dtype = motion['dof'].device, motion['dof'].dtype
-        w = torch.linspace(0.5, 1.0, H, device=device, dtype=dtype)
-        if recovery:
-            groups = {'shoulder': 1.50, 'elbow': 1.50, 'hip': 1.20,
-                      'knee': 1.20, 'ankle': 0.08, 'waist': 0.08, 'wrist': 0.12}
-            a_roll = a_pitch = 1.50
-        else:
-            groups = {'shoulder': 0.03, 'elbow': 0.03, 'hip': 0.02,
-                      'knee': 0.02, 'ankle': 0.02, 'waist': 0.02, 'wrist': 0.03}
-            a_roll = a_pitch = 0.05
-        a_h = 0.03 if recovery else 0.01
-        names29 = tuple(self.skeleton.fk.dof_joint_names)
-        indices = list(range(29)) if self.dof_dim == 29 else list(G1_23DOF_FROM_29DOF_INDICES)
-        names = [names29[i] for i in indices]
-        amps = torch.tensor([next(v for k, v in groups.items() if k in n)
-                             for n in names], device=device, dtype=dtype)
-        limits = self._joint_limit_tensor()
-        if limits is None:
-            limits = torch.as_tensor(
-                [[-np.pi, np.pi]] * 29, dtype=dtype, device=device)
-        else:
-            limits = limits.to(device=device, dtype=dtype)
-        limits = limits[indices]
-        x = motion['dof'][:H]
-        lo = ((limits[:, 0] - x) / w[:, None]).amax(dim=0)
-        hi = ((limits[:, 1] - x) / w[:, None]).amin(dim=0)
-        lower, upper = torch.maximum(lo, -amps), torch.minimum(hi, amps)
-        q = lower + (upper - lower) * torch.rand(self.dof_dim, generator=generator, device=device, dtype=dtype)
-        q = torch.where(lower <= upper, q, torch.zeros_like(q))
-        motion['dof'][:H] += w[:, None] * q
+        w = self._history_aug_weight_schedule(
+            history_count, device, dtype)[:history_count]
 
-        dr = (torch.rand((), generator=generator, device=device, dtype=dtype) * 2 - 1) * a_roll
-        dp = (torch.rand((), generator=generator, device=device, dtype=dtype) * 2 - 1) * a_pitch
+        amps = self._history_aug_amp_vector(device, dtype)
+        limits = self._history_aug_joint_limits(device, dtype)
+        x = motion['dof'][:history_count]
+        active = w > 0.0
+        lo = ((limits[:, 0] - x[active]) / w[active, None]).amax(dim=0)
+        hi = ((limits[:, 1] - x[active]) / w[active, None]).amin(dim=0)
+        lower, upper = torch.maximum(lo, -amps), torch.minimum(hi, amps)
+        q = lower + (upper - lower) * torch.rand(
+            self.dof_dim,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+        q = torch.where(lower <= upper, q, torch.zeros_like(q))
+        motion['dof'][:history_count] += w[:, None] * q
+
+        rx = (
+            torch.rand((), generator=generator, device=device, dtype=dtype)
+            * 2.0 - 1.0
+        ) * _HISTORY_ROOT_AUG_AMPS["x"]
+        ry = (
+            torch.rand((), generator=generator, device=device, dtype=dtype)
+            * 2.0 - 1.0
+        ) * _HISTORY_ROOT_AUG_AMPS["y"]
+        rz = (
+            torch.rand((), generator=generator, device=device, dtype=dtype)
+            * 2.0 - 1.0
+        ) * _HISTORY_ROOT_AUG_AMPS["z"]
         half = 0.5 * w
-        qr = torch.stack((torch.sin(half * dr), torch.zeros_like(half), torch.zeros_like(half), torch.cos(half * dr)), -1)
-        qp = torch.stack((torch.zeros_like(half), torch.sin(half * dp), torch.zeros_like(half), torch.cos(half * dp)), -1)
-        motion['root_rot'][:H] = self._quat_mul_xyzw(qp, self._quat_mul_xyzw(qr, motion['root_rot'][:H]))
-        dh = (torch.rand((), generator=generator, device=device, dtype=dtype) * 2 - 1) * a_h
-        motion['root_trans_offset'][:H, 2] += w * dh
+        zeros = torch.zeros_like(half)
+        q_x = torch.stack((
+            torch.sin(half * rx), zeros, zeros, torch.cos(half * rx)
+        ), dim=-1)
+        q_y = torch.stack((
+            zeros, torch.sin(half * ry), zeros, torch.cos(half * ry)
+        ), dim=-1)
+        q_z = torch.stack((
+            zeros, zeros, torch.sin(half * rz), torch.cos(half * rz)
+        ), dim=-1)
+        q_off = self._quat_mul_xyzw(q_x, self._quat_mul_xyzw(q_y, q_z))
+        motion['root_rot'][:history_count] = self._quat_mul_xyzw(
+            motion['root_rot'][:history_count],
+            q_off,
+        )
+
+        dh = (
+            torch.rand((), generator=generator, device=device, dtype=dtype)
+            * 2.0 - 1.0
+        ) * _HISTORY_ROOT_AUG_AMPS["h"]
+        motion['root_trans_offset'][:history_count, 2] += w * dh
         return True
 
     # =========================================================================
@@ -1509,7 +1596,6 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 primitive = all_motion_primitives[batch_idx][primitive_idx]
                 primitive['_augmented'] = self._augment_raw_motion(
                     primitive['motion'],
-                    bool(primitive.get('is_recovery', False)),
                     generator)
                 motion_batch.append(primitive['motion'])
                 primitives.append(primitive)
@@ -1522,13 +1608,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             ]
             for b, primitive in enumerate(primitives):
                 if primitive['_augmented']:
-                    # Keep the final history delta clean: it references the
-                    # first future pose, which is outside the perturbed window.
-                    delta_start = 11 + self.dof_dim
-                    clean_delta = self._select_model_dof(
-                        primitive['_clean_history_delta_q'].unsqueeze(0))[0]
-                    motion_features[b, self.history_len - 1,
-                                    delta_start:delta_start + self.dof_dim] = clean_delta
+                    if motion_dtype.FeatureVersion == 3:
+                        # Keep the final history delta clean: it references the
+                        # first future pose, which is outside the perturbed window.
+                        delta_start = 11 + self.dof_dim
+                        clean_delta = self._select_model_dof(
+                            primitive['_clean_history_delta_q'].unsqueeze(0))[0]
+                        motion_features[b, self.history_len - 1,
+                                        delta_start:delta_start + self.dof_dim] = clean_delta
                     # Goals stay clean, but ego-centric conditioning is reset to
                     # the perturbed latest history state (v1 contract).
                     ref = self.history_len - 1

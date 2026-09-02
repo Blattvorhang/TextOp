@@ -531,6 +531,11 @@ Use one sampled offset per history window, modulated by the smooth temporal ramp
 
 ## 11. Sampling Strategy
 
+> Superseded for training-time augmentation by
+> `planner_v7_1_fall_recovery.md`: V7.1 keeps the warm-up / train-split /
+> probability gate, but replaces the V5 recovery/normal amplitude split and
+> forward ramp with the unified normal table and smoothstep ramp-out.
+
 Do not perturb every training history, and do not perturb during the clean-history warm-up.
 
 A reasonable first configuration is:
