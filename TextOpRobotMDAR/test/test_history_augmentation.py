@@ -288,5 +288,5 @@ def test_organize_skips_clean_history_delta_restore_for_v6():
     torch.testing.assert_close(batch["motion"], torch.zeros((1, 3, 44)))
     torch.testing.assert_close(
         batch["gt_ref_pos"][0],
-        torch.tensor([3.0, 4.0, 5.0]),
+        torch.tensor([6.0, 7.0, 8.0]),
     )

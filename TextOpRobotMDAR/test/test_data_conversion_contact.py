@@ -204,13 +204,13 @@ def test_joint_state_goal_extraction_uses_direct_gt_frame_without_keypoints():
     assert "world_goal_keypoints" not in primitive
 
 
-def test_shared_extended_goal_rejects_missing_forward_difference_frame():
+def test_shared_extended_goal_rejects_out_of_bounds_goal_frame():
     dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
     dataset.history_len = 2
     dataset.future_len = 4
     dataset.num_primitive = 2
     dataset.segment_len = 11
-    dataset.goal_offset = 0
+    dataset.goal_offset = 1
     dataset.goal_type = GoalType.BODY_EXT
     dataset.goal_per_primitive = False
     dataset._world_goal_keypoints = lambda motion, frame: torch.zeros((4, 3))

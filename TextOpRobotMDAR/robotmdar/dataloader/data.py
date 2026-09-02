@@ -31,6 +31,10 @@ from robotmdar.utils.goal import (
     GOAL_CLAMP_QUANTILE_LEVELS,
     GoalEncoding,
     GoalType,
+    SPLIT_JOINT_SLICE,
+    SPLIT_ORIENTATION_SLICE,
+    SPLIT_POSITION_SLICE,
+    SPLIT_VELOCITY_SLICE,
     build_ego_split_goal,
     SPLIT_GOAL_DIM,
     quaternion_yaw,
@@ -238,15 +242,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 f"after the reference frame, got {self.goal_offset_range}"
             )
 
-        # Goal types with root velocity use a forward difference at the goal. A
-        # shared snippet goal sits on the final raw frame, so it needs one
-        # additional source frame.
-        forward_diff_extra = int(
-            self.goal_type.uses_arrival_time and not self.goal_per_primitive
-        )
-        self.required_length = self.segment_len + max(
-            0, self.max_goal_offset + forward_diff_extra
-        )
+        self.required_length = self.segment_len + max(0, self.max_goal_offset)
         self.weighted_sample = weighted_sample
         self.frame_weight = frame_weight
         self.action_statistics_path = action_statistics_path
@@ -971,12 +967,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'dataset_path': str(self.datadir),
             'goal_type': self.goal_type.value,
             'goal_dim': SPLIT_GOAL_DIM,
+            'goal_schema': 'rotmat_v7',
+            'feature_version': motion_dtype.FeatureVersion,
             'dof_dim': int(self.dof_dim),
         }
 
     def _goal_stats_from_batch(self, batch_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         pos_terms = []
-        log_terms = []
+        d_hor_terms = []
         urgency_terms = []
         velocity_terms = []
         orientation_terms = []
@@ -997,20 +995,19 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 time_to_arrival_seconds=primitive['time_to_arrival'],
                 fps=float(self.fps),
             )
-            trans = goal[:, 0:8]
-            orientation = goal[:, 8:13]
-            pose = goal[:, 13:42]
-            velocity = goal[:, 42:45]
+            trans = goal[:, SPLIT_POSITION_SLICE]
+            orientation = goal[:, SPLIT_ORIENTATION_SLICE]
+            pose = goal[:, SPLIT_JOINT_SLICE]
+            velocity = goal[:, SPLIT_VELOCITY_SLICE]
 
-            pos_terms.append(trans[:, 0:4])
-            log_terms.append(trans[:, 4:5])
-            urgency_terms.append(trans[:, 5:8])
+            pos_terms.append(torch.cat((trans[:, 0:5], trans[:, 6:7]), dim=-1))
+            d_hor_terms.append(trans[:, 4:5])
+            urgency_terms.append(trans[:, 7:12])
             orientation_terms.append(orientation)
             pose_terms.append(pose)
             velocity_terms.append(velocity)
 
-            goal_root = goal.reshape(-1, SPLIT_GOAL_DIM)[0, 0:2]
-            goal_radius = torch.linalg.vector_norm(goal_root).reshape(1)
+            goal_radius = trans.reshape(-1, 12)[0, 4:5]
             clamp_dist_terms.append(goal_radius)
             clamp_speed_terms.append(goal_radius / max(
                 float(primitive['time_to_arrival']), 1.0 / float(self.fps)))
@@ -1019,7 +1016,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             raise ValueError("Unable to compute goal statistics from empty batch")
 
         pos = torch.cat(pos_terms, dim=0)
-        log_terms = torch.cat(log_terms, dim=0)
+        d_hor = torch.cat(d_hor_terms, dim=0)
+        s_d = torch.quantile(
+            d_hor.detach().reshape(-1).float().clamp_min(0.0),
+            0.5,
+        ).clamp(min=1e-6)
+        log_terms = torch.log1p(d_hor / s_d.to(d_hor.device, d_hor.dtype))
         urgency = torch.cat(urgency_terms, dim=0)
         orientation = torch.cat(orientation_terms, dim=0)
         pose = torch.cat(pose_terms, dim=0)
@@ -1045,8 +1047,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             orientation.std(dim=0, unbiased=False), min=1e-6
         )
 
-        q_mean = self.mean[11:40].detach().cpu().clone()
-        q_std = self.std[11:40].detach().cpu().clone()
+        q_start = 13 if motion_dtype.FeatureVersion == 6 else 11
+        q_mean = self.mean[q_start:q_start + 29].detach().cpu().clone()
+        q_std = self.std[q_start:q_start + 29].detach().cpu().clone()
 
         pos_scaled = pos * s_p
         log_scaled = log_terms * s_l
@@ -1063,11 +1066,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         pose_p50, pose_p99 = _abs_p50_p99(pose_scaled)
         s_o_list = [round(float(value), 4) for value in s_o.tolist()]
         logger.info(
-            "Goal stats (split45) scales: s_p={:.4f} s_l={:.4f} s_v={:.4f} s_o={}",
-            float(s_p), float(s_l), float(s_v), s_o_list,
+            "Goal stats (split55) scales: s_p={:.4f} s_l={:.4f} "
+            "s_v={:.4f} s_d={:.4f} s_o={}",
+            float(s_p), float(s_l), float(s_v), float(s_d), s_o_list,
         )
         logger.info(
-            "Goal stats (split45) scaled |p50/p99|: pos={:.3f}/{:.3f} "
+            "Goal stats (split55) scaled |p50/p99|: pos={:.3f}/{:.3f} "
             "log={:.3f}/{:.3f} urg={:.3f}/{:.3f} vel={:.3f}/{:.3f} "
             "ori={:.3f}/{:.3f} pose={:.3f}/{:.3f}",
             pos_p50, pos_p99, log_p50, log_p99, urgency_p50, urgency_p99,
@@ -1081,7 +1085,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         clamp_speed_quantiles = torch.quantile(clamp_speed, clamp_levels)
         clamp_levels_percent = clamp_levels * 100.0
         logger.info(
-            "Goal stats (split45) clamp distribution over {} windows: "
+            "Goal stats (split55) clamp distribution over {} windows: "
             "dist quantiles {} m / speed quantiles {} m/s at percentiles {}",
             int(clamp_dist.numel()),
             [round(float(v), 3) for v in clamp_dist_quantiles],
@@ -1092,6 +1096,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             's_p': torch.as_tensor(float(s_p)),
             's_l': torch.as_tensor(float(s_l)),
             's_v': torch.as_tensor(float(s_v)),
+            's_d': torch.as_tensor(float(s_d)),
             's_o': s_o.detach().cpu(),
             'q_mean': q_mean,
             'q_std': q_std,
@@ -1359,14 +1364,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
     def _world_goal_velocity(self, raw_motion: Dict[str, Any],
                              goal_frame: int) -> torch.Tensor:
         root_position = raw_motion['root_trans_offset']
-        if goal_frame < 0 or goal_frame + 1 >= len(root_position):
+        if goal_frame <= 0 or goal_frame >= len(root_position):
             raise IndexError(
-                f"Goal frame {goal_frame} has no forward-difference frame in "
+                f"Goal frame {goal_frame} has no backward-difference frame in "
                 f"motion of length {len(root_position)}"
             )
         return (
-            torch.as_tensor(root_position[goal_frame + 1], dtype=torch.float32)
-            - torch.as_tensor(root_position[goal_frame], dtype=torch.float32)
+            torch.as_tensor(root_position[goal_frame], dtype=torch.float32)
+            - torch.as_tensor(root_position[goal_frame - 1], dtype=torch.float32)
         ) * float(self.fps)
 
     def _time_to_arrival_seconds(self, reference_frame: int,
@@ -1415,7 +1420,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             sliding_mask = torch.as_tensor(
                 raw_sliding_mask[prim_start:prim_end], dtype=torch.float32)
 
-        reference_frame = prim_start + self.history_len - 1
+        reference_frame = (
+            prim_start + self.history_len
+            if motion_dtype.FeatureVersion == 6
+            else prim_start + self.history_len - 1
+        )
         raw_motion = sample['motion']
         goal_rot = torch.as_tensor(raw_motion['root_rot'][goal_frame])
 
@@ -1481,7 +1490,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             if self.goal_per_primitive:
                 # Goal is the last frame of this specific primitive's window
                 goal_frame = (
-                    prim_start + self.future_len + self.history_len - 1
+                    prim_start + self.future_len + self.history_len
+                    if motion_dtype.FeatureVersion == 6
+                    else prim_start + self.future_len + self.history_len - 1
+                )
+                goal_frame = (
+                    goal_frame
                     + goal_offset
                 )
                 world_goal_keypoints = None
@@ -1489,14 +1503,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 goal_frame = snippet_goal_frame
 
             clip_len = len(sample['motion']['root_trans_offset'])
-            if goal_frame <= prim_start + self.history_len - 1:
+            reference_frame = (
+                prim_start + self.history_len
+                if motion_dtype.FeatureVersion == 6
+                else prim_start + self.history_len - 1
+            )
+            if goal_frame <= reference_frame:
                 raise IndexError(
                     f"Goal frame {goal_frame} must follow primitive reference "
-                    f"frame {prim_start + self.history_len - 1}"
+                    f"frame {reference_frame}"
                 )
-            required_last_frame = goal_frame + int(
-                goal_type.uses_arrival_time
-            )
+            required_last_frame = goal_frame
             if required_last_frame >= clip_len:
                 raise IndexError(
                     f"Goal frame {goal_frame} exceeds motion bounds for "
@@ -1618,7 +1635,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                                         delta_start:delta_start + self.dof_dim] = clean_delta
                     # Goals stay clean, but ego-centric conditioning is reset to
                     # the perturbed latest history state (v1 contract).
-                    ref = self.history_len - 1
+                    ref = (
+                        self.history_len
+                        if motion_dtype.FeatureVersion == 6
+                        else self.history_len - 1
+                    )
                     primitives[b]['gt_ref_rot'] = primitive['motion']['root_rot'][ref].clone()
                     primitives[b]['gt_ref_pos'] = primitive['motion']['root_trans_offset'][ref].clone()
 
@@ -1631,7 +1652,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             batch = {
                 'motion': self.normalize(motion_features),
                 'sliding_mask': torch.stack([
-                    p['sliding_mask'][:feature_len] for p in primitives
+                    (
+                        p['sliding_mask'][1:feature_len + 1]
+                        if motion_dtype.FeatureVersion == 6
+                        else p['sliding_mask'][:feature_len]
+                    )
+                    for p in primitives
                 ]),
                 'scene': [p['scene'] for p in primitives],
                 'action_label': [
