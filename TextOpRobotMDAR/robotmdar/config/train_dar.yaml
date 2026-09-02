@@ -50,6 +50,7 @@ train:
       foot_contact: 0.05
       goal_root_position: 1.0
       goal_root_orientation: 0.2
+      goal_root_velocity: 0.1
       goal_joint_angle: 0.1
 
 ckpt:
