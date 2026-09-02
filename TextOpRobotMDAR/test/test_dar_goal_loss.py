@@ -207,6 +207,64 @@ def test_joint_state_goal_losses_use_selected_goal_frame():
     )
 
 
+def test_joint_state_goal_cache_matches_uncached_losses():
+    manager = _manager()
+    calls = {'denormalize': 0}
+
+    def denormalize(value):
+        calls['denormalize'] += 1
+        return value
+
+    manager.dataset.denormalize = denormalize
+    future = torch.zeros((2, 4, 69), dtype=torch.float32)
+    history = torch.zeros((2, 2, 69), dtype=torch.float32)
+    goal_time_frame = torch.tensor([2, 3])
+    future[:, 1, 0:4] = torch.tensor([0.1, -0.01, -0.2, -0.02])
+    future[:, 2, 0:4] = torch.tensor([0.0, 0.02, 0.1, -0.03])
+    future[:, :, 4] = 0.1
+    history[:, -1, 4] = 0.2
+    future[:, 1, 7:10] = torch.tensor([0.02, 0.0, -0.01])
+    future[:, 2, 7:10] = torch.tensor([0.0, -0.01, 0.03])
+    future[:, 1, 11:40] = torch.linspace(-0.5, 0.5, 29)
+    future[:, 2, 11:40] = torch.linspace(0.5, -0.5, 29)
+    goal = torch.randn((2, 40), dtype=torch.float32)
+
+    uncached = (
+        manager.calc_goal_root_orientation_loss(
+            future, goal, history_motion=history,
+            goal_time_frame=goal_time_frame),
+        manager.calc_goal_joint_angle_loss(
+            future, goal, goal_time_frame=goal_time_frame),
+        manager.calc_goal_root_velocity_loss(
+            future, goal, history_motion=history,
+            goal_time_frame=goal_time_frame),
+    )
+    calls['denormalize'] = 0
+    state = manager._future_goal_state(
+        future,
+        history_motion=history,
+        goal_time_frame=goal_time_frame,
+        include_yaw=True,
+    )
+    assert calls['denormalize'] == 2
+    calls['denormalize'] = 0
+    cached = (
+        manager.calc_goal_root_orientation_loss(
+            future, goal, history_motion=history,
+            goal_time_frame=goal_time_frame, goal_state=state),
+        manager.calc_goal_joint_angle_loss(
+            future, goal, goal_time_frame=goal_time_frame,
+            goal_state=state),
+        manager.calc_goal_root_velocity_loss(
+            future, goal, history_motion=history,
+            goal_time_frame=goal_time_frame, goal_state=state),
+    )
+
+    assert calls['denormalize'] == 0
+    for actual, expected in zip(cached, uncached):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_root_xy_figure_plots_generated_ground_truth_and_goal():
     generated = torch.tensor([
         [[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]],

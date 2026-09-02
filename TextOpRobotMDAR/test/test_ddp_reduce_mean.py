@@ -20,6 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from TextOpRobotMDAR.robotmdar.train.manager import ddp_reduce_mean
 
 
+def _free_port():
+    return 20000 + (os.getpid() % 20000)
+
+
 def _worker(rank, world_size, port, out_queue):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = str(port)
@@ -37,8 +41,8 @@ def _worker(rank, world_size, port, out_queue):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize('port', [29540])
-def test_reduce_union_of_mismatched_key_sets(port):
+def test_reduce_union_of_mismatched_key_sets():
+    port = _free_port()
     ctx = mp.get_context('spawn')
     out_queue = ctx.Queue()
     procs = [ctx.Process(target=_worker, args=(r, 2, port, out_queue))
@@ -47,6 +51,11 @@ def test_reduce_union_of_mismatched_key_sets(port):
         p.start()
     for p in procs:
         p.join(timeout=120)
+    for p in procs:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=10)
+    for p in procs:
         assert p.exitcode == 0, f'rank exited with {p.exitcode}'
     results = [out_queue.get(timeout=10) for _ in range(2)]
     results.sort(key=lambda item: item[0])

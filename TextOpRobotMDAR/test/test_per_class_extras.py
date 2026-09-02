@@ -145,6 +145,8 @@ def test_calc_geometry_loss_v6_reports_per_class_and_keeps_gradient():
             assert key in extras
             for cls in MOTION_CLASSES:
                 assert f'{key}__{cls}' in extras, (key, cls)
+        for key, value in extras.items():
+            assert value.grad_fn is None, key
 
         # Global mean equals the count-weighted mean of the per-class means.
         class_counts = {'walk': 1, 'run': 1, 'fall': 1, 'getup': 1,
