@@ -17,6 +17,7 @@ import torch
 from loguru import logger
 from torch import nn
 
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import motion_dict_to_abs_pose
 
 
@@ -345,6 +346,7 @@ def generate_next_motion(
                                                   ret_fk_full=ret_fk_full)
 
         # Update absolute pose for next primitive
-        new_abs_pose = motion_dict_to_abs_pose(motion_dict, idx=-2)
+        pose_idx = -1 if motion_dtype.FeatureVersion == 6 else -2
+        new_abs_pose = motion_dict_to_abs_pose(motion_dict, idx=pose_idx)
 
         return future_motion_pred, motion_dict, new_abs_pose

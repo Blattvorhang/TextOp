@@ -11,6 +11,7 @@ from omegaconf import DictConfig
 
 from robotmdar.dtype import seed, logger
 from robotmdar.dtype.motion import motion_dict_to_qpos, QPos, get_zero_abs_pose, motion_dict_to_abs_pose, FeatureVersion, get_blended_feature, transform_feature_to_world, dict_concat, dict_to_tensor
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.device import tree_to_numpy
 from robotmdar.dtype.abc import Dataset, VAE, Optimizer, Distribution
 from robotmdar.train.manager import MVAEManager
@@ -76,10 +77,11 @@ def add_batch_fn(motion_buff, val_dataiter, vae, val_data, num_primitive,
             #     # future_motion_pred_dict = dict_concat(history_motion_dict, future_motion_pred_dict)
             #     # future_motion_gt_dict = dict_concat(history_motion_dict, future_motion_gt_dict)
 
+            pose_idx = -1 if motion_dtype.FeatureVersion == 6 else -2
             pd_abs_pose = motion_dict_to_abs_pose(future_motion_pred_dict,
-                                                  idx=-2)
+                                                  idx=pose_idx)
             gt_abs_pose = motion_dict_to_abs_pose(future_motion_gt_dict,
-                                                  idx=-2)
+                                                  idx=pose_idx)
 
             pd_buff.append(
                 tree_to_numpy(motion_dict_to_qpos(

@@ -12,6 +12,7 @@ from robotmdar.utils.goal import (
 from robotmdar.utils.occupancy import query_local_occupancy
 from robotmdar.dtype import seed, logger as dtypelogger
 from robotmdar.dtype.motion import motion_dict_to_qpos, QPos, get_zero_abs_pose, motion_dict_to_abs_pose
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.device import tree_to_numpy
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 from robotmdar.train.manager import DARManager
@@ -153,8 +154,9 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 ret_fk=False)
 
             # Update ground truth absolute pose for next primitive
+            pose_idx = -1 if motion_dtype.FeatureVersion == 6 else -2
             gt_abs_pose = motion_dict_to_abs_pose(future_motion_gt_dict,
-                                                  idx=-2)
+                                                  idx=pose_idx)
 
             pd_buff.append(
                 tree_to_numpy(motion_dict_to_qpos(

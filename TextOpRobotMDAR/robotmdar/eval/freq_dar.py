@@ -23,6 +23,7 @@ from robotmdar.dtype import seed, logger as dtype_logger
 from loguru import logger
 from robotmdar.dtype.motion import (motion_dict_to_abs_pose, get_zero_abs_pose,
                                     get_zero_feature_v3)
+import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 from robotmdar.train.manager import DARManager
 from robotmdar.utils.dof_contract import configure_dof_contract
@@ -116,7 +117,8 @@ def single_inference_step(prev_motion, abs_pose, text_embedding, vae, denoiser,
 
     # 5. Update state for next iteration
     new_prev_motion = full_motion
-    new_abs_pose = motion_dict_to_abs_pose(future_motion_pred_dict, idx=-2)
+    pose_idx = -1 if motion_dtype.FeatureVersion == 6 else -2
+    new_abs_pose = motion_dict_to_abs_pose(future_motion_pred_dict, idx=pose_idx)
 
     timings['total_step'] = time.time() - step_start
 
@@ -142,7 +144,8 @@ def run_benchmark(vae,
     batch_size = 1
 
     # Initialize with zero motion
-    zero_feature = get_zero_feature_v3().unsqueeze(0).expand(
+    zero_feature = motion_dtype.get_zero_feature(
+        dof_dim=getattr(val_data, 'dof_dim', 29)).unsqueeze(0).expand(
         batch_size, history_len, -1).to(cfg.device)
     prev_motion = zero_feature
     abs_pose = get_zero_abs_pose((batch_size, ), device=cfg.device)
