@@ -369,12 +369,13 @@ Scope:
    `train/manager.py` — the `getup` class in
    `metric_class/{train,eval}/{e_q_vel,e_h_vel,e_g_cons}/…` continues to
    monitor recovery quality during training.
-3. The packing-time `_recovery_boost` flag and the ×5 sequence-weight
-   boost in `_cal_sample_weight` (data.py:482–483).
+3. The packing-time `_recovery_boost` flag — kept as metadata for
+   fall-recovery visibility and get-up-class diagnostics.
 
-These three survivors will be revisited when the preprocessing-stage
-scheme of §9 is finalized; §9 may redefine which flat-lying subsets are
-boosted and how.
+Revisited at §9 finalization: V7.1 prefers raw augmented data over
+re-sampling, because augmentation adds genuinely new perturbations.
+Training runs `weighted_sample: false`; any future sampler experiment
+should stay outside the data-construction scripts (§9.3 step 5, §9.4).
 
 ---
 
@@ -517,16 +518,15 @@ New script `dataset/data_process/augment_fall_recovery.py`
    getup-class logging (§8) keeps working.
 4. **Batch per original clip** — generate `k` accepted clips from one
    original before moving to the next (k: §9.4).
-5. **Repack and re-weight** — re-run stage 3+4
+5. **Repack and inspect ratios** — re-run stage 3+4
    (`pack_motion_lib_to_textop.py` walks the folder automatically via
    `rglob`, so `aug_fall_recovery/` is picked up without changes; then
    `cal_weighted_statistics.py --neutral`) to regenerate
-   `data/g1_textop_29dof/samples` + manifests. Afterwards set
-   **`weighted_sample: false`** (`robotmdar/config/train_dar.yaml`) —
-   the ×5 `RECOVERY_WEIGHT_MULTIPLIER` boost (§8) becomes redundant once
-   the augmented pool carries the recovery proportion naturally.
+   `data/g1_textop_29dof/samples` + manifests and print the
+   `_recovery_boost` subset. Prefer **`weighted_sample: false`** for
+   raw-augmentation-first training.
 
-### 9.4 How many augmented clips per original (decided: k = 8)
+### 9.4 How many augmented clips per original
 
 - Existing successful get-up data: **12.6 min total, avg 12.2 s/clip**;
   the 16 kept clips alone ≈ 3.3 min.
@@ -535,24 +535,25 @@ New script `dataset/data_process/augment_fall_recovery.py`
   from the recovery amplitudes, plus a window draw
   `n_lying ~ U(20, 50)` (§9.2), so
   even k = 4 would yield 64 genuinely different lying poses.
-  Single-trial validation (§9.3) makes extra candidates nearly free,
-  so the adopted setting is **k = 8 accepted clips per original**
-  (128 poses, ≈ 26 min) for better coverage of the lying-pose
-  manifold.
-- **Data-size balance**: with `weighted_sample: false`, the natural
-  recovery proportion is the augmented pool's share of the dataset —
-  k = 8 → ≈ 3.5 % (vs. the current ≈ 2 % effective with the ×5
-  boost). ≈ 3.5 % is judged adequate to start: at batch ≈ 1024 every
-  step sees ≈ 35 recovery windows. If getup per-class errors plateau
-  or rollout recovery still fails, escalate to k = 16 (≈ 7 %) — a pure
-  data-generation rerun, no code change; beyond that the recovery
-  share starts degrading the nominal walk/run motions.
+  Single-trial validation (§9.3) makes extra candidates practical.
+  **k = 8** is a smoke-test / minimum-diversity setting, not enough to
+  materially change the raw full-dataset ratio.
+- **Data-size balance**: the current 128 local augmented clips total
+  ≈ 0.283 h (avg 7.95 s/clip). In a ≈ 250 h dataset that is only
+  ≈ 0.11 % raw data. One accepted clip per original adds ≈ 0.035 h, so
+  roughly k ≈ 95 / 170 / 320 is needed to move total `fall` to
+  ≈ 2 % / 3 % / 5 %, respectively (assuming the same base corpus and
+  average augmented length). **Decided: k = 160** — 2,560 accepted clips
+  ≈ 5.6 h, total `fall` ≈ 3 %, raw `_recovery_boost` share ≈ 2.3 %
+  (≈ 23 recovery windows per step at batch 1024). Dataset grows
+  ≈ 2.2 % and training time proportionally.
 - At the §9.5 acceptance rates (100 % for both kept families), generate
   ≈ 1.05× candidates per original to net k accepted (small safety
   margin against rare rejected draws).
-- Validate k ∈ {4, 8, 16} and watch the getup per-class diagnostics
-  (§8); keep the largest k that leaves the nominal walk/run per-class
-  errors unchanged (§11.2).
+- Validate at k = 160 and watch the getup per-class diagnostics (§8):
+  nominal walk/run per-class errors must stay unchanged (§11.2);
+  escalate to k = 320 (total `fall` ≈ 5 %, still under the V5 ≈ 7 %
+  degradation bound) only if the getup diagnostics demand more.
 
 ### 9.5 SONIC success-rate distribution (the analysis)
 
@@ -615,20 +616,24 @@ The augmentation script parallelizes across original clips with
 `--num-workers` (`0` = auto, capped at 8; `1` = serial). Random seeds are
 split per source, and single-motion output files are written in source
 order.
-The default candidate budget is `max(k*8, k+16)`; for `k=8`, this gives
-64 attempts per source and covers the harder `A475` clip observed to need
-18 candidates for 8 accepted samples.
+The default candidate budget is `max(k*8, k+16)`; for k = 160 that is
+1,280 attempts per source — a pure safety cap, since at the §9.5
+acceptance rates the generator stops around 1.05×k ≈ 168 candidates
+(the harder `A475` clip observed at k = 8 needed 18 candidates for 8
+accepted samples).
 
 ### 9.8 Open decisions
 
 1. `n_lying` distribution — resolved: `n_lying ~ U(20, 50)` frames
    (0.4–1.0 s), drawn per candidate (§9.2).
-2. `k` per original clip — resolved: k = 8 (§9.4), with a k = 16
-   escalation path if the getup diagnostics demand more data.
+2. `k` per original clip — resolved: **k = 160** (2,560 accepted clips,
+   ≈ 5.6 h, total `fall` ≈ 3 %; §9.4). Escalate to k = 320 only if the
+   getup diagnostics demand more.
 3. Acceptance test — resolved: one silent SONIC trial per candidate
    (measured: one success ⇒ 20/20; §9.3 step 2).
-4. Timing of the `weighted_sample: false` switch — after the augmented
-   pool is packed and getup diagnostics verified (§9.3 step 5).
+4. Sampling weights — resolved: prefer raw data augmentation with
+   `weighted_sample: false`; keep `action_statistics.json` as a neutral
+   category report artifact (§9.3 step 5, §9.4).
 5. Environment — resolved: textop env with CPU `onnxruntime` (§9.7).
 6. The `faint_stand_up_lying*` family — resolved: kept as-is, sampled
    normally in training, **not augmented** (its start frame is not a
@@ -666,15 +671,14 @@ The default candidate budget is `max(k*8, k+16)`; for `k=8`, this gives
    at frame `n_lying`, one silent SONIC validation trial per candidate
    (`eval_fall_recovery.py` criteria: 0.78 m ± 0.10, σ² < 0.02, last 50
    frames), and motion_lib-schema joblib output with `stand_up_lying*`
-   names preserved. Launch via a wrapper that exports the nvidia lib
-   paths on `LD_LIBRARY_PATH` before python starts (§9.7).
+   names preserved. Launch directly in the `textop` env; CPU ONNX
+   Runtime is the default (§9.7).
 7. **Repack** — re-run stage 3+4 (`pack_motion_lib_to_textop.py` +
    `cal_weighted_statistics.py --neutral`) to regenerate
    `data/g1_textop_29dof/samples` including `aug_fall_recovery/`.
-8. **Sampling weight switch** — set `weighted_sample: false` in
-   `robotmdar/config/train_dar.yaml` once the augmented pool carries the
-   recovery proportion (≈ 2 %) naturally; keep the ×5 multiplier code
-   until then (§8).
+8. **Sampling weight switch** — keep `weighted_sample: false` for the
+   raw-augmentation-first run and use the stage-4 fall-recovery logs to
+   verify the generated raw recovery ratio.
 
 ---
 
@@ -700,8 +704,10 @@ The default candidate budget is `max(k*8, k+16)`; for `k=8`, this gives
    headless SONIC trial (0.78 m ± 0.10, σ² < 0.02, last 50 frames)
    before it is packed — run
    `occHIPC/scripts/eval_fall_recovery.py --motion-dir
-   data/motion_lib_filtered/aug_fall_recovery` (20 trials per clip) as
-   the regression check for the generated pool.
+   data/motion_lib_filtered/aug_fall_recovery` as the regression check.
+   At k = 160 (2,560 clips) run the 20-trial regression on a random
+   subsample (e.g. 128 clips); single-trial acceptance of the full pool
+   is already guaranteed by generation.
 
 ---
 

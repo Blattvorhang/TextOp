@@ -58,6 +58,7 @@ manager:
     rot_chord: 0.02
     g_cons: 0.05
     h_vel: 0.001  # shared with mvae v6 (doc §4.3.5)
+    support_consistency: 0.01
 
     quantize_rot: 0.0
     quantize_trans: 0.0

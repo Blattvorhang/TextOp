@@ -1031,6 +1031,24 @@ def _validate_joint_state_contract(cfg) -> None:
         )
 
 
+def _validate_scene_curriculum_contract(cfg) -> None:
+    """Ensure scene payloads are available before scene conditioning turns on."""
+    if bool(cfg.data.get('load_scene', True)):
+        return
+
+    stages = cfg.train.manager.get('stages', [])
+    max_steps = sum(int(value) for value in stages)
+    scene_start_step = int(cfg.data.get('scene_start_step', max_steps + 1))
+    if scene_start_step <= max_steps:
+        raise ValueError(
+            "data.load_scene=false strips scene occupancy from the dataset, "
+            f"but data.scene_start_step={scene_start_step} enables scene "
+            f"conditioning during this run (max_steps={max_steps}). Set "
+            "data.load_scene=true for scene training, or set "
+            "data.scene_start_step greater than max_steps for a no-scene run."
+        )
+
+
 def main(cfg: DictConfig):
     # Initialize DDP
     rank, world_size, local_rank = ddp_setup()
@@ -1042,6 +1060,7 @@ def main(cfg: DictConfig):
 
     # Override device in config for downstream components.
     cfg.device = str(device)
+    _validate_scene_curriculum_contract(cfg)
 
     train_data: Dataset = instantiate(cfg.data.train)
     goal_encoding = GoalEncoding.parse(
@@ -1273,6 +1292,8 @@ def main(cfg: DictConfig):
                 loss_dict=loss_dict,
                 extras=extras,
             )
+            if not manager:
+                break
 
         # Validation loop
         denoiser.eval()

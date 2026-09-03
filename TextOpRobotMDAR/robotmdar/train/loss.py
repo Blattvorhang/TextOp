@@ -321,6 +321,155 @@ class GeometryLoss:
             'dof': denorm[..., 13:13 + dof_dim],
         }
 
+    def _foot_support_mask_from_contact(self, contact_mask, sliding_mask=None):
+        if contact_mask is None:
+            return None
+        if contact_mask.ndim != 3:
+            raise ValueError(
+                "contact_mask must be [B, T, C], got "
+                f"{tuple(contact_mask.shape)}"
+            )
+        support = contact_mask > 0.5
+        if sliding_mask is not None:
+            if sliding_mask.shape != contact_mask.shape:
+                raise ValueError(
+                    "sliding_mask must match contact_mask shape: "
+                    f"{tuple(sliding_mask.shape)} != {tuple(contact_mask.shape)}"
+                )
+            support = support & ~(sliding_mask > 0.5)
+        return support
+
+    def _hand_support_mask_from_fk(
+        self,
+        fk_result,
+        is_recovery=None,
+        height_thresh: float = 0.12,
+        speed_thresh: float = 0.35,
+    ):
+        hand_ids = getattr(self.dataset.skeleton, 'hand_id', None)
+        if not hand_ids:
+            return None
+        if is_recovery is None:
+            return None
+        recovery = torch.as_tensor(
+            is_recovery,
+            device=fk_result['global_translation_extend'].device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if not recovery.any():
+            return None
+        hand_ids = torch.as_tensor(
+            hand_ids,
+            device=fk_result['global_translation_extend'].device,
+            dtype=torch.long,
+        )
+        hand_pos = fk_result['global_translation_extend'].index_select(2, hand_ids)
+        hand_height = hand_pos[..., 2]
+        hand_speed = hand_pos.new_zeros(hand_pos.shape[:-1])
+        if hand_pos.shape[1] > 1:
+            hand_speed[:, 1:] = (
+                hand_pos[:, 1:] - hand_pos[:, :-1]
+            ).norm(dim=-1) * float(self.dataset.fps)
+        support = (
+            (hand_height < height_thresh)
+            & (hand_speed < speed_thresh)
+        )
+        support = support & recovery[:, None, None]
+        return support
+
+    def _support_component_from_fk(self, fk_result, support_body_ids,
+                                   support_mask):
+        """Return support residual loss plus diagnostic summaries.
+
+        support_mask is expected to be [B, T, K]; the active support frames are
+        the adjacent pairs where the mask stays on for both frames.
+        """
+        zero = fk_result['global_translation_extend'].sum() * 0.0
+        zero_metric = zero.detach()
+        zero_per_sample = fk_result['global_translation_extend'].sum(
+            dim=(1, 2, 3)
+        ) * 0.0
+        zero_per_sample = zero_per_sample.detach()
+        if support_mask is None:
+            return zero, zero_metric, zero_per_sample, zero_metric
+        if support_mask.ndim != 3:
+            raise ValueError(
+                "support_mask must be [B, T, K], got "
+                f"{tuple(support_mask.shape)}"
+            )
+        if fk_result['global_translation_extend'].shape[1] < 2:
+            return zero, zero_metric, zero_per_sample, zero_metric
+
+        global_translation = fk_result['global_translation_extend']
+        global_rotation = fk_result['global_rotation']
+        support_mask = support_mask.to(
+            device=global_translation.device, dtype=torch.bool)
+        support_body_ids = torch.as_tensor(
+            support_body_ids,
+            device=global_translation.device,
+            dtype=torch.long,
+        )
+        if support_mask.shape[0] != global_translation.shape[0]:
+            raise ValueError(
+                "support_mask batch size must match FK result: "
+                f"{support_mask.shape[0]} != {global_translation.shape[0]}"
+            )
+        if support_mask.shape[1] != global_translation.shape[1]:
+            raise ValueError(
+                "support_mask time dimension must match FK result: "
+                f"{support_mask.shape[1]} != {global_translation.shape[1]}"
+            )
+        if support_mask.shape[-1] != support_body_ids.numel():
+            raise ValueError(
+                "support_mask channel count must match support_body_ids: "
+                f"{support_mask.shape[-1]} != {support_body_ids.numel()}"
+            )
+
+        active = support_mask[:, 1:] & support_mask[:, :-1]
+        if not active.any():
+            return zero, zero_metric, zero_per_sample, zero_metric
+
+        root_pos = global_translation[:, :, 0, :]
+        root_rot = quaternion_to_matrix(
+            xyzw_to_wxyz(global_rotation[:, :, 0, :])
+        )
+        support_pos = global_translation.index_select(2, support_body_ids)
+        local_pos = torch.matmul(
+            root_rot.transpose(-1, -2).unsqueeze(-3),
+            (support_pos - root_pos.unsqueeze(-2)).unsqueeze(-1),
+        ).squeeze(-1)
+
+        root_delta_local = torch.matmul(
+            root_rot[:, :-1].transpose(-1, -2),
+            (root_pos[:, 1:] - root_pos[:, :-1]).unsqueeze(-1),
+        ).squeeze(-1)
+        rel_rot = torch.matmul(
+            root_rot[:, :-1].transpose(-1, -2),
+            root_rot[:, 1:],
+        )
+        transported = torch.matmul(
+            rel_rot.unsqueeze(-3),
+            local_pos[:, 1:].unsqueeze(-1),
+        ).squeeze(-1)
+        residual = root_delta_local.unsqueeze(-2) - (
+            local_pos[:, :-1] - transported
+        )
+
+        active_vectors = residual[active]
+        if active_vectors.numel() == 0:
+            return zero, zero_metric, zero_per_sample, zero_metric
+
+        loss = self.rec_criterion(active_vectors, torch.zeros_like(active_vectors))
+        metric = active_vectors.norm(dim=-1).mean()
+
+        residual_norm = residual.detach().norm(dim=-1)
+        active_float = active.to(dtype=residual_norm.dtype)
+        per_sample = (
+            residual_norm * active_float
+        ).sum(dim=(1, 2)) / active_float.sum(dim=(1, 2)).clamp_min(1.0)
+        active_ratio = active_float.mean()
+        return loss, metric, per_sample, active_ratio
+
     @staticmethod
     def _transport_gravity(prev_g, rel_rot):
         return torch.matmul(
@@ -482,6 +631,9 @@ class GeometryLoss:
             diff = motion_tensor[:, 1:, :] - motion_tensor[:, :-1, :]
             terms['smooth'] = torch.abs(diff).mean()
 
+        zero = future_motion_pred.sum() * 0.0
+        zero_metric = zero.detach()
+        per_sample = {}
         future_motion_pred_fk = self.dataset.reconstruct_motion(
             future_motion_pred, need_denormalize=True, ret_fk=True
         )
@@ -578,6 +730,96 @@ class GeometryLoss:
             future_motion_gt_fk.get('sliding_mask'),
         )
 
+        foot_support_mask = self._foot_support_mask_from_contact(
+            future_motion_gt_fk['contact_mask'],
+            future_motion_gt_fk.get('sliding_mask'),
+        )
+        support_losses = []
+        support_metrics = []
+        support_per_sample = []
+        support_ratios = {}
+        foot_active = False
+        hand_active = False
+
+        if foot_support_mask is not None:
+            foot_pred_loss, foot_pred_metric, foot_pred_per_sample, foot_ratio = (
+                self._support_component_from_fk(
+                    future_motion_pred_fk,
+                    self.dataset.skeleton.foot_id,
+                    foot_support_mask,
+                )
+            )
+            with torch.no_grad():
+                _, foot_gt_metric, _, _ = self._support_component_from_fk(
+                    future_motion_gt_fk,
+                    self.dataset.skeleton.foot_id,
+                    foot_support_mask,
+                )
+            foot_active = float(foot_ratio) > 0.0
+            if foot_active:
+                support_losses.append(foot_pred_loss)
+                support_metrics.append(foot_pred_metric.detach())
+                support_per_sample.append(foot_pred_per_sample)
+            support_ratios['foot_support_active_ratio'] = foot_ratio
+            extras['e_support_foot'] = foot_pred_metric.detach()
+            extras['e_support_foot_gt'] = foot_gt_metric
+
+        hand_support_mask = self._hand_support_mask_from_fk(
+            future_motion_gt_fk,
+            is_recovery=is_recovery,
+        )
+        if hand_support_mask is not None:
+            hand_pred_loss, hand_pred_metric, hand_pred_per_sample, hand_ratio = (
+                self._support_component_from_fk(
+                    future_motion_pred_fk,
+                    self.dataset.skeleton.hand_id,
+                    hand_support_mask,
+                )
+            )
+            with torch.no_grad():
+                _, hand_gt_metric, _, _ = self._support_component_from_fk(
+                    future_motion_gt_fk,
+                    self.dataset.skeleton.hand_id,
+                    hand_support_mask,
+                )
+            hand_active = float(hand_ratio) > 0.0
+            if hand_active:
+                support_losses.append(hand_pred_loss)
+                support_metrics.append(hand_pred_metric.detach())
+                support_per_sample.append(hand_pred_per_sample)
+            support_ratios['hand_support_active_ratio'] = hand_ratio
+            extras['e_support_hand'] = hand_pred_metric.detach()
+            extras['e_support_hand_gt'] = hand_gt_metric
+
+        if support_losses:
+            terms['support_consistency'] = (
+                sum(support_losses) / float(len(support_losses))
+            )
+            extras['e_support_consistency'] = (
+                sum(support_metrics) / float(len(support_metrics))
+            )
+            per_sample['e_support_consistency'] = (
+                sum(support_per_sample) / float(len(support_per_sample))
+            )
+            with torch.no_grad():
+                gt_support_metrics = []
+                if foot_active:
+                    gt_support_metrics.append(foot_gt_metric)
+                if hand_active:
+                    gt_support_metrics.append(hand_gt_metric)
+                extras['e_support_consistency_gt'] = (
+                    sum(gt_support_metrics) / float(len(gt_support_metrics))
+                    if gt_support_metrics else zero_metric
+                )
+        else:
+            terms['support_consistency'] = zero
+            extras['e_support_consistency'] = zero_metric
+            extras['e_support_consistency_gt'] = zero_metric
+            per_sample['e_support_consistency'] = future_motion_pred.new_zeros(
+                future_motion_pred.shape[0]
+            )
+        extras.update(support_ratios)
+
         pred = self._feature_v6_components(future_motion_pred)
         with torch.no_grad():
             gt = self._feature_v6_components(future_motion_gt)
@@ -586,8 +828,6 @@ class GeometryLoss:
             pred['rel_rot'] - gt['rel_rot']
         ).square().sum(dim=(-1, -2)).mean()
 
-        zero = future_motion_pred.sum() * 0.0
-        zero_metric = zero.detach()
         residuals = []
         if history_motion is not None:
             hist = self._feature_v6_components(history_motion[:, -1:])
@@ -597,7 +837,6 @@ class GeometryLoss:
             )
             residuals.append(boundary.unsqueeze(1))
             extras['e_g_boundary'] = boundary.detach().norm(dim=-1).mean()
-        per_sample = {}
         if pred['gravity'].shape[1] > 1:
             interior = (
                 pred['gravity'][:, 1:]

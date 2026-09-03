@@ -52,6 +52,7 @@ train:
       goal_root_orientation: 0.2
       goal_root_velocity: 0.1
       goal_joint_angle: 0.1
+      support_consistency: 0.01
 
 ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF
