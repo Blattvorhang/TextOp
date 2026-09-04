@@ -31,6 +31,18 @@ def _resolve_root_mask_prob(value, kwargs):
     return float(value)
 
 
+def _resolve_text_mask_prob(value, kwargs):
+    """Accept the legacy text CFG key while exposing the explicit name."""
+    legacy_value = kwargs.pop('cond_mask_prob', None)
+    if value is None:
+        return 0.0 if legacy_value is None else float(legacy_value)
+    if legacy_value is not None and float(legacy_value) != float(value):
+        raise ValueError(
+            "cond_text_mask_prob and legacy cond_mask_prob disagree"
+        )
+    return float(value)
+
+
 def _joint_state_goal_slices(goal_encoding: GoalEncoding):
     if goal_encoding is GoalEncoding.LEGACY40:
         return slice(0, 3), slice(3, 8), slice(8, 37), slice(37, 40), None
@@ -435,9 +447,11 @@ class DenoiserTransformer(nn.Module):
                  activation="gelu",
                  history_shape=(2, 276),
                  noise_shape=(1, 128),
+                 clip_dim=512,
                  goal_dim=5,
                  goal_encoding=GoalEncoding.LEGACY40,
                  grid_size=25,
+                 cond_text_mask_prob=None,
                  cond_goal_root_mask_prob=None,
                  cond_goal_yaw_mask_prob=0.0,
                  cond_goal_time_mask_prob=0.0,
@@ -458,11 +472,18 @@ class DenoiserTransformer(nn.Module):
 
         self.history_shape = history_shape
         self.noise_shape = noise_shape
+        self.clip_dim = int(clip_dim)
         self.goal_dim = int(goal_dim)
         self.goal_encoding = GoalEncoding.parse(goal_encoding)
         _validate_model_goal_encoding(self.goal_dim, self.goal_encoding)
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
+        self.cond_text_mask_prob = _resolve_text_mask_prob(
+            cond_text_mask_prob, kargs
+        )
+        self.cond_mask_prob = self.cond_text_mask_prob
+        self.text_condition_enabled = bool(
+            kargs.pop('text_condition_enabled', True))
         self.cond_goal_root_mask_prob = _resolve_root_mask_prob(
             cond_goal_root_mask_prob, kargs
         )
@@ -493,6 +514,8 @@ class DenoiserTransformer(nn.Module):
                 1, h_dims=(self.h_dim, self.h_dim), activation=activation)
         else:
             self.embed_goal = nn.Linear(self.goal_dim, self.h_dim)
+        if self.text_condition_enabled:
+            self.embed_text = nn.Linear(self.clip_dim, self.h_dim)
         self.embed_scene = nn.Linear(self.scene_dim, self.h_dim)
         self.embed_history = nn.Linear(self.history_shape[-1], self.h_dim)
         self.embed_noise = nn.Linear(self.noise_shape[-1], self.h_dim)
@@ -514,7 +537,7 @@ class DenoiserTransformer(nn.Module):
 
     def mask_condition(self, cond, probability, force_mask=False,
                        return_keep_mask=False):
-        if force_mask:
+        if force_mask or probability >= 1.0:
             keep_mask = torch.zeros(cond.shape[0], dtype=torch.bool,
                                     device=cond.device)
         elif (not self.training) or probability <= 0.:
@@ -545,40 +568,124 @@ class DenoiserTransformer(nn.Module):
         if y is None:
             raise ValueError("Goal+scene denoiser requires a condition dictionary")
 
+        batch_size = x_t.shape[0]
+        device = x_t.device
+
         emb_time = self.embed_timestep(timesteps)  # [1, bs, d]
-        goal, goal_keep_mask = _mask_goal(self, y['goal'], y)
+
+        goal = y.get('goal')
+        goal_present = goal is not None
+        if goal_present:
+            goal = goal.to(device=device, dtype=x_t.dtype)
+            goal, goal_keep_mask = _mask_goal(self, goal, y)
+        else:
+            goal = torch.zeros(
+                batch_size, self.goal_dim, device=device, dtype=x_t.dtype
+            )
+            goal_keep_mask = torch.zeros(
+                batch_size, dtype=torch.bool, device=device
+            )
+            y['goal_condition_keep_mask'] = goal_keep_mask
+            if self.goal_encoding is GoalEncoding.SPLIT:
+                y['goal_orientation_condition_keep_mask'] = goal_keep_mask
+                y['goal_joint_condition_keep_mask'] = goal_keep_mask
+                y['goal_velocity_condition_keep_mask'] = goal_keep_mask
+                y['goal_time_condition_keep_mask'] = goal_keep_mask
+            elif _goal_dim_uses_arrival_pe(self.goal_dim):
+                y['arrival_time_condition_keep_mask'] = goal_keep_mask
         y['goal_condition_keep_mask'] = goal_keep_mask
+
+        voxel = y.get('voxel')
+        if voxel is None:
+            voxel = torch.zeros(
+                batch_size, self.scene_dim, device=device, dtype=x_t.dtype
+            )
+        else:
+            voxel = voxel.to(device=device, dtype=x_t.dtype)
         voxel = self.mask_condition(
-            y['voxel'], self.cond_scene_mask_prob,
+            voxel, self.cond_scene_mask_prob,
             force_mask=y.get('force_drop_scene', False))
+
+        history_motion = y.get('history_motion_normalized')
+        if history_motion is None:
+            history_motion = torch.zeros(
+                batch_size, *self.history_shape, device=device, dtype=x_t.dtype
+            )
+        else:
+            history_motion = history_motion.to(device=device, dtype=x_t.dtype)
+
+        use_text_condition = bool(
+            getattr(self, 'text_condition_enabled', False))
+        if use_text_condition:
+            text_embedding = y.get('text_embedding')
+            if text_embedding is None:
+                text_embedding = torch.zeros(
+                    batch_size, self.clip_dim, device=device, dtype=x_t.dtype
+                )
+                text_keep_mask = torch.zeros(
+                    batch_size, dtype=torch.bool, device=device
+                )
+            else:
+                if text_embedding.ndim == 1:
+                    text_embedding = text_embedding.unsqueeze(0)
+                if text_embedding.shape[-1] != self.clip_dim:
+                    raise ValueError(
+                        f"text_embedding last dim must be {self.clip_dim}, got "
+                        f"{tuple(text_embedding.shape)}"
+                    )
+                text_embedding = text_embedding.to(device=device, dtype=x_t.dtype)
+                text_embedding, text_keep_mask = self.mask_condition(
+                    text_embedding,
+                    self.cond_text_mask_prob,
+                    force_mask=(
+                        y.get('force_drop_text', False)
+                        or y.get('uncond', False)),
+                    return_keep_mask=True,
+                )
+            y['text_condition_keep_mask'] = text_keep_mask
+            emb_text = self.embed_text(text_embedding).unsqueeze(0)
+            emb_text = emb_text * text_keep_mask.reshape(
+                1, batch_size, 1).to(emb_text.dtype)
+        else:
+            y['text_condition_keep_mask'] = torch.zeros(
+                batch_size, dtype=torch.bool, device=device)
+
         arrival_time_frame = y.get(
             'time_to_arrival_frame', y.get('arrival_time_frame'))
         if _goal_dim_uses_arrival_pe(self.goal_dim):
             if arrival_time_frame is None:
-                raise ValueError(
-                    f"{_goal_dim_name(self.goal_dim)} denoiser requires "
-                    "y['time_to_arrival_frame']")
-            arrival_time_frame, arrival_keep_mask = self.mask_condition(
-                arrival_time_frame.reshape(-1, 1).to(goal.device).float(),
-                self.cond_goal_time_mask_prob,
-                force_mask=(
-                    y.get('force_drop_arrival_time', False)
-                    or y.get('force_drop_goal_time', False)),
-                return_keep_mask=True,
-            )
+                if goal_present:
+                    raise ValueError(
+                        f"{_goal_dim_name(self.goal_dim)} denoiser requires "
+                        "y['time_to_arrival_frame']"
+                    )
+                arrival_time_frame = torch.zeros(
+                    batch_size, 1, device=device, dtype=x_t.dtype
+                )
+                arrival_keep_mask = torch.zeros(
+                    batch_size, dtype=torch.bool, device=device
+                )
+            else:
+                arrival_time_frame, arrival_keep_mask = self.mask_condition(
+                    arrival_time_frame.reshape(-1, 1).to(device=device).float(),
+                    self.cond_goal_time_mask_prob,
+                    force_mask=(
+                        y.get('force_drop_arrival_time', False)
+                        or y.get('force_drop_goal_time', False)),
+                    return_keep_mask=True,
+                )
             y['arrival_time_condition_keep_mask'] = arrival_keep_mask
             arrival_pe = self.arrival_embedder(
                 arrival_time_frame.squeeze(-1))
             arrival_pe = arrival_pe * arrival_keep_mask.unsqueeze(
                 -1).to(arrival_pe.dtype)
-            goal = _apply_arrival_channel_mask(
-                goal, self.goal_dim, arrival_keep_mask)
+            if goal_present:
+                goal = _apply_arrival_channel_mask(
+                    goal, self.goal_dim, arrival_keep_mask)
         else:
             arrival_pe = 0.0
         emb_scene = self.embed_scene(voxel).unsqueeze(0)
-        emb_history = self.embed_history(
-            y['history_motion_normalized']).permute(1, 0,
-                                                    2)  # [History, bs, d]
+        emb_history = self.embed_history(history_motion).permute(1, 0, 2)
         emb_noise = self.embed_noise(x_t).permute(1, 0, 2)  # [1, bs, d]
 
         if self.goal_encoding is GoalEncoding.SPLIT:
@@ -618,27 +725,36 @@ class DenoiserTransformer(nn.Module):
                 emb_goal_time = emb_goal_time * y[
                     'arrival_time_condition_keep_mask'].unsqueeze(
                         -1).to(emb_goal_time.dtype)
-            xseq = torch.cat(
-                (
-                    emb_time,
-                    emb_goal_trans,
-                    emb_goal_rot,
-                    emb_goal_pose,
-                    emb_goal_vel,
-                    emb_goal_time,
-                    emb_scene,
-                    emb_history,
-                    emb_noise,
-                ),
-                dim=0,
-            )
+            xseq_parts = [
+                emb_time,
+                emb_goal_trans,
+                emb_goal_rot,
+                emb_goal_pose,
+                emb_goal_vel,
+                emb_goal_time,
+                emb_scene,
+                emb_history,
+                emb_noise,
+            ]
+            if use_text_condition:
+                xseq_parts.insert(1, emb_text)
+            xseq = torch.cat(tuple(xseq_parts), dim=0)
         else:
             emb_goal = self.embed_goal(goal).unsqueeze(0)
+            emb_goal = emb_goal * goal_keep_mask.unsqueeze(-1).to(
+                emb_goal.dtype)
             if _goal_dim_uses_arrival_pe(self.goal_dim):
                 emb_goal = emb_goal + arrival_pe.unsqueeze(0)
-            xseq = torch.cat(
-                (emb_time, emb_goal, emb_scene, emb_history, emb_noise), dim=0
-            )
+            xseq_parts = [
+                emb_time,
+                emb_goal,
+                emb_scene,
+                emb_history,
+                emb_noise,
+            ]
+            if use_text_condition:
+                xseq_parts.insert(1, emb_text)
+            xseq = torch.cat(tuple(xseq_parts), dim=0)
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqTransEncoder(xseq)[
             -self.noise_shape[0]:]  # [1, bs, h_dim]

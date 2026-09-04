@@ -9,9 +9,11 @@ history_shape:
   - ${...data.history_len}
   - ${...nfeats}
 noise_shape: [1, 128]
+clip_dim: 512
 goal_encoding: split
 goal_dim: 5
 grid_size: 25
+cond_text_mask_prob: 0.1
 cond_goal_root_mask_prob: 0.1
 cond_goal_yaw_mask_prob: 0.0
 cond_goal_time_mask_prob: 0.0

@@ -8,7 +8,7 @@ task: freq-dar
 # Benchmark settings
 num_iterations: 100      # Number of benchmark iterations
 warmup_iterations: 10    # Number of warmup iterations
-text_prompt: "walk forward"  # Default text prompt for benchmarking
+text_prompt: null  # Set a prompt to benchmark text conditioning
 
 # Sampling settings
 use_full_sample: false   # false for single-step (faster), true for full DDPM sampling

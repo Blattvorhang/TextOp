@@ -417,7 +417,7 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             int(cfg.denoiser.grid_size) ** 3,
             device=reference_pos.device,
         )
-    return {
+    conditions = {
         'goal': goal,
         'ego_goal_raw': ego_goal_raw,
         'voxel': voxel,
@@ -430,6 +430,10 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             if time_to_arrival_frame is not None else {}
         ),
     }
+    if 'text_embedding' in primitive:
+        conditions['text_embedding'] = primitive['text_embedding'].to(
+            cfg.device)
+    return conditions
 
 
 def _next_rollout_poses(dataset, motion, history_start_pos, history_start_rot, history_len):

@@ -25,7 +25,6 @@ import torch
 from torch import nn
 from torch.utils import data
 from tqdm import tqdm
-# from robotmdar.model.clip import load_and_freeze_clip, encode_text
 from robotmdar.skeleton.robot import RobotSkeleton
 from robotmdar.utils.goal import (
     GOAL_CLAMP_QUANTILE_LEVELS,
@@ -131,6 +130,55 @@ def _wait_for_goal_stats_cache(goal_stats_path: Path,
                 f"Timed out after {timeout_s:.0f}s waiting for "
                 f"{goal_stats_path}; the train dataset on the writer rank "
                 "never produced it (dataset directory not writable?)"
+            )
+        time.sleep(2.0)
+
+
+def _save_text_embedding_cache(text_embeddings: Dict[str, torch.Tensor],
+                               text_embedding_path: Path) -> None:
+    """Persist CLIP text embeddings atomically from the writer rank."""
+    if not _is_goal_stats_writer():
+        return
+    tmp_path = text_embedding_path.with_name(text_embedding_path.name + ".tmp")
+    try:
+        torch.save(text_embeddings, tmp_path)
+        tmp_path.replace(text_embedding_path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot write text embedding cache {text_embedding_path}: the "
+            "dataset directory is not writable. Disable "
+            "data.load_text_embeddings or place a precomputed cache there."
+        ) from exc
+    logger.info(f" Saved text embeddings to {text_embedding_path}")
+
+
+def _text_embedding_cache_complete(cache: Dict[str, torch.Tensor],
+                                   needed_texts: set[str],
+                                   clip_dim: int) -> bool:
+    if '' not in cache:
+        return False
+    for text in needed_texts:
+        embedding = cache.get(text)
+        if embedding is None or int(embedding.shape[-1]) != int(clip_dim):
+            return False
+    return True
+
+
+def _wait_for_complete_text_embedding_cache(text_embedding_path: Path,
+                                            needed_texts: set[str],
+                                            clip_dim: int,
+                                            timeout_s: float = 900.0
+                                            ) -> Dict[str, torch.Tensor]:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if text_embedding_path.exists():
+            cache = torch.load(text_embedding_path, map_location="cpu")
+            if _text_embedding_cache_complete(cache, needed_texts, clip_dim):
+                return cache
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Timed out after {timeout_s:.0f}s waiting for a complete "
+                f"text embedding cache at {text_embedding_path}."
             )
         time.sleep(2.0)
 
@@ -265,6 +313,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.preload_show_progress = bool(
             kwargs.get('preload_show_progress', _is_goal_stats_writer()))
         self.load_scene = bool(kwargs.get('load_scene', True))
+        self.load_text_embeddings = bool(
+            kwargs.get('load_text_embeddings', True))
+        self.clip_version = str(kwargs.get('clip_version', 'ViT-B/32'))
+        self.clip_dim = int(kwargs.get('clip_dim', 512))
         self._stats_device_cache = {}
         # Planner-side DR is disabled by default: augmentation_enabled must be
         # explicitly set to true (LDM configs only — VAE training stays clean).
@@ -353,9 +405,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         logger.info(f" Found {len(self.valid_indices)} valid samples out of {len(self.raw_data)}")
 
-        # Load text embeddings
-        # DEPRECATED: text embeddings no longer used (goal+scene conditioning).
-        # self._load_text_embeddings()
+        if self.load_text_embeddings:
+            self._load_text_embeddings()
+        else:
+            self.text_embeddings_dict = {
+                '': torch.zeros(self.clip_dim, dtype=torch.float32)
+            }
 
     def _strip_scene_if_needed(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         if getattr(self, 'load_scene', True) or 'scene' not in sample:
@@ -779,55 +834,81 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         motion['root_trans_offset'][:history_count, 2] += w * dh
         return True
 
-    # =========================================================================
-    # DEPRECATED: Text embedding loading & computation.
-    # TextOp's original text-conditioned pipeline (CLIP → Denoiser) has been
-    # replaced by goal + scene conditioning per LDM_goal_scene_design.md.
-    # These methods are preserved for reference / future text-based ablation
-    # experiments — DO NOT DELETE. The active code path uses zero tensors
-    # for the embedding slot (see _extract_single_primitive).
-    # =========================================================================
-    # def _load_text_embeddings(self) -> None:
-    #     """Load or compute text embeddings"""
-    #     text_embedding_path = self.datadir / f'{self.split}_text_embed.pkl'
-    #     if text_embedding_path.exists():
-    #         logger.info(" Loading cached text embeddings...")
-    #         self.text_embeddings_dict = torch.load(text_embedding_path, map_location="cpu")
-    #     else:
-    #         logger.info(" Computing text embeddings...")
-    #         clip_model = load_and_freeze_clip(
-    #             clip_version='ViT-B/32', device="cuda" if torch.cuda.is_available() else "cpu"
-    #         )
-    #         self.text_embeddings_dict = self._compute_text_embeddings(self.raw_data, clip_model)
-    #         torch.save(self.text_embeddings_dict, text_embedding_path)
-    #
-    # @staticmethod
-    # def _compute_text_embeddings(raw_data: List[Dict[str, Any]],
-    #                              clip_model: nn.Module,
-    #                              batch_size: int = 64) -> Dict[str, torch.Tensor]:
-    #     """Compute text embeddings efficiently"""
-    #     # Extract all unique texts
-    #     all_texts = set()
-    #     for item in raw_data:
-    #         for ann in item['frame_ann']:
-    #             all_texts.add(ann[2])
-    #
-    #     uni_texts = list(all_texts)
-    #
-    #     # Batch encode
-    #     embeddings_list = []
-    #     for i in range(0, len(uni_texts), batch_size):
-    #         batch_texts = uni_texts[i:i + batch_size]
-    #         batch_embeddings = encode_text(clip_model, batch_texts)
-    #         embeddings_list.append(batch_embeddings.detach().float())
-    #
-    #     text_embeddings = torch.cat(embeddings_list, dim=0)
-    #
-    #     # Create dictionary
-    #     text_embeddings_dict = dict(zip(uni_texts, text_embeddings))
-    #     text_embeddings_dict[''] = torch.zeros_like(text_embeddings[0])
-    #
-    #     return text_embeddings_dict
+    def _load_text_embeddings(self) -> None:
+        """Load or compute CLIP embeddings for frame_ann text labels."""
+        text_embedding_path = self.datadir / f'{self.split}_text_embed.pkl'
+        needed_texts = self._collect_text_labels(self.raw_data)
+        if text_embedding_path.exists():
+            logger.info(" Loading cached text embeddings...")
+            self.text_embeddings_dict = torch.load(
+                text_embedding_path, map_location="cpu")
+            if _text_embedding_cache_complete(
+                    self.text_embeddings_dict, needed_texts, self.clip_dim):
+                if '' not in self.text_embeddings_dict:
+                    self.text_embeddings_dict[''] = torch.zeros(
+                        self.clip_dim, dtype=torch.float32)
+                return
+            logger.info(" Text embedding cache is stale; rebuilding...")
+            if not _is_goal_stats_writer() and _is_torchrun():
+                self.text_embeddings_dict = (
+                    _wait_for_complete_text_embedding_cache(
+                        text_embedding_path, needed_texts, self.clip_dim))
+                return
+        else:
+            if not _is_goal_stats_writer() and _is_torchrun():
+                logger.info(" Waiting for cached text embeddings...")
+                self.text_embeddings_dict = (
+                    _wait_for_complete_text_embedding_cache(
+                        text_embedding_path, needed_texts, self.clip_dim))
+                if '' not in self.text_embeddings_dict:
+                    self.text_embeddings_dict[''] = torch.zeros(
+                        self.clip_dim, dtype=torch.float32)
+                return
+            logger.info(" Computing text embeddings...")
+            from robotmdar.model.clip import load_and_freeze_clip
+            clip_model = load_and_freeze_clip(
+                clip_version=self.clip_version,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            self.text_embeddings_dict = self._compute_text_embeddings(
+                self.raw_data, clip_model, clip_dim=self.clip_dim)
+            _save_text_embedding_cache(
+                self.text_embeddings_dict, text_embedding_path)
+        if '' not in self.text_embeddings_dict:
+            self.text_embeddings_dict[''] = torch.zeros(
+                self.clip_dim, dtype=torch.float32)
+
+    @staticmethod
+    def _collect_text_labels(raw_data: List[Dict[str, Any]]) -> set[str]:
+        all_texts = set()
+        for item in raw_data:
+            for ann in item.get('frame_ann', []):
+                all_texts.add(str(ann[2]))
+        return all_texts
+
+    @staticmethod
+    def _compute_text_embeddings(raw_data: List[Dict[str, Any]],
+                                 clip_model: nn.Module,
+                                 batch_size: int = 64,
+                                 clip_dim: int = 512
+                                 ) -> Dict[str, torch.Tensor]:
+        """Compute text embeddings for unique frame_ann labels."""
+        uni_texts = sorted(
+            SkeletonPrimitiveDataset._collect_text_labels(raw_data))
+        if not uni_texts:
+            return {'': torch.zeros(clip_dim, dtype=torch.float32)}
+
+        embeddings_list = []
+        from robotmdar.model.clip import encode_text
+        for i in range(0, len(uni_texts), batch_size):
+            batch_texts = uni_texts[i:i + batch_size]
+            batch_embeddings = encode_text(clip_model, batch_texts)
+            embeddings_list.append(batch_embeddings.detach().cpu().float())
+
+        text_embeddings = torch.cat(embeddings_list, dim=0)
+        text_embeddings_dict = dict(zip(uni_texts, text_embeddings))
+        text_embeddings_dict[''] = torch.zeros_like(text_embeddings[0])
+        return text_embeddings_dict
 
     def _load_meanstd(self) -> None:
         """Load or compute mean/std for normalization"""
@@ -1432,6 +1513,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         raw_motion = sample['motion']
         goal_rot = torch.as_tensor(raw_motion['root_rot'][goal_frame])
 
+        action_label = self._primitive_action_label(
+            sample, prim_start, prim_end)
+        text_embedding = self.text_embeddings_dict.get(
+            action_label, self.text_embeddings_dict[''])
+
         primitive = {
             'motion': motion_data,
             'sliding_mask': sliding_mask,
@@ -1443,8 +1529,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'gt_ref_rot': torch.as_tensor(raw_motion['root_rot'][reference_frame], dtype=torch.float32),
             'scene': sample.get('scene', {}),
             'is_recovery': bool(sample.get('_recovery_boost', False)),
-            'action_label': self._primitive_action_label(
-                sample, prim_start, prim_end),
+            'action_label': action_label,
+            'text_embedding': text_embedding.float(),
         }
         primitive['_clean_history_delta_q'] = (
             motion_data['dof'][self.history_len]
@@ -1667,6 +1753,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 'action_label': [
                     p.get('action_label') for p in primitives
                 ],
+                'text_embedding': torch.stack([
+                    p['text_embedding'] for p in primitives
+                ]),
                 'is_recovery': torch.as_tensor(recovery_flags, dtype=torch.bool),
             }
             batch.update({

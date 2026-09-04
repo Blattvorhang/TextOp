@@ -31,6 +31,9 @@ load_goal_stats: true
 preload_ram: false
 preload_num_workers: 8
 load_scene: true
+load_text_embeddings: false
+clip_version: ViT-B/32
+clip_dim: 512
 goal_offset: 0
 goal_offset_range: null
 goal_type: joint_state
@@ -85,6 +88,9 @@ common: &common
   preload_ram: ${..preload_ram}
   preload_num_workers: ${..preload_num_workers}
   load_scene: ${..load_scene}
+  load_text_embeddings: ${..load_text_embeddings}
+  clip_version: ${..clip_version}
+  clip_dim: ${..clip_dim}
   goal_offset: ${..goal_offset}
   goal_offset_range: ${..goal_offset_range}
   goal_type: ${..goal_type}

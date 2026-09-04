@@ -827,13 +827,18 @@ class DARManager(BaseManager, GeometryLoss):
         logger.info(f"Current step: {self.step}")
 
     @staticmethod
-    def _fill_missing_arrival_embedder_state(model: nn.Module,
-                                             checkpoint_state: Dict[str, Any],
-                                             ckpt_path: Path):
-        current_state = model.state_dict()
+    def _fill_missing_optional_condition_state(
+        model: nn.Module,
+        checkpoint_state: Dict[str, Any],
+        ckpt_path: Path,
+    ):
+        current_state = get_ddp_model(model).state_dict()
         missing_keys = [
             key for key in current_state
-            if key.startswith('arrival_embedder.')
+            if (
+                key.startswith('arrival_embedder.')
+                or key.startswith('embed_text.')
+            )
             and key not in checkpoint_state
         ]
         if not missing_keys:
@@ -842,11 +847,14 @@ class DARManager(BaseManager, GeometryLoss):
         checkpoint_state = dict(checkpoint_state)
         for key in missing_keys:
             checkpoint_state[key] = current_state[key]
+        missing_modules = sorted({
+            key.split('.', 1)[0] for key in missing_keys
+        })
         logger.warning(
-            "DAR checkpoint {} is missing {} arrival_embedder keys; "
+            "DAR checkpoint {} is missing {} optional condition keys from {}; "
             "initializing them from the current model and keeping all other "
             "state-dict checks strict",
-            ckpt_path, len(missing_keys))
+            ckpt_path, len(missing_keys), ", ".join(missing_modules))
         return checkpoint_state, True
 
     def load_model(self, ckpt_path: Path):
@@ -857,16 +865,30 @@ class DARManager(BaseManager, GeometryLoss):
                 f"DAR checkpoint FeatureVersion {ckpt_feature_version} does not "
                 f"match active FeatureVersion {motion_dtype.FeatureVersion}"
             )
-        denoiser_state, initialized_arrival = (
-            self._fill_missing_arrival_embedder_state(
-                self.denoiser, state_dict['denoiser'], ckpt_path))
         model_to_load = get_ddp_model(self.denoiser)
+        missing_text_condition = any(
+            key.startswith('embed_text.') and key not in state_dict['denoiser']
+            for key in model_to_load.state_dict()
+        )
+        denoiser_state, initialized_optional = (
+            self._fill_missing_optional_condition_state(
+                model_to_load, state_dict['denoiser'], ckpt_path))
         model_to_load.load_state_dict(denoiser_state)
+        if missing_text_condition and self.optimizer is None and hasattr(
+                model_to_load, 'text_condition_enabled'):
+            model_to_load.text_condition_enabled = False
+            model_to_load.cond_text_mask_prob = 0.0
+            if hasattr(model_to_load, 'cond_mask_prob'):
+                model_to_load.cond_mask_prob = 0.0
+            logger.warning(
+                "DAR checkpoint {} has no text-condition weights; disabling "
+                "text conditioning for inference",
+                ckpt_path)
         if self.optimizer is not None:
-            if initialized_arrival:
+            if initialized_optional:
                 logger.warning(
                     "Skipping optimizer state restore for {} because the "
-                    "arrival_embedder parameters were initialized fresh",
+                    "optional condition parameters were initialized fresh",
                     ckpt_path)
             else:
                 self.optimizer.load_state_dict(state_dict['optimizer'])
@@ -876,7 +898,7 @@ class DARManager(BaseManager, GeometryLoss):
         if self.use_ema and 'ema_models' in state_dict:
             for name, ema_state in state_dict['ema_models'].items():
                 if name in self.ema_models:
-                    ema_state, _ = self._fill_missing_arrival_embedder_state(
+                    ema_state, _ = self._fill_missing_optional_condition_state(
                         self.ema_models[name], ema_state, ckpt_path)
                     self.ema_models[name].load_state_dict(ema_state)
                     logger.info(f"Loaded EMA model: {name}")

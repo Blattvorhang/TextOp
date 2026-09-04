@@ -11,6 +11,9 @@ batch_size: 512
 weighted_sample: false
 frame_weight: false
 use_weighted_meanstd: false
+load_text_embeddings: true
+clip_version: ViT-B/32
+clip_dim: 512
 goal_offset: 0
 goal_type: root
 goal_per_primitive: false
@@ -54,6 +57,9 @@ common: &common
   weighted_sample: ${..weighted_sample}
   frame_weight: ${..frame_weight}
   use_weighted_meanstd: ${..use_weighted_meanstd}
+  load_text_embeddings: ${..load_text_embeddings}
+  clip_version: ${..clip_version}
+  clip_dim: ${..clip_dim}
   goal_offset: ${..goal_offset}
   goal_type: ${..goal_type}
   goal_per_primitive: ${..goal_per_primitive}

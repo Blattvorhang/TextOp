@@ -18,6 +18,9 @@ data:
   weighted_sample: false
   preload_ram: true
   load_scene: false
+  load_text_embeddings: true
+  clip_version: ViT-B/32
+  clip_dim: 512
   goal_type: joint_state
   goal_encoding: split
   goal_per_primitive: true
@@ -38,6 +41,7 @@ data:
 denoiser:
   goal_encoding: ${data.goal_encoding}
   goal_dim: 55
+  cond_text_mask_prob: 0.1
   cond_goal_root_mask_prob: 0.1
   cond_goal_orientation_mask_prob: 0.1
   cond_goal_joint_mask_prob: 0.4
