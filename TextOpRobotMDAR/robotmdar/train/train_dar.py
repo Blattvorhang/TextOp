@@ -13,6 +13,8 @@ from robotmdar.utils.goal import (
     GoalEncoding,
     GoalType,
     ROT_MAT_JOINT_STATE_GOAL_DIM,
+    SPLIT_GOAL_DIM,
+    SPLIT_HORIZONTAL_SLICE,
     build_ego_goal,
     build_ego_joint_state_goal_v6,
     validate_goal_config,
@@ -56,6 +58,9 @@ def _raw_goal_root_target(ego_goal_raw: torch.Tensor) -> torch.Tensor:
     if (motion_dtype.FeatureVersion == 6
             and ego_goal_raw.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
         return ego_goal_raw[:, 1:4]
+    if (motion_dtype.FeatureVersion == 6
+            and ego_goal_raw.shape[-1] == SPLIT_GOAL_DIM):
+        return ego_goal_raw[:, SPLIT_HORIZONTAL_SLICE][:, :3]
     return ego_goal_raw[:, :2]
 
 
@@ -306,6 +311,8 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
     goal_encoding = GoalEncoding.parse(
         cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
     )
+    goal_include_log_d_hor = bool(
+        cfg.data.get('goal_include_log_d_hor', True))
     time_to_arrival = primitive.get(
         'time_to_arrival', primitive.get('goal_timestep'))
     if goal_type.uses_arrival_time:
@@ -379,6 +386,7 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
                 if goal_type.uses_arrival_time else None
             ),
             time_to_arrival_seconds=goal_time,
+            goal_include_log_d_hor=goal_include_log_d_hor,
         )
     else:
         goal = ego_goal_raw
@@ -1086,6 +1094,7 @@ def main(cfg: DictConfig):
         goal_offset_range=cfg.data.goal_offset_range,
         goal_timestep_mode=cfg.data.goal_timestep_mode,
         goal_stats=getattr(train_data, 'goal_stats', None),
+        goal_include_log_d_hor=cfg.data.get('goal_include_log_d_hor', True),
     )
     _validate_joint_state_contract(cfg)
     _validate_goal_root_position_contract(cfg)

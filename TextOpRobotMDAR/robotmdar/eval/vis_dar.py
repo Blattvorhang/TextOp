@@ -115,6 +115,8 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                     batch_item['world_goal_dof'].to(cfg.device)
                     if goal_type is GoalType.JOINT_STATE else None
                 ),
+                goal_include_log_d_hor=cfg.data.get(
+                    'goal_include_log_d_hor', True),
             )
             time_to_arrival_frame = None
             if goal_type.uses_arrival_time:
@@ -196,6 +198,7 @@ def main(cfg: DictConfig):
         goal_offset_range=cfg.data.goal_offset_range,
         goal_timestep_mode=cfg.data.goal_timestep_mode,
         goal_stats=getattr(val_data, 'goal_stats', None),
+        goal_include_log_d_hor=cfg.data.get('goal_include_log_d_hor', True),
     )
     val_dataiter = iter(val_data)
 

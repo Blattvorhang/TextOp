@@ -10,11 +10,16 @@ from robotmdar.utils.goal import (
     EXTENDED_BODY_GOAL_DIM,
     GoalEncoding,
     JOINT_STATE_GOAL_DIM,
+    SPLIT_HORIZONTAL_SLICE,
+    SPLIT_HORIZONTAL_URGENCY_SLICE,
     SPLIT_GOAL_DIM,
     SPLIT_JOINT_SLICE,
     SPLIT_ORIENTATION_SLICE,
-    SPLIT_POSITION_SLICE,
     SPLIT_TIME_SLICE,
+    SPLIT_VERTICAL_GRAVITY_SLICE,
+    SPLIT_VERTICAL_HEIGHT_SLICE,
+    SPLIT_VERTICAL_SLICE,
+    SPLIT_VERTICAL_URGENCY_SLICE,
     SPLIT_VELOCITY_SLICE,
 )
 
@@ -47,12 +52,72 @@ def _joint_state_goal_slices(goal_encoding: GoalEncoding):
     if goal_encoding is GoalEncoding.LEGACY40:
         return slice(0, 3), slice(3, 8), slice(8, 37), slice(37, 40), None
     return (
-        SPLIT_POSITION_SLICE,
+        SPLIT_HORIZONTAL_SLICE,
         SPLIT_ORIENTATION_SLICE,
         SPLIT_JOINT_SLICE,
         SPLIT_VELOCITY_SLICE,
         SPLIT_TIME_SLICE,
     )
+
+
+def _mask_split_goal(model, goal, y):
+    """Mask the 55-D split goal while preserving hor/vert semantics."""
+    hor, root_keep = model.mask_condition(
+        goal[:, SPLIT_HORIZONTAL_SLICE],
+        model.cond_goal_root_mask_prob,
+        force_mask=y.get('force_drop_goal_root', False),
+        return_keep_mask=True,
+    )
+    rot, orientation_keep = model.mask_condition(
+        goal[:, SPLIT_ORIENTATION_SLICE],
+        model.cond_goal_orientation_mask_prob,
+        force_mask=(
+            y.get('force_drop_goal_orientation', False)
+            or y.get('force_drop_goal_yaw', False)),
+        return_keep_mask=True,
+    )
+    joints, joint_keep = model.mask_condition(
+        goal[:, SPLIT_JOINT_SLICE],
+        model.cond_goal_joint_mask_prob,
+        force_mask=y.get('force_drop_goal_joint', False),
+        return_keep_mask=True,
+    )
+    velocity, velocity_keep = model.mask_condition(
+        goal[:, SPLIT_VELOCITY_SLICE],
+        model.cond_goal_velocity_mask_prob,
+        force_mask=y.get('force_drop_goal_velocity', False),
+        return_keep_mask=True,
+    )
+
+    masked = goal.clone()
+    root_keep_f = root_keep.unsqueeze(-1).to(masked.dtype)
+    orientation_keep_f = orientation_keep.unsqueeze(-1).to(masked.dtype)
+    masked[:, SPLIT_HORIZONTAL_SLICE] = hor
+    masked[:, SPLIT_VERTICAL_HEIGHT_SLICE] = (
+        masked[:, SPLIT_VERTICAL_HEIGHT_SLICE] * root_keep_f)
+    masked[:, SPLIT_VERTICAL_URGENCY_SLICE] = (
+        masked[:, SPLIT_VERTICAL_URGENCY_SLICE] * root_keep_f)
+    masked[:, SPLIT_VERTICAL_GRAVITY_SLICE] = (
+        masked[:, SPLIT_VERTICAL_GRAVITY_SLICE] * orientation_keep_f)
+    masked[:, SPLIT_ORIENTATION_SLICE] = rot
+    masked[:, SPLIT_JOINT_SLICE] = joints
+    masked[:, SPLIT_VELOCITY_SLICE] = velocity
+
+    y['goal_orientation_condition_keep_mask'] = orientation_keep
+    y['goal_joint_condition_keep_mask'] = joint_keep
+    y['goal_velocity_condition_keep_mask'] = velocity_keep
+    y['goal_vertical_condition_keep_mask'] = root_keep | orientation_keep
+    if 'arrival_time_condition_keep_mask' in y:
+        time_keep = y['arrival_time_condition_keep_mask']
+    elif y.get('force_drop_goal_time', False) or y.get(
+            'force_drop_arrival_time', False):
+        time_keep = torch.zeros(
+            goal.shape[0], dtype=torch.bool, device=goal.device)
+    else:
+        time_keep = torch.ones(
+            goal.shape[0], dtype=torch.bool, device=goal.device)
+    y['goal_time_condition_keep_mask'] = time_keep
+    return masked, root_keep
 
 
 def _validate_model_goal_encoding(goal_dim: int,
@@ -75,6 +140,8 @@ def _mask_goal(model, goal, y):
     if int(model.goal_dim) in (JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM):
         goal_encoding = getattr(
             model, "goal_encoding", GoalEncoding.LEGACY40)
+        if goal_encoding in (GoalEncoding.SINGLE, GoalEncoding.SPLIT):
+            return _mask_split_goal(model, goal, y)
         (root_slice, orientation_slice, joint_slice,
          velocity_slice, time_slice) = _joint_state_goal_slices(goal_encoding)
         root, root_keep = model.mask_condition(
@@ -190,7 +257,10 @@ def _apply_arrival_channel_mask(goal: torch.Tensor,
         goal = goal.clone()
         keep = arrival_keep_mask.unsqueeze(-1).to(
             device=goal.device, dtype=goal.dtype)
-        goal[:, 7:12] = goal[:, 7:12] * keep
+        goal[:, SPLIT_HORIZONTAL_URGENCY_SLICE] = (
+            goal[:, SPLIT_HORIZONTAL_URGENCY_SLICE] * keep)
+        goal[:, SPLIT_VERTICAL_URGENCY_SLICE] = (
+            goal[:, SPLIT_VERTICAL_URGENCY_SLICE] * keep)
         goal[:, 54:55] = goal[:, 54:55] * keep
         return goal
     return goal
@@ -273,10 +343,12 @@ class DenoiserMLP(nn.Module):
                                                self.sequence_pos_encoder)
 
         if self.goal_encoding is GoalEncoding.SPLIT:
-            self.embed_goal_trans = MLP(
-                12, h_dims=(self.h_dim, self.h_dim), activation=activation)
-            self.embed_goal_rot = MLP(
+            self.embed_goal_hor = MLP(
                 9, h_dims=(self.h_dim, self.h_dim), activation=activation)
+            self.embed_goal_vert = MLP(
+                6, h_dims=(self.h_dim, self.h_dim), activation=activation)
+            self.embed_goal_rot = MLP(
+                6, h_dims=(self.h_dim, self.h_dim), activation=activation)
             self.embed_goal_pose = MLP(
                 29, h_dims=(self.h_dim, self.h_dim), activation=activation)
             self.embed_goal_vel = MLP(
@@ -290,7 +362,7 @@ class DenoiserMLP(nn.Module):
 
         # input: time + goal + scene + history + noise → all projected to h_dim
         input_dim = self.h_dim * (
-            9 if self.goal_encoding is GoalEncoding.SPLIT else 5
+            10 if self.goal_encoding is GoalEncoding.SPLIT else 5
         )
         self.input_project = nn.Linear(input_dim, self.h_dim)
 
@@ -370,12 +442,16 @@ class DenoiserMLP(nn.Module):
         else:
             arrival_pe = 0.0
         if self.goal_encoding is GoalEncoding.SPLIT:
-            emb_goal_trans = self.embed_goal_trans(goal[:, SPLIT_POSITION_SLICE])
+            emb_goal_hor = self.embed_goal_hor(goal[:, SPLIT_HORIZONTAL_SLICE])
+            emb_goal_vert = self.embed_goal_vert(goal[:, SPLIT_VERTICAL_SLICE])
             emb_goal_rot = self.embed_goal_rot(goal[:, SPLIT_ORIENTATION_SLICE])
             emb_goal_pose = self.embed_goal_pose(goal[:, SPLIT_JOINT_SLICE])
             emb_goal_vel = self.embed_goal_vel(goal[:, SPLIT_VELOCITY_SLICE])
-            emb_goal_trans = emb_goal_trans * goal_keep_mask.unsqueeze(
-                -1).to(emb_goal_trans.dtype)
+            emb_goal_hor = emb_goal_hor * goal_keep_mask.unsqueeze(
+                -1).to(emb_goal_hor.dtype)
+            emb_goal_vert = emb_goal_vert * y[
+                'goal_vertical_condition_keep_mask'].unsqueeze(
+                    -1).to(emb_goal_vert.dtype)
             emb_goal_rot = emb_goal_rot * y[
                 'goal_orientation_condition_keep_mask'].unsqueeze(
                     -1).to(emb_goal_rot.dtype)
@@ -391,7 +467,8 @@ class DenoiserMLP(nn.Module):
                     'arrival_time_condition_keep_mask']
             emb_goal = torch.cat(
                 (
-                    emb_goal_trans,
+                    emb_goal_hor,
+                    emb_goal_vert,
                     emb_goal_rot,
                     emb_goal_pose,
                     emb_goal_vel,
@@ -494,10 +571,12 @@ class DenoiserTransformer(nn.Module):
                                                self.sequence_pos_encoder)
 
         if self.goal_encoding is GoalEncoding.SPLIT:
-            self.embed_goal_trans = MLP(
-                12, h_dims=(self.h_dim, self.h_dim), activation=activation)
-            self.embed_goal_rot = MLP(
+            self.embed_goal_hor = MLP(
                 9, h_dims=(self.h_dim, self.h_dim), activation=activation)
+            self.embed_goal_vert = MLP(
+                6, h_dims=(self.h_dim, self.h_dim), activation=activation)
+            self.embed_goal_rot = MLP(
+                6, h_dims=(self.h_dim, self.h_dim), activation=activation)
             self.embed_goal_pose = MLP(
                 29, h_dims=(self.h_dim, self.h_dim), activation=activation)
             self.embed_goal_vel = MLP(
@@ -578,6 +657,7 @@ class DenoiserTransformer(nn.Module):
             y['goal_condition_keep_mask'] = goal_keep_mask
             if self.goal_encoding is GoalEncoding.SPLIT:
                 y['goal_orientation_condition_keep_mask'] = goal_keep_mask
+                y['goal_vertical_condition_keep_mask'] = goal_keep_mask
                 y['goal_joint_condition_keep_mask'] = goal_keep_mask
                 y['goal_velocity_condition_keep_mask'] = goal_keep_mask
                 y['goal_time_condition_keep_mask'] = goal_keep_mask
@@ -679,8 +759,10 @@ class DenoiserTransformer(nn.Module):
         emb_noise = self.embed_noise(x_t).permute(1, 0, 2)  # [1, bs, d]
 
         if self.goal_encoding is GoalEncoding.SPLIT:
-            emb_goal_trans = self.embed_goal_trans(
-                goal[:, SPLIT_POSITION_SLICE]).unsqueeze(0)
+            emb_goal_hor = self.embed_goal_hor(
+                goal[:, SPLIT_HORIZONTAL_SLICE]).unsqueeze(0)
+            emb_goal_vert = self.embed_goal_vert(
+                goal[:, SPLIT_VERTICAL_SLICE]).unsqueeze(0)
             emb_goal_rot = self.embed_goal_rot(
                 goal[:, SPLIT_ORIENTATION_SLICE]).unsqueeze(0)
             emb_goal_pose = self.embed_goal_pose(
@@ -691,8 +773,11 @@ class DenoiserTransformer(nn.Module):
             # bias, but let the slot PE survive so the transformer still knows
             # which condition is missing.  The time condition is its own
             # arrival-PE token; it is not added into the other goal tokens.
-            emb_goal_trans = emb_goal_trans * goal_keep_mask.unsqueeze(
-                -1).to(emb_goal_trans.dtype)
+            emb_goal_hor = emb_goal_hor * goal_keep_mask.unsqueeze(
+                -1).to(emb_goal_hor.dtype)
+            emb_goal_vert = emb_goal_vert * y[
+                'goal_vertical_condition_keep_mask'].unsqueeze(
+                    -1).to(emb_goal_vert.dtype)
             emb_goal_rot = emb_goal_rot * y[
                 'goal_orientation_condition_keep_mask'].unsqueeze(
                     -1).to(emb_goal_rot.dtype)
@@ -708,7 +793,8 @@ class DenoiserTransformer(nn.Module):
                     'arrival_time_condition_keep_mask']
             xseq_parts = [
                 emb_time,
-                emb_goal_trans,
+                emb_goal_hor,
+                emb_goal_vert,
                 emb_goal_rot,
                 emb_goal_pose,
                 emb_goal_vel,

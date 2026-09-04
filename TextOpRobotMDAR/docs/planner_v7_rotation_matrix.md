@@ -1321,14 +1321,14 @@ which dataset frames carry the planner's reference and the goal under the
 arrival-state alignment, how every goal channel is derived and supervised
 by the LDM losses, and what changes in the closed-loop controller path.
 The concrete goal-encoding layout is specified in §4.6.1-4.6.2 below
-(the base goal plus derived priors, `G_t = [G_t^base, G_t^prior]`), and
+(the 55-D token-first split `G_t = [hor, vert, rot, joint, vel, time]`), and
 the goal-loss design in §4.6.3;
 the rest of this subsection pins the conventions that layout must
-satisfy (the `(h_g, Δp_g^hor)` position split, the
-reconstructed-trajectory goal orientation, the full arriving velocity);
+satisfy (the horizontal/vertical root split, the reconstructed-trajectory
+goal orientation, the full arriving velocity);
 the SONIC integration check remains for the LDM integration phase.
 
-#### 4.6.1 Goal representation: base goal + derived priors
+#### 4.6.1 Goal representation: hor/vert split + derived priors
 
 **Design statement.** The goal conditioning separates target-state
 specification from learning priors:
@@ -1442,31 +1442,62 @@ explicitly:
 - `d_hor / T` — scalar urgency;
 - `Δh_{t*}/T` — vertical urgency.
 
-The complete goal conditioning concatenates the two parts:
+The complete goal conditioning is still a 55-D deterministic vector, but
+its flat order is now token-first rather than a global base/prior split:
 
 $$
-\boxed{\mathbf G_t = \left[ \mathbf G_t^{\rm base}, \mathbf G_t^{\rm prior} \right] . }
+\boxed{\mathbf G_t =
+[\mathbf G_t^{\rm hor},\mathbf G_t^{\rm vert},\mathbf G_t^{\rm rot},
+\mathbf G_t^{\rm joint},\mathbf G_t^{\rm vel},T] .}
 $$
 
 $$
-\boxed{\text{base representation preserves target-state semantics;}
-\quad \text{derived priors expose reaching geometry and urgency.}}
+\boxed{\text{horizontal navigation and vertical/posture recovery are
+conditioned asymmetrically.}}
 $$
 
 The priors are a deterministic function of the base channels plus `s_t`
 and `T`, so they can never contradict the base goal — see §4.6.2 for
 why this redundancy is safe, unlike redundancy in the motion feature.
 
-**Token layout (split convention kept).** `G_t` keeps the v3
-split-embedding structure: per token the base channels stay in the split
-order (position, orientation, joint, velocity, time), and each derived
-prior is appended **inside the block of the base channels it derives
-from** — the position-derived priors (`d_hor`, the log-scale cue,
-`Δh_{t*}`, `^{E_t}Δp_{t*}^hor/T`, `d_hor/T`, `Δh_{t*}/T`) sit in the
-position block together with `emb_goal_position` (which already holds
-`[h_{t*}, ^{E_t}Δp_{t*}^hor]`), and likewise for any future prior. The
-position block therefore carries 4 base + 8 priors = 12 channels, and
-`G_t` totals 55 (47 base + 8 priors).
+**Token layout (hor/vert split).** `G_t` keeps the split-embedding
+principle, but the old position/orientation split is replaced by an
+explicit horizontal/vertical asymmetry:
+
+- `hor` token, channels `0:9`:
+  `[^{E_t}Δp_{t*}^{hor}(3), d_hor,
+  log(1+d_hor/s_d), ^{E_t}Δp_{t*}^{hor}/T_eff(3), d_hor/T_eff]`.
+  This token carries horizontal navigation only. The log-distance channel
+  stays in the 55-D layout but can be ablated with
+  `data.goal_include_log_d_hor=false`, which sets channel `4` to zero in
+  both training and planner-side goal construction.
+- `vert` token, channels `9:15`:
+  `[h_{t*}, Δh_{t*}, g_{t*}(3), Δh_{t*}/T_eff]`.
+  This token carries ground-relative height and goal gravity; it is the
+  posture/recovery cue used to identify lying, get-up and other vertical
+  behavior modes.
+- `rot` token, channels `15:21`: `ρ_6(R_t^T R_{t*})` only. `g_{t*}` is
+  intentionally removed from this token.
+- `joint` token, channels `21:50`: `q_{t*}`.
+- `vel` token, channels `50:54`:
+  `[^{E_t}v_{t*}^{hor}(3), v_{t*}^{vert}]`.
+- `time` channel, `54:55`: `T` in seconds in the raw goal vector. In the
+  denoiser this is embedded by `ArrivalTimeEmbedder(time_to_arrival_frame)`
+  as its own token; the arrival PE is not manually added to the other
+  goal tokens. Slot positional encodings are still kept for all goal
+  tokens, including masked tokens.
+
+`T_eff` is the time budget after optional goal-clamp capping; if the
+original arrival time is zero, all urgency channels are zeroed. `G_t`
+therefore remains 55-D (47 base channels + 8 deterministic priors), but
+the model consumes six split goal tokens instead of the previous five:
+`hor`, `vert`, `rot`, `joint`, `vel`, and `time`. Because the dimension
+does not change while the semantics do, `goal_stats.pkl` must be
+refrozen with `goal_schema = "rotmat_v7_hor_vert"`; old
+`goal_schema = "rotmat_v7"` caches must be rejected. The
+`goal_include_log_d_hor` flag is also stored in the stats metadata, so a
+log-distance ablation run cannot accidentally reuse stats from the
+opposite setting.
 
 #### 4.6.2 Redundancy: motion outputs vs. goal inputs
 
@@ -2181,11 +2212,13 @@ ablation studies:
    single feature slot `t*−1` (vertical part from the authoritative
    heights, §4), and no separate current-state condition is needed. The
    concrete goal-encoding layout is now specified:
-   `G_t = [G_t^base, G_t^prior]` (§4.6.1-4.6.2) — the base goal
-   `(h, Δp^hor, g, ρ_6, v^hor, v^vert, q, T)` plus the derived priors
-   (`d_hor`, multi-scale distance, `Δh`, directional and vertical
-   urgency), constructed deterministically from `(s_t, s_{t*}, T)` under
-   the §4.6 conventions. What remains for the LDM integration phase:
+   `G_t = [hor, vert, rot, joint, vel, time]` (§4.6.1-4.6.2): `hor`
+   contains only horizontal navigation (`Δp^hor`, distance, log distance,
+   horizontal urgency), `vert` groups `h`, `Δh`, goal gravity `g` and
+   vertical urgency as the recovery/posture cue, `rot` contains only
+   `rot6d`, and the independent time token comes from
+   `ArrivalTimeEmbedder(time_to_arrival_frame)` without being manually
+   added to other tokens. What remains for the LDM integration phase:
    (a) the goal-loss weight set (§4.6.3) — reference starting values:
    `goal_root_position` 1.0, `goal_root_orientation` 0.2 (chordal),
    `goal_joint_angle` 0.1 (down from 0.2 to avoid double-incentivizing
@@ -2202,12 +2235,13 @@ ablation studies:
    the derived-prior normalization and `s_d` — `s_d` is the training-set
    median (p50) of the clamped `d_hor` distribution, computed in the
    goal-statistics refreeze (§4.6.1); per-channel prior normalization
-   follows; (e) the encoding-layout migration — the split convention is
-   kept (§4.6.1: priors sit in the block of their source base channels);
-   remaining work is implementation only (`G_t` = 55 channels replaces
-   the split45 encoding, `goal_dim`/conditioning-head/goal-stats
-   pipeline); and (f) the SONIC interface verification (§4.2) —
-   deferred: it belongs to the post-training closed-loop planner phase,
+   follows and `s_o` scales `[g(3), rot6d(6)]`; (e) the encoding-layout
+   migration — the split convention is kept but now uses six goal tokens;
+   `goal_dim` remains 55, so the `goal_schema="rotmat_v7_hor_vert"`
+   metadata plus `goal_include_log_d_hor` flag are mandatory and old
+   `rotmat_v7` stats/checkpoints must not be
+   treated as compatible; and (f) the SONIC interface verification (§4.2)
+   — deferred: it belongs to the post-training closed-loop planner phase,
    not to the LDM integration phase.
 8. **BONES-SEED CSV Euler convention — resolved.** Extrinsic xyz,
    verified against the official SEED G1 CSV spec and a synthetic SciPy

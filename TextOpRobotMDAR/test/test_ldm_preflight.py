@@ -49,6 +49,12 @@ from TextOpRobotMDAR.robotmdar.dtype.rotation import (
 from TextOpRobotMDAR.robotmdar.utils import goal as goal_module
 from TextOpRobotMDAR.robotmdar.utils.goal import (
     SPLIT_GOAL_DIM,
+    SPLIT_HORIZONTAL_SLICE,
+    SPLIT_JOINT_SLICE,
+    SPLIT_ORIENTATION_SLICE,
+    SPLIT_TIME_SLICE,
+    SPLIT_VERTICAL_SLICE,
+    SPLIT_VELOCITY_SLICE,
     build_ego_joint_state_goal_v6,
     build_ego_split_goal,
     validate_goal_stats,
@@ -206,8 +212,14 @@ def test_split_goal_se2_invariance():
         dof, Q @ velocity,
     )
     assert G.shape == (SPLIT_GOAL_DIM,)
-    for s in (slice(0, 12), slice(12, 21), slice(21, 50),
-              slice(50, 54), slice(54, 55)):
+    for s in (
+            SPLIT_HORIZONTAL_SLICE,
+            SPLIT_VERTICAL_SLICE,
+            SPLIT_ORIENTATION_SLICE,
+            SPLIT_JOINT_SLICE,
+            SPLIT_VELOCITY_SLICE,
+            SPLIT_TIME_SLICE,
+    ):
         assert_close(G[s], Gp[s], rtol=1e-8, atol=1e-8)
 
 
@@ -413,6 +425,15 @@ def test_train_dar_config_freezes_v6_contract():
     assert motion_feature_dim_for_dof(29, feature_version=6) == 44
     assert cfg.data.goal_type == "joint_state"
     assert cfg.data.goal_encoding == "split"
+    assert cfg.data.goal_include_log_d_hor is True
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg_without_log = compose(
+            config_name="train_dar",
+            overrides=["data.goal_include_log_d_hor=false"],
+        )
+    assert cfg_without_log.data.goal_include_log_d_hor is False
+    assert cfg_without_log.data.train.goal_include_log_d_hor is False
+    assert cfg_without_log.data.val.goal_include_log_d_hor is False
     assert cfg.data.load_scene is False
     assert cfg.denoiser.goal_dim == SPLIT_GOAL_DIM
     assert cfg.data.history_len == 16 and cfg.data.future_len == 64
@@ -514,4 +535,5 @@ def test_frozen_vae_statistics_and_goal_stats_on_disk():
         fps=50.0,
         goal_timestep_mode="relative",
         datadir=str(datadir),
+        goal_include_log_d_hor=True,
     )

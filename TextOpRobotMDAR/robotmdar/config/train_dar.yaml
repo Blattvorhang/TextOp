@@ -29,6 +29,7 @@ data:
   # future frame inside each primitive window.
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
+  goal_include_log_d_hor: true
   # Keep clean histories for the warm-up, then enable V7.1 history DR in the
   # dataloader. The server training launch may override this threshold.
   augmentation_enabled: true

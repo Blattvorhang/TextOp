@@ -18,6 +18,7 @@ data:
   goal_per_primitive: true
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
+  goal_include_log_d_hor: true
   # The task recomputes the stats explicitly; keep the dataset init from
   # loading (or silently caching) the datadir copy.
   load_goal_stats: false

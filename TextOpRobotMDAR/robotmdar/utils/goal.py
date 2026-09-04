@@ -22,6 +22,7 @@ JOINT_STATE_GOAL_DIM = 40
 ROT_MAT_JOINT_STATE_GOAL_DIM = 47
 SPLIT_GOAL_DIM = 55
 EXTENDED_BODY_GOAL_DIM = 21
+SPLIT_GOAL_SCHEMA = "rotmat_v7_hor_vert"
 
 V6_RAW_POSITION_SLICE = slice(0, 4)
 V6_RAW_ORIENTATION_SLICE = slice(4, 13)
@@ -29,11 +30,21 @@ V6_RAW_JOINT_SLICE = slice(13, 42)
 V6_RAW_VELOCITY_SLICE = slice(42, 46)
 V6_RAW_TIME_SLICE = slice(46, 47)
 
-SPLIT_POSITION_SLICE = slice(0, 12)
-SPLIT_ORIENTATION_SLICE = slice(12, 21)
+SPLIT_HORIZONTAL_SLICE = slice(0, 9)
+SPLIT_HORIZONTAL_URGENCY_SLICE = slice(5, 9)
+SPLIT_VERTICAL_SLICE = slice(9, 15)
+SPLIT_VERTICAL_HEIGHT_SLICE = slice(9, 11)
+SPLIT_VERTICAL_GRAVITY_SLICE = slice(11, 14)
+SPLIT_VERTICAL_URGENCY_SLICE = slice(14, 15)
+SPLIT_ORIENTATION_SLICE = slice(15, 21)
 SPLIT_JOINT_SLICE = slice(21, 50)
 SPLIT_VELOCITY_SLICE = slice(50, 54)
 SPLIT_TIME_SLICE = slice(54, 55)
+
+# Backward-compatible name for callers that still treat the first split goal
+# block as the root-position token.  In the current schema it is the horizontal
+# navigation token.
+SPLIT_POSITION_SLICE = SPLIT_HORIZONTAL_SLICE
 
 # Percentiles of the training goal distribution stored in goal_stats.pkl.
 # The dataset statistics pipeline quantizes the per-window ego goal distance
@@ -111,7 +122,7 @@ class GoalEncoding(str, Enum):
 
     @property
     def token_count(self) -> int:
-        return 5 if self is GoalEncoding.SPLIT else 1
+        return 6 if self is GoalEncoding.SPLIT else 1
 
     @property
     def uses_split_statistics(self) -> bool:
@@ -136,6 +147,7 @@ def validate_goal_config(
     goal_offset_range=None,
     goal_timestep_mode: str | None = None,
     goal_stats: Optional[dict] = None,
+    goal_include_log_d_hor: bool | None = None,
 ) -> GoalType:
     """Validate and return the configured goal type."""
     parsed = GoalType.parse(goal_type)
@@ -200,6 +212,7 @@ def validate_goal_config(
             goal_encoding=parsed_encoding,
             goal_offset_range=parsed_offsets,
             goal_timestep_mode=goal_timestep_mode,
+            goal_include_log_d_hor=goal_include_log_d_hor,
         )
 
     return parsed
@@ -740,6 +753,7 @@ def build_ego_split_goal(
     fps: float,
     goal_clamp: Optional[GoalClamp] = None,
     distance_scale: Optional[float | torch.Tensor] = None,
+    goal_include_log_d_hor: bool = True,
 ) -> torch.Tensor:
     """Express a GT-frame joint_state goal as the 55-D v7 split vector."""
     raw = build_ego_joint_state_goal_v6(
@@ -756,7 +770,8 @@ def build_ego_split_goal(
 
     h_goal = raw[..., 0:1]
     delta_hor = raw[..., 1:4]
-    orientation = raw[..., 4:13]
+    goal_g = raw[..., 4:7]
+    rel_rot6d = raw[..., 7:13]
     dof = raw[..., 13:42]
     velocity = raw[..., 42:46]
     time_to_arrival_seconds = raw[..., 46]
@@ -770,6 +785,8 @@ def build_ego_split_goal(
             distance_scale, device=raw.device, dtype=raw.dtype)
     log_d_hor = torch.log1p(
         d_hor / distance_scale_tensor.clamp_min(1e-6))
+    if not goal_include_log_d_hor:
+        log_d_hor = torch.zeros_like(log_d_hor)
     delta_h = h_goal - reference_pos.to(
         device=raw.device, dtype=raw.dtype)[..., 2:3]
     T_eff = _goal_time_budget(time_to_arrival_seconds, fps, goal_clamp)
@@ -778,11 +795,15 @@ def build_ego_split_goal(
         torch.cat((delta_hor, d_hor, delta_h), dim=-1) / T_eff[..., None],
         torch.zeros_like(torch.cat((delta_hor, d_hor, delta_h), dim=-1)),
     )
-    f_trans = torch.cat(
-        (h_goal, delta_hor, d_hor, log_d_hor, delta_h, urgency),
+    urgency_hor = urgency[..., 0:4]
+    urgency_vert = urgency[..., 4:5]
+    f_hor = torch.cat(
+        (delta_hor, d_hor, log_d_hor, urgency_hor),
         dim=-1,
     )
-    return torch.cat((f_trans, orientation, dof, velocity, raw[..., 46:47]), dim=-1)
+    f_vert = torch.cat((h_goal, delta_h, goal_g, urgency_vert), dim=-1)
+    return torch.cat(
+        (f_hor, f_vert, rel_rot6d, dof, velocity, raw[..., 46:47]), dim=-1)
 
 
 def scale_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
@@ -802,6 +823,11 @@ def scale_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
             f"goal_stats were computed for goal_dim={meta.get('goal_dim')}, "
             f"expected {SPLIT_GOAL_DIM}"
         )
+    if str(meta.get("goal_schema", "")) != SPLIT_GOAL_SCHEMA:
+        raise ValueError(
+            f"goal_stats were computed for schema "
+            f"{meta.get('goal_schema')!r}, expected {SPLIT_GOAL_SCHEMA!r}"
+        )
 
     s_p = torch.as_tensor(goal_stats["s_p"], device=goal.device, dtype=goal.dtype)
     s_l = torch.as_tensor(goal_stats["s_l"], device=goal.device, dtype=goal.dtype)
@@ -816,11 +842,13 @@ def scale_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
             f"{s_o.numel()}"
         )
 
-    scaled[..., 0:5] = scaled[..., 0:5] * s_p
-    scaled[..., 5:6] = scaled[..., 5:6] * s_l
-    scaled[..., 6:7] = scaled[..., 6:7] * s_p
-    scaled[..., 7:12] = scaled[..., 7:12] * s_v
-    scaled[..., 12:21] = scaled[..., 12:21] * s_o
+    scaled[..., 0:4] = scaled[..., 0:4] * s_p
+    scaled[..., 4:5] = scaled[..., 4:5] * s_l
+    scaled[..., 5:9] = scaled[..., 5:9] * s_v
+    scaled[..., 9:11] = scaled[..., 9:11] * s_p
+    scaled[..., 11:14] = scaled[..., 11:14] * s_o[:3]
+    scaled[..., 14:15] = scaled[..., 14:15] * s_v
+    scaled[..., 15:21] = scaled[..., 15:21] * s_o[3:9]
     scaled[..., 21:50] = (scaled[..., 21:50] - q_mean) / q_std.clamp_min(1e-6)
     scaled[..., 50:54] = scaled[..., 50:54] * s_v
     return scaled
@@ -836,6 +864,7 @@ def validate_goal_stats(
     fps: float | None = None,
     goal_timestep_mode: str | None = None,
     datadir: str | None = None,
+    goal_include_log_d_hor: bool | None = None,
 ) -> dict:
     """Validate the cached goal statistics against the active config."""
     if goal_stats is None:
@@ -887,6 +916,18 @@ def validate_goal_stats(
         mismatches.append(
             f"goal_dim: expected {SPLIT_GOAL_DIM}, got {meta.get('goal_dim')}"
         )
+    if str(meta.get("goal_schema", "")) != SPLIT_GOAL_SCHEMA:
+        mismatches.append(
+            f"goal_schema: expected {SPLIT_GOAL_SCHEMA!r}, got "
+            f"{meta.get('goal_schema')!r}"
+        )
+    if goal_include_log_d_hor is not None:
+        stored_include_log = bool(meta.get("goal_include_log_d_hor", True))
+        if stored_include_log != bool(goal_include_log_d_hor):
+            mismatches.append(
+                "goal_include_log_d_hor: expected "
+                f"{bool(goal_include_log_d_hor)}, got {stored_include_log}"
+            )
     for key in ("s_p", "s_l", "s_v", "s_o", "s_d", "q_mean", "q_std"):
         if key not in goal_stats:
             mismatches.append(f"missing {key!r}")
@@ -920,7 +961,8 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
                    time_to_arrival_seconds: Optional[torch.Tensor] = None,
                    world_goal_rot: Optional[torch.Tensor] = None,
                    world_goal_dof: Optional[torch.Tensor] = None,
-                   goal_clamp: Optional[GoalClamp] = None) -> torch.Tensor:
+                   goal_clamp: Optional[GoalClamp] = None,
+                   goal_include_log_d_hor: bool = True) -> torch.Tensor:
     """Express a world-space root or body goal in the local X-forward frame."""
     goal_type = GoalType.parse(goal_type)
     parsed_encoding = (
@@ -963,6 +1005,14 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
             raise ValueError(
                 "fps is required for split/single joint_state goals"
             )
+        stored_include_log = bool(
+            goal_stats.get("meta", {}).get("goal_include_log_d_hor", True))
+        if stored_include_log != bool(goal_include_log_d_hor):
+            raise ValueError(
+                "goal_stats were computed with goal_include_log_d_hor="
+                f"{stored_include_log}, but the active goal builder requested "
+                f"{bool(goal_include_log_d_hor)}"
+            )
         split_goal = build_ego_split_goal(
             world_goal_pos=world_goal_pos,
             world_goal_rot=world_goal_rot,
@@ -974,6 +1024,7 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
             fps=resolved_fps,
             goal_clamp=goal_clamp,
             distance_scale=goal_stats.get("s_d", 1.0),
+            goal_include_log_d_hor=goal_include_log_d_hor,
         )
         return scale_goal(split_goal, goal_stats)
 

@@ -18,6 +18,12 @@ from robotmdar.utils.goal import (
     GoalType,
     JOINT_STATE_GOAL_DIM,
     ROT_MAT_JOINT_STATE_GOAL_DIM,
+    SPLIT_GOAL_DIM,
+    SPLIT_HORIZONTAL_SLICE,
+    SPLIT_JOINT_SLICE,
+    SPLIT_ORIENTATION_SLICE,
+    SPLIT_VELOCITY_SLICE,
+    SPLIT_VERTICAL_HEIGHT_SLICE,
     V6_RAW_JOINT_SLICE,
     V6_RAW_ORIENTATION_SLICE,
     V6_RAW_POSITION_SLICE,
@@ -1063,7 +1069,8 @@ class GeometryLoss:
                                      goal_time_frame=None):
         """Match generated horizontal root displacement to the goal endpoint."""
         if (motion_dtype.FeatureVersion == 6
-                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+                and ego_goal.shape[-1]
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
             goal_state = self._future_goal_state_v6(
                 future_motion_pred, history_motion,
                 goal_time_frame=goal_time_frame)
@@ -1074,7 +1081,15 @@ class GeometryLoss:
                 ),
                 dim=-1,
             )
-            target = ego_goal[..., V6_RAW_POSITION_SLICE]
+            if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+                vertical = ego_goal[..., SPLIT_VERTICAL_HEIGHT_SLICE]
+                horizontal = ego_goal[..., SPLIT_HORIZONTAL_SLICE]
+                target = torch.cat(
+                    (vertical[..., :1], horizontal[..., :3]),
+                    dim=-1,
+                )
+            else:
+                target = ego_goal[..., V6_RAW_POSITION_SLICE]
             valid = torch.ones(
                 target.shape[0], dtype=torch.bool, device=target.device)
             if goal_condition_keep_mask is not None:
@@ -1193,16 +1208,21 @@ class GeometryLoss:
     ):
         """Match TextOp-style root orientation at the selected goal frame."""
         if (motion_dtype.FeatureVersion == 6
-                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+                and ego_goal.shape[-1]
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
             if goal_state is None:
                 goal_state = self._future_goal_state_v6(
                     future_motion_pred, history_motion,
                     goal_time_frame=goal_time_frame)
             predicted = goal_state['rel_rot_at_goal']
-            target = ego_goal[..., V6_RAW_ORIENTATION_SLICE]
-            target_R = rot6d_to_matrix(target[..., 3:9])
+            if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+                target_rot6d = ego_goal[..., SPLIT_ORIENTATION_SLICE]
+            else:
+                target = ego_goal[..., V6_RAW_ORIENTATION_SLICE]
+                target_rot6d = target[..., 3:9]
+            target_R = rot6d_to_matrix(target_rot6d)
             valid = self._valid_goal_component_mask(
-                target.shape[0], target.device,
+                target_rot6d.shape[0], target_rot6d.device,
                 goal_orientation_condition_keep_mask)
             if not valid.any():
                 return future_motion_pred.sum() * 0.0
@@ -1242,11 +1262,16 @@ class GeometryLoss:
                 f"{dof_dim}"
             )
         if (motion_dtype.FeatureVersion == 6
-                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+                and ego_goal.shape[-1]
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
             selected = self._future_feature_at_goal(
                 future_motion_pred, goal_time_frame, goal_state=goal_state)
             predicted = selected[..., 13:42]
-            target = ego_goal[..., V6_RAW_JOINT_SLICE]
+            target = (
+                ego_goal[..., SPLIT_JOINT_SLICE]
+                if ego_goal.shape[-1] == SPLIT_GOAL_DIM
+                else ego_goal[..., V6_RAW_JOINT_SLICE]
+            )
             valid = self._valid_goal_component_mask(
                 target.shape[0], target.device, goal_joint_condition_keep_mask)
             if not valid.any():
@@ -1274,13 +1299,18 @@ class GeometryLoss:
     ):
         """Match reference-ego root velocity at the selected goal frame."""
         if (motion_dtype.FeatureVersion == 6
-                and ego_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
+                and ego_goal.shape[-1]
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
             if goal_state is None:
                 goal_state = self._future_goal_state_v6(
                     future_motion_pred, history_motion,
                     goal_time_frame=goal_time_frame)
             predicted = goal_state['velocity_at_goal']
-            target = ego_goal[..., V6_RAW_VELOCITY_SLICE]
+            target = (
+                ego_goal[..., SPLIT_VELOCITY_SLICE]
+                if ego_goal.shape[-1] == SPLIT_GOAL_DIM
+                else ego_goal[..., V6_RAW_VELOCITY_SLICE]
+            )
             valid = self._valid_goal_component_mask(
                 target.shape[0], target.device,
                 goal_velocity_condition_keep_mask)
@@ -1611,7 +1641,11 @@ def calc_dar_loss(
             goal_time_frame=goal_time_frame,
         )
 
-    joint_goal_dims = (JOINT_STATE_GOAL_DIM, ROT_MAT_JOINT_STATE_GOAL_DIM)
+    joint_goal_dims = (
+        JOINT_STATE_GOAL_DIM,
+        ROT_MAT_JOINT_STATE_GOAL_DIM,
+        SPLIT_GOAL_DIM,
+    )
     if ego_goal is not None and ego_goal.shape[-1] in joint_goal_dims:
         compute_goal_root_orientation = (
             self.loss_weight.get('goal_root_orientation', 0.0) > 0.0

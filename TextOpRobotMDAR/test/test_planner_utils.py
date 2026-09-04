@@ -27,6 +27,7 @@ from TextOpRobotMDAR.robotmdar.dtype.motion import (
 )
 from TextOpRobotMDAR.robotmdar.dtype.rotation import euler_angles_to_quaternion
 from TextOpRobotMDAR.robotmdar.skeleton.robot import RobotSkeleton
+from TextOpRobotMDAR.robotmdar.utils.goal import GoalEncoding
 
 
 class IdentityNormalization:
@@ -49,6 +50,10 @@ def _set_both_feature_versions(version: int):
     runtime_motion_dtype.set_feature_version(version)
     package_motion_dtype.set_feature_version(version)
     return old_runtime, old_package
+
+
+def _xyzw_to_wxyz_np(values):
+    return np.ascontiguousarray(np.asarray(values)[..., [3, 0, 1, 2]])
 
 
 def test_fk_preserves_non_upright_root_quaternion():
@@ -182,7 +187,7 @@ def test_controller_history_ends_at_current_non_upright_pose():
     joints = np.zeros((5, 29), dtype=np.float32)
     state = SimpleNamespace(raw={
         "g1_pos": positions,
-        "g1_root_rot": rotations,
+        "g1_root_rot": _xyzw_to_wxyz_np(rotations),
         "g1_joint_pos": joints,
     })
 
@@ -209,9 +214,9 @@ def test_controller_29dof_history_builds_legacy_57d_model_input():
         [0.2, 0.0, 0.77],
     ], dtype=np.float32)
     rotations = np.asarray([
-        [0.0, 0.0, 0.0, 1.0],
-        [0.0, 0.0, 0.0, 1.0],
-        [0.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
     ], dtype=np.float32)
     joints = np.stack([
         np.arange(29, dtype=np.float32) + frame * 100.0
@@ -246,9 +251,9 @@ def test_controller_v6_history_consumes_h_plus_one_physical_states():
             [0.2, 0.0, 0.77],
         ], dtype=np.float32)
         rotations = np.asarray([
-            [0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
         ], dtype=np.float32)
         joints = np.zeros((3, 29), dtype=np.float32)
         state = SimpleNamespace(raw={
@@ -275,6 +280,62 @@ def test_controller_v6_history_consumes_h_plus_one_physical_states():
         package_motion_dtype.set_feature_version(old_package)
 
 
+def test_joint_state_goal_falls_back_when_condition_blocks_invalid():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        positions = np.asarray([
+            [0.0, 0.0, 0.77],
+            [0.1, 0.0, 0.78],
+            [0.2, 0.0, 0.79],
+        ], dtype=np.float32)
+        rotations = np.asarray([
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ], dtype=np.float32)
+        joints = np.stack([
+            np.arange(29, dtype=np.float32) + frame * 100.0
+            for frame in range(3)
+        ])
+        state = SimpleNamespace(
+            raw={
+                "g1_pos": positions,
+                "g1_root_rot": rotations,
+                "g1_joint_pos": joints,
+            },
+            goal_type="joint_state",
+            goal_root_pos_world=None,
+            goal_root_velocity_world=None,
+            goal_root_rot_world=None,
+            goal_dof_pos=None,
+            goal_timestamp_ns=None,
+            timestamps_ns=None,
+            goal_root_valid=False,
+            goal_orientation_valid=False,
+            goal_joint_valid=False,
+            goal_velocity_valid=False,
+            goal_time_valid=False,
+        )
+
+        goal = state_to_ego_goal(
+            state, "cpu", goal_type="joint_state",
+            goal_encoding=GoalEncoding.LEGACY40, fps=50.0)
+
+        assert goal.shape == (1, 47)
+        assert torch.isfinite(goal).all()
+        torch.testing.assert_close(
+            goal[:, 0], torch.tensor([positions[-1, 2]]))
+        torch.testing.assert_close(goal[:, 1:4], torch.zeros((1, 3)))
+        torch.testing.assert_close(goal[:, 42:46], torch.zeros((1, 4)))
+        torch.testing.assert_close(goal[:, 46:], torch.zeros((1, 1)))
+        torch.testing.assert_close(
+            goal[:, 13:42],
+            torch.as_tensor(isaaclab_to_mujoco_dof(joints[-1:])))
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
 def test_goal_uses_current_history_feature_reference():
     state = SimpleNamespace(
         goal_root_pos_world=np.asarray([2.0, 1.0, 0.77], dtype=np.float32),
@@ -286,9 +347,9 @@ def test_goal_uses_current_history_feature_reference():
                 [1.1, 1.0, 0.77],
             ], dtype=np.float32),
             "g1_root_rot": np.asarray([
-                [0.0, 0.0, 0.0, 1.0],
-                [0.0, 0.0, 0.0, 1.0],
-                [0.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
             ], dtype=np.float32),
         },
     )
@@ -327,8 +388,8 @@ def test_generated_history_alignment_translates_anchor_without_mutation():
             [10.0, 20.0, 0.9],
         ], dtype=np.float32),
         "g1_root_rot": np.asarray([
-            [0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
         ], dtype=np.float32),
     })
 
@@ -369,7 +430,7 @@ def test_generated_history_alignment_corrects_absolute_height_channel():
     real_pos = torch.tensor([[10.0, 20.0, 0.25]])
     state = SimpleNamespace(raw={
         "g1_pos": real_pos.numpy(),
-        "g1_root_rot": real_rot.numpy(),
+        "g1_root_rot": _xyzw_to_wxyz_np(real_rot.numpy()),
     })
 
     (aligned_pose, _, _, _, aligned_history) = align_generated_history_pose(

@@ -40,6 +40,7 @@ goal_type: joint_state
 goal_encoding: split
 goal_per_primitive: true
 goal_timestep_mode: relative
+goal_include_log_d_hor: true
 occupancy_unit: 0.08
 
 # Planner V7.1 history augmentation (LDM-only). This explicit opt-in keeps VAE
@@ -97,6 +98,7 @@ common: &common
   goal_encoding: ${..goal_encoding}
   goal_per_primitive: ${..goal_per_primitive}
   goal_timestep_mode: ${..goal_timestep_mode}
+  goal_include_log_d_hor: ${..goal_include_log_d_hor}
   augmentation_start_step: ${..augmentation_start_step}
   augmentation_prob: ${..augmentation_prob}
   augmentation_enabled: ${..augmentation_enabled}

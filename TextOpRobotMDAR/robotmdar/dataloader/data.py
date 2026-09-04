@@ -30,9 +30,11 @@ from robotmdar.utils.goal import (
     GOAL_CLAMP_QUANTILE_LEVELS,
     GoalEncoding,
     GoalType,
+    SPLIT_GOAL_SCHEMA,
+    SPLIT_HORIZONTAL_SLICE,
     SPLIT_JOINT_SLICE,
     SPLIT_ORIENTATION_SLICE,
-    SPLIT_POSITION_SLICE,
+    SPLIT_VERTICAL_SLICE,
     SPLIT_VELOCITY_SLICE,
     build_ego_split_goal,
     SPLIT_GOAL_DIM,
@@ -212,6 +214,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         goal_encoding: GoalEncoding | str | None = None,
         goal_per_primitive: bool = False,
         goal_timestep_mode: str = "relative",
+        goal_include_log_d_hor: bool = True,
         time_to_arrival_mode: Optional[str] = None,
         weighted_sample: bool = False,
         frame_weight: bool = False,
@@ -259,6 +262,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 f"{self.dof_dim}"
             )
         self.goal_per_primitive = goal_per_primitive
+        self.goal_include_log_d_hor = bool(goal_include_log_d_hor)
         if time_to_arrival_mode is not None:
             goal_timestep_mode = time_to_arrival_mode
         self.goal_timestep_mode = str(goal_timestep_mode).lower()
@@ -1048,7 +1052,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'dataset_path': str(self.datadir),
             'goal_type': self.goal_type.value,
             'goal_dim': SPLIT_GOAL_DIM,
-            'goal_schema': 'rotmat_v7',
+            'goal_schema': SPLIT_GOAL_SCHEMA,
+            'goal_include_log_d_hor': bool(self.goal_include_log_d_hor),
             'feature_version': motion_dtype.FeatureVersion,
             'dof_dim': int(self.dof_dim),
         }
@@ -1075,20 +1080,22 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 reference_rot=primitive['gt_ref_rot'],
                 time_to_arrival_seconds=primitive['time_to_arrival'],
                 fps=float(self.fps),
+                goal_include_log_d_hor=self.goal_include_log_d_hor,
             )
-            trans = goal[:, SPLIT_POSITION_SLICE]
+            hor = goal[:, SPLIT_HORIZONTAL_SLICE]
+            vert = goal[:, SPLIT_VERTICAL_SLICE]
             orientation = goal[:, SPLIT_ORIENTATION_SLICE]
             pose = goal[:, SPLIT_JOINT_SLICE]
             velocity = goal[:, SPLIT_VELOCITY_SLICE]
 
-            pos_terms.append(torch.cat((trans[:, 0:5], trans[:, 6:7]), dim=-1))
-            d_hor_terms.append(trans[:, 4:5])
-            urgency_terms.append(trans[:, 7:12])
-            orientation_terms.append(orientation)
+            pos_terms.append(torch.cat((hor[:, 0:4], vert[:, 0:2]), dim=-1))
+            d_hor_terms.append(hor[:, 3:4])
+            urgency_terms.append(torch.cat((hor[:, 5:9], vert[:, 5:6]), dim=-1))
+            orientation_terms.append(torch.cat((vert[:, 2:5], orientation), dim=-1))
             pose_terms.append(pose)
             velocity_terms.append(velocity)
 
-            goal_radius = trans[..., 4:5]
+            goal_radius = hor[..., 3:4]
             time_budget = torch.as_tensor(
                 primitive['time_to_arrival'],
                 device=goal_radius.device,
@@ -1106,7 +1113,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             d_hor.detach().reshape(-1).float().clamp_min(0.0),
             0.5,
         ).clamp(min=1e-6)
-        log_terms = torch.log1p(d_hor / s_d.to(d_hor.device, d_hor.dtype))
+        if self.goal_include_log_d_hor:
+            log_terms = torch.log1p(
+                d_hor / s_d.to(device=d_hor.device, dtype=d_hor.dtype)
+            )
+        else:
+            log_terms = torch.zeros_like(d_hor)
         urgency = torch.cat(urgency_terms, dim=0)
         orientation = torch.cat(orientation_terms, dim=0)
         pose = torch.cat(pose_terms, dim=0)
@@ -1123,7 +1135,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         )
 
         s_p = 1.0 / torch.clamp(pos.reshape(-1).std(unbiased=False), min=1e-6)
-        s_l = 1.0 / torch.clamp(log_terms.reshape(-1).std(unbiased=False), min=1e-6)
+        if self.goal_include_log_d_hor:
+            s_l = 1.0 / torch.clamp(
+                log_terms.reshape(-1).std(unbiased=False), min=1e-6)
+        else:
+            s_l = log_terms.new_tensor(1.0)
         s_v = 1.0 / torch.clamp(
             torch.cat((urgency.reshape(-1), velocity.reshape(-1)), dim=0).std(unbiased=False),
             min=1e-6,
@@ -1257,6 +1273,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 fps=float(self.fps),
                 goal_timestep_mode=self.goal_timestep_mode,
                 datadir=str(self.datadir),
+                goal_include_log_d_hor=self.goal_include_log_d_hor,
             )
         except ValueError:
             if self.split != 'train':

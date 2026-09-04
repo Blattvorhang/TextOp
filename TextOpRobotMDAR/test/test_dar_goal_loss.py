@@ -10,8 +10,10 @@ from TextOpRobotMDAR.robotmdar.dtype.rotation import matrix_to_rot6d
 from TextOpRobotMDAR.robotmdar.train.manager import DARManager
 from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _make_root_xy_figure,
+    _raw_goal_root_target,
     _validate_goal_root_position_contract,
 )
+from TextOpRobotMDAR.robotmdar.utils.goal import SPLIT_GOAL_DIM
 
 
 def _manager():
@@ -248,6 +250,75 @@ def test_v6_joint_state_goal_losses_use_arrival_rotmat_goal_frame():
         goal[0, 46] = 2.0 / 50.0
         goal_time_frame = torch.tensor([2])
 
+        torch.testing.assert_close(
+            manager.calc_goal_root_position_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            manager.calc_goal_root_orientation_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            manager.calc_goal_joint_angle_loss(
+                future, goal, goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            manager.calc_goal_root_velocity_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_v6_split_goal_losses_use_hor_vert_rot_layout():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.dataset.dof_dim = 29
+        manager.dataset.fps = 50
+
+        rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
+        history = torch.zeros((1, 2, 44), dtype=torch.float32)
+        future = torch.zeros((1, 4, 44), dtype=torch.float32)
+        for motion in (history, future):
+            motion[..., 0] = 0.77
+            motion[..., 1:4] = torch.tensor([0.0, 0.0, -1.0])
+            motion[..., 7:13] = rot6d_identity
+            motion[..., 42:44] = 1.0
+
+        future[0, 0:2, 4] = 0.25
+        q_goal = torch.linspace(-0.5, 0.5, 29)
+        future[0, 1, 13:42] = q_goal
+
+        goal = torch.zeros((1, SPLIT_GOAL_DIM), dtype=torch.float32)
+        goal[0, 0:3] = torch.tensor([0.5, 0.0, 0.0])
+        goal[0, 3] = 0.5
+        goal[0, 4] = torch.log1p(torch.tensor(0.5))
+        goal[0, 9:15] = torch.tensor([0.77, 0.0, 0.0, 0.0, -1.0, 0.0])
+        goal[0, 15:21] = rot6d_identity
+        goal[0, 21:50] = q_goal
+        goal[0, 50:54] = torch.tensor([12.5, 0.0, 0.0, 0.0])
+        goal[0, 54] = 2.0 / 50.0
+        goal_time_frame = torch.tensor([2])
+
+        torch.testing.assert_close(
+            _raw_goal_root_target(goal), torch.tensor([[0.5, 0.0, 0.0]]))
         torch.testing.assert_close(
             manager.calc_goal_root_position_loss(
                 future, goal, history_motion=history,
