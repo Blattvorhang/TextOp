@@ -31,7 +31,7 @@ from dataset.data_process.pack_motion_lib_to_textop import TARGET_DOF_NAMES
 
 DEFAULT_INPUT_DIR = REPO_ROOT / "data/motion_lib_filtered"
 DEFAULT_OUTPUT_SUBDIR = "aug_fall_recovery"
-DEFAULT_OCC_HIPC_ROOT = REPO_ROOT.parent / "occHIPC"
+DEFAULT_OCC_HIPC_ROOT = REPO_ROOT / "occHIPC"
 DEFAULT_G1_XML = (
     REPO_ROOT / "TextOpRobotMDAR/description/robots/g1/g1_29dof.xml"
 )
@@ -66,6 +66,7 @@ class AugmentConfig:
     torch_device: str
     occ_hipc_root: Path
     device: str
+    onnx_num_threads: int
     validate: bool
     recompute_contact: bool
     quiet_policy_init: bool
@@ -321,7 +322,7 @@ def _recompute_contact(
 
 
 class SonicValidator:
-    def __init__(self, occ_hipc_root: Path, device: str):
+    def __init__(self, occ_hipc_root: Path, device: str, onnx_num_threads: int):
         occ_hipc_root = occ_hipc_root.resolve()
         if str(occ_hipc_root) not in sys.path:
             sys.path.insert(0, str(occ_hipc_root))
@@ -371,7 +372,8 @@ class SonicValidator:
         self.model = mujoco.MjModel.from_xml_path(str(G1_XML))
         self.model.opt.timestep = SIMULATION_DT
         self.data = mujoco.MjData(self.model)
-        self.policy = SonicWbcPolicy(enc_path, dec_path, device=device)
+        with _patched_ort_session_options(onnx_num_threads):
+            self.policy = SonicWbcPolicy(enc_path, dec_path, device=device)
         self.action = np.zeros(NUM_ACTIONS, dtype=np.float32)
         self.target_dof_pos = default_angles.copy()
         self.zero_dq = np.zeros(NUM_ACTIONS, dtype=np.float64)
@@ -452,7 +454,34 @@ def _resolve_num_workers(requested: int, source_count: int) -> int:
     return max(1, min(source_count, cpu_count, DEFAULT_MAX_AUTO_WORKERS))
 
 
-def _limit_worker_threads() -> None:
+@contextlib.contextmanager
+def _patched_ort_session_options(num_threads: int):
+    if num_threads <= 0:
+        yield
+        return
+
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = num_threads
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+    original = ort.InferenceSession
+
+    def _create_session(path_or_bytes, *args, **kwargs):
+        kwargs.setdefault("sess_options", options)
+        return original(path_or_bytes, *args, **kwargs)
+
+    ort.InferenceSession = _create_session
+    try:
+        yield
+    finally:
+        ort.InferenceSession = original
+
+
+def _limit_worker_threads(num_threads: int) -> None:
+    value = str(max(1, num_threads))
     for name in (
         "OMP_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
@@ -460,7 +489,7 @@ def _limit_worker_threads() -> None:
         "NUMEXPR_NUM_THREADS",
         "VECLIB_MAXIMUM_THREADS",
     ):
-        os.environ.setdefault(name, "1")
+        os.environ[name] = value
 
 
 def _source_seeds(seed: int, source_count: int) -> list[int]:
@@ -476,9 +505,17 @@ def _init_worker(config: AugmentConfig, joint_limits: np.ndarray) -> None:
         _WORKER_VALIDATOR = None
     elif config.quiet_policy_init:
         with contextlib.redirect_stdout(io.StringIO()):
-            _WORKER_VALIDATOR = SonicValidator(config.occ_hipc_root, config.device)
+            _WORKER_VALIDATOR = SonicValidator(
+                config.occ_hipc_root,
+                config.device,
+                config.onnx_num_threads,
+            )
     else:
-        _WORKER_VALIDATOR = SonicValidator(config.occ_hipc_root, config.device)
+        _WORKER_VALIDATOR = SonicValidator(
+            config.occ_hipc_root,
+            config.device,
+            config.onnx_num_threads,
+        )
 
 
 def _augment_source_task(
@@ -562,12 +599,24 @@ def _augment_source_task(
     )
 
 
+def _write_source_result(output_dir: Path, result: SourceResult) -> int:
+    written = 0
+    for aug_name, candidate in result.accepted_entries:
+        out_path = output_dir / f"{aug_name}.pkl"
+        tmp_path = output_dir / f"{aug_name}.pkl.tmp"
+        joblib.dump({aug_name: candidate}, tmp_path, compress=3)
+        tmp_path.replace(out_path)
+        written += 1
+    return written
+
+
 def _run_augmentation_tasks(
     sources: list[tuple[Path, str, dict]],
     config: AugmentConfig,
     joint_limits: np.ndarray,
     num_workers: int,
     seed: int,
+    output_dir: Path,
 ) -> list[SourceResult]:
     seeds = _source_seeds(seed, len(sources))
     results: list[SourceResult | None] = [None] * len(sources)
@@ -589,9 +638,14 @@ def _run_augmentation_tasks(
             )
             for message in result.rejects:
                 tqdm.write(message, file=sys.stdout)
+            written = _write_source_result(output_dir, result)
+            tqdm.write(
+                f"[WRITE] {result.source_name}: {written} file(s)",
+                file=sys.stdout,
+            )
             results[result.index] = result
     else:
-        _limit_worker_threads()
+        _limit_worker_threads(config.onnx_num_threads or 1)
         with ProcessPoolExecutor(
             max_workers=num_workers,
             initializer=_init_worker,
@@ -617,6 +671,11 @@ def _run_augmentation_tasks(
                 result = future.result()
                 for message in result.rejects:
                     tqdm.write(message, file=sys.stdout)
+                written = _write_source_result(output_dir, result)
+                tqdm.write(
+                    f"[WRITE] {result.source_name}: {written} file(s)",
+                    file=sys.stdout,
+                )
                 results[result.index] = result
 
     missing = [idx for idx, result in enumerate(results) if result is None]
@@ -631,7 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--accepted-per-original", type=int, default=8)
+    parser.add_argument("--accepted-per-original", type=int, default=128)
     parser.add_argument(
         "--max-candidates-per-original",
         type=int,
@@ -655,6 +714,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["cpu", "cuda", "tensorrt"],
         default="cpu",
         help="SONIC ONNX Runtime device for validation.",
+    )
+    parser.add_argument(
+        "--onnx-num-threads",
+        type=int,
+        default=1,
+        help=(
+            "ONNX Runtime intra-op threads per validator process. "
+            "Use 0 to leave ORT defaults."
+        ),
     )
     parser.add_argument(
         "--num-workers",
@@ -689,6 +757,8 @@ def main() -> None:
         raise SystemExit("--accepted-per-original must be positive")
     if args.n_lying_min < 1 or args.n_lying_max < args.n_lying_min:
         raise SystemExit("Invalid n_lying bounds")
+    if args.onnx_num_threads < 0:
+        raise SystemExit("--onnx-num-threads must be >= 0")
 
     input_dir = args.input_dir.resolve()
     output_dir = (
@@ -710,6 +780,8 @@ def main() -> None:
         raise SystemExit("--max-candidates-per-original must be >= accepted target")
 
     num_workers = _resolve_num_workers(args.num_workers, len(sources))
+    native_threads = args.onnx_num_threads or 1
+    _limit_worker_threads(native_threads)
     print(f"[Discover] {len(sources)} original clip(s) under {input_dir}")
     print(f"[Output]   {output_dir}")
     print(
@@ -730,7 +802,11 @@ def main() -> None:
     existing_outputs = []
     if output_dir.exists():
         existing_outputs = sorted(output_dir.glob("*_aug_*.pkl"))
+        temp_outputs = sorted(output_dir.glob("*.pkl.tmp"))
         legacy_bundles = sorted(output_dir.glob("aug_*.pkl"))
+        existing_outputs.extend(
+            path for path in temp_outputs if path not in existing_outputs
+        )
         existing_outputs.extend(
             path for path in legacy_bundles if path not in existing_outputs
         )
@@ -755,6 +831,7 @@ def main() -> None:
         torch_device=args.torch_device,
         occ_hipc_root=args.occ_hipc_root.resolve(),
         device=args.device,
+        onnx_num_threads=args.onnx_num_threads,
         validate=args.validate,
         recompute_contact=args.recompute_contact,
         quiet_policy_init=num_workers > 1,
@@ -765,14 +842,12 @@ def main() -> None:
         joint_limits,
         num_workers,
         args.seed,
+        output_dir,
     )
-    for result in results:
-        for aug_name, candidate in result.accepted_entries:
-            out_path = output_dir / f"{aug_name}.pkl"
-            joblib.dump({aug_name: candidate}, out_path, compress=3)
     total_candidates = sum(result.candidates for result in results)
+    total_written = sum(len(result.accepted_entries) for result in results)
     print(
-        f"[Done] Wrote {len(sources) * args.accepted_per_original} "
+        f"[Done] Wrote {total_written} "
         f"single-motion PKL file(s) "
         f"from {total_candidates} candidate(s)."
     )

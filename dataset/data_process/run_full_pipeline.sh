@@ -123,10 +123,10 @@ else
 fi
 
 # ============================================================================
-#  Stage 4: action_statistics.json for weighted_sample
+#  Stage 4: action_statistics.json and fall-recovery raw report
 # ============================================================================
 # --neutral: keep natural data distribution (weight=1.0 for all categories).
-# Fall recovery is boosted separately via _recovery_boost in the dataloader.
+# The printed recovery subset is a raw-data visibility check.
 echo ""
 echo "Stage 4/4: cal_weighted_statistics.py (neutral)"
 echo "  Input : ${S3_OUT}/train.pkl"
@@ -164,6 +164,5 @@ echo ""
 echo "Next:"
 echo "  robotmdar --config-name=train_mvae \\"
 echo "    data.datadir=${S3_OUT} \\"
-echo "    data.weighted_sample=true (optional) \\"
-echo "    data.action_statistics_path=${S4_OUT}/action_statistics.json \\"
+echo "    data.weighted_sample=false \\"
 echo "    skeleton.asset.assetRoot=${MJCF_DIR}"

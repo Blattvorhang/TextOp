@@ -288,6 +288,28 @@ def load_motion_lib_dicts(input_paths: list[str]) -> dict[str, dict]:
     return dict(iter_motion_lib_dicts(input_paths))
 
 
+def _manifest_hours(records: list[dict], fallback_fps: int) -> float:
+    return sum(
+        record["length"] / float(record.get("_fps", fallback_fps))
+        for record in records
+    ) / 3600
+
+
+def _recovery_manifest_stats(
+    records: list[dict],
+    total_hours: float,
+    fallback_fps: int,
+) -> dict[str, float]:
+    recovery = [record for record in records if record.get("_recovery_boost")]
+    hours = _manifest_hours(recovery, fallback_fps)
+    return {
+        "count": len(recovery),
+        "hours": round(hours, 3),
+        "pct_data": round(hours / total_hours * 100, 3)
+        if total_hours > 0 else 0.0,
+    }
+
+
 def _pack_source_file(task: tuple) -> tuple[list[dict], int, set[int], str | None]:
     """Load, convert, and save one source PKL.
 
@@ -584,8 +606,12 @@ def main():
 
     # ── Statistics ──
     fps_val = next(iter(fps_values))
-    train_hours = sum(d["length"] for d in train_data) / fps_val / 3600
-    val_hours = sum(d["length"] for d in val_data) / fps_val / 3600
+    train_hours = _manifest_hours(train_data, fps_val)
+    val_hours = _manifest_hours(val_data, fps_val)
+    total_hours = train_hours + val_hours
+    train_recovery = _recovery_manifest_stats(train_data, train_hours, fps_val)
+    val_recovery = _recovery_manifest_stats(val_data, val_hours, fps_val)
+    all_recovery = _recovery_manifest_stats(manifest, total_hours, fps_val)
 
     stats = {
         "dataset name": "BONES-SEED → TextOp (G1 29-DOF, 50fps)",
@@ -599,6 +625,11 @@ def main():
         "val count": len(val_data),
         "train hours": round(train_hours, 1),
         "val hours": round(val_hours, 1),
+        "recovery_boost": {
+            "train": train_recovery,
+            "val": val_recovery,
+            "all": all_recovery,
+        },
     }
     stats_path = out / "statistics.yaml"
     with open(stats_path, "w") as f:

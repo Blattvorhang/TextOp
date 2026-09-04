@@ -122,10 +122,49 @@ TARGET_MASS = {
     "other":     0.5,
 }
 
-
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
+def _sequence_duration(item: dict) -> float:
+    fps = item.get("_fps")
+    if fps:
+        return float(item["length"]) / float(fps)
+
+    motion = item.get("motion")
+    if isinstance(motion, dict) and motion.get("fps"):
+        return float(item["length"]) / float(motion["fps"])
+
+    frame_ann = item.get("frame_ann", [])
+    if frame_ann:
+        return max(float(seg[1]) for seg in frame_ann)
+
+    return 0.0
+
+
+def _recovery_summary(
+    data: list[dict],
+    cat_duration: dict[str, float],
+) -> dict[str, float]:
+    total_duration = sum(cat_duration.values())
+    fall_duration = cat_duration.get("fall", 0.0)
+    recovery_count = 0
+    recovery_duration = 0.0
+
+    for item in data:
+        if item.get("_recovery_boost"):
+            recovery_count += 1
+            recovery_duration += _sequence_duration(item)
+
+    return {
+        "count": recovery_count,
+        "hours": recovery_duration / 3600,
+        "pct_data": recovery_duration / total_duration * 100
+        if total_duration > 0 else 0.0,
+        "pct_fall": recovery_duration / fall_duration * 100
+        if fall_duration > 0 else 0.0,
+    }
+
+
 def compute_action_statistics(
     data_folder: str,
     json_filename: str,
@@ -148,8 +187,7 @@ def compute_action_statistics(
         Cap: weight ≤ max_weight_ratio × median_weight across all categories.
         Set to 0 or negative to disable capping.
     """
-    # Neutral mode: all categories get weight=1.0 → natural data distribution.
-    # Category-level rebalancing is handled externally (e.g. _recovery_boost).
+    # Neutral mode: all categories get weight=1.0, matching raw data duration.
     neutral = (target_mass is None)
 
     if target_mass is None:
@@ -246,6 +284,7 @@ def compute_action_statistics(
         _print_report_neutral(action_stats, cat_duration)
     else:
         _print_report(action_stats, cat_duration, target_mass, total_mass)
+    _print_recovery_report(_recovery_summary(data, cat_duration))
 
     # ── 6. Save (data loader needs 'weight' and 'total_len') ──
     export = {}
@@ -261,9 +300,6 @@ def compute_action_statistics(
         json.dump(export, f, indent=4)
 
     print(f"\nSaved: {export_path}")
-    print(f"Ready for training:")
-    print(f"  data.weighted_sample=true")
-    print(f"  data.action_statistics_path={export_path.resolve()}")
     return export
 
 
@@ -293,7 +329,16 @@ def _print_report_neutral(
     print(f"  Total: {total_hours:.2f} hours across {len(cat_duration)} categories")
     print()
     print("  Training distribution = natural data distribution (P ∝ duration).")
-    print("  Category rebalancing is handled externally (e.g. _recovery_boost).")
+    print("  Fall-recovery raw subset is reported below.")
+
+
+def _print_recovery_report(summary: dict[str, float]) -> None:
+    print()
+    print("Recovery subset (_recovery_boost=True):")
+    print(f"  Count:        {int(summary['count']):,} sequences")
+    print(f"  Hours:        {summary['hours']:.3f}")
+    print(f"  %Data:        {summary['pct_data']:.3f}%")
+    print(f"  %Fall:        {summary['pct_fall']:.2f}% of fall category")
 
 
 # ---------------------------------------------------------------------------
@@ -392,17 +437,15 @@ def main():
     parser.add_argument(
         "--neutral", action="store_true",
         help="Generate neutral weights (weight=1.0 for all categories). "
-             "Training distribution matches natural data distribution. "
-             "Use this when data-level boosting (e.g. recovery_boost) handles "
-             "rebalancing instead of TARGET_MASS.",
+             "This is useful when you only want the category and "
+             "fall-recovery raw-data report.",
     )
 
     args = parser.parse_args()
 
     target_mass = TARGET_MASS
     if args.neutral:
-        # Neutral mode: weight=1.0 for all categories → natural data distribution.
-        # Category-level rebalancing is handled externally (e.g. _recovery_boost).
+        # Neutral mode: weight=1.0 for all categories.
         target_mass = None  # signal compute_action_statistics to use neutral
     elif args.mass_config:
         config_path = Path(args.mass_config)
