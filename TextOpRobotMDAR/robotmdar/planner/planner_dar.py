@@ -16,7 +16,12 @@ from robotmdar.dtype import logger as dtype_logger
 from robotmdar.dtype import seed
 from robotmdar.dtype.abc import Dataset, Denoiser, Diffusion, SSampler, VAE
 import robotmdar.dtype.motion as motion_dtype
-from robotmdar.eval.generate_dar import generate_next_motion, encode_motion_lib_initial_noise
+from robotmdar.eval.generate_dar import (
+    denoiser_supports_text_guidance,
+    encode_motion_lib_initial_noise,
+    generate_next_motion,
+)
+from robotmdar.model.clip import encode_text, load_and_freeze_clip
 from robotmdar.utils.dof_contract import (
     configure_dof_contract,
     validate_training_contract,
@@ -55,6 +60,16 @@ def _load_models(cfg: DictConfig):
     return vae, denoiser, diffusion, val_data
 
 
+def _load_text_embedding(text_prompt, device: str):
+    if text_prompt is None or str(text_prompt).strip() == "":
+        return None
+    clip_model = load_and_freeze_clip("ViT-B/32", device=device)
+    with torch.no_grad():
+        text_embedding = encode_text(clip_model, [str(text_prompt)])
+    del clip_model
+    return text_embedding.to(device=device)
+
+
 def _cuda_synchronize(device: str) -> None:
     if torch.cuda.is_available() and str(device).startswith("cuda"):
         torch.cuda.synchronize(device)
@@ -81,6 +96,66 @@ def _time_to_arrival_from_state(
         device=device,
     )).to(dtype=torch.long)
     return time_to_arrival_s, time_to_arrival_frame
+
+
+def _state_bool_field(state_msg, name: str, default: bool = True) -> bool:
+    value = getattr(state_msg, name, None)
+    if value is None:
+        raw = getattr(state_msg, "raw", {})
+        value = raw.get(name) if isinstance(raw, dict) else None
+    if value is None:
+        return bool(default)
+    if isinstance(value, np.ndarray):
+        if value.size != 1:
+            raise ValueError(f"{name} must be scalar-like, got {value.shape}")
+        value = value.reshape(-1)[0]
+    return bool(value)
+
+
+def _condition_force_drop_flags(cfg: DictConfig, state_msg,
+                                goal_type: GoalType) -> dict[str, bool]:
+    flags = {
+        "force_drop_goal_root": (
+            bool(cfg.get("force_drop_goal_root", False))
+            or not _state_bool_field(state_msg, "goal_root_valid", True)
+        ),
+        "force_drop_goal_yaw": (
+            bool(cfg.get("force_drop_goal_yaw", False))
+            or not _state_bool_field(state_msg, "goal_yaw_valid", True)
+        ),
+        "force_drop_goal_time": (
+            bool(cfg.get("force_drop_goal_time", False))
+            or not _state_bool_field(state_msg, "goal_time_valid", True)
+        ),
+        "force_drop_goal_body": (
+            bool(cfg.get("force_drop_goal_body", False))
+            or not _state_bool_field(state_msg, "goal_body_valid", True)
+        ),
+        "force_drop_goal_orientation": (
+            bool(cfg.get("force_drop_goal_orientation", False))
+            or not _state_bool_field(state_msg, "goal_orientation_valid", True)
+        ),
+        "force_drop_goal_joint": (
+            bool(cfg.get("force_drop_goal_joint", False))
+            or not _state_bool_field(state_msg, "goal_joint_valid", True)
+        ),
+        "force_drop_goal_velocity": (
+            bool(cfg.get("force_drop_goal_velocity", False))
+            or not _state_bool_field(state_msg, "goal_velocity_valid", True)
+        ),
+        "force_drop_scene": (
+            bool(cfg.get("force_drop_scene", False))
+            or not _state_bool_field(state_msg, "scene_valid", True)
+        ),
+    }
+    if goal_type is GoalType.JOINT_STATE and flags["force_drop_goal_yaw"]:
+        flags["force_drop_goal_orientation"] = True
+    flags["force_drop_arrival_time"] = (
+        bool(cfg.get("force_drop_arrival_time",
+                     flags["force_drop_goal_time"]))
+        or flags["force_drop_goal_time"]
+    )
+    return flags
 
 
 def _goal_log_components(ego_goal_raw: torch.Tensor,
@@ -274,6 +349,21 @@ def main(cfg: DictConfig) -> None:
         "Loading {}-DoF/{}-D DAR model and dataset statistics",
         cfg.data.dof_dim, cfg.data.nfeats)
     vae, denoiser, diffusion, val_data = _load_models(cfg)
+    text_prompt = cfg.get("text_prompt")
+    text_embedding = None
+    if text_prompt is not None and str(text_prompt).strip() != "":
+        if denoiser_supports_text_guidance(denoiser):
+            text_embedding = _load_text_embedding(text_prompt, str(cfg.device))
+            logger.info("Text prompt enabled: {!r}", text_prompt)
+        else:
+            logger.warning(
+                "Text prompt {!r} ignored because the loaded DAR checkpoint "
+                "does not support text conditioning",
+                text_prompt)
+    else:
+        logger.info("Text prompt disabled")
+    goal_include_log_d_hor = bool(
+        cfg.data.get('goal_include_log_d_hor', True))
     goal_stats = None
     if goal_encoding is not GoalEncoding.LEGACY40:
         goal_stats_path = _checkpoint_goal_stats_path(cfg)
@@ -290,6 +380,7 @@ def main(cfg: DictConfig) -> None:
             fps=float(val_data.fps),
             goal_timestep_mode=cfg.data.goal_timestep_mode,
             datadir=str(val_data.datadir),
+            goal_include_log_d_hor=goal_include_log_d_hor,
         )
     goal_type = validate_goal_config(
         cfg.data.goal_type,
@@ -299,6 +390,7 @@ def main(cfg: DictConfig) -> None:
         goal_offset_range=cfg.data.goal_offset_range,
         goal_timestep_mode=cfg.data.goal_timestep_mode,
         goal_stats=goal_stats,
+        goal_include_log_d_hor=goal_include_log_d_hor,
     )
     validate_training_contract(
         cfg, [("planner", val_data)], vae, denoiser)
@@ -439,6 +531,8 @@ def main(cfg: DictConfig) -> None:
                     raise ValueError(
                         f"Planner is configured for goal_type={goal_type.value!r}, "
                         f"but controller sent {state_goal_type.value!r}")
+                condition_force_drop = _condition_force_drop_flags(
+                    cfg, latest_state, goal_type)
                 using_generated_history = (
                     use_generated_history and tracked_plan is not None)
                 if using_generated_history:
@@ -474,7 +568,8 @@ def main(cfg: DictConfig) -> None:
                                 goal_reference_path=goal_reference_path,
                                 goal_encoding=goal_encoding,
                                 goal_stats=goal_stats,
-                                goal_clamp=goal_clamp, fps=motion_fps)
+                                goal_clamp=goal_clamp, fps=motion_fps,
+                                goal_include_log_d_hor=goal_include_log_d_hor)
                         )
                     else:
                         abs_pose = {
@@ -498,7 +593,8 @@ def main(cfg: DictConfig) -> None:
                                 goal_reference_path=goal_reference_path,
                                 goal_encoding=goal_encoding,
                                 goal_stats=goal_stats,
-                                goal_clamp=goal_clamp, fps=motion_fps)
+                                goal_clamp=goal_clamp, fps=motion_fps,
+                                goal_include_log_d_hor=goal_include_log_d_hor)
                         )
                 else:
                     tracked_frame = None
@@ -524,7 +620,8 @@ def main(cfg: DictConfig) -> None:
                             goal_reference_path=goal_reference_path,
                             goal_encoding=goal_encoding,
                             goal_stats=goal_stats,
-                            goal_clamp=goal_clamp, fps=motion_fps)
+                            goal_clamp=goal_clamp, fps=motion_fps,
+                            goal_include_log_d_hor=goal_include_log_d_hor)
                     )
                     history_translation = None
 
@@ -574,8 +671,8 @@ def main(cfg: DictConfig) -> None:
                     _goal_yaw_world_deg = float('nan')
 
                 # ── ego (as seen by planner, after dropout) ──
-                _force_drop_yaw = bool(cfg.get("force_drop_goal_yaw", False))
-                _force_drop_time = bool(cfg.get("force_drop_goal_time", False))
+                _force_drop_yaw = condition_force_drop["force_drop_goal_yaw"]
+                _force_drop_time = condition_force_drop["force_drop_goal_time"]
                 if goal_type in (GoalType.ROOT, GoalType.BODY_EXT):
                     if _force_drop_yaw:
                         _goal_ego_yaw_deg = 0.0  # mask_condition zeros the yaw channels
@@ -583,7 +680,8 @@ def main(cfg: DictConfig) -> None:
                         _goal_ego_yaw_deg = _goal_ego_yaw_raw_deg
                 elif goal_type is GoalType.JOINT_STATE:
                     if (_force_drop_yaw
-                            or bool(cfg.get("force_drop_goal_orientation", False))):
+                            or condition_force_drop[
+                                "force_drop_goal_orientation"]):
                         _goal_ego_yaw_deg = 0.0
                     else:
                         _goal_ego_yaw_deg = _goal_ego_yaw_raw_deg
@@ -593,10 +691,17 @@ def main(cfg: DictConfig) -> None:
                 time_to_arrival_frame = None
                 time_to_arrival_s = float('nan')
                 if goal_type.uses_arrival_time:
-                    time_to_arrival_s, time_to_arrival_frame = (
-                        _time_to_arrival_from_state(
-                            latest_state, motion_fps, cfg.device))
-                    if goal_clamp is not None:
+                    if _state_bool_field(latest_state, "goal_time_valid", True):
+                        time_to_arrival_s, time_to_arrival_frame = (
+                            _time_to_arrival_from_state(
+                                latest_state, motion_fps, cfg.device))
+                    else:
+                        time_to_arrival_s = 0.0
+                        time_to_arrival_frame = torch.zeros(
+                            1, dtype=torch.long, device=cfg.device)
+                    if (goal_clamp is not None
+                            and not condition_force_drop[
+                                "force_drop_arrival_time"]):
                         # Keep the arrival PE inside the training horizon
                         # (same cap the goal builder applies to urgency).
                         time_to_arrival_frame = time_to_arrival_frame.clamp(
@@ -604,14 +709,17 @@ def main(cfg: DictConfig) -> None:
 
                 _cuda_synchronize(str(cfg.device))
                 infer_start = time.perf_counter()
-                if latest_state.ego_occ is None:
-                    raise ValueError(
-                        f"State {state_seq} does not contain ego occupancy")
-                ego_occ = unpack_occ(latest_state.ego_occ, n_voxels)
-                if ego_occ.size != n_voxels:
-                    raise ValueError(
-                        f"State {state_seq} occupancy has {ego_occ.size} "
-                        f"voxels; expected {n_voxels} for grid_size={grid_size}")
+                if condition_force_drop["force_drop_scene"]:
+                    ego_occ = np.zeros(n_voxels, dtype=np.float32)
+                else:
+                    if latest_state.ego_occ is None:
+                        raise ValueError(
+                            f"State {state_seq} does not contain ego occupancy")
+                    ego_occ = unpack_occ(latest_state.ego_occ, n_voxels)
+                    if ego_occ.size != n_voxels:
+                        raise ValueError(
+                            f"State {state_seq} occupancy has {ego_occ.size} "
+                            f"voxels; expected {n_voxels} for grid_size={grid_size}")
                 voxel = torch.as_tensor(
                     ego_occ, dtype=torch.float32, device=cfg.device
                 ).unsqueeze(0)
@@ -627,25 +735,28 @@ def main(cfg: DictConfig) -> None:
                     future_len=future_len,
                     use_full_sample=bool(cfg.use_full_sample),
                     guidance_scale=cfg.guidance_scale,
+                    text_embedding=text_embedding,
+                    force_drop_text=bool(cfg.get("force_drop_text", False)),
                     initial_noise=fixed_sampling_noise,
                     ret_fk=True,
-                    force_drop_goal_root=bool(
-                        cfg.get("force_drop_goal_root", False)),
-                    force_drop_goal_yaw=bool(
-                        cfg.get("force_drop_goal_yaw", False)),
-                    force_drop_goal_time=bool(
-                        cfg.get("force_drop_goal_time", False)),
-                    force_drop_goal_body=bool(
-                        cfg.get("force_drop_goal_body", False)),
-                    force_drop_goal_orientation=bool(
-                        cfg.get("force_drop_goal_orientation", False)),
-                    force_drop_goal_joint=bool(
-                        cfg.get("force_drop_goal_joint", False)),
-                    force_drop_goal_velocity=bool(
-                        cfg.get("force_drop_goal_velocity", False)),
-                    force_drop_arrival_time=bool(
-                        cfg.get("force_drop_arrival_time",
-                                cfg.get("force_drop_goal_time", False))),
+                    force_drop_goal_root=condition_force_drop[
+                        "force_drop_goal_root"],
+                    force_drop_goal_yaw=condition_force_drop[
+                        "force_drop_goal_yaw"],
+                    force_drop_goal_time=condition_force_drop[
+                        "force_drop_goal_time"],
+                    force_drop_goal_body=condition_force_drop[
+                        "force_drop_goal_body"],
+                    force_drop_goal_orientation=condition_force_drop[
+                        "force_drop_goal_orientation"],
+                    force_drop_goal_joint=condition_force_drop[
+                        "force_drop_goal_joint"],
+                    force_drop_goal_velocity=condition_force_drop[
+                        "force_drop_goal_velocity"],
+                    force_drop_scene=condition_force_drop[
+                        "force_drop_scene"],
+                    force_drop_arrival_time=condition_force_drop[
+                        "force_drop_arrival_time"],
                     time_to_arrival_frame=time_to_arrival_frame,
                 )
                 _cuda_synchronize(str(cfg.device))
@@ -721,14 +832,14 @@ def main(cfg: DictConfig) -> None:
                         dtype=np.float32))
                 measured_pos = np.asarray(
                     latest_state.raw["g1_pos"][-1], dtype=np.float32)
-                measured_rot_xyzw = np.asarray(
+                measured_rot_wxyz = np.asarray(
                     latest_state.raw["g1_root_rot"][-1], dtype=np.float32)
                 if getattr(motion, "root_ori", None) is not None:
-                    published_rot_xyzw = motion.root_ori[0, [1, 2, 3, 0]]
+                    published_rot_wxyz = motion.root_ori[0]
                 else:
-                    published_rot_xyzw = motion.body_ori[0, 0, [1, 2, 3, 0]]
+                    published_rot_wxyz = motion.body_ori[0, 0]
                 quat_dot = float(np.clip(np.abs(np.dot(
-                    measured_rot_xyzw, published_rot_xyzw)), 0.0, 1.0))
+                    measured_rot_wxyz, published_rot_wxyz)), 0.0, 1.0))
                 published_root_pos = (
                     motion.root_pos[0]
                     if getattr(motion, "root_pos", None) is not None
