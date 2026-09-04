@@ -273,6 +273,32 @@ def test_split_goal_stats_clip_outliers_before_std(tmp_path):
     assert stats["meta"]["encodings"] == [GoalEncoding.SINGLE.value, GoalEncoding.SPLIT.value]
 
 
+def test_split_goal_stats_handles_batched_time_to_arrival(tmp_path):
+    dataset = _split_goal_dataset(tmp_path)
+    batch_data = [
+        {
+            "world_goal_pos": torch.tensor(
+                [[3.0, 4.0, 0.5], [6.0, 8.0, 0.5]], dtype=torch.float32),
+            "world_goal_rot": _identity_quaternion(batch=2),
+            "world_goal_dof": torch.stack([
+                torch.linspace(-1.0, 1.0, 29),
+                torch.linspace(1.0, -1.0, 29),
+            ], dim=0),
+            "world_goal_vel": torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=torch.float32),
+            "gt_ref_pos": torch.zeros((2, 3), dtype=torch.float32),
+            "gt_ref_rot": _identity_quaternion(batch=2),
+            "time_to_arrival": torch.tensor([[1.0], [4.0]], dtype=torch.float32),
+        }
+    ]
+
+    stats = SkeletonPrimitiveDataset._goal_stats_from_batch(dataset, batch_data)
+
+    assert stats["goal_clamp"]["n_samples"] == 2
+    assert stats["goal_clamp"]["dist_quantiles"][0] == pytest.approx(7.5)
+    assert stats["goal_clamp"]["speed_quantiles"][0] == pytest.approx(3.75)
+
+
 def test_split_goal_stats_meta_validation_rejects_mismatch(tmp_path):
     stats = _split_goal_stats_fixture(tmp_path)
 

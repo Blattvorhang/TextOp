@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch.testing import assert_close
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -51,6 +52,9 @@ from TextOpRobotMDAR.robotmdar.utils.goal import (
     build_ego_joint_state_goal_v6,
     build_ego_split_goal,
     validate_goal_stats,
+)
+from TextOpRobotMDAR.robotmdar.train.train_dar import (
+    _validate_scene_curriculum_contract,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -409,6 +413,7 @@ def test_train_dar_config_freezes_v6_contract():
     assert motion_feature_dim_for_dof(29, feature_version=6) == 44
     assert cfg.data.goal_type == "joint_state"
     assert cfg.data.goal_encoding == "split"
+    assert cfg.data.load_scene is False
     assert cfg.denoiser.goal_dim == SPLIT_GOAL_DIM
     assert cfg.data.history_len == 16 and cfg.data.future_len == 64
 
@@ -432,6 +437,39 @@ def test_train_dar_config_freezes_v6_contract():
     # 29-dof VAE checkpoint is intentionally null in the config: the launch
     # must freeze ckpt.vae to the trained ckpt_100000.pth explicitly.
     assert cfg.ckpt.vae is None
+
+
+def test_train_dar_preflight_rejects_scene_gate_without_scene_payloads():
+    cfg = OmegaConf.create({
+        "data": {
+            "load_scene": False,
+            "scene_start_step": 50000,
+        },
+        "train": {
+            "manager": {
+                "stages": [25000, 12500, 12500],
+            },
+        },
+    })
+
+    with pytest.raises(ValueError, match="data.load_scene=false"):
+        _validate_scene_curriculum_contract(cfg)
+
+
+def test_train_dar_preflight_allows_no_scene_run_with_gate_after_max_steps():
+    cfg = OmegaConf.create({
+        "data": {
+            "load_scene": False,
+            "scene_start_step": 50001,
+        },
+        "train": {
+            "manager": {
+                "stages": [25000, 12500, 12500],
+            },
+        },
+    })
+
+    _validate_scene_curriculum_contract(cfg)
 
 
 def test_frozen_vae_statistics_and_goal_stats_on_disk():
