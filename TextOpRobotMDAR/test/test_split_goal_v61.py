@@ -12,7 +12,12 @@ from TextOpRobotMDAR.robotmdar.dtype.rotation import (
     quaternion_to_matrix,
     xyzw_to_wxyz,
 )
-from TextOpRobotMDAR.robotmdar.model.mld_denoiser import _apply_arrival_channel_mask
+from TextOpRobotMDAR.robotmdar.model.mld_denoiser import (
+    DenoiserMLP,
+    DenoiserTransformer,
+    _apply_arrival_channel_mask,
+)
+from TextOpRobotMDAR.robotmdar.train.manager import DARManager
 from TextOpRobotMDAR.robotmdar.utils.goal import (
     GoalEncoding,
     GoalType,
@@ -85,6 +90,40 @@ def _joint_state_sample(pos, vel, euler, dof, time_to_arrival):
         "gt_ref_rot": reference_rot.clone(),
         "time_to_arrival": torch.tensor([time_to_arrival], dtype=torch.float32),
     }
+
+
+class _ZeroGoalToken(torch.nn.Module):
+
+    def __init__(self, h_dim: int):
+        super().__init__()
+        self.h_dim = h_dim
+
+    def forward(self, x):
+        return x.new_zeros((x.shape[0], self.h_dim))
+
+
+class _FixedArrivalToken(torch.nn.Module):
+
+    def __init__(self, value: torch.Tensor):
+        super().__init__()
+        self.register_buffer("value", value.reshape(1, -1).float())
+
+    def forward(self, time_to_arrival_frame):
+        return self.value.to(
+            device=time_to_arrival_frame.device,
+            dtype=time_to_arrival_frame.dtype,
+        ).expand(time_to_arrival_frame.shape[0], -1)
+
+
+class _CaptureEncoder(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.last_input = None
+
+    def forward(self, x):
+        self.last_input = x.detach().clone()
+        return x
 
 
 def test_split_goal_layout_scaling_round_trip(tmp_path):
@@ -218,6 +257,132 @@ def test_split_goal_time_mask_zeroes_f_trans():
     torch.testing.assert_close(masked[:, 54:55], torch.zeros((1, 1)))
     torch.testing.assert_close(masked[:, :7], goal[:, :7])
     torch.testing.assert_close(masked[:, 12:54], goal[:, 12:54])
+
+
+def test_split_denoisers_use_arrival_pe_as_the_time_token_only():
+    transformer = DenoiserTransformer(
+        h_dim=8,
+        ff_size=16,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        history_shape=(2, 6),
+        noise_shape=(1, 4),
+        goal_dim=SPLIT_GOAL_DIM,
+        goal_encoding=GoalEncoding.SPLIT,
+        grid_size=2,
+        cond_text_mask_prob=0.0,
+        text_condition_enabled=False,
+        cond_goal_root_mask_prob=0.0,
+        cond_goal_orientation_mask_prob=0.0,
+        cond_goal_joint_mask_prob=0.0,
+        cond_goal_velocity_mask_prob=0.0,
+        cond_goal_time_mask_prob=0.0,
+        cond_scene_mask_prob=0.0,
+    ).eval()
+    mlp = DenoiserMLP(
+        h_dim=8,
+        n_blocks=1,
+        dropout=0.0,
+        history_shape=(2, 12),
+        noise_shape=(1, 4),
+        goal_dim=SPLIT_GOAL_DIM,
+        goal_encoding=GoalEncoding.SPLIT,
+        grid_size=2,
+        cond_goal_root_mask_prob=0.0,
+        cond_goal_orientation_mask_prob=0.0,
+        cond_goal_joint_mask_prob=0.0,
+        cond_goal_velocity_mask_prob=0.0,
+        cond_goal_time_mask_prob=0.0,
+        cond_scene_mask_prob=0.0,
+    )
+
+    assert not hasattr(transformer, "embed_goal_time")
+    assert not hasattr(mlp, "embed_goal_time")
+
+    batch_size = 2
+    x_t = torch.zeros(batch_size, 1, 4)
+    timesteps = torch.zeros(batch_size, dtype=torch.long)
+    y_mlp = {
+        "goal": torch.ones(batch_size, SPLIT_GOAL_DIM),
+        "voxel": torch.zeros(batch_size, 8),
+        "history_motion_normalized": torch.zeros(batch_size, 2, 6),
+        "time_to_arrival_frame": torch.tensor([5, 10], dtype=torch.long),
+    }
+    out = mlp.eval()(x_t=x_t, timesteps=timesteps, y=y_mlp)
+    assert out.shape == x_t.shape
+    assert y_mlp["goal_time_condition_keep_mask"].tolist() == [True, True]
+
+    for name in ("embed_goal_trans", "embed_goal_rot",
+                 "embed_goal_pose", "embed_goal_vel"):
+        setattr(transformer, name, _ZeroGoalToken(8))
+    transformer.arrival_embedder = _FixedArrivalToken(
+        torch.arange(1, 9, dtype=torch.float32))
+    transformer.sequence_pos_encoder = torch.nn.Identity()
+    capture = _CaptureEncoder()
+    transformer.seqTransEncoder = capture
+    y = {
+        "goal": torch.ones(batch_size, SPLIT_GOAL_DIM),
+        "voxel": torch.zeros(batch_size, 8),
+        "history_motion_normalized": torch.zeros(batch_size, 2, 6),
+        "time_to_arrival_frame": torch.tensor([5, 10], dtype=torch.long),
+    }
+
+    transformer(x_t=x_t, timesteps=timesteps, y=y)
+
+    xseq = capture.last_input
+    expected_time = torch.arange(1, 9, dtype=torch.float32).expand(batch_size, -1)
+    torch.testing.assert_close(xseq[1], torch.zeros_like(xseq[1]))
+    torch.testing.assert_close(xseq[2], torch.zeros_like(xseq[2]))
+    torch.testing.assert_close(xseq[3], torch.zeros_like(xseq[3]))
+    torch.testing.assert_close(xseq[4], torch.zeros_like(xseq[4]))
+    torch.testing.assert_close(xseq[5], expected_time)
+    assert y["goal_time_condition_keep_mask"].tolist() == [True, True]
+
+    y_drop = {
+        "goal": torch.ones(batch_size, SPLIT_GOAL_DIM),
+        "voxel": torch.zeros(batch_size, 8),
+        "history_motion_normalized": torch.zeros(batch_size, 2, 6),
+        "time_to_arrival_frame": torch.tensor([5, 10], dtype=torch.long),
+        "force_drop_goal_time": True,
+    }
+    transformer(x_t=x_t, timesteps=timesteps, y=y_drop)
+    xseq = capture.last_input
+    torch.testing.assert_close(xseq[1], torch.zeros_like(xseq[1]))
+    torch.testing.assert_close(xseq[5], torch.zeros_like(xseq[5]))
+    assert y_drop["goal_time_condition_keep_mask"].tolist() == [False, False]
+
+
+def test_split_checkpoint_adapter_drops_deprecated_time_scalar_mlp(tmp_path):
+    model = DenoiserTransformer(
+        h_dim=8,
+        ff_size=16,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        history_shape=(2, 6),
+        noise_shape=(1, 4),
+        goal_dim=SPLIT_GOAL_DIM,
+        goal_encoding=GoalEncoding.SPLIT,
+        grid_size=2,
+        cond_text_mask_prob=0.0,
+        text_condition_enabled=False,
+        cond_goal_root_mask_prob=0.0,
+        cond_goal_orientation_mask_prob=0.0,
+        cond_goal_joint_mask_prob=0.0,
+        cond_goal_velocity_mask_prob=0.0,
+        cond_goal_time_mask_prob=0.0,
+        cond_scene_mask_prob=0.0,
+    )
+    checkpoint_state = dict(model.state_dict())
+    checkpoint_state["embed_goal_time.layers.0.weight"] = torch.ones(8, 1)
+
+    adapted_state, adapted = DARManager._fill_missing_optional_condition_state(
+        model, checkpoint_state, tmp_path / "ckpt.pth")
+
+    assert adapted is True
+    assert "embed_goal_time.layers.0.weight" not in adapted_state
+    model.load_state_dict(adapted_state)
 
 
 def test_split_goal_stats_clip_outliers_before_std(tmp_path):

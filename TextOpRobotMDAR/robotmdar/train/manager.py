@@ -833,6 +833,10 @@ class DARManager(BaseManager, GeometryLoss):
         ckpt_path: Path,
     ):
         current_state = get_ddp_model(model).state_dict()
+        deprecated_keys = [
+            key for key in checkpoint_state
+            if key.startswith('embed_goal_time.') and key not in current_state
+        ]
         missing_keys = [
             key for key in current_state
             if (
@@ -841,20 +845,25 @@ class DARManager(BaseManager, GeometryLoss):
             )
             and key not in checkpoint_state
         ]
-        if not missing_keys:
+        if not missing_keys and not deprecated_keys:
             return checkpoint_state, False
 
         checkpoint_state = dict(checkpoint_state)
+        for key in deprecated_keys:
+            checkpoint_state.pop(key)
         for key in missing_keys:
             checkpoint_state[key] = current_state[key]
-        missing_modules = sorted({
+        adapted_modules = sorted({
             key.split('.', 1)[0] for key in missing_keys
+        } | {
+            key.split('.', 1)[0] for key in deprecated_keys
         })
         logger.warning(
-            "DAR checkpoint {} is missing {} optional condition keys from {}; "
-            "initializing them from the current model and keeping all other "
-            "state-dict checks strict",
-            ckpt_path, len(missing_keys), ", ".join(missing_modules))
+            "DAR checkpoint {} required optional condition state adaptation "
+            "for {} ({} missing keys initialized, {} deprecated keys ignored); "
+            "keeping all other state-dict checks strict",
+            ckpt_path, ", ".join(adapted_modules), len(missing_keys),
+            len(deprecated_keys))
         return checkpoint_state, True
 
     def load_model(self, ckpt_path: Path):
@@ -870,7 +879,7 @@ class DARManager(BaseManager, GeometryLoss):
             key.startswith('embed_text.') and key not in state_dict['denoiser']
             for key in model_to_load.state_dict()
         )
-        denoiser_state, initialized_optional = (
+        denoiser_state, adapted_optional = (
             self._fill_missing_optional_condition_state(
                 model_to_load, state_dict['denoiser'], ckpt_path))
         model_to_load.load_state_dict(denoiser_state)
@@ -885,10 +894,10 @@ class DARManager(BaseManager, GeometryLoss):
                 "text conditioning for inference",
                 ckpt_path)
         if self.optimizer is not None:
-            if initialized_optional:
+            if adapted_optional:
                 logger.warning(
                     "Skipping optimizer state restore for {} because the "
-                    "optional condition parameters were initialized fresh",
+                    "optional condition state was adapted",
                     ckpt_path)
             else:
                 self.optimizer.load_state_dict(state_dict['optimizer'])

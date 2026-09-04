@@ -281,8 +281,6 @@ class DenoiserMLP(nn.Module):
                 29, h_dims=(self.h_dim, self.h_dim), activation=activation)
             self.embed_goal_vel = MLP(
                 4, h_dims=(self.h_dim, self.h_dim), activation=activation)
-            self.embed_goal_time = MLP(
-                1, h_dims=(self.h_dim, self.h_dim), activation=activation)
         else:
             self.embed_goal = nn.Linear(self.goal_dim, self.h_dim)
         self.embed_scene = nn.Linear(self.scene_dim, self.h_dim)
@@ -376,7 +374,6 @@ class DenoiserMLP(nn.Module):
             emb_goal_rot = self.embed_goal_rot(goal[:, SPLIT_ORIENTATION_SLICE])
             emb_goal_pose = self.embed_goal_pose(goal[:, SPLIT_JOINT_SLICE])
             emb_goal_vel = self.embed_goal_vel(goal[:, SPLIT_VELOCITY_SLICE])
-            emb_goal_time = self.embed_goal_time(goal[:, SPLIT_TIME_SLICE])
             emb_goal_trans = emb_goal_trans * goal_keep_mask.unsqueeze(
                 -1).to(emb_goal_trans.dtype)
             emb_goal_rot = emb_goal_rot * y[
@@ -389,14 +386,9 @@ class DenoiserMLP(nn.Module):
                 'goal_velocity_condition_keep_mask'].unsqueeze(
                     -1).to(emb_goal_vel.dtype)
             if _goal_dim_uses_arrival_pe(self.goal_dim):
-                emb_goal_trans = emb_goal_trans + arrival_pe
-                emb_goal_rot = emb_goal_rot + arrival_pe
-                emb_goal_pose = emb_goal_pose + arrival_pe
-                emb_goal_vel = emb_goal_vel + arrival_pe
-                emb_goal_time = emb_goal_time + arrival_pe
-                emb_goal_time = emb_goal_time * y[
-                    'arrival_time_condition_keep_mask'].unsqueeze(
-                        -1).to(emb_goal_time.dtype)
+                emb_goal_time = arrival_pe
+                y['goal_time_condition_keep_mask'] = y[
+                    'arrival_time_condition_keep_mask']
             emb_goal = torch.cat(
                 (
                     emb_goal_trans,
@@ -510,8 +502,6 @@ class DenoiserTransformer(nn.Module):
                 29, h_dims=(self.h_dim, self.h_dim), activation=activation)
             self.embed_goal_vel = MLP(
                 4, h_dims=(self.h_dim, self.h_dim), activation=activation)
-            self.embed_goal_time = MLP(
-                1, h_dims=(self.h_dim, self.h_dim), activation=activation)
         else:
             self.embed_goal = nn.Linear(self.goal_dim, self.h_dim)
         if self.text_condition_enabled:
@@ -697,19 +687,10 @@ class DenoiserTransformer(nn.Module):
                 goal[:, SPLIT_JOINT_SLICE]).unsqueeze(0)
             emb_goal_vel = self.embed_goal_vel(
                 goal[:, SPLIT_VELOCITY_SLICE]).unsqueeze(0)
-            emb_goal_time = self.embed_goal_time(
-                goal[:, SPLIT_TIME_SLICE]).unsqueeze(0)
-            if _goal_dim_uses_arrival_pe(self.goal_dim):
-                arrival_pe_ = arrival_pe.unsqueeze(0)
-                emb_goal_trans = emb_goal_trans + arrival_pe_
-                emb_goal_rot = emb_goal_rot + arrival_pe_
-                emb_goal_pose = emb_goal_pose + arrival_pe_
-                emb_goal_vel = emb_goal_vel + arrival_pe_
-                emb_goal_time = emb_goal_time + arrival_pe_
             # Mask before sequence_pos_encoder: zero component content, MLP
-            # bias, and arrival PE (the V6 no-timing-leak rule), but let the
-            # slot PE survive so the transformer still knows which condition
-            # is missing.
+            # bias, but let the slot PE survive so the transformer still knows
+            # which condition is missing.  The time condition is its own
+            # arrival-PE token; it is not added into the other goal tokens.
             emb_goal_trans = emb_goal_trans * goal_keep_mask.unsqueeze(
                 -1).to(emb_goal_trans.dtype)
             emb_goal_rot = emb_goal_rot * y[
@@ -722,9 +703,9 @@ class DenoiserTransformer(nn.Module):
                 'goal_velocity_condition_keep_mask'].unsqueeze(
                     -1).to(emb_goal_vel.dtype)
             if _goal_dim_uses_arrival_pe(self.goal_dim):
-                emb_goal_time = emb_goal_time * y[
-                    'arrival_time_condition_keep_mask'].unsqueeze(
-                        -1).to(emb_goal_time.dtype)
+                emb_goal_time = arrival_pe.unsqueeze(0)
+                y['goal_time_condition_keep_mask'] = y[
+                    'arrival_time_condition_keep_mask']
             xseq_parts = [
                 emb_time,
                 emb_goal_trans,
