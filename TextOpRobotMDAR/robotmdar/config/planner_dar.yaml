@@ -14,6 +14,18 @@ state_timeout_ms: 1
 log_every: 20
 pub_all_frames: false
 
+# Smooth measured controller joint history before it is encoded as model
+# history. The newest state is kept exact; older states are pulled backward
+# into a max-velocity tube so physical oscillation does not create OOD joint
+# deltas at the planner input. Tune max_velocity_rad_s from training-set
+# per-joint velocity percentiles when those stats are available.
+history_joint_smoothing:
+  enabled: true
+  max_velocity_rad_s: 10.0
+  # 1.0 disables the optional backward EMA. Use <1.0 for extra low-pass
+  # smoothing after checking that the added history lag is acceptable.
+  ema_alpha: 1.0
+
 # Keep the diffusion latent fixed across MPC updates. Nearby controller states
 # should produce nearby plans instead of independent samples at every seam.
 resample_noise_each_plan: false
@@ -25,6 +37,9 @@ motion_path: null
 motion_start_frame: 0
 # Clip name inside the pkl (required when pkl has >1 clip; auto-detected otherwise).
 motion_clip: null
+
+# Optional CLIP prompt for action style conditioning. Set to null to disable.
+text_prompt: null
 
 # Bootstrap from controller history once, then autoregress on generated history.
 # Before each replan, translate the generated history endpoint to the measured
@@ -52,6 +67,7 @@ data:
   goal_per_primitive: true
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
+  goal_include_log_d_hor: false
   history_len: 16
   future_len: 64
   load_goal_stats: false
@@ -59,13 +75,18 @@ data:
 denoiser:
   goal_encoding: ${data.goal_encoding}
   goal_dim: 55
+  cond_text_mask_prob: 0.1
 
 # V6 uses the TextOp-style root orientation block. Dropping yaw is treated as
 # dropping the whole orientation block for joint_state.
+force_drop_text: false
+force_drop_goal_root: false
 force_drop_goal_yaw: false
+force_drop_goal_body: false
 force_drop_goal_orientation: false
 force_drop_goal_joint: false
 force_drop_goal_velocity: false
+force_drop_scene: false
 
 # V6 arrival time is a separate positional encoding.
 force_drop_goal_time: false

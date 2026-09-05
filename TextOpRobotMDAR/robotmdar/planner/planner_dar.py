@@ -458,6 +458,36 @@ def main(cfg: DictConfig) -> None:
     inference_count = 0
     use_generated_history = bool(cfg.use_generated_history)
     align_generated_history = bool(cfg.align_generated_history_to_g1)
+    joint_smoothing_cfg = cfg.get("history_joint_smoothing")
+    joint_smoothing_enabled = (
+        joint_smoothing_cfg is not None
+        and bool(joint_smoothing_cfg.get("enabled", False))
+    )
+    joint_smoothing_max_velocity = None
+    joint_smoothing_ema_alpha = 1.0
+    if joint_smoothing_enabled:
+        joint_smoothing_max_velocity = joint_smoothing_cfg.get(
+            "max_velocity_rad_s")
+        joint_smoothing_ema_alpha = float(
+            joint_smoothing_cfg.get("ema_alpha", 1.0))
+        if (not math.isfinite(joint_smoothing_ema_alpha)
+                or not 0.0 < joint_smoothing_ema_alpha <= 1.0):
+            raise ValueError(
+                "history_joint_smoothing.ema_alpha must be in (0, 1], "
+                f"got {joint_smoothing_ema_alpha}")
+        if (joint_smoothing_max_velocity is None
+                and joint_smoothing_ema_alpha >= 1.0):
+            raise ValueError(
+                "history_joint_smoothing.enabled=true requires "
+                "max_velocity_rad_s or ema_alpha < 1.0")
+        max_velocity_log = joint_smoothing_max_velocity
+        if OmegaConf.is_config(max_velocity_log):
+            max_velocity_log = OmegaConf.to_container(
+                max_velocity_log, resolve=True)
+        logger.info(
+            "Controller joint-history smoothing enabled: "
+            "max_velocity={} rad/s, ema_alpha={:.3f}",
+            max_velocity_log, joint_smoothing_ema_alpha)
     generated_plans = {}
     next_ack_log_time = 0.0
     infer_times: list[float] = []  # rolling window for running average
@@ -607,7 +637,11 @@ def main(cfg: DictConfig) -> None:
                             f"State {state_seq} has {latest_state.n_states} "
                             f"entries; need at least {history_len}")
                     history_motion, abs_pose = state_to_model_input(
-                        latest_state, history_len, val_data, cfg.device)
+                        latest_state, history_len, val_data, cfg.device,
+                        fps=motion_fps,
+                        joint_smoothing_max_velocity_rad_s=(
+                            joint_smoothing_max_velocity),
+                        joint_smoothing_ema_alpha=joint_smoothing_ema_alpha)
                     ego_goal_raw = state_to_ego_goal(
                         latest_state, cfg.device, goal_type=goal_type,
                         goal_reference_path=goal_reference_path,

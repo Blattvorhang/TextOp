@@ -280,6 +280,48 @@ def test_controller_v6_history_consumes_h_plus_one_physical_states():
         package_motion_dtype.set_feature_version(old_package)
 
 
+def test_controller_joint_history_smoothing_limits_v6_input_velocity():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        positions = np.asarray([
+            [0.0, 0.0, 0.77],
+            [0.1, 0.0, 0.77],
+            [0.2, 0.0, 0.77],
+        ], dtype=np.float32)
+        rotations = np.asarray([
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ], dtype=np.float32)
+        joints = np.zeros((3, 29), dtype=np.float32)
+        joints[0] = -20.0
+        joints[1] = 20.0
+        joints[2] = 10.0
+        state = SimpleNamespace(raw={
+            "g1_pos": positions,
+            "g1_root_rot": rotations,
+            "g1_joint_pos": joints,
+        })
+
+        feature, _ = state_to_model_input(
+            state,
+            history_len=2,
+            val_data=IdentityNormalization(),
+            device="cpu",
+            fps=50.0,
+            joint_smoothing_max_velocity_rad_s=5.0,
+        )
+
+        dof_history = feature[0, :, 13:42].numpy()
+        qvel = np.diff(dof_history, axis=0) * 50.0
+        assert np.max(np.abs(qvel)) <= 5.0 + 1e-4
+        np.testing.assert_allclose(
+            dof_history[-1], isaaclab_to_mujoco_dof(joints[-1:])[0])
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
 def test_joint_state_goal_falls_back_when_condition_blocks_invalid():
     old_runtime, old_package = _set_both_feature_versions(6)
     try:

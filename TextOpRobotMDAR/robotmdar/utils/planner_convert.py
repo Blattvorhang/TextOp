@@ -128,8 +128,80 @@ def _normalized_wire_quaternions_wxyz_as_xyzw(values: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(normalized_wxyz[..., [1, 2, 3, 0]])
 
 
+def _joint_velocity_limit(max_velocity_rad_s: Any,
+                          dof_dim: int) -> np.ndarray | None:
+    if max_velocity_rad_s is None:
+        return None
+    limit = np.asarray(max_velocity_rad_s, dtype=np.float32)
+    if limit.ndim == 0 or limit.size == 1:
+        value = float(limit.reshape(-1)[0])
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "joint smoothing max_velocity_rad_s must be positive and finite, "
+                f"got {value!r}")
+        return np.full((dof_dim,), value, dtype=np.float32)
+    limit = np.asarray(limit, dtype=np.float32).reshape(-1)
+    if limit.shape != (dof_dim,):
+        raise ValueError(
+            "joint smoothing max_velocity_rad_s must be scalar or have "
+            f"{dof_dim} entries, got {limit.shape}")
+    if not np.isfinite(limit).all() or np.any(limit <= 0.0):
+        raise ValueError(
+            "joint smoothing max_velocity_rad_s contains non-positive or "
+            "non-finite values")
+    return np.ascontiguousarray(limit)
+
+
+def smooth_joint_history(joints: np.ndarray,
+                         *,
+                         fps: float,
+                         max_velocity_rad_s: Any = None,
+                         ema_alpha: float = 1.0) -> np.ndarray:
+    """Smooth controller joint history while preserving the latest state.
+
+    The pass runs backward from the newest physical sample, so the planner seam
+    still matches the measured robot while older history frames are pulled into
+    a velocity-limited tube around it.
+    """
+    joints = np.array(joints, dtype=np.float32, copy=True)
+    if joints.ndim != 2:
+        raise ValueError(f"Expected joint history [n, dof], got {joints.shape}")
+    if not np.isfinite(joints).all():
+        raise ValueError("Joint history contains non-finite values")
+
+    alpha = float(ema_alpha)
+    if not np.isfinite(alpha) or not 0.0 < alpha <= 1.0:
+        raise ValueError(
+            f"joint smoothing ema_alpha must be in (0, 1], got {ema_alpha}")
+    velocity_limit = _joint_velocity_limit(max_velocity_rad_s, joints.shape[-1])
+    if velocity_limit is None and alpha >= 1.0:
+        return np.ascontiguousarray(joints)
+    if fps <= 0:
+        raise ValueError(f"Joint smoothing fps must be positive, got {fps}")
+
+    smoothed = joints
+    if alpha < 1.0 and len(smoothed) > 1:
+        filtered = smoothed.copy()
+        for idx in range(len(filtered) - 2, -1, -1):
+            filtered[idx] = alpha * smoothed[idx] + (
+                1.0 - alpha) * filtered[idx + 1]
+        smoothed = filtered
+
+    if velocity_limit is not None and len(smoothed) > 1:
+        max_delta = velocity_limit / float(fps)
+        for idx in range(len(smoothed) - 2, -1, -1):
+            delta = smoothed[idx] - smoothed[idx + 1]
+            smoothed[idx] = smoothed[idx + 1] + np.clip(
+                delta, -max_delta, max_delta)
+
+    return np.ascontiguousarray(smoothed)
+
+
 def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
-                         device: str | torch.device):
+                         device: str | torch.device, *,
+                         fps: float | None = None,
+                         joint_smoothing_max_velocity_rad_s: Any = None,
+                         joint_smoothing_ema_alpha: float = 1.0):
     """Build normalized DAR history from the latest physical controller states.
 
     FeatureVersion 6 is arrival-aligned: H model history features require
@@ -161,7 +233,19 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
 
     positions = positions[-required_states:]
     rotations = rotations[-required_states:]
-    joints_mujoco = isaaclab_to_mujoco_dof(joints[-required_states:])
+    joints = joints[-required_states:]
+    joint_smoothing_ema_alpha = float(joint_smoothing_ema_alpha)
+    if (joint_smoothing_max_velocity_rad_s is not None
+            or joint_smoothing_ema_alpha != 1.0):
+        resolved_fps = float(
+            getattr(val_data, "fps", 0.0) if fps is None else fps)
+        joints = smooth_joint_history(
+            joints,
+            fps=resolved_fps,
+            max_velocity_rad_s=joint_smoothing_max_velocity_rad_s,
+            ema_alpha=joint_smoothing_ema_alpha,
+        )
+    joints_mujoco = isaaclab_to_mujoco_dof(joints)
     model_dof_dim = int(getattr(val_data, "dof_dim", 29))
     if model_dof_dim == 23:
         joints_mujoco = _reduce_mujoco_29_to_23(joints_mujoco)
