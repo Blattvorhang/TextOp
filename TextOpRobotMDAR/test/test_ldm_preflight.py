@@ -53,6 +53,7 @@ from TextOpRobotMDAR.robotmdar.utils.goal import (
     SPLIT_JOINT_SLICE,
     SPLIT_ORIENTATION_SLICE,
     SPLIT_TIME_SLICE,
+    SPLIT_VERTICAL_GRAVITY_SLICE,
     SPLIT_VERTICAL_SLICE,
     SPLIT_VELOCITY_SLICE,
     build_ego_joint_state_goal_v6,
@@ -270,8 +271,11 @@ def test_v6_goal_orientation_is_rel_rot6d_no_yaw_helpers(monkeypatch):
     assert_close(raw[7:13], matrix_to_rot6d(ref_R.T @ goal_R))
 
     split = _split_goal(ref_pos, ref_rot, goal_pos, goal_rot, dof, velocity)
-    assert_close(split[12:15], goal_R.T @ g_w)
-    assert_close(split[15:21], matrix_to_rot6d(ref_R.T @ goal_R))
+    assert_close(split[SPLIT_VERTICAL_GRAVITY_SLICE], goal_R.T @ g_w)
+    assert_close(
+        split[SPLIT_ORIENTATION_SLICE],
+        matrix_to_rot6d(ref_R.T @ goal_R),
+    )
 
     # routing: the split encoding must never call the legacy yaw builders
     def _boom(*args, **kwargs):
@@ -438,14 +442,29 @@ def test_train_dar_config_freezes_v6_contract():
     assert cfg.denoiser.goal_dim == SPLIT_GOAL_DIM
     assert cfg.data.history_len == 16 and cfg.data.future_len == 64
 
-    # the four frozen goal/contact weights; hydra's dict merge keeps the
-    # VAE-era keys contributed by train/dar.yaml (rec, kl, ...), which the
-    # DAR manager does not read — only these four are pinned for round 1
+    # The DAR loss weights are split by locomotion/getup so recovery samples
+    # can use a distinct objective while sharing the same batch.
     loss = cfg.train.manager.loss_weight
-    assert loss.foot_contact == 0.05
-    assert loss.goal_root_position == 1.0
-    assert loss.goal_root_orientation == 0.2
-    assert loss.goal_joint_angle == 0.1
+    assert set(loss.keys()) == {"locomotion", "getup"}
+    assert loss.locomotion.foot_contact == 0.01
+    assert loss.locomotion.support_consistency == 0.01
+    assert "goal_root_position_hor" not in loss.locomotion
+    assert loss.locomotion.goal.g == 0.0
+    assert loss.locomotion.goal.root_position_hor == 0.25
+    assert loss.locomotion.goal.root_position_vert == 0.05
+    assert loss.locomotion.goal.root_orientation == 0.005
+    assert loss.locomotion.goal.root_velocity == 0.05
+    assert loss.locomotion.goal.joint_angle == 0.01
+
+    assert loss.getup.foot_contact == 0.01
+    assert loss.getup.support_consistency == 0.01
+    assert "goal_root_position_hor" not in loss.getup
+    assert loss.getup.goal.g == 0.05
+    assert loss.getup.goal.root_position_hor == 0.005
+    assert loss.getup.goal.root_position_vert == 0.1
+    assert loss.getup.goal.root_orientation == 0.0
+    assert loss.getup.goal.root_velocity == 0.01
+    assert loss.getup.goal.joint_angle == 0.01
     assert (cfg.denoiser.cond_goal_root_mask_prob,
             cfg.denoiser.cond_goal_orientation_mask_prob,
             cfg.denoiser.cond_goal_joint_mask_prob,

@@ -1165,7 +1165,8 @@ into one of four tensorboard groups via `_classify_extra`
   split).
 
 **Every individually logged term is the unweighted raw loss** — the
-weights enter only `total` (`Σ_k loss_weight[k]·v`,
+weights enter only `total` (via the loss-weight lookup; goal weights may
+live under the nested `loss_weight.<section>.goal.*` block),
 [train/manager.py:1204](../../TextOpRobotMDAR/robotmdar/train/manager.py#L1204)).
 The unweighted magnitudes the §4.3.5 weight-setting procedure needs are
 therefore already in tensorboard; no extra machinery is required for
@@ -2050,21 +2051,24 @@ per-sample at `t*` like v3 — any frame in `[1, F]`, not necessarily the
 window endpoint. Weight setting follows this division of labor: in LDM
 training the goal chordal is the *primary* geometric term at the goal
 frame (its 6-D fidelity layer lives outside the goal loss), and it
-keeps its own weight slot — the v3 `goal_root_orientation` (0.2 in
-`train_dar.yaml`), now with chordal semantics instead of the v3
-RPY-family Huber — not copied from the small §4.3.2 `λ_chord`
-complement.
+keeps its own config weight slot — `goal.root_orientation` in
+`train_dar.yaml`, logged as the historical `goal_root_orientation` term
+— now with chordal semantics instead of the v3 RPY-family Huber, and
+not copied from the small §4.3.2 `λ_chord` complement.
 
 The per-sample keep masks (`goal_condition_keep_mask` family) restrict
 each term to goal-conditioned samples, and a fully-masked batch returns
 `future_motion_pred.sum() * 0.0` — a zero tensor connected to the graph,
 keeping the backward pass graph-stable
 ([manager.py:1662-1663](../../TextOpRobotMDAR/robotmdar/train/manager.py#L1662-L1663)).
-The existing weights `goal_root_position` / `goal_root_orientation` /
-`goal_joint_angle` / `goal_root_velocity` map one-to-one onto the
-base-goal channels; their final values remain part of the §7.7 goal-loss
-weight set, and the DAR eval path reports the same terms as logged
-losses
+The config weights `goal.root_position_hor` /
+`goal.root_position_vert` / `goal.g` / `goal.root_orientation` /
+`goal.joint_angle` / `goal.root_velocity` map one-to-one onto the
+base-goal channels. `goal.g` supervises only the target gravity direction
+(`g_goal`) at the arrival frame. `goal.root_orientation` remains the full
+rot6d/chordal endpoint term, so getup should set it to `0.0` when recovery
+must ignore yaw/heading. The DAR eval path reports them as `goal_*` losses,
+including `goal_g`,
 ([train_dar.py:1303](../../TextOpRobotMDAR/robotmdar/train/train_dar.py#L1303),
 §4.3.6).
 
@@ -2219,12 +2223,15 @@ ablation studies:
    `rot6d`, and the independent time token comes from
    `ArrivalTimeEmbedder(time_to_arrival_frame)` without being manually
    added to other tokens. What remains for the LDM integration phase:
-   (a) the goal-loss weight set (§4.6.3) — reference starting values:
-   `goal_root_position` 1.0, `goal_root_orientation` 0.2 (chordal),
-   `goal_joint_angle` 0.1 (down from 0.2 to avoid double-incentivizing
+   (a) the nested goal-loss weight set (§4.6.3) — reference starting
+   values: `goal.root_position_hor` 1.0,
+   `goal.root_position_vert` 1.0,
+   `goal.g` 0.0 for locomotion / tuned higher for getup,
+   `goal.root_orientation` 0.2 (chordal),
+   `goal.joint_angle` 0.1 (down from 0.2 to avoid double-incentivizing
    `q`, which `dof_pos` already supervises; the 0.2 runs were acceptable
    — final values re-chosen from the first LDM-run logs),
-   `goal_root_velocity` 0.0→0.1, `T`/priors conditioning-only; (b) the
+   `goal.root_velocity` 0.0→0.1, `T`/priors conditioning-only; (b) the
    perturbation semantics — resolved: goals stay clean under both the
    training-time history augmentation and the preprocessing-stage
    fall-recovery augmentation; the V7.1 ramp makes the current frame

@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import (
@@ -23,6 +24,7 @@ from robotmdar.utils.goal import (
     SPLIT_JOINT_SLICE,
     SPLIT_ORIENTATION_SLICE,
     SPLIT_VELOCITY_SLICE,
+    SPLIT_VERTICAL_GRAVITY_SLICE,
     SPLIT_VERTICAL_HEIGHT_SLICE,
     V6_RAW_JOINT_SLICE,
     V6_RAW_ORIENTATION_SLICE,
@@ -38,6 +40,190 @@ _FAST_LOCOMOTION_VERBS = frozenset({'jog', 'run', 'sprint', 'jump', 'sport'})
 _WALKING_SPEED_VERBS = frozenset(
     {'walk', 'step_over', 'carry', 'turn', 'push', 'injured'})
 MOTION_CLASSES = ('walk', 'run', 'fall', 'getup', 'unknown')
+LOSS_WEIGHT_SECTIONS = ('locomotion', 'getup')
+GOAL_LOSS_WEIGHT_NEST = 'goal'
+GOAL_LOSS_WEIGHT_PREFIX = 'goal_'
+
+
+def _mapping_get(mapping, key, default=None):
+    if mapping is None:
+        return default
+    getter = getattr(mapping, 'get', None)
+    if getter is not None:
+        return getter(key, default)
+    try:
+        return mapping[key]
+    except (KeyError, TypeError):
+        return default
+
+
+def _has_loss_weight_sections(loss_weight) -> bool:
+    return any(_mapping_get(loss_weight, section) is not None
+               for section in LOSS_WEIGHT_SECTIONS)
+
+
+def _goal_loss_nested_key(key: str) -> str | None:
+    if key.startswith(GOAL_LOSS_WEIGHT_PREFIX):
+        return key[len(GOAL_LOSS_WEIGHT_PREFIX):]
+    return None
+
+
+def _loss_weight_value_from_mapping(loss_weight, key: str):
+    value = _mapping_get(loss_weight, key, None)
+    if value is not None:
+        return float(value)
+    nested_key = _goal_loss_nested_key(key)
+    if nested_key is None:
+        return None
+    goal_weights = _mapping_get(loss_weight, GOAL_LOSS_WEIGHT_NEST, None)
+    value = _mapping_get(goal_weights, nested_key, None)
+    if value is not None:
+        return float(value)
+    return None
+
+
+def _loss_weight_value(loss_weight, key: str,
+                       section: str | None = None) -> float:
+    if _has_loss_weight_sections(loss_weight):
+        if section is not None:
+            section_weights = _mapping_get(loss_weight, section)
+            value = _loss_weight_value_from_mapping(section_weights, key)
+            if value is not None:
+                return value
+        value = _loss_weight_value_from_mapping(loss_weight, key)
+        if value is not None:
+            return value
+        if section is None:
+            section_weights = _mapping_get(loss_weight, 'locomotion')
+            value = _loss_weight_value_from_mapping(section_weights, key)
+            if value is not None:
+                return value
+        return 0.0
+    value = _loss_weight_value_from_mapping(loss_weight, key)
+    return 0.0 if value is None else value
+
+
+def _loss_weight_any(loss_weight, key: str) -> float:
+    values = [_loss_weight_value(loss_weight, key, section)
+              for section in LOSS_WEIGHT_SECTIONS]
+    values.append(_loss_weight_value(loss_weight, key, None))
+    return max(values)
+
+
+def _loss_weight_vector(loss_weight, key: str, is_recovery, batch_size: int,
+                        device, dtype) -> torch.Tensor:
+    if not _has_loss_weight_sections(loss_weight):
+        value = _loss_weight_value(loss_weight, key)
+        return torch.full((batch_size,), value, device=device, dtype=dtype)
+    if is_recovery is None:
+        value = _loss_weight_value(loss_weight, key, 'locomotion')
+        return torch.full((batch_size,), value, device=device, dtype=dtype)
+    recovery = torch.as_tensor(
+        is_recovery, device=device, dtype=torch.bool).reshape(-1)
+    if recovery.shape[0] != batch_size:
+        raise ValueError(
+            f'is_recovery must have shape [B] with B={batch_size}, got '
+            f'{tuple(recovery.shape)}'
+        )
+    locomotion = torch.full(
+        (batch_size,),
+        _loss_weight_value(loss_weight, key, 'locomotion'),
+        device=device,
+        dtype=dtype,
+    )
+    getup = torch.full(
+        (batch_size,),
+        _loss_weight_value(loss_weight, key, 'getup'),
+        device=device,
+        dtype=dtype,
+    )
+    return torch.where(recovery, getup, locomotion)
+
+
+def _elementwise_rec_loss(criterion: nn.Module, pred: torch.Tensor,
+                          target: torch.Tensor) -> torch.Tensor:
+    if isinstance(criterion, nn.HuberLoss):
+        return F.huber_loss(
+            pred, target, reduction='none',
+            delta=float(getattr(criterion, 'delta', 1.0)),
+        )
+    if isinstance(criterion, nn.L1Loss):
+        return (pred - target).abs()
+    if isinstance(criterion, nn.MSELoss):
+        return (pred - target).square()
+    return F.huber_loss(pred, target, reduction='none', delta=1.0)
+
+
+def _rec_loss_per_sample(criterion: nn.Module, pred: torch.Tensor,
+                         target: torch.Tensor) -> torch.Tensor:
+    loss = _elementwise_rec_loss(criterion, pred, target)
+    return loss.reshape(loss.shape[0], -1).mean(dim=1)
+
+
+def _rec_loss_per_batch_sample(criterion: nn.Module, pred: torch.Tensor,
+                               target: torch.Tensor,
+                               batch_size: int) -> torch.Tensor:
+    if pred.shape[0] == batch_size:
+        return _rec_loss_per_sample(criterion, pred, target)
+    if pred.ndim >= 2 and pred.shape[1] == batch_size:
+        dims = [1, 0] + list(range(2, pred.ndim))
+        return _rec_loss_per_sample(
+            criterion, pred.permute(*dims), target.permute(*dims))
+    raise ValueError(
+        f'Cannot infer batch dimension for per-sample loss: expected B='
+        f'{batch_size}, got pred shape {tuple(pred.shape)}'
+    )
+
+
+def _masked_scalar_from_per_sample(values: torch.Tensor,
+                                   valid: torch.Tensor | None,
+                                   zero: torch.Tensor) -> torch.Tensor:
+    if valid is None:
+        return values.mean()
+    valid = valid.to(device=values.device, dtype=torch.bool).reshape(-1)
+    if not valid.any():
+        return zero
+    return values[valid].mean()
+
+
+def _weighted_total_from_terms(
+    terms: Dict[str, torch.Tensor],
+    loss_weight,
+    *,
+    batch_size: int,
+    device,
+    dtype,
+    is_recovery=None,
+    per_sample_terms=None,
+) -> torch.Tensor:
+    if per_sample_terms is None:
+        per_sample_terms = {}
+    total = torch.zeros((), device=device, dtype=dtype)
+    for key, value in terms.items():
+        if key == 'total':
+            continue
+        if key in per_sample_terms:
+            per_values, valid = per_sample_terms[key]
+            weight = _loss_weight_vector(
+                loss_weight, key, is_recovery, batch_size, device,
+                per_values.dtype)
+            if valid is not None:
+                valid = valid.to(
+                    device=per_values.device, dtype=torch.bool).reshape(-1)
+                if not valid.any():
+                    continue
+                total = total + (per_values * weight * valid).sum() / (
+                    valid.to(dtype=per_values.dtype).sum().clamp_min(1.0))
+            else:
+                total = total + (per_values * weight).mean()
+            continue
+        if _has_loss_weight_sections(loss_weight):
+            weight = _loss_weight_vector(
+                loss_weight, key, is_recovery, batch_size, device, dtype).mean()
+            total = total + weight * value
+        else:
+            total = total + _loss_weight_value(loss_weight, key) * value
+    return total
 
 
 def _motion_class_labels(action_label, is_recovery=None) -> List[str]:
@@ -123,10 +309,16 @@ class GeometryLoss:
     def calc_foot_sliding_loss(self, foot_positions, contact_mask, fps,
                                sliding_mask=None):
         """Penalize predicted world-foot velocity on ground-truth stance frames."""
+        return self.calc_foot_sliding_loss_per_sample(
+            foot_positions, contact_mask, fps, sliding_mask).mean()
+
+    def calc_foot_sliding_loss_per_sample(self, foot_positions, contact_mask,
+                                          fps, sliding_mask=None):
+        """Per-sample version of the stance-foot velocity penalty."""
         if fps is None or fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
         if foot_positions.shape[1] < 2:
-            return foot_positions.sum() * 0.0
+            return foot_positions.new_zeros(foot_positions.shape[0])
         foot_velocity = (
             foot_positions[:, 1:] - foot_positions[:, :-1]
         ) * fps
@@ -135,7 +327,8 @@ class GeometryLoss:
             stance = stance & ~(sliding_mask[:, 1:] > 0.5)
         stance = stance.unsqueeze(-1).to(dtype=foot_velocity.dtype)
         masked_velocity = foot_velocity * stance
-        return self.rec_criterion(masked_velocity, torch.zeros_like(masked_velocity))
+        return _rec_loss_per_sample(
+            self.rec_criterion, masked_velocity, torch.zeros_like(masked_velocity))
 
     @staticmethod
     def calc_sliding_ratio(contact_mask, sliding_mask):
@@ -384,7 +577,8 @@ class GeometryLoss:
         return support
 
     def _support_component_from_fk(self, fk_result, support_body_ids,
-                                   support_mask):
+                                   support_mask,
+                                   return_loss_per_sample: bool = False):
         """Return support residual loss plus diagnostic summaries.
 
         support_mask is expected to be [B, T, K]; the active support frames are
@@ -397,14 +591,20 @@ class GeometryLoss:
         ) * 0.0
         zero_per_sample = zero_per_sample.detach()
         if support_mask is None:
-            return zero, zero_metric, zero_per_sample, zero_metric
+            result = (zero, zero_metric, zero_per_sample, zero_metric)
+            if return_loss_per_sample:
+                return (*result, zero_per_sample)
+            return result
         if support_mask.ndim != 3:
             raise ValueError(
                 "support_mask must be [B, T, K], got "
                 f"{tuple(support_mask.shape)}"
             )
         if fk_result['global_translation_extend'].shape[1] < 2:
-            return zero, zero_metric, zero_per_sample, zero_metric
+            result = (zero, zero_metric, zero_per_sample, zero_metric)
+            if return_loss_per_sample:
+                return (*result, zero_per_sample)
+            return result
 
         global_translation = fk_result['global_translation_extend']
         global_rotation = fk_result['global_rotation']
@@ -433,7 +633,10 @@ class GeometryLoss:
 
         active = support_mask[:, 1:] & support_mask[:, :-1]
         if not active.any():
-            return zero, zero_metric, zero_per_sample, zero_metric
+            result = (zero, zero_metric, zero_per_sample, zero_metric)
+            if return_loss_per_sample:
+                return (*result, zero_per_sample)
+            return result
 
         root_pos = global_translation[:, :, 0, :]
         root_rot = quaternion_to_matrix(
@@ -463,8 +666,19 @@ class GeometryLoss:
 
         active_vectors = residual[active]
         if active_vectors.numel() == 0:
-            return zero, zero_metric, zero_per_sample, zero_metric
+            result = (zero, zero_metric, zero_per_sample, zero_metric)
+            if return_loss_per_sample:
+                return (*result, zero_per_sample)
+            return result
 
+        element_loss = _elementwise_rec_loss(
+            self.rec_criterion, residual, torch.zeros_like(residual))
+        active_loss = element_loss * active.unsqueeze(-1).to(
+            dtype=element_loss.dtype)
+        loss_per_sample = active_loss.sum(dim=(1, 2, 3)) / (
+            active.to(dtype=element_loss.dtype).sum(dim=(1, 2)).clamp_min(1.0)
+            * float(residual.shape[-1])
+        )
         loss = self.rec_criterion(active_vectors, torch.zeros_like(active_vectors))
         metric = active_vectors.norm(dim=-1).mean()
 
@@ -474,7 +688,10 @@ class GeometryLoss:
             residual_norm * active_float
         ).sum(dim=(1, 2)) / active_float.sum(dim=(1, 2)).clamp_min(1.0)
         active_ratio = active_float.mean()
-        return loss, metric, per_sample, active_ratio
+        result = (loss, metric, per_sample, active_ratio)
+        if return_loss_per_sample:
+            return (*result, loss_per_sample)
+        return result
 
     @staticmethod
     def _transport_gravity(prev_g, rel_rot):
@@ -557,6 +774,7 @@ class GeometryLoss:
             'batch_idx': batch_idx,
             'selected': future_motion[batch_idx, goal_step],
             'height_at_goal': pred['height'][batch_idx, goal_step],
+            'gravity_at_goal': pred['gravity'][batch_idx, goal_step],
             'trajectory': trajectory,
             'displacement_at_goal': trajectory[
                 batch_idx, (goal_step + 1).clamp(max=trajectory.shape[1] - 1)],
@@ -613,10 +831,15 @@ class GeometryLoss:
 
     @staticmethod
     def _quat_chordal_loss(q_pred, q_gt):
+        return GeometryLoss._quat_chordal_per_sample(q_pred, q_gt).mean()
+
+    @staticmethod
+    def _quat_chordal_per_sample(q_pred, q_gt):
         q_pred = torch.nn.functional.normalize(q_pred, dim=-1, eps=1e-8)
         q_gt = torch.nn.functional.normalize(q_gt, dim=-1, eps=1e-8)
         dot = (q_pred * q_gt).sum(dim=-1).clamp(-1.0, 1.0)
-        return (8.0 * (1.0 - dot.square())).mean()
+        loss = 8.0 * (1.0 - dot.square())
+        return loss.reshape(loss.shape[0], -1).mean(dim=1)
 
     def calc_geometry_loss_v6(
         self,
@@ -627,6 +850,7 @@ class GeometryLoss:
         sliding_mask=None,
         action_label=None,
         is_recovery=None,
+        return_per_sample_loss_terms: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Geometry losses for the gravity + relative-rotation v6 feature."""
         terms = {}
@@ -640,6 +864,7 @@ class GeometryLoss:
         zero = future_motion_pred.sum() * 0.0
         zero_metric = zero.detach()
         per_sample = {}
+        per_sample_loss_terms = {}
         future_motion_pred_fk = self.dataset.reconstruct_motion(
             future_motion_pred, need_denormalize=True, ret_fk=True
         )
@@ -649,14 +874,19 @@ class GeometryLoss:
                 sliding_mask=sliding_mask,
             )
 
-        body_trans_loss = self.rec_criterion(
+        body_trans_per_sample = _rec_loss_per_sample(
+            self.rec_criterion,
             future_motion_pred_fk['global_translation_extend'],
             future_motion_gt_fk['global_translation_extend'],
         )
-        body_rot_loss = self._quat_chordal_loss(
+        body_trans_loss = body_trans_per_sample.mean()
+        per_sample_loss_terms['body_trans'] = body_trans_per_sample
+        body_rot_per_sample = self._quat_chordal_per_sample(
             future_motion_pred_fk['global_rotation'],
             future_motion_gt_fk['global_rotation'],
         )
+        body_rot_loss = body_rot_per_sample.mean()
+        per_sample_loss_terms['body_rot'] = body_rot_per_sample
 
         dof_dim = int(self.dataset.dof_dim)
         for label, fk_result in (
@@ -674,12 +904,18 @@ class GeometryLoss:
                     f"{label} dof_vel must match dof_pos shape "
                     f"{expected_shape}, got {tuple(fk_result['dof_vel'].shape)}"
                 )
-        dof_pos_loss = self.rec_criterion(
+        dof_pos_per_sample = _rec_loss_per_sample(
+            self.rec_criterion,
             future_motion_pred_fk['dof_pos'], future_motion_gt_fk['dof_pos']
         )
-        dof_vel_loss = self.rec_criterion(
+        dof_pos_loss = dof_pos_per_sample.mean()
+        per_sample_loss_terms['dof_pos'] = dof_pos_per_sample
+        dof_vel_per_sample = _rec_loss_per_sample(
+            self.rec_criterion,
             future_motion_pred_fk['dof_vel'], future_motion_gt_fk['dof_vel']
         )
+        dof_vel_loss = dof_vel_per_sample.mean()
+        per_sample_loss_terms['dof_vel'] = dof_vel_per_sample
 
         if dof_dim == 29:
             core_ids = torch.as_tensor(
@@ -725,12 +961,14 @@ class GeometryLoss:
         foot_trans_pred = future_motion_pred_fk['global_translation_extend'][
             :, :, self.dataset.skeleton.foot_id, :
         ]
-        foot_contact_loss = self.calc_foot_sliding_loss(
+        foot_contact_per_sample = self.calc_foot_sliding_loss_per_sample(
             foot_trans_pred,
             future_motion_gt_fk['contact_mask'],
             fps=self.dataset.fps,
             sliding_mask=future_motion_gt_fk.get('sliding_mask'),
         )
+        foot_contact_loss = foot_contact_per_sample.mean()
+        per_sample_loss_terms['foot_contact'] = foot_contact_per_sample
         extras['sliding_ratio'] = self.calc_sliding_ratio(
             future_motion_gt_fk['contact_mask'],
             future_motion_gt_fk.get('sliding_mask'),
@@ -743,16 +981,19 @@ class GeometryLoss:
         support_losses = []
         support_metrics = []
         support_per_sample = []
+        support_loss_per_sample = []
         support_ratios = {}
         foot_active = False
         hand_active = False
 
         if foot_support_mask is not None:
-            foot_pred_loss, foot_pred_metric, foot_pred_per_sample, foot_ratio = (
+            (foot_pred_loss, foot_pred_metric, foot_pred_per_sample,
+             foot_ratio, foot_loss_per_sample) = (
                 self._support_component_from_fk(
                     future_motion_pred_fk,
                     self.dataset.skeleton.foot_id,
                     foot_support_mask,
+                    return_loss_per_sample=True,
                 )
             )
             with torch.no_grad():
@@ -766,6 +1007,7 @@ class GeometryLoss:
                 support_losses.append(foot_pred_loss)
                 support_metrics.append(foot_pred_metric.detach())
                 support_per_sample.append(foot_pred_per_sample)
+                support_loss_per_sample.append(foot_loss_per_sample)
             support_ratios['foot_support_active_ratio'] = foot_ratio
             extras['e_support_foot'] = foot_pred_metric.detach()
             extras['e_support_foot_gt'] = foot_gt_metric
@@ -775,11 +1017,13 @@ class GeometryLoss:
             is_recovery=is_recovery,
         )
         if hand_support_mask is not None:
-            hand_pred_loss, hand_pred_metric, hand_pred_per_sample, hand_ratio = (
+            (hand_pred_loss, hand_pred_metric, hand_pred_per_sample,
+             hand_ratio, hand_loss_per_sample) = (
                 self._support_component_from_fk(
                     future_motion_pred_fk,
                     self.dataset.skeleton.hand_id,
                     hand_support_mask,
+                    return_loss_per_sample=True,
                 )
             )
             with torch.no_grad():
@@ -793,6 +1037,7 @@ class GeometryLoss:
                 support_losses.append(hand_pred_loss)
                 support_metrics.append(hand_pred_metric.detach())
                 support_per_sample.append(hand_pred_per_sample)
+                support_loss_per_sample.append(hand_loss_per_sample)
             support_ratios['hand_support_active_ratio'] = hand_ratio
             extras['e_support_hand'] = hand_pred_metric.detach()
             extras['e_support_hand_gt'] = hand_gt_metric
@@ -806,6 +1051,10 @@ class GeometryLoss:
             )
             per_sample['e_support_consistency'] = (
                 sum(support_per_sample) / float(len(support_per_sample))
+            )
+            per_sample_loss_terms['support_consistency'] = (
+                sum(support_loss_per_sample)
+                / float(len(support_loss_per_sample))
             )
             with torch.no_grad():
                 gt_support_metrics = []
@@ -824,15 +1073,20 @@ class GeometryLoss:
             per_sample['e_support_consistency'] = future_motion_pred.new_zeros(
                 future_motion_pred.shape[0]
             )
+            per_sample_loss_terms['support_consistency'] = (
+                future_motion_pred.new_zeros(future_motion_pred.shape[0])
+            )
         extras.update(support_ratios)
 
         pred = self._feature_v6_components(future_motion_pred)
         with torch.no_grad():
             gt = self._feature_v6_components(future_motion_gt)
 
-        terms['rot_chord'] = (
+        rot_chord_per_sample = (
             pred['rel_rot'] - gt['rel_rot']
-        ).square().sum(dim=(-1, -2)).mean()
+        ).square().sum(dim=(-1, -2)).mean(dim=1)
+        terms['rot_chord'] = rot_chord_per_sample.mean()
+        per_sample_loss_terms['rot_chord'] = rot_chord_per_sample
 
         residuals = []
         if history_motion is not None:
@@ -857,16 +1111,24 @@ class GeometryLoss:
             per_sample['e_g_cons'] = interior_norm.mean(dim=1)  # [B]
         else:
             extras['e_g_cons'] = zero_metric
-        terms['g_cons'] = (
-            torch.cat(residuals, dim=1).square().sum(dim=-1).mean()
-            if residuals else zero
-        )
+        if residuals:
+            g_cons_residual = torch.cat(residuals, dim=1)
+            g_cons_per_sample = g_cons_residual.square().sum(dim=-1).mean(dim=1)
+            terms['g_cons'] = g_cons_per_sample.mean()
+            per_sample_loss_terms['g_cons'] = g_cons_per_sample
+        else:
+            terms['g_cons'] = zero
+            per_sample_loss_terms['g_cons'] = future_motion_pred.new_zeros(
+                future_motion_pred.shape[0])
 
         if pred['height'].shape[1] > 1:
             fps = float(self.dataset.fps)
             pred_h_vel = (pred['height'][:, 1:] - pred['height'][:, :-1]) * fps
             gt_h_vel = (gt['height'][:, 1:] - gt['height'][:, :-1]) * fps
-            terms['h_vel'] = self.rec_criterion(pred_h_vel, gt_h_vel)
+            h_vel_per_sample = _rec_loss_per_sample(
+                self.rec_criterion, pred_h_vel, gt_h_vel)
+            terms['h_vel'] = h_vel_per_sample.mean()
+            per_sample_loss_terms['h_vel'] = h_vel_per_sample
             per_h = (
                 pred_h_vel.detach() - gt_h_vel
             ).abs().mean(dim=1)  # [B]
@@ -885,6 +1147,8 @@ class GeometryLoss:
             terms['h_vel'] = zero
             extras['e_h_vel'] = zero_metric
             extras['e_q_vel'] = zero_metric
+            per_sample_loss_terms['h_vel'] = future_motion_pred.new_zeros(
+                future_motion_pred.shape[0])
 
         with torch.no_grad():
             extras['e_g_proj'] = (
@@ -936,6 +1200,8 @@ class GeometryLoss:
         terms['dof_vel'] = dof_vel_loss
         terms['foot_contact'] = foot_contact_loss
 
+        if return_per_sample_loss_terms:
+            return terms, extras, per_sample_loss_terms
         return terms, extras
 
     def calc_geometry_loss_v2(self,
@@ -1063,11 +1329,86 @@ class GeometryLoss:
 
         return terms, extras
 
+    def calc_goal_root_position_loss_components(
+        self,
+        future_motion_pred,
+        ego_goal,
+        goal_condition_keep_mask=None,
+        history_motion=None,
+        goal_time_frame=None,
+        goal_state=None,
+        return_per_sample: bool = False,
+    ):
+        """Match root-position goal as separate horizontal and vertical terms."""
+        zero = future_motion_pred.sum() * 0.0
+        if (motion_dtype.FeatureVersion == 6
+                and ego_goal.shape[-1]
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+            if goal_state is None:
+                goal_state = self._future_goal_state_v6(
+                    future_motion_pred, history_motion,
+                    goal_time_frame=goal_time_frame)
+            predicted_vert = goal_state['height_at_goal'].unsqueeze(-1)
+            predicted_hor = goal_state['displacement_at_goal']
+            if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+                target_vert = ego_goal[..., SPLIT_VERTICAL_HEIGHT_SLICE][..., :1]
+                target_hor = ego_goal[..., SPLIT_HORIZONTAL_SLICE][..., :3]
+            else:
+                target = ego_goal[..., V6_RAW_POSITION_SLICE]
+                target_vert = target[..., :1]
+                target_hor = target[..., 1:4]
+            valid = torch.ones(
+                target_hor.shape[0], dtype=torch.bool, device=target_hor.device)
+            if goal_condition_keep_mask is not None:
+                valid = valid & goal_condition_keep_mask.to(
+                    device=valid.device, dtype=torch.bool)
+            hor_per = _rec_loss_per_sample(
+                self.rec_criterion, predicted_hor, target_hor)
+            vert_per = _rec_loss_per_sample(
+                self.rec_criterion, predicted_vert, target_vert)
+            hor = _masked_scalar_from_per_sample(hor_per, valid, zero)
+            vert = _masked_scalar_from_per_sample(vert_per, valid, zero)
+            if return_per_sample:
+                return {
+                    'goal_root_position_hor': (hor, hor_per, valid),
+                    'goal_root_position_vert': (vert, vert_per, valid),
+                }
+            return {
+                'goal_root_position_hor': hor,
+                'goal_root_position_vert': vert,
+            }
+
+        root_displacement = self.root_displacement_ego(
+            future_motion_pred, history_motion,
+            goal_time_frame=goal_time_frame)
+        goal_root_position = ego_goal[..., :2]
+        valid = torch.ones(
+            goal_root_position.shape[0], dtype=torch.bool,
+            device=goal_root_position.device)
+        if goal_condition_keep_mask is not None:
+            valid = valid & goal_condition_keep_mask.to(
+                device=valid.device, dtype=torch.bool
+            )
+        hor_per = _rec_loss_per_sample(
+            self.rec_criterion, root_displacement, goal_root_position)
+        hor = _masked_scalar_from_per_sample(hor_per, valid, zero)
+        vert_per = future_motion_pred.new_zeros(future_motion_pred.shape[0])
+        vert = zero
+        if return_per_sample:
+            return {
+                'goal_root_position_hor': (hor, hor_per, valid),
+                'goal_root_position_vert': (vert, vert_per, valid),
+            }
+        return {
+            'goal_root_position_hor': hor,
+            'goal_root_position_vert': vert,
+        }
+
     def calc_goal_root_position_loss(self, future_motion_pred, ego_goal,
                                      goal_condition_keep_mask=None,
                                      history_motion=None,
                                      goal_time_frame=None):
-        """Match generated horizontal root displacement to the goal endpoint."""
+        """Backward-compatible combined root-position goal metric."""
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
@@ -1205,8 +1546,10 @@ class GeometryLoss:
         history_motion=None,
         goal_time_frame=None,
         goal_state=None,
+        return_per_sample: bool = False,
     ):
         """Match TextOp-style root orientation at the selected goal frame."""
+        zero = future_motion_pred.sum() * 0.0
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
@@ -1224,10 +1567,11 @@ class GeometryLoss:
             valid = self._valid_goal_component_mask(
                 target_rot6d.shape[0], target_rot6d.device,
                 goal_orientation_condition_keep_mask)
-            if not valid.any():
-                return future_motion_pred.sum() * 0.0
-            return (predicted[valid] - target_R[valid]).square().sum(
-                dim=(-1, -2)).mean()
+            per_sample = (predicted - target_R).square().sum(dim=(-1, -2))
+            loss = _masked_scalar_from_per_sample(per_sample, valid, zero)
+            if return_per_sample:
+                return loss, per_sample, valid
+            return loss
 
         selected = self._future_feature_at_goal(
             future_motion_pred, goal_time_frame, goal_state=goal_state)
@@ -1242,9 +1586,50 @@ class GeometryLoss:
         valid = self._valid_goal_component_mask(
             target.shape[0], target.device,
             goal_orientation_condition_keep_mask)
-        if not valid.any():
-            return future_motion_pred.sum() * 0.0
-        return self.rec_criterion(error[valid], torch.zeros_like(error[valid]))
+        per_sample = _rec_loss_per_sample(
+            self.rec_criterion, error, torch.zeros_like(error))
+        loss = _masked_scalar_from_per_sample(per_sample, valid, zero)
+        if return_per_sample:
+            return loss, per_sample, valid
+        return loss
+
+    def calc_goal_g_loss(
+        self,
+        future_motion_pred,
+        ego_goal,
+        goal_orientation_condition_keep_mask=None,
+        history_motion=None,
+        goal_time_frame=None,
+        goal_state=None,
+        return_per_sample: bool = False,
+    ):
+        """Match the target gravity direction at the selected goal frame."""
+        zero = future_motion_pred.sum() * 0.0
+        if not (motion_dtype.FeatureVersion == 6
+                and ego_goal.shape[-1]
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+            raise ValueError(
+                "goal_g loss requires feature_version=6 with a rot-matrix "
+                "joint_state goal"
+            )
+        if goal_state is None:
+            goal_state = self._future_goal_state_v6(
+                future_motion_pred, history_motion,
+                goal_time_frame=goal_time_frame)
+        predicted = goal_state['gravity_at_goal']
+        if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+            target = ego_goal[..., SPLIT_VERTICAL_GRAVITY_SLICE]
+        else:
+            target = ego_goal[..., V6_RAW_ORIENTATION_SLICE][..., :3]
+        target = F.normalize(target, dim=-1, eps=1e-8)
+        valid = self._valid_goal_component_mask(
+            target.shape[0], target.device,
+            goal_orientation_condition_keep_mask)
+        per_sample = (predicted - target).square().sum(dim=-1)
+        loss = _masked_scalar_from_per_sample(per_sample, valid, zero)
+        if return_per_sample:
+            return loss, per_sample, valid
+        return loss
 
     def calc_goal_joint_angle_loss(
         self,
@@ -1253,8 +1638,10 @@ class GeometryLoss:
         goal_joint_condition_keep_mask=None,
         goal_time_frame=None,
         goal_state=None,
+        return_per_sample: bool = False,
     ):
         """Match the 29-DOF joint angles at the selected goal frame."""
+        zero = future_motion_pred.sum() * 0.0
         dof_dim = int(self.dataset.dof_dim)
         if dof_dim != 29:
             raise ValueError(
@@ -1274,9 +1661,12 @@ class GeometryLoss:
             )
             valid = self._valid_goal_component_mask(
                 target.shape[0], target.device, goal_joint_condition_keep_mask)
-            if not valid.any():
-                return future_motion_pred.sum() * 0.0
-            return self.rec_criterion(predicted[valid], target[valid])
+            per_sample = _rec_loss_per_sample(
+                self.rec_criterion, predicted, target)
+            loss = _masked_scalar_from_per_sample(per_sample, valid, zero)
+            if return_per_sample:
+                return loss, per_sample, valid
+            return loss
 
         selected = self._future_feature_at_goal(
             future_motion_pred, goal_time_frame, goal_state=goal_state)
@@ -1284,9 +1674,11 @@ class GeometryLoss:
         target = ego_goal[..., 8:37]
         valid = self._valid_goal_component_mask(
             target.shape[0], target.device, goal_joint_condition_keep_mask)
-        if not valid.any():
-            return future_motion_pred.sum() * 0.0
-        return self.rec_criterion(predicted[valid], target[valid])
+        per_sample = _rec_loss_per_sample(self.rec_criterion, predicted, target)
+        loss = _masked_scalar_from_per_sample(per_sample, valid, zero)
+        if return_per_sample:
+            return loss, per_sample, valid
+        return loss
 
     def calc_goal_root_velocity_loss(
         self,
@@ -1296,8 +1688,10 @@ class GeometryLoss:
         history_motion=None,
         goal_time_frame=None,
         goal_state=None,
+        return_per_sample: bool = False,
     ):
         """Match reference-ego root velocity at the selected goal frame."""
+        zero = future_motion_pred.sum() * 0.0
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
@@ -1314,9 +1708,12 @@ class GeometryLoss:
             valid = self._valid_goal_component_mask(
                 target.shape[0], target.device,
                 goal_velocity_condition_keep_mask)
-            if not valid.any():
-                return future_motion_pred.sum() * 0.0
-            return self.rec_criterion(predicted[valid], target[valid])
+            per_sample = _rec_loss_per_sample(
+                self.rec_criterion, predicted, target)
+            loss = _masked_scalar_from_per_sample(per_sample, valid, zero)
+            if return_per_sample:
+                return loss, per_sample, valid
+            return loss
 
         selected = self._future_feature_at_goal(
             future_motion_pred, goal_time_frame, goal_state=goal_state)
@@ -1337,9 +1734,11 @@ class GeometryLoss:
         target = ego_goal[..., 37:40]
         valid = self._valid_goal_component_mask(
             target.shape[0], target.device, goal_velocity_condition_keep_mask)
-        if not valid.any():
-            return future_motion_pred.sum() * 0.0
-        return self.rec_criterion(predicted[valid], target[valid])
+        per_sample = _rec_loss_per_sample(self.rec_criterion, predicted, target)
+        loss = _masked_scalar_from_per_sample(per_sample, valid, zero)
+        if return_per_sample:
+            return loss, per_sample, valid
+        return loss
 
     def _trajectory_at_step(self, trajectory, goal_time_frame=None):
         if goal_time_frame is None:
@@ -1483,10 +1882,14 @@ def calc_mvae_loss(self,
               is_recovery=None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     terms = {}
     extras = {}
+    per_sample_terms = {}
 
     # 重构损失
-    rec_loss = self.rec_criterion(future_motion_pred, future_motion_gt)
+    rec_per_sample = _rec_loss_per_sample(
+        self.rec_criterion, future_motion_pred, future_motion_gt)
+    rec_loss = rec_per_sample.mean()
     terms['rec'] = rec_loss
+    per_sample_terms['rec'] = (rec_per_sample, None)
 
     # if self.loss_weight['smooth'] > 0.0:
     #     recon_diff = future_motion_pred[:, 1:, :] - future_motion_pred[:, :-1, :]
@@ -1498,6 +1901,7 @@ def calc_mvae_loss(self,
     terms['kl'] = kl_loss
 
     # 使用继承的几何损失计算方法
+    geometry_per_sample_terms = {}
     if motion_dtype.FeatureVersion == 4:
         geometry_terms, geometry_extras = self.calc_geometry_loss_v2(
             future_motion_pred, future_motion_gt, history_motion
@@ -1508,33 +1912,50 @@ def calc_mvae_loss(self,
             sliding_mask=sliding_mask,
         )
     elif motion_dtype.FeatureVersion == 6:
-        geometry_terms, geometry_extras = self.calc_geometry_loss_v6(
-            future_motion_pred,
-            future_motion_gt,
-            history_motion,
-            smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
-            sliding_mask=sliding_mask,
-            action_label=action_label,
-            is_recovery=is_recovery,
+        geometry_terms, geometry_extras, geometry_per_sample_terms = (
+            self.calc_geometry_loss_v6(
+                future_motion_pred,
+                future_motion_gt,
+                history_motion,
+                smooth=_loss_weight_any(self.loss_weight, 'smooth') > 0.0,
+                sliding_mask=sliding_mask,
+                action_label=action_label,
+                is_recovery=is_recovery,
+                return_per_sample_loss_terms=True,
+            )
         )
     else:
-        quantize = (self.loss_weight.get('quantize_rot', 0.0) > 0.0 or self.loss_weight.get('quantize_trans', 0.0) > 0.0)
-        endpoint = (self.loss_weight.get('endpoint_xy', 0.0) > 0.0 or self.loss_weight.get('endpoint_yaw', 0.0) > 0.0)
+        quantize = (
+            _loss_weight_any(self.loss_weight, 'quantize_rot') > 0.0
+            or _loss_weight_any(self.loss_weight, 'quantize_trans') > 0.0)
+        endpoint = (
+            _loss_weight_any(self.loss_weight, 'endpoint_xy') > 0.0
+            or _loss_weight_any(self.loss_weight, 'endpoint_yaw') > 0.0)
         geometry_terms, geometry_extras = self.calc_geometry_loss(
             future_motion_pred,
             future_motion_gt,
             history_motion,
-            smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
+            smooth=_loss_weight_any(self.loss_weight, 'smooth') > 0.0,
             quantize=quantize,
             endpoint=endpoint,
             sliding_mask=sliding_mask,
         )
 
     # geometry_terms = self.calc_geometry_loss_v2(future_motion_pred, future_motion_gt, history_motion)
+    for key, values in geometry_per_sample_terms.items():
+        per_sample_terms[key] = (values, None)
     terms.update(geometry_terms)
     extras.update(geometry_extras)
 
-    total_loss = sum(self.loss_weight.get(k, 0.0) * v for k, v in terms.items())
+    total_loss = _weighted_total_from_terms(
+        terms,
+        self.loss_weight,
+        batch_size=future_motion_gt.shape[0],
+        device=future_motion_gt.device,
+        dtype=future_motion_gt.dtype,
+        is_recovery=is_recovery,
+        per_sample_terms=per_sample_terms,
+    )
     terms['total'] = total_loss
     return terms, extras
 
@@ -1562,10 +1983,14 @@ def calc_dar_loss(
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     terms = {}
     extras = {}
+    per_sample_terms = {}
 
     # 重构损失
-    rec_loss = self.rec_criterion(future_motion_pred, future_motion_gt)
+    rec_per_sample = _rec_loss_per_sample(
+        self.rec_criterion, future_motion_pred, future_motion_gt)
+    rec_loss = rec_per_sample.mean()
     terms['rec'] = rec_loss
+    per_sample_terms['rec'] = (rec_per_sample, None)
 
     # KL损失
     if dist is not None:
@@ -1577,13 +2002,21 @@ def calc_dar_loss(
 
     # latent重构损失
     if latent_pred is not None and latent is not None:
-        latent_rec_loss = self.rec_criterion(latent_pred, latent)
+        latent_rec_per_sample = _rec_loss_per_batch_sample(
+            self.rec_criterion,
+            latent_pred,
+            latent,
+            future_motion_gt.shape[0],
+        )
+        latent_rec_loss = latent_rec_per_sample.mean()
         terms['latent_rec'] = latent_rec_loss
+        per_sample_terms['latent_rec'] = (latent_rec_per_sample, None)
     else:
         latent_rec_loss = torch.tensor(0.0, device=future_motion_gt.device)
         terms['latent_rec'] = latent_rec_loss
 
     # 几何损失
+    geometry_per_sample_terms = {}
     if motion_dtype.FeatureVersion == 4:
         geometry_terms, geometry_extras = self.calc_geometry_loss_v2(
             future_motion_pred, future_motion_gt, history_motion
@@ -1594,23 +2027,30 @@ def calc_dar_loss(
             sliding_mask=sliding_mask,
         )
     elif motion_dtype.FeatureVersion == 6:
-        geometry_terms, geometry_extras = self.calc_geometry_loss_v6(
-            future_motion_pred,
-            future_motion_gt,
-            history_motion,
-            smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
-            sliding_mask=sliding_mask,
-            action_label=action_label,
-            is_recovery=is_recovery,
+        geometry_terms, geometry_extras, geometry_per_sample_terms = (
+            self.calc_geometry_loss_v6(
+                future_motion_pred,
+                future_motion_gt,
+                history_motion,
+                smooth=_loss_weight_any(self.loss_weight, 'smooth') > 0.0,
+                sliding_mask=sliding_mask,
+                action_label=action_label,
+                is_recovery=is_recovery,
+                return_per_sample_loss_terms=True,
+            )
         )
     else:
-        quantize = (self.loss_weight.get('quantize_rot', 0.0) > 0.0 or self.loss_weight.get('quantize_trans', 0.0) > 0.0)
-        endpoint = (self.loss_weight.get('endpoint_xy', 0.0) > 0.0 or self.loss_weight.get('endpoint_yaw', 0.0) > 0.0)
+        quantize = (
+            _loss_weight_any(self.loss_weight, 'quantize_rot') > 0.0
+            or _loss_weight_any(self.loss_weight, 'quantize_trans') > 0.0)
+        endpoint = (
+            _loss_weight_any(self.loss_weight, 'endpoint_xy') > 0.0
+            or _loss_weight_any(self.loss_weight, 'endpoint_yaw') > 0.0)
         geometry_terms, geometry_extras = self.calc_geometry_loss(
             future_motion_pred,
             future_motion_gt,
             history_motion,
-            smooth=self.loss_weight.get('smooth', 0.0) > 0.0,
+            smooth=_loss_weight_any(self.loss_weight, 'smooth') > 0.0,
             quantize=quantize,
             endpoint=endpoint,
             sliding_mask=sliding_mask,
@@ -1622,12 +2062,17 @@ def calc_dar_loss(
     #                                          future_motion_gt, history_motion=history_motion)
 
     # geometry_terms = self.calc_geometry_loss_v2(future_motion_pred, future_motion_gt, history_motion)
+    for key, values in geometry_per_sample_terms.items():
+        per_sample_terms[key] = (values, None)
     terms.update(geometry_terms)
     extras.update(geometry_extras)
 
     goal_type = GoalType.parse(goal_type)
     compute_goal_root_position = (
-        self.loss_weight.get('goal_root_position', 0.0) > 0.0 or is_eval
+        _loss_weight_any(self.loss_weight, 'goal_root_position_hor') > 0.0
+        or _loss_weight_any(self.loss_weight, 'goal_root_position_vert') > 0.0
+        or _loss_weight_any(self.loss_weight, 'goal_root_position') > 0.0
+        or is_eval
     )
     if compute_goal_root_position:
         if ego_goal is None:
@@ -1635,11 +2080,21 @@ def calc_dar_loss(
                 "ego_goal is required when goal_root_position loss is enabled "
                 "or during eval"
             )
-        terms['goal_root_position'] = self.calc_goal_root_position_loss(
+        root_position_components = self.calc_goal_root_position_loss_components(
             future_motion_pred, ego_goal, goal_condition_keep_mask,
             history_motion=history_motion,
             goal_time_frame=goal_time_frame,
+            return_per_sample=True,
         )
+        for key, (loss, per_sample, valid) in root_position_components.items():
+            terms[key] = loss
+            per_sample_terms[key] = (per_sample, valid)
+        if _loss_weight_any(self.loss_weight, 'goal_root_position') > 0.0:
+            terms['goal_root_position'] = self.calc_goal_root_position_loss(
+                future_motion_pred, ego_goal, goal_condition_keep_mask,
+                history_motion=history_motion,
+                goal_time_frame=goal_time_frame,
+            )
 
     joint_goal_dims = (
         JOINT_STATE_GOAL_DIM,
@@ -1648,19 +2103,29 @@ def calc_dar_loss(
     )
     if ego_goal is not None and ego_goal.shape[-1] in joint_goal_dims:
         compute_goal_root_orientation = (
-            self.loss_weight.get('goal_root_orientation', 0.0) > 0.0
+            _loss_weight_any(self.loss_weight, 'goal_root_orientation') > 0.0
             or is_eval
         )
+        compute_goal_g = (
+            motion_dtype.FeatureVersion == 6
+            and ego_goal.shape[-1] in (ROT_MAT_JOINT_STATE_GOAL_DIM,
+                                       SPLIT_GOAL_DIM)
+            and (
+                _loss_weight_any(self.loss_weight, 'goal_g') > 0.0
+                or is_eval
+            )
+        )
         compute_goal_joint_angle = (
-            self.loss_weight.get('goal_joint_angle', 0.0) > 0.0
+            _loss_weight_any(self.loss_weight, 'goal_joint_angle') > 0.0
             or is_eval
         )
         compute_goal_root_velocity = (
-            self.loss_weight.get('goal_root_velocity', 0.0) > 0.0
+            _loss_weight_any(self.loss_weight, 'goal_root_velocity') > 0.0
             or is_eval
         )
         goal_state = None
-        if (compute_goal_root_orientation or compute_goal_joint_angle
+        if (compute_goal_root_orientation or compute_goal_g
+                or compute_goal_joint_angle
                 or compute_goal_root_velocity):
             goal_state = self._future_goal_state(
                 future_motion_pred,
@@ -1671,44 +2136,65 @@ def calc_dar_loss(
                     or compute_goal_root_velocity
                 ),
             )
-        if (self.loss_weight.get('goal_root_orientation', 0.0) > 0.0
+        if (_loss_weight_any(self.loss_weight, 'goal_root_orientation') > 0.0
                 or is_eval):
-            terms['goal_root_orientation'] = (
-                self.calc_goal_root_orientation_loss(
-                    future_motion_pred,
-                    ego_goal,
-                    goal_orientation_condition_keep_mask,
-                    history_motion=history_motion,
-                    goal_time_frame=goal_time_frame,
-                    goal_state=goal_state,
-                )
+            loss, per_sample, valid = self.calc_goal_root_orientation_loss(
+                future_motion_pred,
+                ego_goal,
+                goal_orientation_condition_keep_mask,
+                history_motion=history_motion,
+                goal_time_frame=goal_time_frame,
+                goal_state=goal_state,
+                return_per_sample=True,
             )
-        if (self.loss_weight.get('goal_joint_angle', 0.0) > 0.0
+            terms['goal_root_orientation'] = loss
+            per_sample_terms['goal_root_orientation'] = (per_sample, valid)
+        if compute_goal_g:
+            loss, per_sample, valid = self.calc_goal_g_loss(
+                future_motion_pred,
+                ego_goal,
+                goal_orientation_condition_keep_mask,
+                history_motion=history_motion,
+                goal_time_frame=goal_time_frame,
+                goal_state=goal_state,
+                return_per_sample=True,
+            )
+            terms['goal_g'] = loss
+            per_sample_terms['goal_g'] = (per_sample, valid)
+        if (_loss_weight_any(self.loss_weight, 'goal_joint_angle') > 0.0
                 or is_eval):
-            terms['goal_joint_angle'] = (
-                self.calc_goal_joint_angle_loss(
-                    future_motion_pred,
-                    ego_goal,
-                    goal_joint_condition_keep_mask,
-                    goal_time_frame=goal_time_frame,
-                    goal_state=goal_state,
-                )
+            loss, per_sample, valid = self.calc_goal_joint_angle_loss(
+                future_motion_pred,
+                ego_goal,
+                goal_joint_condition_keep_mask,
+                goal_time_frame=goal_time_frame,
+                goal_state=goal_state,
+                return_per_sample=True,
             )
-        if (self.loss_weight.get('goal_root_velocity', 0.0) > 0.0
+            terms['goal_joint_angle'] = loss
+            per_sample_terms['goal_joint_angle'] = (per_sample, valid)
+        if (_loss_weight_any(self.loss_weight, 'goal_root_velocity') > 0.0
                 or is_eval):
-            terms['goal_root_velocity'] = (
-                self.calc_goal_root_velocity_loss(
-                    future_motion_pred,
-                    ego_goal,
-                    goal_velocity_condition_keep_mask,
-                    history_motion=history_motion,
-                    goal_time_frame=goal_time_frame,
-                    goal_state=goal_state,
-                )
+            loss, per_sample, valid = self.calc_goal_root_velocity_loss(
+                future_motion_pred,
+                ego_goal,
+                goal_velocity_condition_keep_mask,
+                history_motion=history_motion,
+                goal_time_frame=goal_time_frame,
+                goal_state=goal_state,
+                return_per_sample=True,
             )
+            terms['goal_root_velocity'] = loss
+            per_sample_terms['goal_root_velocity'] = (per_sample, valid)
 
-    total_loss = sum(
-        self.loss_weight.get(k, 0.0) * v for k, v in terms.items()
+    total_loss = _weighted_total_from_terms(
+        terms,
+        self.loss_weight,
+        batch_size=future_motion_gt.shape[0],
+        device=future_motion_gt.device,
+        dtype=future_motion_gt.dtype,
+        is_recovery=is_recovery,
+        per_sample_terms=per_sample_terms,
     )
 
     # diffusion训练时可加权

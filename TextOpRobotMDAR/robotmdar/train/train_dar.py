@@ -68,6 +68,33 @@ def _raw_goal_xy(ego_goal_raw: torch.Tensor) -> torch.Tensor:
     return _raw_goal_root_target(ego_goal_raw)[:, :2]
 
 
+def _loss_weight_config_value(loss_weight, key: str) -> float:
+    if loss_weight is None:
+        return 0.0
+    sections = ('locomotion', 'getup')
+    values = []
+    for section in sections:
+        section_weight = loss_weight.get(section)
+        if section_weight is not None:
+            values.append(_loss_weight_config_value_from_mapping(
+                section_weight, key))
+    values.append(_loss_weight_config_value_from_mapping(loss_weight, key))
+    return max(values)
+
+
+def _loss_weight_config_value_from_mapping(loss_weight, key: str) -> float:
+    value = loss_weight.get(key, None)
+    if value is not None:
+        return float(value)
+    if key.startswith('goal_'):
+        goal_weight = loss_weight.get('goal', None)
+        if goal_weight is not None:
+            value = goal_weight.get(key[len('goal_'):], None)
+            if value is not None:
+                return float(value)
+    return 0.0
+
+
 def _make_root_xy_figure(
     generated_trajectory: torch.Tensor,
     goal_xy: torch.Tensor,
@@ -979,8 +1006,12 @@ def _validate_batch(batch, cfg) -> None:
 
 def _validate_goal_root_position_contract(cfg) -> None:
     """Validate the goal root-position loss timing contract."""
-    weight = float(
-        cfg.train.manager.loss_weight.get('goal_root_position', 0.0))
+    loss_weight = cfg.train.manager.loss_weight
+    weight = max(
+        _loss_weight_config_value(loss_weight, 'goal_root_position'),
+        _loss_weight_config_value(loss_weight, 'goal_root_position_hor'),
+        _loss_weight_config_value(loss_weight, 'goal_root_position_vert'),
+    )
     if weight <= 0.0:
         return
 

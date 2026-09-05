@@ -13,7 +13,10 @@ from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _raw_goal_root_target,
     _validate_goal_root_position_contract,
 )
-from TextOpRobotMDAR.robotmdar.utils.goal import SPLIT_GOAL_DIM
+from TextOpRobotMDAR.robotmdar.utils.goal import (
+    SPLIT_GOAL_DIM,
+    SPLIT_VERTICAL_GRAVITY_SLICE,
+)
 
 
 def _manager():
@@ -170,6 +173,33 @@ def test_goal_root_position_contract_allows_joint_state_random_offsets():
     _validate_goal_root_position_contract(cfg)
 
 
+def test_goal_root_position_contract_reads_nested_hor_vert_weights():
+    cfg = OmegaConf.create({
+        'data': {
+            'goal_type': 'root',
+            'goal_per_primitive': True,
+            'goal_offset': 0,
+            'goal_offset_range': [-3, 0],
+            'goal_timestep_mode': 'relative',
+        },
+        'train': {
+            'manager': {
+                'loss_weight': {
+                    'locomotion': {
+                        'goal': {'root_position_hor': 0.0},
+                    },
+                    'getup': {
+                        'goal': {'root_position_vert': 0.5},
+                    },
+                },
+            },
+        },
+    })
+
+    with pytest.raises(ValueError, match='explicit arrival time'):
+        _validate_goal_root_position_contract(cfg)
+
+
 def test_joint_state_goal_losses_use_selected_goal_frame():
     manager = _manager()
     future = torch.zeros((1, 4, 69), dtype=torch.float32)
@@ -267,6 +297,14 @@ def test_v6_joint_state_goal_losses_use_arrival_rotmat_goal_frame():
             rtol=0,
         )
         torch.testing.assert_close(
+            manager.calc_goal_g_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
             manager.calc_goal_joint_angle_loss(
                 future, goal, goal_time_frame=goal_time_frame),
             torch.tensor(0.0),
@@ -336,6 +374,14 @@ def test_v6_split_goal_losses_use_hor_vert_rot_layout():
             rtol=0,
         )
         torch.testing.assert_close(
+            manager.calc_goal_g_loss(
+                future, goal, history_motion=history,
+                goal_time_frame=goal_time_frame),
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
             manager.calc_goal_joint_angle_loss(
                 future, goal, goal_time_frame=goal_time_frame),
             torch.tensor(0.0),
@@ -350,6 +396,192 @@ def test_v6_split_goal_losses_use_hor_vert_rot_layout():
             atol=1e-6,
             rtol=0,
         )
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_v6_split_goal_root_position_loss_reports_hor_and_vert_separately():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.dataset.dof_dim = 29
+        manager.dataset.fps = 50
+
+        rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
+        history = torch.zeros((1, 2, 44), dtype=torch.float32)
+        future = torch.zeros((1, 4, 44), dtype=torch.float32)
+        for motion in (history, future):
+            motion[..., 0] = 0.77
+            motion[..., 1:4] = torch.tensor([0.0, 0.0, -1.0])
+            motion[..., 7:13] = rot6d_identity
+            motion[..., 42:44] = 1.0
+        future[0, 0:2, 4] = 0.25
+
+        goal = torch.zeros((1, SPLIT_GOAL_DIM), dtype=torch.float32)
+        goal[0, 0:3] = torch.tensor([0.6, 0.0, 0.0])
+        goal[0, 9] = 0.80
+        goal_time_frame = torch.tensor([2])
+
+        components = manager.calc_goal_root_position_loss_components(
+            future,
+            goal,
+            history_motion=history,
+            goal_time_frame=goal_time_frame,
+        )
+
+        torch.testing.assert_close(
+            components['goal_root_position_hor'],
+            torch.tensor(0.5 * 0.1**2 / 3.0),
+            atol=1e-7,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            components['goal_root_position_vert'],
+            torch.tensor(0.5 * 0.03**2),
+            atol=1e-7,
+            rtol=0,
+        )
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_nested_goal_loss_weights_contribute_to_total():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.dataset.dof_dim = 29
+        manager.dataset.fps = 50
+        manager.loss_weight = {
+            'locomotion': {
+                'goal': {
+                    'root_position_hor': 1.0,
+                    'root_position_vert': 0.0,
+                },
+            },
+            'getup': {
+                'goal': {
+                    'root_position_hor': 10.0,
+                    'root_position_vert': 0.0,
+                },
+            },
+        }
+        manager.calc_geometry_loss_v6 = (
+            lambda *args, **kwargs: ({}, {}, {})
+        )
+
+        rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
+        history = torch.zeros((2, 2, 44), dtype=torch.float32)
+        future = torch.zeros((2, 4, 44), dtype=torch.float32)
+        for motion in (history, future):
+            motion[..., 0] = 0.77
+            motion[..., 1:4] = torch.tensor([0.0, 0.0, -1.0])
+            motion[..., 7:13] = rot6d_identity
+        future[:, 0:2, 4] = 0.25
+        goal = torch.zeros((2, SPLIT_GOAL_DIM), dtype=torch.float32)
+        goal_time_frame = torch.tensor([2, 2])
+
+        loss_dict, _ = manager.calc_loss(
+            torch.zeros_like(future),
+            future,
+            None,
+            None,
+            None,
+            None,
+            history_motion=history,
+            ego_goal=goal,
+            goal_type='joint_state',
+            goal_time_frame=goal_time_frame,
+            is_recovery=torch.tensor([False, True]),
+        )
+
+        # Each sample has horizontal Huber mean (0.5 * 0.5^2) / 3.
+        per_sample_hor = torch.tensor(0.5 * 0.5**2 / 3.0)
+        expected = (per_sample_hor * 1.0 + per_sample_hor * 10.0) / 2.0
+        torch.testing.assert_close(loss_dict['total'], expected)
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_nested_goal_g_loss_weights_use_getup_for_recovery_samples():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.dataset.dof_dim = 29
+        manager.dataset.fps = 50
+        manager.loss_weight = {
+            'locomotion': {'goal': {'g': 1.0}},
+            'getup': {'goal': {'g': 10.0}},
+        }
+        manager.calc_geometry_loss_v6 = (
+            lambda *args, **kwargs: ({}, {}, {})
+        )
+
+        rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
+        history = torch.zeros((2, 2, 44), dtype=torch.float32)
+        future = torch.zeros((2, 4, 44), dtype=torch.float32)
+        for motion in (history, future):
+            motion[..., 0] = 0.77
+            motion[..., 1:4] = torch.tensor([0.0, 0.0, -1.0])
+            motion[..., 7:13] = rot6d_identity
+        goal = torch.zeros((2, SPLIT_GOAL_DIM), dtype=torch.float32)
+        goal[:, SPLIT_VERTICAL_GRAVITY_SLICE] = torch.tensor([0.0, 1.0, 0.0])
+
+        loss_dict, _ = manager.calc_loss(
+            torch.zeros_like(future),
+            future,
+            None,
+            None,
+            None,
+            None,
+            history_motion=history,
+            ego_goal=goal,
+            goal_type='joint_state',
+            goal_time_frame=torch.tensor([2, 2]),
+            is_recovery=torch.tensor([False, True]),
+        )
+
+        # ||[0, 0, -1] - [0, 1, 0]||^2 = 2 for each sample.
+        expected = torch.tensor((2.0 * 1.0 + 2.0 * 10.0) / 2.0)
+        torch.testing.assert_close(loss_dict['goal_g'], torch.tensor(2.0))
+        torch.testing.assert_close(loss_dict['total'], expected)
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_nested_loss_weights_use_getup_for_recovery_samples():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.loss_weight = {
+            'locomotion': {'rec': 1.0},
+            'getup': {'rec': 10.0},
+        }
+        manager.calc_geometry_loss_v6 = (
+            lambda *args, **kwargs: ({}, {}, {})
+        )
+        future_gt = torch.zeros((2, 1, 1), dtype=torch.float32)
+        future_pred = torch.tensor([[[1.0]], [[2.0]]], dtype=torch.float32)
+        latent = torch.zeros((1, 2, 1), dtype=torch.float32)
+
+        loss_dict, _ = manager.calc_loss(
+            future_gt,
+            future_pred,
+            latent,
+            None,
+            None,
+            None,
+            history_motion=torch.zeros_like(future_gt),
+            is_recovery=torch.tensor([False, True]),
+        )
+
+        # Huber(1)=0.5 uses locomotion weight 1;
+        # Huber(2)=1.5 uses getup weight 10.
+        torch.testing.assert_close(
+            loss_dict['total'], torch.tensor((0.5 * 1.0 + 1.5 * 10.0) / 2.0))
     finally:
         runtime_motion_dtype.set_feature_version(old_runtime)
         package_motion_dtype.set_feature_version(old_package)

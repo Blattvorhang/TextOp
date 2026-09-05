@@ -187,7 +187,7 @@ class BaseManager(ABC):
     anneal_lr: bool
     learning_rate: float
     max_grad_norm: float
-    loss_weight: Dict[str, float]
+    loss_weight: Dict[str, Any]
     extra: Dict[str, float]
     ckpt: DictConfig
     device: str

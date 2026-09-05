@@ -35,36 +35,43 @@ manager:
   ema_decay: 0.999
 
   loss_weight:
-    rec: 1.0
-    kl: 1e-4 
-    latent_rec: 1.0
-    body_trans: 0.05
-    body_rot: 1e-2
-    dof_pos: 0.03
-    dof_vel: 3e-3  # shared with mvae v6 (doc §4.3.5); live under feature_version=3
-                   # DAR too — override back to 1e-5 for v3 experiments
-    foot_contact: 0.01
-    goal_root_position: 0.5
+    locomotion: &dar_locomotion_loss_weight
+      rec: 1.0
+      kl: 1e-4
+      latent_rec: 1.0
+      body_trans: 0.05
+      body_rot: 1e-2
+      dof_pos: 0.03
+      # shared with mvae v6 (doc §4.3.5); live under feature_version=3
+      # DAR too — override back to 1e-5 for v3 experiments
+      dof_vel: 3e-3
+      foot_contact: 0.01
+      goal:
+        g: 0.0
+        root_position_hor: 0.5
+        root_position_vert: 0.5
 
-    fk_joints_rec: 1.0
-    joints_consistency: 1.0
-    joints_delta: 1.0
-    trans_delta: 1.0
-    orient_delta: 1.0
+      fk_joints_rec: 1.0
+      joints_consistency: 1.0
+      joints_delta: 1.0
+      trans_delta: 1.0
+      orient_delta: 1.0
 
-    dof_delta: 1.0
-    smooth: 0.0
+      dof_delta: 1.0
+      smooth: 0.0
 
-    rot_chord: 0.02
-    g_cons: 0.05
-    h_vel: 0.001  # shared with mvae v6 (doc §4.3.5)
-    support_consistency: 0.01
+      rot_chord: 0.02
+      g_cons: 0.05
+      h_vel: 0.001  # shared with mvae v6 (doc §4.3.5)
+      support_consistency: 0.01
 
-    quantize_rot: 0.0
-    quantize_trans: 0.0
-    
-    endpoint_yaw: 0.0
-    endpoint_xy: 0.0
+      quantize_rot: 0.0
+      quantize_trans: 0.0
+
+      endpoint_yaw: 0.0
+      endpoint_xy: 0.0
+    getup:
+      <<: *dar_locomotion_loss_weight
 
   ckpt: ${...ckpt}
 

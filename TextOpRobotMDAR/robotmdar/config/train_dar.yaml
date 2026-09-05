@@ -52,12 +52,26 @@ denoiser:
 train:
   manager:
     loss_weight:
-      foot_contact: 0.05
-      goal_root_position: 1.0
-      goal_root_orientation: 0.2
-      goal_root_velocity: 0.1
-      goal_joint_angle: 0.1
-      support_consistency: 0.01
+      locomotion:
+        foot_contact: 0.01
+        support_consistency: 0.01
+        goal:
+          g: 0.0
+          root_position_hor: 0.25
+          root_position_vert: 0.05
+          root_orientation: 0.005
+          root_velocity: 0.05
+          joint_angle: 0.01
+      getup:
+        foot_contact: 0.01
+        support_consistency: 0.01
+        goal:
+          g: 0.05
+          root_position_hor: 0.005
+          root_position_vert: 0.10
+          root_orientation: 0.0
+          root_velocity: 0.01
+          joint_angle: 0.01
 
 ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF

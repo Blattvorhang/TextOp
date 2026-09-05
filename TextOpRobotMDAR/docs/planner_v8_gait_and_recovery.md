@@ -1,6 +1,7 @@
 # Planner V8: Gait Trackability and Fall-Recovery Support Consistency
 
-> Status: discussion draft, implementation pending.
+> Status: discussion draft, diagnostics/support consistency implemented;
+> root-position goal loss split and locomotion/getup loss-weight sets added.
 >
 > Builds on `planner_v7_rotation_matrix.md` and
 > `planner_v7_1_fall_recovery.md`. V7 fixes the orientation representation and
@@ -248,26 +249,47 @@ foot_contact:          0.05
 rot_chord:             0.02
 g_cons:                0.05
 h_vel:                 0.001
-goal_root_position:    1.0
-goal_root_orientation: 0.2
-goal_root_velocity:    0.1
-goal_joint_angle:      0.1
+goal:
+  g:                   0.0
+  root_position_hor:   1.0
+  root_position_vert:  1.0
+  root_orientation:    0.2
+  root_velocity:       0.1
+  joint_angle:         0.1
 ```
+
+The manager loss weights are now configured as two sections:
+
+```text
+train.manager.loss_weight.locomotion.*
+train.manager.loss_weight.getup.*
+```
+
+`is_recovery=True` selects the `getup` section for that sample; all other
+samples use `locomotion`. The default values are intentionally copied between
+the two sections until a recovery-specific setting is chosen.
 
 These weights are reasonable for reaching the V7 goal contract. They are not
 yet sufficient for enforcing support-based locomotion or recovery.
 
 Current interpretation:
 
-1. `goal_root_position = 1.0` is effective, but can reward root-displacement
-   shortcuts when support consistency is missing.
-2. `goal_root_velocity = 0.1` helps time-to-arrival and urgency, but can also
+1. `goal.root_position_hor = 1.0` is effective for navigation, but can reward
+   horizontal root-displacement shortcuts when support consistency is missing.
+2. `goal.root_position_vert = 1.0` directly supervises target root height. For
+   recovery this may need a different `getup` weight than locomotion, because
+   overemphasizing height can encourage "root rises first" references.
+3. `goal.root_velocity = 0.1` helps time-to-arrival and urgency, but can also
    reinforce root motion if the support mechanics are underconstrained.
-3. `foot_contact = 0.05` is useful, but it supervises only a narrow stance-foot
+4. `goal.g` is an additional endpoint tilt supervision term on the target
+   gravity direction. It can stay `0.0` for locomotion and become the main
+   recovery uprightness goal while `goal.root_orientation` is disabled for
+   getup, because the full orientation term also carries yaw/heading.
+5. `foot_contact = 0.05` is useful, but it supervises only a narrow stance-foot
    velocity behavior and does not cover generated SONIC references enough.
-4. `g_cons = 0.05` regularizes rotation/gravity consistency. Its oscillation is
+6. `g_cons = 0.05` regularizes rotation/gravity consistency. Its oscillation is
    not the main issue here; increasing it is unlikely to fix gait sliding.
-5. `dof_vel = 0.003` and `h_vel = 0.001` help smoothness, but do not directly
+7. `dof_vel = 0.003` and `h_vel = 0.001` help smoothness, but do not directly
    bind root translation to contact kinematics.
 
 Therefore, the current loss weights are not "wrong" for the present model, but
@@ -280,10 +302,12 @@ The current goal losses select the requested arrival frame and compare the
 prediction there:
 
 ```text
-goal_root_position    -> state at goal_time_frame
-goal_root_orientation -> state at goal_time_frame
-goal_joint_angle      -> state at goal_time_frame
-goal_root_velocity    -> state at goal_time_frame
+goal.root_position_hor  -> horizontal displacement at goal_time_frame
+goal.root_position_vert -> root height at goal_time_frame
+goal.g                  -> target gravity direction at goal_time_frame
+goal.root_orientation   -> state at goal_time_frame
+goal.joint_angle        -> state at goal_time_frame
+goal.root_velocity      -> state at goal_time_frame
 ```
 
 This is the right endpoint contract. The ambiguity is not in the selected-frame
@@ -683,8 +707,9 @@ late checkpoints may improve goal metrics by exploiting unsupported root
 motion. If support diagnostics confirm this, test weaker root-goal pressure:
 
 ```text
-goal_root_position: 1.0 -> 0.5
-goal_root_velocity: 0.1 -> 0.05
+goal.root_position_hor: 1.0 -> 0.5
+goal.root_position_vert: tune separately for locomotion/getup
+goal.root_velocity: 0.1 -> 0.05
 ```
 
 Keep these as ablations, not the first change. If root-goal weights are reduced
@@ -712,7 +737,7 @@ can follow the current manager step count.
 
 ### 5.5 Do not solve early-goal behavior by only lowering goal weights
 
-Lowering `goal_joint_angle` or `goal_root_velocity` may reduce early goal-like
+Lowering `goal.joint_angle` or `goal.root_velocity` may reduce early goal-like
 motion, but it also weakens the arrival contract. The first fix should be
 temporal: better diagnostics, per-frame arrival-phase conditioning, and
 possibly a weak temporal profile loss.
@@ -768,8 +793,9 @@ A1: foot_contact 0.05 -> 0.1
 A2: add support_consistency=0.02
 A3: add support_consistency=0.05
 A4: add support_consistency=0.05 and reduce root goal weights
-    goal_root_position 1.0 -> 0.5
-    goal_root_velocity 0.1 -> 0.05
+    goal.root_position_hor 1.0 -> 0.5
+    goal.root_position_vert separately in locomotion/getup
+    goal.root_velocity 0.1 -> 0.05
 A5: recovery-only h_dot or staged-subgoal constraint
 A6: add per-frame arrival-phase conditioning
 A7: add weak temporal goal-profile loss
@@ -907,7 +933,8 @@ For the current project state:
 7. For behind-goal navigation, prefer staged turn-and-walk goals unless
    backward movement is explicitly requested.
 8. Only after support consistency and temporal conditioning exist, test lower
-   `goal_root_position`/`goal_root_velocity` weights.
+   `goal.root_position_hor`/`goal.root_velocity` weights and a separate
+   `goal.root_position_vert` value for getup.
 
 The core design principle for V8:
 
