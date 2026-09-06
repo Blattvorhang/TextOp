@@ -24,28 +24,139 @@ from robotmdar.utils.goal import (
 )
 
 
-def _resolve_root_mask_prob(value, kwargs):
-    """Accept the pre-V4 config key while exposing only the precise V4 name."""
-    legacy_value = kwargs.pop('cond_goal_mask_prob', None)
-    if value is None:
-        return 0.1 if legacy_value is None else float(legacy_value)
-    if legacy_value is not None and float(legacy_value) != float(value):
-        raise ValueError(
-            "cond_goal_root_mask_prob and legacy cond_goal_mask_prob disagree"
-        )
-    return float(value)
+def _mapping_get(mapping, key, default=None):
+    if mapping is None:
+        return default
+    getter = getattr(mapping, 'get', None)
+    if getter is not None:
+        return getter(key, default)
+    try:
+        return mapping[key]
+    except (KeyError, TypeError):
+        return default
 
 
-def _resolve_text_mask_prob(value, kwargs):
-    """Accept the legacy text CFG key while exposing the explicit name."""
-    legacy_value = kwargs.pop('cond_mask_prob', None)
-    if value is None:
-        return 0.0 if legacy_value is None else float(legacy_value)
-    if legacy_value is not None and float(legacy_value) != float(value):
-        raise ValueError(
-            "cond_text_mask_prob and legacy cond_mask_prob disagree"
-        )
-    return float(value)
+def _is_mapping_like(value) -> bool:
+    return hasattr(value, 'get') and not isinstance(
+        value, (str, bytes, int, float, bool))
+
+
+def _nested_mask_value(cond_mask_prob, path):
+    value = cond_mask_prob
+    for key in path:
+        value = _mapping_get(value, key, None)
+        if value is None:
+            return None
+    return value
+
+
+def _resolve_mask_value(default, *candidates):
+    values = [(label, float(value)) for label, value in candidates
+              if value is not None]
+    if not values:
+        return float(default)
+    first_label, first_value = values[0]
+    for label, value in values[1:]:
+        if value != first_value:
+            raise ValueError(f"{first_label} and {label} disagree")
+    return first_value
+
+
+def _resolve_condition_mask_probs(
+    kwargs,
+    *,
+    cond_mask_prob=None,
+    cond_text_mask_prob=None,
+    cond_goal_root_mask_prob=None,
+    cond_goal_yaw_mask_prob=None,
+    cond_goal_time_mask_prob=None,
+    cond_goal_body_mask_prob=None,
+    cond_goal_orientation_mask_prob=None,
+    cond_goal_joint_mask_prob=None,
+    cond_goal_velocity_mask_prob=None,
+    cond_scene_mask_prob=None,
+    scalar_cond_mask_target='text',
+):
+    """Resolve nested condition-mask config while accepting legacy flat keys."""
+    legacy_cond_mask_prob = kwargs.pop('cond_mask_prob', None)
+    if cond_mask_prob is None:
+        cond_mask_prob = legacy_cond_mask_prob
+    elif legacy_cond_mask_prob is not None:
+        raise ValueError("cond_mask_prob passed twice")
+
+    nested = cond_mask_prob if _is_mapping_like(cond_mask_prob) else None
+    scalar_cond_mask_prob = None if nested is not None else cond_mask_prob
+    legacy_goal_mask_prob = kwargs.pop('cond_goal_mask_prob', None)
+
+    scalar_text = (
+        scalar_cond_mask_prob
+        if scalar_cond_mask_target == 'text' else None
+    )
+    scalar_position = (
+        scalar_cond_mask_prob
+        if scalar_cond_mask_target == 'position' else None
+    )
+
+    return {
+        'text': _resolve_mask_value(
+            0.0,
+            ('cond_mask_prob.text',
+             _nested_mask_value(nested, ('text',))),
+            ('cond_text_mask_prob', cond_text_mask_prob),
+            ('legacy cond_mask_prob', scalar_text),
+        ),
+        'goal_position': _resolve_mask_value(
+            0.1,
+            ('cond_mask_prob.goal.position',
+             _nested_mask_value(nested, ('goal', 'position'))),
+            ('cond_goal_root_mask_prob', cond_goal_root_mask_prob),
+            ('legacy cond_goal_mask_prob', legacy_goal_mask_prob),
+            ('legacy cond_mask_prob', scalar_position),
+        ),
+        'goal_yaw': _resolve_mask_value(
+            0.0,
+            ('cond_mask_prob.goal.yaw',
+             _nested_mask_value(nested, ('goal', 'yaw'))),
+            ('cond_goal_yaw_mask_prob', cond_goal_yaw_mask_prob),
+        ),
+        'goal_time': _resolve_mask_value(
+            0.0,
+            ('cond_mask_prob.goal.time',
+             _nested_mask_value(nested, ('goal', 'time'))),
+            ('cond_goal_time_mask_prob', cond_goal_time_mask_prob),
+        ),
+        'goal_body': _resolve_mask_value(
+            0.0,
+            ('cond_mask_prob.goal.body',
+             _nested_mask_value(nested, ('goal', 'body'))),
+            ('cond_goal_body_mask_prob', cond_goal_body_mask_prob),
+        ),
+        'goal_orientation': _resolve_mask_value(
+            0.0,
+            ('cond_mask_prob.goal.orientation',
+             _nested_mask_value(nested, ('goal', 'orientation'))),
+            ('cond_goal_orientation_mask_prob',
+             cond_goal_orientation_mask_prob),
+        ),
+        'goal_joint': _resolve_mask_value(
+            0.0,
+            ('cond_mask_prob.goal.joint',
+             _nested_mask_value(nested, ('goal', 'joint'))),
+            ('cond_goal_joint_mask_prob', cond_goal_joint_mask_prob),
+        ),
+        'goal_velocity': _resolve_mask_value(
+            0.0,
+            ('cond_mask_prob.goal.velocity',
+             _nested_mask_value(nested, ('goal', 'velocity'))),
+            ('cond_goal_velocity_mask_prob', cond_goal_velocity_mask_prob),
+        ),
+        'scene': _resolve_mask_value(
+            0.1,
+            ('cond_mask_prob.scene',
+             _nested_mask_value(nested, ('scene',))),
+            ('cond_scene_mask_prob', cond_scene_mask_prob),
+        ),
+    }
 
 
 def _joint_state_goal_slices(goal_encoding: GoalEncoding):
@@ -290,8 +401,8 @@ class DenoiserMLP(nn.Module):
     # a lighter alternative for ablations / memory-constrained runs.  It is
     # fully wired for goal + scene conditioning and will work out of the box
     # if you switch the config's _target_ to this class and add the matching
-    # keys (goal_dim, grid_size, cond_goal_root_mask_prob,
-    # cond_scene_mask_prob).
+    # keys (goal_dim, grid_size, cond_mask_prob.goal.position,
+    # cond_mask_prob.scene). Legacy flat mask keys are still accepted.
     # =========================================================================
 
     def __init__(self,
@@ -304,14 +415,15 @@ class DenoiserMLP(nn.Module):
                  goal_dim=5,
                  goal_encoding=GoalEncoding.LEGACY40,
                  grid_size=25,
+                 cond_mask_prob=None,
                  cond_goal_root_mask_prob=None,
-                 cond_goal_yaw_mask_prob=0.0,
-                 cond_goal_time_mask_prob=0.0,
-                 cond_goal_body_mask_prob=0.0,
-                 cond_goal_orientation_mask_prob=0.0,
-                 cond_goal_joint_mask_prob=0.0,
-                 cond_goal_velocity_mask_prob=0.0,
-                 cond_scene_mask_prob=0.1,
+                 cond_goal_yaw_mask_prob=None,
+                 cond_goal_time_mask_prob=None,
+                 cond_goal_body_mask_prob=None,
+                 cond_goal_orientation_mask_prob=None,
+                 cond_goal_joint_mask_prob=None,
+                 cond_goal_velocity_mask_prob=None,
+                 cond_scene_mask_prob=None,
                  **kargs):
         super().__init__()
         self.h_dim = h_dim
@@ -326,16 +438,27 @@ class DenoiserMLP(nn.Module):
         _validate_model_goal_encoding(self.goal_dim, self.goal_encoding)
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
-        self.cond_goal_root_mask_prob = _resolve_root_mask_prob(
-            cond_goal_root_mask_prob, kargs
+        mask_probs = _resolve_condition_mask_probs(
+            kargs,
+            cond_mask_prob=cond_mask_prob,
+            cond_goal_root_mask_prob=cond_goal_root_mask_prob,
+            cond_goal_yaw_mask_prob=cond_goal_yaw_mask_prob,
+            cond_goal_time_mask_prob=cond_goal_time_mask_prob,
+            cond_goal_body_mask_prob=cond_goal_body_mask_prob,
+            cond_goal_orientation_mask_prob=cond_goal_orientation_mask_prob,
+            cond_goal_joint_mask_prob=cond_goal_joint_mask_prob,
+            cond_goal_velocity_mask_prob=cond_goal_velocity_mask_prob,
+            cond_scene_mask_prob=cond_scene_mask_prob,
+            scalar_cond_mask_target='position',
         )
-        self.cond_goal_yaw_mask_prob = cond_goal_yaw_mask_prob
-        self.cond_goal_time_mask_prob = cond_goal_time_mask_prob
-        self.cond_goal_body_mask_prob = cond_goal_body_mask_prob
-        self.cond_goal_orientation_mask_prob = cond_goal_orientation_mask_prob
-        self.cond_goal_joint_mask_prob = cond_goal_joint_mask_prob
-        self.cond_goal_velocity_mask_prob = cond_goal_velocity_mask_prob
-        self.cond_scene_mask_prob = cond_scene_mask_prob
+        self.cond_goal_root_mask_prob = mask_probs['goal_position']
+        self.cond_goal_yaw_mask_prob = mask_probs['goal_yaw']
+        self.cond_goal_time_mask_prob = mask_probs['goal_time']
+        self.cond_goal_body_mask_prob = mask_probs['goal_body']
+        self.cond_goal_orientation_mask_prob = mask_probs['goal_orientation']
+        self.cond_goal_joint_mask_prob = mask_probs['goal_joint']
+        self.cond_goal_velocity_mask_prob = mask_probs['goal_velocity']
+        self.cond_scene_mask_prob = mask_probs['scene']
 
         self.sequence_pos_encoder = PositionalEncoding(self.h_dim,
                                                        self.dropout)
@@ -520,15 +643,16 @@ class DenoiserTransformer(nn.Module):
                  goal_dim=5,
                  goal_encoding=GoalEncoding.LEGACY40,
                  grid_size=25,
+                 cond_mask_prob=None,
                  cond_text_mask_prob=None,
                  cond_goal_root_mask_prob=None,
-                 cond_goal_yaw_mask_prob=0.0,
-                 cond_goal_time_mask_prob=0.0,
-                 cond_goal_body_mask_prob=0.0,
-                 cond_goal_orientation_mask_prob=0.0,
-                 cond_goal_joint_mask_prob=0.0,
-                 cond_goal_velocity_mask_prob=0.0,
-                 cond_scene_mask_prob=0.1,
+                 cond_goal_yaw_mask_prob=None,
+                 cond_goal_time_mask_prob=None,
+                 cond_goal_body_mask_prob=None,
+                 cond_goal_orientation_mask_prob=None,
+                 cond_goal_joint_mask_prob=None,
+                 cond_goal_velocity_mask_prob=None,
+                 cond_scene_mask_prob=None,
                  use_vae=True,
                  **kargs):
         super().__init__()
@@ -547,22 +671,32 @@ class DenoiserTransformer(nn.Module):
         _validate_model_goal_encoding(self.goal_dim, self.goal_encoding)
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
-        self.cond_text_mask_prob = _resolve_text_mask_prob(
-            cond_text_mask_prob, kargs
+        mask_probs = _resolve_condition_mask_probs(
+            kargs,
+            cond_mask_prob=cond_mask_prob,
+            cond_text_mask_prob=cond_text_mask_prob,
+            cond_goal_root_mask_prob=cond_goal_root_mask_prob,
+            cond_goal_yaw_mask_prob=cond_goal_yaw_mask_prob,
+            cond_goal_time_mask_prob=cond_goal_time_mask_prob,
+            cond_goal_body_mask_prob=cond_goal_body_mask_prob,
+            cond_goal_orientation_mask_prob=cond_goal_orientation_mask_prob,
+            cond_goal_joint_mask_prob=cond_goal_joint_mask_prob,
+            cond_goal_velocity_mask_prob=cond_goal_velocity_mask_prob,
+            cond_scene_mask_prob=cond_scene_mask_prob,
+            scalar_cond_mask_target='text',
         )
+        self.cond_text_mask_prob = mask_probs['text']
         self.cond_mask_prob = self.cond_text_mask_prob
         self.text_condition_enabled = bool(
-            kargs.pop('text_condition_enabled', True))
-        self.cond_goal_root_mask_prob = _resolve_root_mask_prob(
-            cond_goal_root_mask_prob, kargs
-        )
-        self.cond_goal_yaw_mask_prob = cond_goal_yaw_mask_prob
-        self.cond_goal_time_mask_prob = cond_goal_time_mask_prob
-        self.cond_goal_body_mask_prob = cond_goal_body_mask_prob
-        self.cond_goal_orientation_mask_prob = cond_goal_orientation_mask_prob
-        self.cond_goal_joint_mask_prob = cond_goal_joint_mask_prob
-        self.cond_goal_velocity_mask_prob = cond_goal_velocity_mask_prob
-        self.cond_scene_mask_prob = cond_scene_mask_prob
+            kargs.pop('text_condition_enabled', False))
+        self.cond_goal_root_mask_prob = mask_probs['goal_position']
+        self.cond_goal_yaw_mask_prob = mask_probs['goal_yaw']
+        self.cond_goal_time_mask_prob = mask_probs['goal_time']
+        self.cond_goal_body_mask_prob = mask_probs['goal_body']
+        self.cond_goal_orientation_mask_prob = mask_probs['goal_orientation']
+        self.cond_goal_joint_mask_prob = mask_probs['goal_joint']
+        self.cond_goal_velocity_mask_prob = mask_probs['goal_velocity']
+        self.cond_scene_mask_prob = mask_probs['scene']
 
         # input embeddings
         self.sequence_pos_encoder = PositionalEncoding(self.h_dim,

@@ -8,4 +8,6 @@ history_shape:
   - 2
   - ${...nfeats}
 noise_shape: [1, 128]
-cond_mask_prob: 0.1
+cond_mask_prob:
+  goal:
+    position: 0.1
