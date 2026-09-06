@@ -25,10 +25,10 @@ from robotmdar.dtype.motion import (motion_dict_to_abs_pose, get_zero_abs_pose,
                                     get_zero_feature_v3)
 import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
+from robotmdar.eval.generate_dar import denoiser_supports_text_guidance
+from robotmdar.model.clip import encode_text, load_and_freeze_clip
 from robotmdar.train.manager import DARManager
 from robotmdar.utils.dof_contract import configure_dof_contract
-import clip
-import torch_tensorrt
 
 
 def get_text_embedding(text: str, clip_model,
@@ -37,10 +37,7 @@ def get_text_embedding(text: str, clip_model,
     start_time = time.time()
 
     with torch.no_grad():
-        text_tokens = clip.tokenize([text]).to(device)
-        text_embedding = clip_model.encode_text(text_tokens)
-        text_embedding = text_embedding / text_embedding.norm(dim=-1,
-                                                              keepdim=True)
+        text_embedding = encode_text(clip_model, [text])
 
     timing = time.time() - start_time
     return text_embedding.float(), timing
@@ -66,9 +63,10 @@ def single_inference_step(prev_motion, abs_pose, text_embedding, vae, denoiser,
 
         # Prepare conditioning
         y = {
-            'text_embedding': text_embedding,
             'history_motion_normalized': history_motion,
         }
+        if text_embedding is not None:
+            y['text_embedding'] = text_embedding
 
         # Choose sampling method
         use_full_sample = getattr(cfg, 'use_full_sample', False)
@@ -150,13 +148,17 @@ def run_benchmark(vae,
     prev_motion = zero_feature
     abs_pose = get_zero_abs_pose((batch_size, ), device=cfg.device)
 
-    # Get text embedding
-    text_prompt = getattr(cfg, 'text_prompt', "walk forward")
-    text_embedding, text_time = get_text_embedding(text_prompt, clip_model,
-                                                   cfg.device)
-    logger.info(
-        f"Text embedding computed in {text_time*1000:.2f}ms for: '{text_prompt}'"
-    )
+    text_embedding = None
+    text_prompt = getattr(cfg, 'text_prompt', None)
+    if (clip_model is not None and text_prompt is not None
+            and str(text_prompt).strip() != ""):
+        text_embedding, text_time = get_text_embedding(text_prompt, clip_model,
+                                                       cfg.device)
+        logger.info(
+            f"Text embedding computed in {text_time*1000:.2f}ms for: '{text_prompt}'"
+        )
+    else:
+        logger.info("Text prompt disabled")
 
     # Warmup phase
     logger.info("Warmup phase...")
@@ -251,10 +253,6 @@ def main(cfg: DictConfig):
 
     logger.info("Loading models...")
 
-    # Load CLIP model for text encoding
-    clip_model, _ = clip.load("ViT-B/32", device=cfg.device)
-    clip_model.eval()
-
     # Load dataset (for motion reconstruction)
     val_data: Dataset = instantiate(cfg.data.val)
 
@@ -273,6 +271,18 @@ def main(cfg: DictConfig):
     # Load checkpoints
     manager: DARManager = instantiate(cfg.train.manager)
     manager.hold_model(vae, denoiser, None, val_data)
+
+    clip_model = None
+    text_prompt = getattr(cfg, 'text_prompt', None)
+    if text_prompt is not None and str(text_prompt).strip() != "":
+        if denoiser_supports_text_guidance(denoiser):
+            clip_model = load_and_freeze_clip("ViT-B/32", device=cfg.device)
+            clip_model.eval()
+        else:
+            logger.warning(
+                "Text prompt {!r} ignored because the loaded DAR checkpoint "
+                "does not support text conditioning",
+                text_prompt)
     vae_trt = torch.compile(vae, backend='tensorrt')
     denoiser_trt = torch.compile(denoiser, backend='tensorrt')
 

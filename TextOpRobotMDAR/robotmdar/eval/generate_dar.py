@@ -19,6 +19,17 @@ from torch import nn
 
 import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import motion_dict_to_abs_pose
+from robotmdar.utils.goal import (
+    EXTENDED_BODY_GOAL_DIM,
+    SPLIT_GOAL_DIM,
+    SPLIT_TIME_SLICE,
+)
+
+
+def denoiser_supports_text_guidance(model) -> bool:
+    if hasattr(model, 'text_condition_enabled'):
+        return bool(model.text_condition_enabled)
+    return float(getattr(model, 'cond_text_mask_prob', 0.0)) > 0.0
 
 
 class ClassifierFreeWrapper(nn.Module):
@@ -27,19 +38,36 @@ class ClassifierFreeWrapper(nn.Module):
         super().__init__()
         self.model = model  # model is the actual model to run
 
-        assert self.model.cond_mask_prob > 0, 'Cannot run a guided diffusion on a model that has not been trained with no conditions'
+        assert denoiser_supports_text_guidance(self.model), (
+            'Cannot run a guided diffusion on a model that has not been '
+            'trained with text-conditioning dropout'
+        )
 
-    def forward(self, x, timesteps, y: Dict[str, Any]):
-        y['uncond'] = False
-        out = self.model(x, timesteps, y)
-        y_uncond = y
+    def forward(self, x_t=None, timesteps=None, y: Optional[Dict[str, Any]] = None,
+                **kwargs):
+        if x_t is None:
+            x_t = kwargs.pop('x', None)
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(
+                f"ClassifierFreeWrapper.forward() got an unexpected keyword "
+                f"argument {unexpected!r}"
+            )
+        if x_t is None:
+            raise TypeError("ClassifierFreeWrapper.forward() missing x_t")
+        if timesteps is None:
+            raise TypeError("ClassifierFreeWrapper.forward() missing timesteps")
+        if y is None:
+            raise ValueError("Classifier-free guidance requires conditions")
+
+        y_cond = dict(y)
+        y_cond['uncond'] = False
+        out = self.model(x_t=x_t, timesteps=timesteps, y=y_cond)
+        y_uncond = dict(y)
         y_uncond['uncond'] = True
-        out_uncond = self.model(x, timesteps, y_uncond)
-        # print('scale:', y['scale'])
-        # diff_cond = (out - out_uncond).norm()
-        # print('diff_cond:', diff_cond, 'out', out.norm(), 'out_uncond',
-        #       out_uncond.norm())
-        return out_uncond + (y['scale'] * (out - out_uncond))
+        out_uncond = self.model(x_t=x_t, timesteps=timesteps, y=y_uncond)
+        scale = y.get('scale', 1.0)
+        return out_uncond + (scale * (out - out_uncond))
 
     @property
     def noise_shape(self):
@@ -193,6 +221,8 @@ def generate_next_motion(
         ret_fk_full: bool = False,
         use_vae=True,
         use_ddim=False,
+        text_embedding: Optional[torch.Tensor] = None,
+        force_drop_text: bool = False,
         force_drop_goal_root: bool = False,
         force_drop_goal_yaw: bool = False,
         force_drop_goal_time: bool = False,
@@ -200,6 +230,7 @@ def generate_next_motion(
         force_drop_goal_orientation: bool = False,
         force_drop_goal_joint: bool = False,
         force_drop_goal_velocity: bool = False,
+        force_drop_scene: bool = False,
         force_drop_arrival_time: bool = False,
         time_to_arrival_frame: Optional[torch.Tensor] = None):
     """
@@ -223,6 +254,7 @@ def generate_next_motion(
         force_drop_goal_orientation: Mask the joint_state orientation block.
         force_drop_goal_joint: Mask the joint_state 29-DOF target block.
         force_drop_goal_velocity: Mask the joint_state root-velocity block.
+        force_drop_scene: Mask the scene occupancy condition at inference.
         force_drop_arrival_time: Mask the arrival-time PE at inference.
         time_to_arrival_frame: Optional frame index passed to the arrival PE.
 
@@ -232,6 +264,16 @@ def generate_next_motion(
     device = history_motion.device
     with torch.no_grad():
         batch_size = goal.shape[0]
+        if text_embedding is not None:
+            if text_embedding.ndim == 1:
+                text_embedding = text_embedding.unsqueeze(0)
+            if text_embedding.shape[0] == 1 and batch_size > 1:
+                text_embedding = text_embedding.expand(batch_size, -1)
+            elif text_embedding.shape[0] != batch_size:
+                raise ValueError(
+                    f"text_embedding batch size {text_embedding.shape[0]} "
+                    f"does not match goal batch size {batch_size}"
+                )
         # latent_shape = (batch_size, 1, 128
         #                 )  # [B, T=1, D] - latent_dim from config
         latent_shape = (batch_size, *denoiser.noise_shape)
@@ -256,10 +298,15 @@ def generate_next_motion(
         force_drop_arrival_time = (
             bool(force_drop_arrival_time) or bool(force_drop_goal_time)
         )
-        if time_to_arrival_frame is None and goal.shape[-1] == 21:
+        if time_to_arrival_frame is None and goal.shape[-1] == EXTENDED_BODY_GOAL_DIM:
             fps = float(getattr(val_data, 'fps', 50.0))
             time_to_arrival_frame = torch.round(
                 goal[:, 8].clamp_min(0.0) * fps
+            ).to(dtype=torch.long)
+        if time_to_arrival_frame is None and goal.shape[-1] == SPLIT_GOAL_DIM:
+            fps = float(getattr(val_data, 'fps', 50.0))
+            time_to_arrival_frame = torch.round(
+                goal[:, SPLIT_TIME_SLICE].reshape(-1).clamp_min(0.0) * fps
             ).to(dtype=torch.long)
         y: Dict[str, Any] = {
             'goal': goal,
@@ -272,13 +319,23 @@ def generate_next_motion(
             'force_drop_goal_orientation': force_drop_goal_orientation,
             'force_drop_goal_joint': force_drop_goal_joint,
             'force_drop_goal_velocity': force_drop_goal_velocity,
+            'force_drop_scene': force_drop_scene,
             'force_drop_arrival_time': force_drop_arrival_time,
         }
+        if text_embedding is not None:
+            y['text_embedding'] = text_embedding.to(device=device)
         if time_to_arrival_frame is not None:
             y['time_to_arrival_frame'] = time_to_arrival_frame
             y['arrival_time_frame'] = time_to_arrival_frame
         if guidance_scale is not None:
             y['scale'] = guidance_scale
+        if force_drop_text:
+            y['force_drop_text'] = True
+
+        denoiser_for_sampling = denoiser
+        if (guidance_scale is not None and text_embedding is not None
+                and denoiser_supports_text_guidance(denoiser)):
+            denoiser_for_sampling = ClassifierFreeWrapper(denoiser)
 
         # print(diffusion.num_timesteps)
         if use_full_sample:
@@ -286,7 +343,7 @@ def generate_next_motion(
                 # Use complete DDPM sampling loop
                 sample_fn = diffusion.p_sample_loop
                 x_start_pred = sample_fn(
-                    denoiser,
+                    denoiser_for_sampling,
                     latent_shape,
                     clip_denoised=False,
                     model_kwargs={'y': y},  # Wrap y in the expected structure
@@ -301,7 +358,7 @@ def generate_next_motion(
                 # zjk: use DDIM sampling loop
                 sample_fn = diffusion.ddim_sample_loop
                 x_start_pred = sample_fn(
-                    denoiser,
+                    denoiser_for_sampling,
                     latent_shape,
                     clip_denoised=False,
                     model_kwargs={'y': y},  # Wrap y in the expected structure
@@ -319,9 +376,11 @@ def generate_next_motion(
                 f"Expected tensor, got {type(x_start_pred)}"
         else:
             # Single step denoising (default mode)
-            x_start_pred = denoiser(x_t=x_start_noise,
-                                    timesteps=diffusion._scale_timesteps(t),
-                                    y=y)  # [B, T=1, D]
+            x_start_pred = denoiser_for_sampling(
+                x_t=x_start_noise,
+                timesteps=diffusion._scale_timesteps(t),
+                y=y,
+            )  # [B, T=1, D]
 
         if use_vae:
             # Convert to VAE format [T=1, B, D]
