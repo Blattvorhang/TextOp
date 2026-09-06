@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from robotmdar.utils.goal import (
     GoalClamp,
@@ -676,6 +677,57 @@ def state_goal_from_reference(state_msg: Any,
         goal_include_log_d_hor=goal_include_log_d_hor)
 
 
+def _skew_matrix(vec: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros_like(vec[..., 0])
+    x, y, z = vec.unbind(-1)
+    return torch.stack(
+        (
+            torch.stack((zeros, -z, y), dim=-1),
+            torch.stack((z, zeros, -x), dim=-1),
+            torch.stack((-y, x, zeros), dim=-1),
+        ),
+        dim=-2,
+    )
+
+
+def _canonical_axis_perpendicular_to(vec: torch.Tensor) -> torch.Tensor:
+    abs_vec = vec.abs()
+    basis_index = abs_vec.argmin(dim=-1)
+    basis = torch.zeros_like(vec)
+    basis.scatter_(-1, basis_index.unsqueeze(-1), 1.0)
+    return F.normalize(torch.cross(vec, basis, dim=-1), dim=-1, eps=1e-8)
+
+
+def _rotation_matrix_between_vectors(source: torch.Tensor,
+                                     target: torch.Tensor) -> torch.Tensor:
+    """Return the shortest rotation matrix mapping source vectors to target."""
+    source = F.normalize(source, dim=-1, eps=1e-8)
+    target = F.normalize(target, dim=-1, eps=1e-8)
+    batch_size = source.shape[0]
+    eye = torch.eye(
+        3, device=source.device, dtype=source.dtype
+    ).unsqueeze(0).expand(batch_size, 3, 3).clone()
+
+    axis = torch.cross(source, target, dim=-1)
+    s = axis.norm(dim=-1, keepdim=True)
+    c = (source * target).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    k = _skew_matrix(axis)
+    factor = (1.0 - c).view(batch_size, 1, 1) / (
+        s.square().view(batch_size, 1, 1).clamp(min=1e-16)
+    )
+    rodrigues = eye + k + torch.matmul(k, k) * factor
+
+    fallback_axis = _canonical_axis_perpendicular_to(source)
+    fallback = (
+        2.0 * fallback_axis.unsqueeze(-1) * fallback_axis.unsqueeze(-2)
+        - eye
+    )
+    parallel = s.squeeze(-1) < 1e-7
+    antiparallel = parallel & (c.squeeze(-1) < 0.0)
+    result = torch.where(parallel.view(batch_size, 1, 1), eye, rodrigues)
+    return torch.where(antiparallel.view(batch_size, 1, 1), fallback, result)
+
+
 def align_generated_history_pose(abs_pose: dict,
                                  generated_reference_pos: torch.Tensor,
                                  generated_reference_rot: torch.Tensor,
@@ -685,9 +737,9 @@ def align_generated_history_pose(abs_pose: dict,
                                  val_data: Any = None):
     """Translate and rotate generated history so its reference pose matches the real G1 root.
 
-    When *history_motion* and *val_data* are provided the per-frame roll, pitch
-    and delta_yaw features are also rotated so that **every** reconstructed
-    frame (not just the starting abs_pose) carries the correction.
+    When *history_motion* and *val_data* are provided, version-specific
+    absolute pose channels are also corrected so every reconstructed frame
+    carries the current G1 seam state.
     """
     from robotmdar.dtype.rotation import (
         euler_angles_to_quaternion,
@@ -726,24 +778,134 @@ def align_generated_history_pose(abs_pose: dict,
             q_delta, abs_pose["root_rot"].to(device), w_last=True),
     }
 
-    # ------------------------------------------------------------------
-    # Also rotate every history-frame feature so the full reconstructed
-    # trajectory carries the correction (not just frame 0 via abs_pose).
-    #
-    # The roll / pitch sincos are **absolute** per frame and delta_yaw is
-    # a forward difference — all three must be updated.  Likewise
-    # delta_trans_local lives in the per-frame yaw-aligned basis and
-    # needs to be re-expressed after the rotation correction.
-    # ------------------------------------------------------------------
+    # Also correct history-frame features when the representation contains
+    # absolute pose channels that would otherwise keep the generated seam.
     aligned_history_motion = history_motion
     if (motion_dtype.FeatureVersion == 6
             and history_motion is not None and val_data is not None):
-        pass
+        from robotmdar.dtype.rotation import quaternion_to_matrix, xyzw_to_wxyz
+
+        raw = val_data.denormalize(history_motion.to(device))
+        B, T = raw.shape[:2]
+        if T <= 0:
+            raise ValueError("Generated history must contain at least one feature")
+
+        real_height = real_current_pos[:, 2].to(dtype=raw.dtype)
+        real_rot_matrix = quaternion_to_matrix(
+            xyzw_to_wxyz(real_current_rot.to(dtype=raw.dtype))
+        )
+        world_gravity = torch.zeros(
+            real_rot_matrix.shape[:-2] + (3, ),
+            device=device,
+            dtype=raw.dtype,
+        )
+        world_gravity[..., 2] = -1.0
+        real_gravity = torch.matmul(
+            real_rot_matrix.transpose(-1, -2),
+            world_gravity.unsqueeze(-1),
+        ).squeeze(-1)
+
+        if real_height.shape[0] != B:
+            if real_height.shape[0] != 1:
+                raise ValueError(
+                    "Real current state batch does not match generated history: "
+                    f"{real_height.shape[0]} != {B}")
+            real_height = real_height.expand(B)
+            real_gravity = real_gravity.expand(B, 3)
+
+        # FeatureVersion 6 has no absolute XY channel.  Its endpoint state is
+        # represented by the final feature's absolute height and gravity.
+        delta_h = real_height - raw[:, -1, 0]
+        raw[..., 0] = raw[..., 0] + delta_h.reshape(B, 1)
+
+        gravity_delta = _rotation_matrix_between_vectors(
+            raw[:, -1, 1:4], real_gravity)
+        raw[..., 1:4] = torch.matmul(
+            gravity_delta.unsqueeze(1),
+            raw[..., 1:4].unsqueeze(-1),
+        ).squeeze(-1)
+        raw[..., 1:4] = F.normalize(raw[..., 1:4], dim=-1, eps=1e-8)
+
+        abs_root_pos = abs_pose["root_trans_offset"].to(
+            device=device, dtype=raw.dtype).reshape(-1, 3)
+        if abs_root_pos.shape[0] != B:
+            if abs_root_pos.shape[0] != 1:
+                raise ValueError(
+                    "Generated abs_pose batch does not match generated history: "
+                    f"{abs_root_pos.shape[0]} != {B}")
+            abs_root_pos = abs_root_pos.expand(B, 3)
+        aligned_root_pos = aligned_abs_pose["root_trans_offset"].to(
+            device=device, dtype=raw.dtype).reshape(-1, 3)
+        if aligned_root_pos.shape[0] != B:
+            if aligned_root_pos.shape[0] != 1:
+                raise ValueError(
+                    "Aligned abs_pose batch does not match generated history: "
+                    f"{aligned_root_pos.shape[0]} != {B}")
+            aligned_root_pos = aligned_root_pos.expand(B, 3)
+        aligned_root_pos = aligned_root_pos.clone()
+        aligned_root_pos[:, 2] = abs_root_pos[:, 2] + delta_h
+        aligned_abs_pose = dict(aligned_abs_pose)
+        aligned_abs_pose["root_trans_offset"] = aligned_root_pos
+        aligned_root_rot = aligned_abs_pose["root_rot"].to(
+            device=device, dtype=raw.dtype).reshape(-1, 4)
+        if aligned_root_rot.shape[0] != B:
+            if aligned_root_rot.shape[0] != 1:
+                raise ValueError(
+                    "Aligned root rotation batch does not match generated history: "
+                    f"{aligned_root_rot.shape[0]} != {B}")
+            aligned_root_rot = aligned_root_rot.expand(B, 4)
+        aligned_abs_pose["root_rot"] = aligned_root_rot.clone()
+
+        decoded_history = motion_dtype.motion_feature_to_dict(
+            raw, aligned_abs_pose)
+        decoded_endpoint_rot = decoded_history["root_rot"][:, -1].to(
+            device=device, dtype=raw.dtype)
+        real_endpoint_rot = real_current_rot.to(
+            device=device, dtype=raw.dtype).reshape(-1, 4)
+        if real_endpoint_rot.shape[0] != B:
+            if real_endpoint_rot.shape[0] != 1:
+                raise ValueError(
+                    "Real root rotation batch does not match generated history: "
+                    f"{real_endpoint_rot.shape[0]} != {B}")
+            real_endpoint_rot = real_endpoint_rot.expand(B, 4)
+        root_rot_residual = quat_mul(
+            real_endpoint_rot,
+            quat_inverse(decoded_endpoint_rot, w_last=True),
+            w_last=True,
+        )
+        aligned_abs_pose["root_rot"] = F.normalize(
+            quat_mul(
+                root_rot_residual,
+                aligned_abs_pose["root_rot"],
+                w_last=True,
+            ),
+            dim=-1,
+            eps=1e-8,
+        )
+
+        decoded_history = motion_dtype.motion_feature_to_dict(
+            raw, aligned_abs_pose)
+        decoded_endpoint = decoded_history["root_trans_offset"][:, -1]
+        real_endpoint_pos = real_current_pos.to(
+            device=device, dtype=decoded_endpoint.dtype)
+        if real_endpoint_pos.shape[0] != B:
+            if real_endpoint_pos.shape[0] != 1:
+                raise ValueError(
+                    "Real root position batch does not match generated history: "
+                    f"{real_endpoint_pos.shape[0]} != {B}")
+            real_endpoint_pos = real_endpoint_pos.expand(B, 3)
+        aligned_abs_pose["root_trans_offset"][:, :2] += (
+            real_endpoint_pos[:, :2] - decoded_endpoint[:, :2])
+
+        aligned_history_motion = val_data.normalize(raw)
     elif history_motion is not None and val_data is not None:
         raw = val_data.denormalize(
             history_motion.to(device))          # (B, T, 57 or 69)
         B, T = raw.shape[:2]
 
+        # V3 stores absolute roll/pitch sincos and a forward delta_yaw.
+        # Re-express all three, plus yaw-local translation deltas, under the
+        # same rigid correction used for abs_pose.
         # -- original per-frame Euler angles (matching motion_feature_to_dict_v3) --
         sin_roll = raw[..., 0]
         cos_roll = raw[..., 1] + 1              # stored as cos(roll) - 1

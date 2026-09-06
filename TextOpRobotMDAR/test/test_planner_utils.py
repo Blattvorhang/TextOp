@@ -23,9 +23,15 @@ from TextOpRobotMDAR.robotmdar.dtype.motion import (
     G1_MUJOCO_DOF_JOINT_NAMES,
     G1_MUJOCO_DOF_LINK_NAMES,
     motion_dict_to_feature_v3,
+    motion_dict_to_feature_v6,
     motion_feature_to_dict_v3,
+    motion_feature_to_dict_v6,
 )
-from TextOpRobotMDAR.robotmdar.dtype.rotation import euler_angles_to_quaternion
+from TextOpRobotMDAR.robotmdar.dtype.rotation import (
+    euler_angles_to_quaternion,
+    quaternion_to_matrix,
+    xyzw_to_wxyz,
+)
 from TextOpRobotMDAR.robotmdar.skeleton.robot import RobotSkeleton
 from TextOpRobotMDAR.robotmdar.utils.goal import GoalEncoding
 
@@ -494,6 +500,106 @@ def test_generated_history_alignment_corrects_absolute_height_channel():
         reconstructed["root_rot"][:, -1] * real_rot, dim=-1))
     torch.testing.assert_close(
         rotation_dot, torch.ones_like(rotation_dot), atol=1e-5, rtol=1e-5)
+
+
+def _local_gravity_from_xyzw(root_rot: torch.Tensor) -> torch.Tensor:
+    rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(root_rot))
+    world_gravity = torch.zeros(
+        rot_matrix.shape[:-2] + (3, ),
+        device=root_rot.device,
+        dtype=root_rot.dtype,
+    )
+    world_gravity[..., 2] = -1.0
+    return torch.matmul(
+        rot_matrix.transpose(-1, -2),
+        world_gravity.unsqueeze(-1),
+    ).squeeze(-1)
+
+
+def test_generated_history_alignment_v6_corrects_h_and_g_only():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        generated_pos = torch.tensor([
+            [[1.0, 2.0, 0.7], [1.2, 2.1, 0.8], [1.4, 2.2, 0.9]],
+        ])
+        generated_rot = euler_angles_to_quaternion(torch.tensor([
+            [[0.1, 0.0, 0.2], [0.2, -0.1, 0.4], [0.3, -0.2, 0.6]],
+        ]))
+        generated_dof = torch.zeros((1, 3, 29))
+        generated_contact = torch.ones((1, 3, 2))
+        history, abs_pose = motion_dict_to_feature_v6({
+            "root_trans_offset": generated_pos,
+            "root_rot": generated_rot,
+            "dof": generated_dof,
+            "contact_mask": generated_contact,
+        })
+        history_before = history.clone()
+
+        real_rot = euler_angles_to_quaternion(
+            torch.tensor([[0.8, -0.35, 0.25]]))
+        real_pos = torch.tensor([[10.0, 20.0, 0.25]])
+        state = SimpleNamespace(raw={
+            "g1_pos": real_pos.numpy(),
+            "g1_root_rot": _xyzw_to_wxyz_np(real_rot.numpy()),
+        })
+
+        (aligned_pose, goal_reference_pos, goal_reference_rot, _,
+         aligned_history) = align_generated_history_pose(
+            abs_pose,
+            generated_pos[:, -1],
+            generated_rot[:, -1],
+            state,
+            "cpu",
+            history_motion=history,
+            val_data=IdentityNormalization(),
+        )
+
+        delta_h = real_pos[:, 2] - history_before[:, -1, 0]
+        torch.testing.assert_close(
+            aligned_history[..., 0],
+            history_before[..., 0] + delta_h.reshape(1, 1),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            aligned_history[:, -1, 1:4],
+            _local_gravity_from_xyzw(real_rot),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        torch.testing.assert_close(
+            aligned_history[..., 4:13],
+            history_before[..., 4:13],
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(goal_reference_pos, real_pos)
+        torch.testing.assert_close(goal_reference_rot, real_rot)
+
+        reconstructed = motion_feature_to_dict_v6(
+            aligned_history, aligned_pose)
+        torch.testing.assert_close(
+            reconstructed["root_trans_offset"][:, -1],
+            real_pos,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        torch.testing.assert_close(
+            quaternion_to_matrix(
+                xyzw_to_wxyz(reconstructed["root_rot"][:, -1])),
+            quaternion_to_matrix(xyzw_to_wxyz(real_rot)),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        torch.testing.assert_close(
+            _local_gravity_from_xyzw(reconstructed["root_rot"][:, -1]),
+            _local_gravity_from_xyzw(real_rot),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
 
 
 def test_tracking_timestamps_select_consumed_frame():
