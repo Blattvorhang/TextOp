@@ -250,6 +250,16 @@ def discover_motion_lib_pkls(input_paths: list[str]) -> list[tuple[Path, Path | 
     return discovered
 
 
+def _directory_source_prefix(pkl_f: Path, root: Path | None) -> str:
+    """Return the source-folder prefix for a directory-packed motion PKL."""
+    if root is None:
+        return ""
+    rel_parent = pkl_f.relative_to(root).parent
+    if str(rel_parent) == ".":
+        return ""
+    return str(rel_parent).replace("/", "__") + "__"
+
+
 def iter_motion_lib_dicts(
     input_paths: list[str],
 ):
@@ -266,9 +276,7 @@ def iter_motion_lib_dicts(
             print(f"  WARNING: {pkl_f} does not contain a dict, skipping")
             continue
 
-        prefix = ""
-        if root is not None:
-            prefix = str(pkl_f.relative_to(root).with_suffix("")).replace("/", "__") + "__"
+        prefix = _directory_source_prefix(pkl_f, root)
         for raw_name, entry in data.items():
             name = str(raw_name)
             unique_name = prefix + name if prefix else name
@@ -293,6 +301,125 @@ def _manifest_hours(records: list[dict], fallback_fps: int) -> float:
         record["length"] / float(record.get("_fps", fallback_fps))
         for record in records
     ) / 3600
+
+
+_SOURCE_EXT_RE = re.compile(r"\.(?:csv|pkl)$", flags=re.IGNORECASE)
+_AUG_SUFFIX_RE = re.compile(r"_aug_\d+$", flags=re.IGNORECASE)
+_MIRROR_SUFFIX_RE = re.compile(r"_M$", flags=re.IGNORECASE)
+
+
+def _motion_split_key(source: str) -> str:
+    """Return a canonical key for split-only grouping.
+
+    Only the BONES-SEED suffix conventions are normalized:
+      - mirrored files: ``motion_M`` -> ``motion``
+      - augmented files: ``motion_aug_003`` -> ``motion``
+      - mirrored augmented files: ``motion_M_aug_003`` -> ``motion``
+    """
+    stem = _SOURCE_EXT_RE.sub("", str(source))
+    stem = _AUG_SUFFIX_RE.sub("", stem)
+    return _MIRROR_SUFFIX_RE.sub("", stem)
+
+
+def _is_mirrored_motion(source: str) -> bool:
+    """Check whether a source name carries the BONES-SEED mirror marker."""
+    stem = _SOURCE_EXT_RE.sub("", str(source))
+    stem = _AUG_SUFFIX_RE.sub("", stem)
+    return _MIRROR_SUFFIX_RE.search(stem) is not None
+
+
+def _is_augmented_motion(source: str) -> bool:
+    """Check whether a source name carries the generated augmentation suffix."""
+    stem = _SOURCE_EXT_RE.sub("", str(source))
+    return _AUG_SUFFIX_RE.search(stem) is not None
+
+
+def split_manifest_train_val(
+    manifest: list[dict],
+    val_ratio: float,
+    seed: int,
+) -> tuple[list[dict], list[dict], dict]:
+    """Split records by canonical motion group to prevent mirror leakage."""
+    groups: dict[str, list[dict]] = {}
+    for idx, record in enumerate(manifest):
+        source = record.get("_source") or record.get("_data_path") or f"record_{idx}"
+        key = _motion_split_key(str(source))
+        groups.setdefault(key, []).append(record)
+
+    rng = random.Random(seed)
+    group_items = list(groups.items())
+    rng.shuffle(group_items)
+
+    for _, records in group_items:
+        rng.shuffle(records)
+
+    total_records = len(manifest)
+    can_make_val = val_ratio > 0 and total_records > 1 and len(group_items) > 1
+    target_val_count = int(total_records * val_ratio) if can_make_val else 0
+    if can_make_val:
+        target_val_count = max(1, min(target_val_count, total_records - 1))
+
+    train_data: list[dict] = []
+    val_data: list[dict] = []
+    train_keys: set[str] = set()
+    val_keys: set[str] = set()
+
+    for group_idx, (key, records) in enumerate(group_items):
+        keep_train_group = group_idx == len(group_items) - 1
+        if len(val_data) < target_val_count and not keep_train_group:
+            val_data.extend(records)
+            val_keys.add(key)
+        else:
+            train_data.extend(records)
+            train_keys.add(key)
+
+    leakage_keys = train_keys & val_keys
+    if leakage_keys:
+        examples = ", ".join(sorted(leakage_keys)[:5])
+        raise RuntimeError(
+            "Mirror-safe split failed: canonical motion group(s) appear in "
+            f"both train and val: {examples}"
+        )
+
+    mirror_records = 0
+    mirror_groups = 0
+    augmented_records = 0
+    augmented_groups = 0
+    paired_original_mirror_groups = 0
+    for _key, records in group_items:
+        mirror_flags = [
+            _is_mirrored_motion(str(record.get("_source", "")))
+            for record in records
+        ]
+        augmented_flags = [
+            _is_augmented_motion(str(record.get("_source", "")))
+            for record in records
+        ]
+        mirror_count = sum(mirror_flags)
+        augmented_count = sum(augmented_flags)
+        mirror_records += mirror_count
+        augmented_records += augmented_count
+        if mirror_count:
+            mirror_groups += 1
+        if augmented_count:
+            augmented_groups += 1
+        if 0 < mirror_count < len(records):
+            paired_original_mirror_groups += 1
+
+    stats = {
+        "unit": "canonical_motion_group",
+        "groups": len(group_items),
+        "train_groups": len(train_keys),
+        "val_groups": len(val_keys),
+        "target_val_count": target_val_count,
+        "mirror_records": mirror_records,
+        "mirror_groups": mirror_groups,
+        "augmented_records": augmented_records,
+        "augmented_groups": augmented_groups,
+        "paired_original_mirror_groups": paired_original_mirror_groups,
+        "leakage_groups": 0,
+    }
+    return train_data, val_data, stats
 
 
 def _recovery_manifest_stats(
@@ -324,26 +451,25 @@ def _pack_source_file(task: tuple) -> tuple[list[dict], int, set[int], str | Non
     if not isinstance(data, dict):
         return [], 0, set(), f"{pkl_f} does not contain a dict"
 
-    prefix = ""
-    if root is not None:
-        prefix = str(pkl_f.relative_to(root).with_suffix("")).replace("/", "__") + "__"
+    prefix = _directory_source_prefix(pkl_f, root)
 
     records: list[dict] = []
     skipped = 0
     fps_values: set[int] = set()
     warning = None
     for entry_idx, (raw_name, entry) in enumerate(data.items()):
-        name = prefix + str(raw_name) if prefix else str(raw_name)
+        label_name = str(raw_name)
+        source_name = prefix + label_name if prefix else label_name
         try:
-            item = motion_lib_entry_to_textop(name, entry)
+            item = motion_lib_entry_to_textop(label_name, entry)
         except (TypeError, ValueError) as exc:
-            warning = f"invalid motion {name}: {exc}"
+            warning = f"invalid motion {source_name}: {exc}"
             item = None
         if item is None or (min_frames and item["length"] < min_frames):
             skipped += 1
             continue
 
-        item["_source"] = name
+        item["_source"] = source_name
         sample_relpath = (
             Path("samples") / f"{source_idx:08d}_{entry_idx:04d}.pkl"
         )
@@ -353,7 +479,7 @@ def _pack_source_file(task: tuple) -> tuple[list[dict], int, set[int], str | Non
         records.append({
             "length": item["length"],
             "frame_ann": item["frame_ann"],
-            "_source": name,
+            "_source": source_name,
             "_data_path": sample_relpath.as_posix(),
             "_fps": fps,
             "_recovery_boost": item.get("_recovery_boost", False),
@@ -588,13 +714,21 @@ def main():
         print(f"ERROR: Mixed source frame rates are unsupported: {sorted(fps_values)}")
         sys.exit(1)
 
-    # ── Shuffle & split ──
-    random.Random(args.seed).shuffle(manifest)
-    n_val = int(len(manifest) * args.val_ratio)
-    if args.val_ratio > 0 and len(manifest) > 1:
-        n_val = max(1, min(n_val, len(manifest) - 1))
-    train_data = manifest[n_val:]
-    val_data = manifest[:n_val]
+    # ── Grouped shuffle & split ──
+    train_data, val_data, split_stats = split_manifest_train_val(
+        manifest, args.val_ratio, args.seed
+    )
+    print(
+        "Split by canonical motion groups: "
+        f"train={len(train_data)} seqs/{split_stats['train_groups']} groups, "
+        f"val={len(val_data)} seqs/{split_stats['val_groups']} groups "
+        f"(target val seqs={split_stats['target_val_count']})"
+    )
+    if args.val_ratio > 0 and split_stats["groups"] <= 1:
+        print(
+            "WARNING: Validation split is empty because only one canonical "
+            "motion group is available; keeping the group intact in train."
+        )
 
     # ── Save ──
     train_path = out / "train.pkl"
@@ -625,6 +759,7 @@ def main():
         "val count": len(val_data),
         "train hours": round(train_hours, 1),
         "val hours": round(val_hours, 1),
+        "split": split_stats,
         "recovery_boost": {
             "train": train_recovery,
             "val": val_recovery,

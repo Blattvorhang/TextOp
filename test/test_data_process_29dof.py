@@ -133,6 +133,83 @@ def test_parallel_packer_matches_serial_output(tmp_path):
         )
 
 
+def test_directory_packer_uses_folder_prefix_without_repeating_motion_name(tmp_path):
+    frames = 8
+    source_dir = tmp_path / "source"
+    session_dir = source_dir / "221010"
+    session_dir.mkdir(parents=True)
+    entry = {
+        "root_trans_offset": np.zeros((frames, 3), dtype=np.float32),
+        "root_rot": np.tile([0, 0, 0, 1], (frames, 1)).astype(np.float32),
+        "dof": np.zeros((frames, 29), dtype=np.float32),
+        "contact_mask": np.ones((frames, 2), dtype=np.float32),
+        "fps": 50,
+    }
+    source_path = session_dir / "walk_ff_loop_180_R_003__A045_M.pkl"
+    joblib.dump({"walk_ff_loop_180_R_003__A045_M": entry}, source_path)
+
+    out = tmp_path / "out"
+    (out / "samples").mkdir(parents=True)
+    manifest, skipped, fps_values = packer.pack_source_files(
+        [(source_path, source_dir)],
+        out,
+        min_frames=0,
+        sample_compress=0,
+        workers=1,
+    )
+
+    assert skipped == 0
+    assert fps_values == {50}
+    assert manifest[0]["_source"] == "221010__walk_ff_loop_180_R_003__A045_M"
+    assert manifest[0]["frame_ann"] == [(0.0, frames / 50, "walk", ["walk"])]
+    stored = joblib.load(out / manifest[0]["_data_path"])
+    assert stored["_source"] == manifest[0]["_source"]
+    assert stored["frame_ann"] == manifest[0]["frame_ann"]
+    assert stored["length"] == frames
+
+
+def test_motion_split_key_groups_original_and_mirror_sources():
+    original = "221010__walk_ff_loop_180_R_003__A045"
+    mirrored = "221010__walk_ff_loop_180_R_003__A045_M"
+    augmented_original = "221010__walk_ff_loop_180_R_003__A045_aug_003"
+    augmented_mirror = "221010__walk_ff_loop_180_R_003__A045_M_aug_003"
+
+    split_key = packer._motion_split_key(original)
+    assert split_key == packer._motion_split_key(mirrored)
+    assert split_key == packer._motion_split_key(augmented_original)
+    assert split_key == packer._motion_split_key(augmented_mirror)
+
+
+def test_grouped_train_val_split_keeps_mirrors_together():
+    mirror_original = "walk_ff_loop_180_R_003__A045"
+    mirror_copy = "walk_ff_loop_180_R_003__A045_M"
+    augmented = "walk_ff_loop_180_R_003__A045_aug_003"
+    augmented_mirror = "walk_ff_loop_180_R_003__A045_M_aug_003"
+    manifest = [
+        {"_source": mirror_original, "length": 10, "_fps": 50, "frame_ann": []},
+        {"_source": mirror_copy, "length": 10, "_fps": 50, "frame_ann": []},
+        {"_source": augmented, "length": 10, "_fps": 50, "frame_ann": []},
+        {"_source": augmented_mirror, "length": 10, "_fps": 50, "frame_ann": []},
+        {"_source": "idle_001__A001", "length": 10, "_fps": 50, "frame_ann": []},
+        {"_source": "jump_001__A002", "length": 10, "_fps": 50, "frame_ann": []},
+    ]
+
+    train_data, val_data, stats = packer.split_manifest_train_val(
+        manifest, val_ratio=0.5, seed=7
+    )
+
+    train_keys = {packer._motion_split_key(record["_source"]) for record in train_data}
+    val_keys = {packer._motion_split_key(record["_source"]) for record in val_data}
+    mirror_key = packer._motion_split_key(mirror_original)
+    mirror_split_count = int(mirror_key in train_keys) + int(mirror_key in val_keys)
+
+    assert train_keys.isdisjoint(val_keys)
+    assert mirror_split_count == 1
+    assert stats["leakage_groups"] == 0
+    assert stats["paired_original_mirror_groups"] == 1
+    assert stats["augmented_records"] == 2
+
+
 def test_torch_fk_matches_mujoco():
     mujoco = pytest.importorskip("mujoco")
     pytest.importorskip("torch")
