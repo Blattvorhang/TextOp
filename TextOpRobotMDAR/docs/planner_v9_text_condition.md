@@ -21,7 +21,7 @@ The short version:
 - `_COARSE_RULES` is useful for statistics, sampling, and rough grouping. It is
   too lossy to be the final text supervision for action style.
 - Text conditioning is intended to behave like the goal components: it has an
-  independent probability mask controlled by `denoiser.cond_text_mask_prob`.
+  independent probability mask controlled by `denoiser.cond_mask_prob.text`.
   Setting it to `1.0` makes the text condition always empty while preserving the
   model's fixed token layout.
 
@@ -519,7 +519,7 @@ Implemented behavior:
 - `train_dar.py::_conditions()` forwards `text_embedding` into the denoiser
   condition dictionary.
 - `DenoiserTransformer` has a text token projected by `embed_text`.
-- `denoiser.cond_text_mask_prob` controls independent text dropout.
+- `denoiser.cond_mask_prob.text` controls independent text dropout.
 - `force_drop_text` and `y["uncond"]` force the text branch to the null
   condition.
 - Planner/eval generation can accept an optional `text_embedding`.
@@ -540,14 +540,16 @@ data:
 
 denoiser:
   clip_dim: 512
-  cond_text_mask_prob: 0.1
+  text_condition_enabled: true
+  cond_mask_prob:
+    text: 0.1
 ```
 
 `data.load_text_embeddings` controls whether the dataset loads or computes CLIP
 embeddings. If it is `false`, the dataloader still emits a `[B, 512]` zero
 embedding so the training code path stays stable.
 
-`denoiser.cond_text_mask_prob` controls whether the model can see the text:
+`denoiser.cond_mask_prob.text` controls whether the model can see the text:
 
 | Value | Meaning |
 | --- | --- |
@@ -555,7 +557,7 @@ embedding so the training code path stays stable.
 | `0.1` | TextOp/ADAPT-style classifier-free text dropout |
 | `1.0` | always drop text, useful for no-text ablations |
 
-Setting `cond_text_mask_prob = 1.0` does not physically remove the text token
+Setting `cond_mask_prob.text = 1.0` does not physically remove the text token
 from the transformer sequence. It keeps the fixed token layout and zeros the
 text content. This is intentionally consistent with goal-component masking.
 
@@ -566,7 +568,9 @@ data:
   load_text_embeddings: false
 
 denoiser:
-  cond_text_mask_prob: 1.0
+  text_condition_enabled: true
+  cond_mask_prob:
+    text: 1.0
 ```
 
 ## 11. Recommended Data Update
@@ -640,7 +644,7 @@ expected to respond to text prompts without fine-tuning or retraining.
 Recommended experiment order:
 
 1. Train with text embeddings from the existing coarse `frame_ann[*][2]`.
-2. Run the no-text ablation with `cond_text_mask_prob=1.0`.
+2. Run the no-text ablation with `cond_mask_prob.text=1.0`.
 3. Replace coarse labels with `style_text` generated from structured
    Bones-SEED semantics.
 4. Compare matched goal settings where only `style_text` changes.
