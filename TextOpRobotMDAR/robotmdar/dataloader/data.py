@@ -10,10 +10,11 @@ This is a clean, well-structured implementation with:
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import pickle
 import numpy as np
 import joblib
 import yaml
-from typing import Any, Tuple, Dict, List, Optional
+from typing import Any, Callable, Tuple, Dict, List, Optional
 import sys
 import os
 import time
@@ -127,22 +128,44 @@ def _save_goal_stats_cache(goal_stats, goal_stats_path: Path) -> None:
     logger.info(f" Saved goal stats to {goal_stats_path}")
 
 
-def _wait_for_goal_stats_cache(goal_stats_path: Path,
-                               timeout_s: float = 900.0) -> None:
-    """Wait for the writer rank's train dataset to publish the cache file.
-
-    The atomic rename in _save_goal_stats_cache guarantees that a visible
-    file is always a complete one.
-    """
+def _wait_for_cache(
+        cache_path: Path,
+        cache_description: str,
+        cache_validator: Optional[Callable[[Any], bool]] = None,
+        timeout_s: float = 900.0,
+) -> Any:
+    """Wait for rank 0 to publish a complete, validated cache file."""
     deadline = time.monotonic() + timeout_s
-    while not goal_stats_path.exists():
+    validator = cache_validator or (lambda cache: True)
+    while True:
+        if cache_path.exists():
+            try:
+                cache = torch.load(cache_path, map_location="cpu")
+            except (OSError, EOFError, RuntimeError, pickle.UnpicklingError):
+                cache = None
+            if cache is not None and validator(cache):
+                return cache
         if time.monotonic() > deadline:
             raise TimeoutError(
                 f"Timed out after {timeout_s:.0f}s waiting for "
-                f"{goal_stats_path}; the train dataset on the writer rank "
-                "never produced it (dataset directory not writable?)"
+                f"{cache_description} at {cache_path}; the writer rank "
+                "never produced a valid cache (dataset directory not "
+                "writable?)"
             )
         time.sleep(2.0)
+
+
+def _wait_for_goal_stats_cache(goal_stats_path: Path,
+                               cache_validator: Optional[
+                                   Callable[[Any], bool]
+                               ] = None,
+                               timeout_s: float = 900.0) -> Any:
+    return _wait_for_cache(
+        goal_stats_path,
+        "goal stats cache",
+        cache_validator=cache_validator,
+        timeout_s=timeout_s,
+    )
 
 
 def _save_text_embedding_cache(text_embeddings: Dict[str, torch.Tensor],
@@ -531,8 +554,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         return sample
 
     def _cal_sample_weight(self):
-
-        logger.info(f" ====================Use Weighted Sample====================")
+        is_weight_writer = _is_goal_stats_writer()
+        if is_weight_writer:
+            logger.info(
+                " ====================Use Weighted Sample===================="
+            )
 
         with open(self.action_statistics_path, 'r') as f:
             action_statistics = json.load(f)
@@ -543,49 +569,80 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # sees them more often without changing the global category distribution.
         RECOVERY_WEIGHT_MULTIPLIER = 5.0
 
-        for data in self.raw_data:
-            seq_weight = 0
-            for seg in data['frame_ann']:
-                seg_act_cat = seg[3]
-                act_weights = 0
-                for act_cat in seg_act_cat:
-                    # breakpoint()
-                    if act_cat not in action_statistics:
-                        continue
-                    else:
-                        act_weights += action_statistics[act_cat]['weight']
-                seq_weight += (seg[1] - seg[0]) * act_weights
+        # frame_weights are only read when frame_weight=True. The old code
+        # calculated them unconditionally, which made every weighted run scan
+        # all possible windows even though the training config disables this
+        # feature.
+        calculate_frame_weights = bool(self.frame_weight)
+        valid_data = [self.raw_data[i] for i in self.valid_indices]
+        if is_weight_writer:
+            logger.info(
+                f"Calculating weights for {len(valid_data)} valid "
+                f"{self.split} records (frame_weight="
+                f"{calculate_frame_weights})"
+            )
+        progress = tqdm(
+            valid_data,
+            total=len(valid_data),
+            desc=f"weighted sample [{self.split}]",
+            unit="seq",
+            dynamic_ncols=True,
+            disable=not is_weight_writer,
+        )
+        start_time = time.perf_counter()
+
+        for data in progress:
+            # Resolve the category weight once per annotation. The previous
+            # implementation repeated this lookup for every frame window.
+            weighted_segments = []
+            seq_weight = 0.0
+            for seg in data.get('frame_ann', []):
+                act_weight = sum(
+                    action_statistics[act_cat]['weight']
+                    for act_cat in seg[3]
+                    if act_cat in action_statistics
+                )
+                weighted_segments.append((
+                    float(seg[0]),
+                    float(seg[1]),
+                    float(act_weight),
+                ))
+                seq_weight += (float(seg[1]) - float(seg[0])) * act_weight
 
             if data.get('_recovery_boost'):
                 seq_weight *= RECOVERY_WEIGHT_MULTIPLIER
 
             data['weight'] = seq_weight
-            num_frames = data['length']
+            if calculate_frame_weights:
+                num_frames = int(data['length'])
+                num_windows = max(0, num_frames - self.segment_len + 1)
+                frame_weights = []
+                for frame_idx in range(num_windows):
+                    start_t = frame_idx / self.fps
+                    end_t = (frame_idx + self.segment_len - 1) / self.fps
+                    frame_weights.append(sum(
+                        max(
+                            0.0,
+                            min(seg_end, end_t) - max(seg_start, start_t),
+                        ) * seg_weight
+                        for seg_start, seg_end, seg_weight in weighted_segments
+                    ))
+                data['frame_weights'] = frame_weights
 
-            frame_weights = []
-            for frame_idx in range(0, num_frames - self.segment_len + 1):
-                start_t = frame_idx / self.fps
-                end_t = (frame_idx + self.segment_len - 1) / self.fps
-                frame_weight = 0
-                for seg in data['frame_ann']:
-                    overlap_len = self._get_overlap([seg[0], seg[1]], [start_t, end_t])
-                    if overlap_len > 0:
-                        act_weights = 0
-                        for act_cat in seg[3]:
-                            if act_cat not in action_statistics:
-                                continue
-                            else:
-                                act_weights += action_statistics[act_cat]['weight']
-                        # act_weights = sum([action_statistics[act_cat]['weight'] for act_cat in seg[3]])
-                        frame_weight += overlap_len * act_weights
-                frame_weights.append(frame_weight)
-            data['frame_weights'] = frame_weights
+        elapsed = time.perf_counter() - start_time
+        if is_weight_writer:
+            logger.info(
+                f"Finished weighted sampling for {len(valid_data)} records "
+                f"in {elapsed:.1f}s"
+            )
 
-        valid_data = [self.raw_data[i] for i in self.valid_indices]
         babel_sum = sum(data['weight'] for data in valid_data)
-        print('babel sum: ', babel_sum)
         samp_percent = 0.0
-        print('samp percent: ', samp_percent)
+        if is_weight_writer:
+            logger.info(
+                f"Weighted sampling raw sum={babel_sum:.6f}, "
+                f"sample_percent={samp_percent:.1%}"
+            )
         if babel_sum > 0:
             for data in valid_data:
                 data['weight'] = data['weight'] / babel_sum * (1 - samp_percent)
@@ -936,78 +993,118 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         text_embeddings_dict[''] = torch.zeros_like(text_embeddings[0])
         return text_embeddings_dict
 
+    def _wait_for_meanstd_cache(self, meanstd_cache_path: Path) -> Any:
+        return _wait_for_cache(
+            meanstd_cache_path,
+            "mean/std cache",
+            cache_validator=self._meanstd_cache_is_current,
+        )
+
+    def _save_meanstd_cache(self, meanstd, meanstd_cache_path: Path) -> None:
+        """Atomically publish mean/std from the writer rank only."""
+        if not _is_goal_stats_writer():
+            return
+        tmp_path = meanstd_cache_path.with_name(
+            meanstd_cache_path.name + ".tmp")
+        try:
+            torch.save(
+                self._meanstd_cache_payload(meanstd),
+                tmp_path,
+            )
+            tmp_path.replace(meanstd_cache_path)
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Cannot write mean/std cache {meanstd_cache_path}: the "
+                "dataset directory is not writable."
+            ) from exc
+        logger.info(f" Saved mean/std to {meanstd_cache_path}")
+
     def _load_meanstd(self) -> None:
-        """Load or compute mean/std for normalization"""
+        """Load or compute mean/std for normalization."""
         meanstd_cache_path = (
             self.normalization_path
             if self.normalization_path is not None
             else self._default_meanstd_path(weighted=False)
         )
+        is_writer = _is_goal_stats_writer()
+        is_torchrun = _is_torchrun()
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
             meanstd = torch.load(meanstd_cache_path, map_location="cpu")
             if not self._meanstd_cache_is_current(meanstd):
-                logger.warning(
-                    " Cached mean/std at {} is stale for FeatureVersion {} "
-                    "(arrival-state v6 caches are stored with metadata); "
-                    "recomputing",
-                    meanstd_cache_path, motion_dtype.FeatureVersion,
-                )
-                meanstd = self._compute_meanstd()
-                torch.save(
-                    self._meanstd_cache_payload(meanstd),
-                    meanstd_cache_path,
-                )
+                if is_torchrun and not is_writer:
+                    meanstd = self._wait_for_meanstd_cache(
+                        meanstd_cache_path)
+                else:
+                    logger.warning(
+                        " Cached mean/std at {} is stale for FeatureVersion {} "
+                        "(arrival-state v6 caches are stored with metadata); "
+                        "recomputing",
+                        meanstd_cache_path, motion_dtype.FeatureVersion,
+                    )
+                    meanstd = self._compute_meanstd()
+                    self._save_meanstd_cache(
+                        meanstd, meanstd_cache_path)
         else:
-            logger.info(f" Computing mean/std..")
-            assert self.split == 'train', "Compute mean and std from 'train' set"
+            if is_torchrun and not is_writer:
+                meanstd = self._wait_for_meanstd_cache(
+                    meanstd_cache_path)
+            else:
+                logger.info(" Computing mean/std...")
+                assert self.split == 'train', (
+                    "Compute mean and std from 'train' set"
+                )
 
-            # zjk: DART meanstd cal method
-            meanstd = self._compute_meanstd()
-            # meanstd = self._compute_meanstd_V2()
+                # zjk: DART meanstd cal method
+                meanstd = self._compute_meanstd()
+                # meanstd = self._compute_meanstd_V2()
 
-            torch.save(
-                self._meanstd_cache_payload(meanstd),
-                meanstd_cache_path,
-            )
-            logger.info(f" Saved mean/std to {meanstd_cache_path}")
+                self._save_meanstd_cache(
+                    meanstd, meanstd_cache_path)
 
         self._set_meanstd(self._meanstd_cache_tuple(meanstd), meanstd_cache_path)
 
     def _load_weighted_meanstd(self) -> None:
-        """Load or compute mean/std for normalization"""
+        """Load or compute weighted mean/std for normalization."""
         meanstd_cache_path = (
             self.normalization_path
             if self.normalization_path is not None
             else self._default_meanstd_path(weighted=True)
         )
+        is_writer = _is_goal_stats_writer()
+        is_torchrun = _is_torchrun()
         if meanstd_cache_path.exists():
             logger.info(f" Loading cached mean/std from {meanstd_cache_path}...")
             meanstd = torch.load(meanstd_cache_path, map_location="cpu")
             if not self._meanstd_cache_is_current(meanstd):
-                logger.warning(
-                    " Cached weighted mean/std at {} is stale for "
-                    "FeatureVersion {}; recomputing",
-                    meanstd_cache_path, motion_dtype.FeatureVersion,
-                )
-                meanstd = self._compute_meanstd()
-                torch.save(
-                    self._meanstd_cache_payload(meanstd),
-                    meanstd_cache_path,
-                )
+                if is_torchrun and not is_writer:
+                    meanstd = self._wait_for_meanstd_cache(
+                        meanstd_cache_path)
+                else:
+                    logger.warning(
+                        " Cached weighted mean/std at {} is stale for "
+                        "FeatureVersion {}; recomputing",
+                        meanstd_cache_path, motion_dtype.FeatureVersion,
+                    )
+                    meanstd = self._compute_meanstd()
+                    self._save_meanstd_cache(
+                        meanstd, meanstd_cache_path)
         else:
-            logger.info(f" Computing mean/std..")
-            assert self.split == 'train', "Compute mean and std from 'train' set"
+            if is_torchrun and not is_writer:
+                meanstd = self._wait_for_meanstd_cache(
+                    meanstd_cache_path)
+            else:
+                logger.info(" Computing weighted mean/std...")
+                assert self.split == 'train', (
+                    "Compute mean and std from 'train' set"
+                )
 
-            # zjk: DART meanstd cal method
-            meanstd = self._compute_meanstd()
-            # meanstd = self._compute_meanstd_V2()
+                # zjk: DART meanstd cal method
+                meanstd = self._compute_meanstd()
+                # meanstd = self._compute_meanstd_V2()
 
-            torch.save(
-                self._meanstd_cache_payload(meanstd),
-                meanstd_cache_path,
-            )
-            logger.info(f" Saved mean/std to {meanstd_cache_path}")
+                self._save_meanstd_cache(
+                    meanstd, meanstd_cache_path)
 
         self._set_meanstd(self._meanstd_cache_tuple(meanstd), meanstd_cache_path)
 
@@ -1325,7 +1422,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         try:
             N = 10000 // self.batch_size + 1
             samples = []
-            for i in tqdm(range(N)):
+            for i in tqdm(
+                    range(N),
+                    desc="goal stats",
+                    unit="batch",
+                    dynamic_ncols=True,
+                    disable=not _is_goal_stats_writer()):
                 batch_data = self._generate_batch_optimized(
                     generator=torch.Generator().manual_seed(i)
                 )
@@ -1336,6 +1438,28 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self.std = saved_std
             self._stats_device_cache.clear()
         return stats
+
+    def _validate_goal_stats_cache(self, goal_stats: Dict[str, Any]) -> None:
+        validate_goal_stats(
+            goal_stats,
+            goal_encoding=self.goal_encoding,
+            goal_offset_range=self.goal_offset_range,
+            goal_per_primitive=self.goal_per_primitive,
+            future_len=self.future_len,
+            fps=float(self.fps),
+            goal_timestep_mode=self.goal_timestep_mode,
+            datadir=str(self.datadir),
+            goal_include_log_d_hor=self.goal_include_log_d_hor,
+        )
+
+    def _goal_stats_cache_is_current(self, goal_stats: Any) -> bool:
+        if not isinstance(goal_stats, dict):
+            return False
+        try:
+            self._validate_goal_stats_cache(goal_stats)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+        return self.split != 'train' or 'goal_clamp' in goal_stats
 
     def _load_goal_stats(self) -> None:
         if not self.load_goal_stats:
@@ -1349,36 +1473,47 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             return
 
         goal_stats_path = self.goal_stats_path
+        is_writer = _is_goal_stats_writer()
+        is_torchrun = _is_torchrun()
         if goal_stats_path.exists():
             logger.info(f" Loading cached goal stats from {goal_stats_path}...")
             goal_stats = torch.load(goal_stats_path, map_location="cpu")
+            if not self._goal_stats_cache_is_current(goal_stats):
+                if is_torchrun and not is_writer:
+                    goal_stats = _wait_for_goal_stats_cache(
+                        goal_stats_path,
+                        cache_validator=self._goal_stats_cache_is_current,
+                    )
+                elif self.split != 'train':
+                    raise ValueError(
+                        f"Goal stats cache at {goal_stats_path} is stale "
+                        f"for split={self.split!r}"
+                    )
+                else:
+                    logger.warning(
+                        "Cached goal stats at {} do not match the active "
+                        "train config; recomputing",
+                        goal_stats_path,
+                    )
+                    goal_stats = self._compute_goal_stats()
+                    _save_goal_stats_cache(goal_stats, goal_stats_path)
+        elif is_torchrun and not is_writer:
+            goal_stats = _wait_for_goal_stats_cache(
+                goal_stats_path,
+                cache_validator=self._goal_stats_cache_is_current,
+            )
         elif self.split != 'train':
-            if not _is_torchrun():
-                raise FileNotFoundError(
-                    f"Missing goal stats cache {goal_stats_path} for "
-                    f"split={self.split!r}"
-                )
-            # Multi-rank job: the writer rank's train dataset is producing
-            # the cache right now; poll until the atomic rename publishes it.
-            _wait_for_goal_stats_cache(goal_stats_path)
-            goal_stats = torch.load(goal_stats_path, map_location="cpu")
+            raise FileNotFoundError(
+                f"Missing goal stats cache {goal_stats_path} for "
+                f"split={self.split!r}"
+            )
         else:
             logger.info(" Computing goal stats...")
             goal_stats = self._compute_goal_stats()
             _save_goal_stats_cache(goal_stats, goal_stats_path)
 
         try:
-            validate_goal_stats(
-                goal_stats,
-                goal_encoding=self.goal_encoding,
-                goal_offset_range=self.goal_offset_range,
-                goal_per_primitive=self.goal_per_primitive,
-                future_len=self.future_len,
-                fps=float(self.fps),
-                goal_timestep_mode=self.goal_timestep_mode,
-                datadir=str(self.datadir),
-                goal_include_log_d_hor=self.goal_include_log_d_hor,
-            )
+            self._validate_goal_stats_cache(goal_stats)
         except ValueError:
             if self.split != 'train':
                 raise
@@ -1412,7 +1547,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.std = torch.ones(self.nfeats)
         self._stats_device_cache.clear()
         # for i in range(N):
-        for i in tqdm(range(N)):
+        for i in tqdm(
+                range(N),
+                desc="mean/std",
+                unit="batch",
+                dynamic_ncols=True,
+                disable=not _is_goal_stats_writer()):
             batch_data = self._generate_batch_optimized(generator=torch.Generator().manual_seed(i))
 
             for primitive_idx in range(self.num_primitive):

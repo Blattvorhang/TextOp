@@ -1996,10 +1996,10 @@ class GeometryLoss:
     def _end_effector_anchors(self):
         mjcf_file = str(self.dataset.skeleton.fk.mjcf_file)
         cache_key = getattr(self, '_end_effector_anchor_mjcf_file', None)
-        anchors = getattr(self, '_end_effector_anchors', None)
+        anchors = getattr(self, '_end_effector_anchors_cache', None)
         if anchors is None or cache_key != mjcf_file:
             anchors = resolve_end_effector_anchors(self.dataset.skeleton)
-            self._end_effector_anchors = anchors
+            self._end_effector_anchors_cache = anchors
             self._end_effector_anchor_mjcf_file = mjcf_file
         return anchors
 
