@@ -15,11 +15,13 @@
 #     FK_BACKEND         torch or mujoco                (default: torch)
 #     TORCH_DEVICE       cpu or cuda for batched FK     (default: cpu)
 #     MOB_RASTER_BACKEND vectorized or scalar exact MOB (default: vectorized)
+#     METADATA_CSV       BONES-SEED metadata CSV        (default: ${BONES_SEED_DIR}/metadata/seed_metadata_v004.csv)
+#     TEMPORAL_JSONL     temporal event labels          (default: ${BONES_SEED_DIR}/metadata/seed_metadata_v002_temporal_labels.jsonl)
 #
 # Stages:
 #     1. convert_soma_csv_to_motion_lib.py    CSV -> motion_lib PKL (+ contact_mask + scene occu)
 #     2. filter_and_copy_bones_data.py        keyword filter
-#     3. pack_motion_lib_to_textop.py         motion_lib -> TextOp format (+ coarse frame_ann)
+#     3. pack_motion_lib_to_textop.py         motion_lib -> TextOp format (+ metadata frame_ann)
 #     4. cal_weighted_statistics.py           generate action_statistics.json for weighted_sample
 #
 # Each stage writes a .done marker so the pipeline can be safely restarted
@@ -45,6 +47,8 @@ SEED="${SEED:-42}"
 FK_BACKEND="${FK_BACKEND:-torch}"
 TORCH_DEVICE="${TORCH_DEVICE:-cpu}"
 MOB_RASTER_BACKEND="${MOB_RASTER_BACKEND:-vectorized}"
+METADATA_CSV="${METADATA_CSV:-${BONES_SEED_DIR}/metadata/seed_metadata_v004.csv}"
+TEMPORAL_JSONL="${TEMPORAL_JSONL:-${BONES_SEED_DIR}/metadata/seed_metadata_v002_temporal_labels.jsonl}"
 
 S1_OUT="${OUTPUT_ROOT}/motion_lib"
 S1_DONE="${S1_OUT}/.done"
@@ -108,6 +112,8 @@ echo ""
 echo "Stage 3/4: pack_motion_lib_to_textop.py"
 echo "  Input : ${S2_OUT}"
 echo "  Output: ${S3_OUT}"
+echo "  Metadata: ${METADATA_CSV}"
+echo "  Temporal: ${TEMPORAL_JSONL}"
 
 if [ -f "${S3_DONE}" ]; then
     echo "  [SKIP] already done"
@@ -115,6 +121,8 @@ else
     python3 "${SCRIPT_DIR}/pack_motion_lib_to_textop.py" \
         --input "${S2_OUT}" \
         --output "${S3_OUT}" \
+        --metadata-csv "${METADATA_CSV}" \
+        --temporal-jsonl "${TEMPORAL_JSONL}" \
         --val_ratio "${VAL_RATIO}" \
         --seed "${SEED}" \
         --workers "${PACK_WORKERS}"
@@ -154,7 +162,7 @@ echo "  lazy motion samples     : ${S3_OUT}/samples/"
 echo "  statistics.yaml         : ${S3_OUT}/statistics.yaml"
 echo "  action_statistics.json  : ${S4_OUT}/action_statistics.json"
 echo "  scene occu              : inferred pseudo-obstacles (per-motion, in .pkl entries)"
-echo "  frame_ann               : coarse action categories (per-sequence, in .pkl entries)"
+echo "  frame_ann               : metadata/temporal text annotations (in .pkl entries)"
 echo ""
 # symlink into robotmdar dataset dir
 ln -sfn "$(realpath "${S3_OUT}")" "${PROJECT_ROOT}/TextOpRobotMDAR/dataset/BONES-SEED-29dof-FULL-50fps"
