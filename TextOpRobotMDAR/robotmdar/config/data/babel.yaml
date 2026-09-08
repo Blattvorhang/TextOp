@@ -13,6 +13,9 @@ frame_weight: false
 use_weighted_meanstd: false
 load_text_embeddings: true
 clip_version: ViT-B/32
+# Optional local checkpoint for offline machines. If null, CLIP's normal cache
+# and download behavior is used; TEXTOP_CLIP_PATH is also supported.
+clip_model_path: null
 clip_dim: 512
 goal_offset: 0
 goal_type: root
@@ -59,6 +62,7 @@ common: &common
   use_weighted_meanstd: ${..use_weighted_meanstd}
   load_text_embeddings: ${..load_text_embeddings}
   clip_version: ${..clip_version}
+  clip_model_path: ${..clip_model_path}
   clip_dim: ${..clip_dim}
   goal_offset: ${..goal_offset}
   goal_type: ${..goal_type}

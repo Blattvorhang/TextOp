@@ -329,6 +329,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.load_text_embeddings = bool(
             kwargs.get('load_text_embeddings', True))
         self.clip_version = str(kwargs.get('clip_version', 'ViT-B/32'))
+        self.clip_model_path = kwargs.get('clip_model_path')
         self.clip_dim = int(kwargs.get('clip_dim', 512))
         self._stats_device_cache = {}
         # Planner-side DR is disabled by default: augmentation_enabled must be
@@ -882,6 +883,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             clip_model = load_and_freeze_clip(
                 clip_version=self.clip_version,
                 device="cuda" if torch.cuda.is_available() else "cpu",
+                clip_model_path=self.clip_model_path,
             )
             self.text_embeddings_dict = self._compute_text_embeddings(
                 self.raw_data, clip_model, clip_dim=self.clip_dim)
