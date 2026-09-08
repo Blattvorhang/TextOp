@@ -1720,22 +1720,32 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _world_goal_end_effectors(self, raw_motion: Dict[str, Any],
                                   goal_frame: int) -> torch.Tensor:
+        return self._world_goal_end_effectors_batch(
+            raw_motion, [goal_frame])[0]
+
+    def _world_goal_end_effectors_batch(
+        self, raw_motion: Dict[str, Any], goal_frames: List[int]
+    ) -> torch.Tensor:
+        """Compute multiple end-effector goals with one batched FK call."""
+        if not goal_frames:
+            return torch.empty((0, 4, 3), dtype=torch.float32)
+        frame_index = torch.as_tensor(goal_frames, dtype=torch.long)
         goal_motion = {
             'dof': self._select_model_dof(torch.as_tensor(
-                raw_motion['dof'][goal_frame:goal_frame + 1],
-                dtype=torch.float32)),
+                raw_motion['dof'][frame_index], dtype=torch.float32
+            ).unsqueeze(1)),
             'root_trans_offset': torch.as_tensor(
-                raw_motion['root_trans_offset'][goal_frame:goal_frame + 1],
-                dtype=torch.float32),
+                raw_motion['root_trans_offset'][frame_index],
+                dtype=torch.float32).unsqueeze(1),
             'root_rot': torch.as_tensor(
-                raw_motion['root_rot'][goal_frame:goal_frame + 1],
-                dtype=torch.float32),
+                raw_motion['root_rot'][frame_index],
+                dtype=torch.float32).unsqueeze(1),
         }
         goal_fk = self.skeleton.forward_kinematics(
             goal_motion, fps=self.fps)
         return extract_end_effector_positions(
             goal_fk, self.skeleton,
-            anchors=self._end_effector_anchors())[0, 0]
+            anchors=self._end_effector_anchors())[:, 0]
 
     def _world_goal_velocity(self, raw_motion: Dict[str, Any],
                              goal_frame: int) -> torch.Tensor:
@@ -1867,6 +1877,20 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         snippet_goal_frame = seg_start + self.segment_len - 1 + goal_offset
         world_goal_keypoints = None
         world_goal_end_effectors = None
+        world_goal_end_effectors_batch = None
+        if (goal_type is GoalType.JOINT_STATE
+                and self.goal_encoding.uses_end_effectors
+                and self.goal_per_primitive):
+            goal_frames = [
+                seg_start + primitive_idx * self.future_len
+                + self.future_len + self.history_len
+                + (0 if motion_dtype.FeatureVersion == 6 else -1)
+                + goal_offset
+                for primitive_idx in range(self.num_primitive)
+            ]
+            world_goal_end_effectors_batch = (
+                self._world_goal_end_effectors_batch(
+                    sample['motion'], goal_frames))
         primitives = []
 
         for primitive_idx in range(self.num_primitive):
@@ -1916,8 +1940,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             if (goal_type is GoalType.JOINT_STATE
                     and self.goal_encoding.uses_end_effectors
                     and world_goal_end_effectors is None):
-                world_goal_end_effectors = self._world_goal_end_effectors(
-                    sample['motion'], goal_frame)
+                if world_goal_end_effectors_batch is not None:
+                    world_goal_end_effectors = (
+                        world_goal_end_effectors_batch[primitive_idx])
+                else:
+                    world_goal_end_effectors = (
+                        self._world_goal_end_effectors(
+                            sample['motion'], goal_frame))
 
             primitives.append(self._extract_single_primitive(
                 sample, prim_start, prim_end, goal_frame,

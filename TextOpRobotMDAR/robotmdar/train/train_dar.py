@@ -1,6 +1,8 @@
 import os
 import math
 import random
+import queue
+import threading
 from typing import List, Optional
 
 import numpy as np
@@ -42,6 +44,52 @@ import robotmdar.dtype.motion as motion_dtype
 # expands dynamically when a trajectory or goal exceeds it.
 # See dataset/data_analyze/analyze_64f_goal_xy.py
 _DEFAULT_XY_LIMIT = 0.2
+_PREFETCH_ERROR = object()
+
+
+class _BackgroundPrefetchIterator:
+    """Generate one CPU batch ahead while the current batch trains."""
+
+    def __init__(self, source):
+        self._source = iter(source)
+        self._queue = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="textop-data-prefetch",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                batch = next(self._source)
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put(batch, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as exc:
+            self._queue.put((_PREFETCH_ERROR, exc))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._queue.get()
+        if (isinstance(item, tuple)
+                and len(item) == 2
+                and item[0] is _PREFETCH_ERROR):
+            self.close()
+            raise item[1]
+        return item
+
+    def close(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 def _compute_xy_limit(*trajectories, goals_xy, default=_DEFAULT_XY_LIMIT):
@@ -337,7 +385,8 @@ def _goal_time_frame_for_loss(conditions, cfg):
 
 
 def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
-                fps: float, goal_stats=None, use_scene: bool = True):
+                fps: float, goal_stats=None, use_scene: bool = True,
+                text_embedding=None):
     goal_type = GoalType.parse(cfg.data.goal_type)
     goal_encoding = GoalEncoding.parse(
         cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
@@ -496,10 +545,28 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
     if goal_encoding.uses_end_effectors:
         conditions['goal_end_effectors_ego_raw'] = ego_goal_raw[
             :, SPLIT_END_EFFECTOR_SLICE].reshape(-1, 4, 3)
-    if 'text_embedding' in primitive:
-        conditions['text_embedding'] = primitive['text_embedding'].to(
-            cfg.device)
+    if text_embedding is None and 'text_embedding' in primitive:
+        text_embedding = primitive['text_embedding'].to(
+            cfg.device, non_blocking=True)
+    if text_embedding is not None:
+        conditions['text_embedding'] = text_embedding
     return conditions
+
+
+def _prepare_batch_text_embeddings(batch, cfg, device):
+    """Move all primitive text embeddings to the training device once."""
+    if not bool(cfg.denoiser.get('text_condition_enabled', False)):
+        return None
+    cond_mask_prob = cfg.denoiser.get('cond_mask_prob', {})
+    if float(cond_mask_prob.get('text', 0.0)) >= 1.0:
+        # Text is guaranteed to be dropped during training; avoid the
+        # otherwise unnecessary CPU -> GPU transfer for this condition.
+        return None
+    embeddings = [primitive.get('text_embedding') for primitive in batch]
+    if any(embedding is None for embedding in embeddings):
+        return None
+    return torch.stack(embeddings, dim=0).to(
+        device=device, non_blocking=True)
 
 
 def _next_rollout_poses(dataset, motion, history_start_pos, history_start_rot, history_len):
@@ -1236,6 +1303,13 @@ def main(cfg: DictConfig):
     history_len: int = cfg.data.history_len
 
     train_dataiter = iter(train_data)
+    # The custom dataset builds a whole segment synchronously.  When history
+    # augmentation is active, keep the step-dependent generation synchronous;
+    # otherwise overlap the next segment's CPU preparation with GPU training.
+    train_data_prefetch = None
+    if not bool(getattr(train_data, 'augmentation_enabled', False)):
+        train_data_prefetch = _BackgroundPrefetchIterator(train_dataiter)
+        train_dataiter = train_data_prefetch
     val_dataiter = iter(val_data)
     train_batch_validated = False
     val_batch_validated = False
@@ -1249,6 +1323,8 @@ def main(cfg: DictConfig):
             _validate_batch(batch, cfg)
             train_batch_validated = True
 
+        batch_text_embeddings = _prepare_batch_text_embeddings(
+            batch, cfg, device)
         prev_motion = None
         rollout_history_start_pos = None
         rollout_history_start_rot = None
@@ -1283,7 +1359,11 @@ def main(cfg: DictConfig):
             y = _conditions(primitive, reference_pos, reference_rot,
                             history_motion, cfg, train_data.fps,
                             goal_stats=getattr(train_data, 'goal_stats', None),
-                            use_scene=manager.should_use_scene())
+                            use_scene=manager.should_use_scene(),
+                            text_embedding=(
+                                batch_text_embeddings[pidx]
+                                if batch_text_embeddings is not None else None
+                            ))
             goal_time_frame = _goal_time_frame_for_loss(y, cfg)
 
             # Sample timesteps
@@ -1397,6 +1477,8 @@ def main(cfg: DictConfig):
             if not val_batch_validated:
                 _validate_batch(batch, cfg)
                 val_batch_validated = True
+            batch_text_embeddings = _prepare_batch_text_embeddings(
+                batch, cfg, device)
             for pidx in range(num_primitive):
                 if not manager.should_eval():
                     break
@@ -1418,6 +1500,10 @@ def main(cfg: DictConfig):
                     val_data.fps,
                     goal_stats=getattr(val_data, 'goal_stats', None),
                     use_scene=use_scene,
+                    text_embedding=(
+                        batch_text_embeddings[pidx]
+                        if batch_text_embeddings is not None else None
+                    ),
                 )
                 goal_time_frame = _goal_time_frame_for_loss(y, cfg)
 
@@ -1574,6 +1660,9 @@ def main(cfg: DictConfig):
                     loss_dict=loss_dict,
                     extras=extras,
                 )
+
+    if train_data_prefetch is not None:
+        train_data_prefetch.close()
 
     # Clean up DDP resources
     if dist.is_initialized():
