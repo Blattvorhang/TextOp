@@ -22,7 +22,7 @@ data:
   clip_version: ViT-B/32
   clip_dim: 512
   goal_type: joint_state
-  goal_encoding: split
+  goal_encoding: split_end_effector
   goal_per_primitive: true
   goal_offset: 0
   # Arrival time disambiguates randomized targets, so training can cover every
@@ -41,7 +41,7 @@ data:
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
-  goal_dim: 55
+  goal_dim: 67
   text_condition_enabled: true
   cond_mask_prob:
     text: 0.2
@@ -50,6 +50,11 @@ denoiser:
       velocity: 0.1
       orientation: 0.3
       joint: 0.6
+      end_effector:
+        left_hand: 0.3
+        right_hand: 0.3
+        left_foot: 0.3
+        right_foot: 0.3
       time: 0.1
 
 train:
@@ -66,6 +71,7 @@ train:
           root_velocity: 0.02
           root_orientation: 0.002
           joint_angle: 0.0
+          end_effector: 0.0
       getup:
         rec: 1.5
         foot_contact: 0.01
@@ -77,6 +83,7 @@ train:
           root_velocity: 0.002
           root_orientation: 0.0
           joint_angle: 0.0
+          end_effector: 0.0
 
 ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF

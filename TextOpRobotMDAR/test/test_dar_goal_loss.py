@@ -6,7 +6,12 @@ from omegaconf import OmegaConf
 
 import robotmdar.dtype.motion as runtime_motion_dtype
 import TextOpRobotMDAR.robotmdar.dtype.motion as package_motion_dtype
-from TextOpRobotMDAR.robotmdar.dtype.rotation import matrix_to_rot6d
+from TextOpRobotMDAR.robotmdar.dtype.rotation import (
+    matrix_to_rot6d,
+    quaternion_to_matrix,
+    xyzw_to_wxyz,
+)
+from TextOpRobotMDAR.robotmdar.skeleton.end_effector import EndEffectorAnchor
 from TextOpRobotMDAR.robotmdar.train.manager import DARManager
 from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _make_root_xy_figure,
@@ -14,6 +19,8 @@ from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _validate_goal_root_position_contract,
 )
 from TextOpRobotMDAR.robotmdar.utils.goal import (
+    SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_SLICE,
     SPLIT_GOAL_DIM,
     SPLIT_VERTICAL_GRAVITY_SLICE,
 )
@@ -48,6 +55,12 @@ def _set_both_feature_versions(version: int):
     runtime_motion_dtype.set_feature_version(version)
     package_motion_dtype.set_feature_version(version)
     return old_runtime, old_package
+
+
+def _empty_geometry_loss_v6(*args, **kwargs):
+    if kwargs.get("return_fk_results", False):
+        return {}, {}, {}, None
+    return {}, {}, {}
 
 
 def test_goal_root_position_loss_is_zero_for_matching_endpoint():
@@ -447,6 +460,280 @@ def test_v6_split_goal_root_position_loss_reports_hor_and_vert_separately():
         package_motion_dtype.set_feature_version(old_package)
 
 
+def test_goal_end_effector_loss_sums_independent_visible_token_losses():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.goal_end_effector_loss_beta = 0.05
+        manager.dataset.skeleton = SimpleNamespace()
+        manager._end_effector_anchors = lambda: tuple(
+            EndEffectorAnchor(
+                name=f"ee_{idx}",
+                source_type="body",
+                source_name=f"body_{idx}",
+                parent_body=f"body_{idx}",
+                parent_body_index=idx,
+                local_pos=torch.zeros(3),
+            )
+            for idx in range(4)
+        )
+        future = torch.zeros((2, 4, 44), dtype=torch.float32)
+        pred_translation = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        pred_rotation = torch.eye(3).reshape(1, 1, 1, 3, 3).expand(
+            2, 4, 4, 3, 3).clone()
+        goal = torch.zeros((2, SPLIT_END_EFFECTOR_GOAL_DIM), dtype=torch.float32)
+        goal[:, SPLIT_END_EFFECTOR_SLICE] = torch.tensor(
+            [[1.0, 0.0, 0.0] * 4,
+             [2.0, 0.0, 0.0] * 4],
+            dtype=torch.float32,
+        )
+
+        loss, per_token_sample, valid, metrics = (
+            manager.calc_goal_end_effector_loss(
+                future,
+                goal,
+                goal_end_effector_condition_keep_mask=torch.tensor(
+                    [[True, False, False, False],
+                     [False, True, False, False]]),
+                future_motion_pred_fk={
+                    "global_translation": pred_translation,
+                    "global_rotation_mat": pred_rotation,
+                },
+                goal_time_frame=torch.tensor([2, 2]),
+                return_per_sample=True,
+            ))
+
+        left_hand_loss = torch.tensor(1.0 - 0.5 * 0.05)
+        right_hand_loss = torch.tensor(2.0 - 0.5 * 0.05)
+        expected = left_hand_loss + right_hand_loss
+        torch.testing.assert_close(loss, expected)
+        torch.testing.assert_close(
+            per_token_sample,
+            torch.tensor([
+                [float(left_hand_loss), 0.0, 0.0, 0.0],
+                [0.0, float(right_hand_loss), 0.0, 0.0],
+            ]),
+        )
+        assert valid.tolist() == [
+            [True, False, False, False],
+            [False, True, False, False],
+        ]
+        torch.testing.assert_close(
+            metrics['goal_end_effector'], torch.tensor(1.5))
+        torch.testing.assert_close(
+            metrics['goal_end_effector_left_hand'], torch.tensor(1.0))
+        torch.testing.assert_close(
+            metrics['goal_end_effector_right_hand'], torch.tensor(2.0))
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_goal_end_effector_loss_aligns_prediction_to_current_state_reference():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.goal_end_effector_loss_beta = 0.05
+        manager._end_effector_anchors = lambda: tuple(
+            EndEffectorAnchor(
+                name=f"ee_{idx}",
+                source_type="body",
+                source_name=f"body_{idx}",
+                parent_body=f"body_{idx}",
+                parent_body_index=idx,
+                local_pos=torch.zeros(3),
+            )
+            for idx in range(4)
+        )
+
+        future = torch.zeros((1, 4, 44), dtype=torch.float32)
+        reference_pos = torch.tensor([[10.0, 20.0, 0.75]])
+        sqrt_half = 2.0**-0.5
+        reference_rot = torch.tensor(
+            [[0.0, 0.0, sqrt_half, sqrt_half]], dtype=torch.float32)
+        ee_ego = torch.tensor(
+            [[[1.0, 0.0, 0.1],
+              [0.0, 2.0, 0.2],
+              [-1.0, 0.0, -0.3],
+              [0.0, -2.0, -0.4]]],
+            dtype=torch.float32,
+        )
+        reference_matrix = quaternion_to_matrix(xyzw_to_wxyz(reference_rot))
+        ee_world = reference_pos.unsqueeze(1) + torch.matmul(
+            reference_matrix.unsqueeze(1),
+            ee_ego.unsqueeze(-1),
+        ).squeeze(-1)
+
+        calls = {}
+
+        def reconstruct_motion(motion_feature, abs_pose=None,
+                               need_denormalize=True, ret_fk=True):
+            calls['abs_pose'] = abs_pose
+            calls['ret_fk'] = ret_fk
+            assert need_denormalize is True
+            assert ret_fk is False
+            B, T = motion_feature.shape[:2]
+            root_rot = torch.zeros((B, T, 4), dtype=motion_feature.dtype)
+            root_rot[..., 3] = 1.0
+            return {
+                'root_trans_offset': torch.zeros(
+                    B, T, 3, dtype=motion_feature.dtype),
+                'root_rot': root_rot,
+                'dof': torch.zeros(B, T, 29, dtype=motion_feature.dtype),
+                'contact_mask': torch.zeros(
+                    B, T, 4, dtype=motion_feature.dtype),
+            }
+
+        def forward_kinematics(motion_dict, return_full=False, fps=30.0):
+            calls['fk_time_dim'] = motion_dict['dof'].shape[1]
+            global_rotation = torch.eye(3).reshape(1, 1, 1, 3, 3).expand(
+                1, 1, 4, 3, 3).clone()
+            return {
+                'global_translation': ee_world.unsqueeze(1),
+                'global_rotation_mat': global_rotation,
+            }
+
+        manager.dataset.reconstruct_motion = reconstruct_motion
+        manager.dataset.skeleton = SimpleNamespace(
+            forward_kinematics=forward_kinematics)
+
+        goal = torch.zeros((1, SPLIT_END_EFFECTOR_GOAL_DIM),
+                           dtype=torch.float32)
+        goal[:, SPLIT_END_EFFECTOR_SLICE] = ee_ego.reshape(1, 12)
+
+        loss, per_token_sample, valid, metrics = (
+            manager.calc_goal_end_effector_loss(
+                future,
+                goal,
+                goal_end_effector_condition_keep_mask=torch.tensor(
+                    [[True, True, True, True]]),
+                goal_reference_pos=reference_pos,
+                goal_reference_rot=reference_rot,
+                goal_time_frame=torch.tensor([2]),
+                return_per_sample=True,
+            ))
+
+        torch.testing.assert_close(loss, torch.tensor(0.0), atol=1e-6, rtol=0)
+        torch.testing.assert_close(
+            per_token_sample, torch.zeros((1, 4)), atol=1e-6, rtol=0)
+        assert valid.tolist() == [[True, True, True, True]]
+        torch.testing.assert_close(
+            metrics['goal_end_effector'], torch.tensor(0.0), atol=1e-6, rtol=0)
+        torch.testing.assert_close(
+            calls['abs_pose']['root_trans_offset'], reference_pos)
+        torch.testing.assert_close(calls['abs_pose']['root_rot'], reference_rot)
+        assert calls['ret_fk'] is False
+        assert calls['fk_time_dim'] == 1
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_goal_end_effector_total_loss_uses_sum_of_token_means():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.goal_end_effector_loss_beta = 0.05
+        manager.loss_weight = {'goal': {'end_effector': 1.0}}
+        manager.dataset.skeleton = SimpleNamespace()
+        manager._end_effector_anchors = lambda: tuple(
+            EndEffectorAnchor(
+                name=f"ee_{idx}",
+                source_type="body",
+                source_name=f"body_{idx}",
+                parent_body=f"body_{idx}",
+                parent_body_index=idx,
+                local_pos=torch.zeros(3),
+            )
+            for idx in range(4)
+        )
+        future = torch.zeros((2, 4, 44), dtype=torch.float32)
+        pred_translation = torch.zeros((2, 1, 4, 3), dtype=torch.float32)
+        pred_rotation = torch.eye(3).reshape(1, 1, 1, 3, 3).expand(
+            2, 1, 4, 3, 3).clone()
+
+        def reconstruct_motion(motion_feature, abs_pose=None,
+                               need_denormalize=True, ret_fk=True):
+            assert abs_pose is not None
+            assert need_denormalize is True
+            assert ret_fk is False
+            B, T = motion_feature.shape[:2]
+            root_rot = torch.zeros((B, T, 4), dtype=motion_feature.dtype)
+            root_rot[..., 3] = 1.0
+            return {
+                'root_trans_offset': torch.zeros(
+                    B, T, 3, dtype=motion_feature.dtype),
+                'root_rot': root_rot,
+                'dof': torch.zeros(B, T, 29, dtype=motion_feature.dtype),
+                'contact_mask': torch.zeros(
+                    B, T, 4, dtype=motion_feature.dtype),
+            }
+
+        def forward_kinematics(motion_dict, return_full=False, fps=30.0):
+            assert motion_dict['dof'].shape[1] == 1
+            return {
+                "global_translation": pred_translation,
+                "global_rotation_mat": pred_rotation,
+            }
+
+        manager.dataset.reconstruct_motion = reconstruct_motion
+        manager.dataset.skeleton.forward_kinematics = forward_kinematics
+        manager.calc_geometry_loss_v6 = lambda *args, **kwargs: (
+            {},
+            {},
+            {},
+            {
+                "future_motion_pred_fk": {
+                    "global_translation": torch.ones((2, 4, 4, 3)),
+                    "global_rotation_mat": torch.eye(3).reshape(
+                        1, 1, 1, 3, 3).expand(2, 4, 4, 3, 3).clone(),
+                }
+            },
+        )
+
+        goal = torch.zeros((2, SPLIT_END_EFFECTOR_GOAL_DIM), dtype=torch.float32)
+        goal[:, SPLIT_END_EFFECTOR_SLICE] = torch.tensor(
+            [[1.0, 0.0, 0.0] * 4,
+             [2.0, 0.0, 0.0] * 4],
+            dtype=torch.float32,
+        )
+        keep_mask = torch.tensor(
+            [[True, False, False, False],
+             [False, True, False, False]])
+        reference_pos = torch.zeros((2, 3), dtype=torch.float32)
+        reference_rot = torch.zeros((2, 4), dtype=torch.float32)
+        reference_rot[:, 3] = 1.0
+
+        loss_dict, extras = manager.calc_loss(
+            torch.zeros_like(future),
+            future,
+            None,
+            None,
+            None,
+            None,
+            ego_goal=goal,
+            goal_type='joint_state',
+            goal_end_effector_condition_keep_mask=keep_mask,
+            goal_reference_pos=reference_pos,
+            goal_reference_rot=reference_rot,
+            goal_time_frame=torch.tensor([2, 2]),
+        )
+
+        expected = torch.tensor((1.0 - 0.5 * 0.05)
+                                + (2.0 - 0.5 * 0.05))
+        torch.testing.assert_close(loss_dict['goal_end_effector'], expected)
+        torch.testing.assert_close(loss_dict['total'], expected)
+        torch.testing.assert_close(
+            extras['e_goal_end_effector'], torch.tensor(1.5))
+        torch.testing.assert_close(
+            extras['e_goal_end_effector_left_hand'], torch.tensor(1.0))
+        torch.testing.assert_close(
+            extras['e_goal_end_effector_right_hand'], torch.tensor(2.0))
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
 def test_nested_goal_loss_weights_contribute_to_total():
     old_runtime, old_package = _set_both_feature_versions(6)
     try:
@@ -467,9 +754,7 @@ def test_nested_goal_loss_weights_contribute_to_total():
                 },
             },
         }
-        manager.calc_geometry_loss_v6 = (
-            lambda *args, **kwargs: ({}, {}, {})
-        )
+        manager.calc_geometry_loss_v6 = _empty_geometry_loss_v6
 
         rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
         history = torch.zeros((2, 2, 44), dtype=torch.float32)
@@ -515,9 +800,7 @@ def test_nested_goal_g_loss_weights_use_getup_for_recovery_samples():
             'locomotion': {'goal': {'g': 1.0}},
             'getup': {'goal': {'g': 10.0}},
         }
-        manager.calc_geometry_loss_v6 = (
-            lambda *args, **kwargs: ({}, {}, {})
-        )
+        manager.calc_geometry_loss_v6 = _empty_geometry_loss_v6
 
         rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
         history = torch.zeros((2, 2, 44), dtype=torch.float32)
@@ -560,9 +843,7 @@ def test_nested_loss_weights_use_getup_for_recovery_samples():
             'locomotion': {'rec': 1.0},
             'getup': {'rec': 10.0},
         }
-        manager.calc_geometry_loss_v6 = (
-            lambda *args, **kwargs: ({}, {}, {})
-        )
+        manager.calc_geometry_loss_v6 = _empty_geometry_loss_v6
         future_gt = torch.zeros((2, 1, 1), dtype=torch.float32)
         future_pred = torch.tensor([[[1.0]], [[2.0]]], dtype=torch.float32)
         latent = torch.zeros((1, 2, 1), dtype=torch.float32)

@@ -313,7 +313,7 @@ def test_state_joint_state_goal_uses_root_rotation_dof_and_velocity():
         goal_root_pos_world=np.asarray([2.0, 3.0, 0.8], dtype=np.float32),
         goal_yaw_world=None,
         goal_root_rot_world=np.asarray(
-            [0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float32),
         goal_dof_pos=goal_dof,
         goal_root_velocity_world=np.asarray(
             [0.5, -0.25, 0.0], dtype=np.float32),

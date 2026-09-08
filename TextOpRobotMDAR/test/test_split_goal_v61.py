@@ -22,12 +22,18 @@ from TextOpRobotMDAR.robotmdar.train.manager import DARManager
 from TextOpRobotMDAR.robotmdar.utils.goal import (
     GoalEncoding,
     GoalType,
+    SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_GOAL_SCHEMA,
+    SPLIT_END_EFFECTOR_SLICE,
+    SPLIT_END_EFFECTOR_TOKEN_ORDER,
     SPLIT_GOAL_DIM,
     SPLIT_GOAL_SCHEMA,
     SPLIT_HORIZONTAL_SLICE,
     SPLIT_ORIENTATION_SLICE,
     SPLIT_VERTICAL_SLICE,
+    build_ego_end_effector_goal,
     build_ego_goal,
+    build_ego_split_end_effector_goal,
     build_ego_split_goal,
     scale_goal,
     validate_goal_config,
@@ -63,6 +69,22 @@ def _split_goal_stats_fixture(tmp_path: Path) -> dict:
             "dof_dim": 29,
         },
     }
+
+
+def _split_end_effector_goal_stats_fixture(tmp_path: Path) -> dict:
+    stats = dict(_split_goal_stats_fixture(tmp_path))
+    stats["meta"] = dict(
+        stats["meta"],
+        encodings=[GoalEncoding.SPLIT_END_EFFECTOR.value],
+        goal_dim=SPLIT_END_EFFECTOR_GOAL_DIM,
+        goal_schema=SPLIT_END_EFFECTOR_GOAL_SCHEMA,
+        end_effector_source="active_mjcf",
+        end_effector_token_order=list(SPLIT_END_EFFECTOR_TOKEN_ORDER),
+        resolved_end_effector_anchors=[],
+        mjcf_file=str(tmp_path / "g1_29dof.xml"),
+    )
+    stats["s_ee"] = torch.linspace(1.0, 12.0, 12)
+    return stats
 
 
 def _split_goal_dataset(tmp_path: Path) -> SkeletonPrimitiveDataset:
@@ -245,6 +267,88 @@ def test_split_goal_layout_scaling_round_trip(tmp_path):
         world_goal_rot=world_goal_rot,
         world_goal_dof=world_goal_dof,
         world_root_velocity=world_root_velocity,
+        time_to_arrival_seconds=time_to_arrival,
+    )
+    torch.testing.assert_close(dispatched, scaled, atol=1e-6, rtol=0)
+
+
+def test_split_end_effector_goal_appends_four_fk_positions(tmp_path):
+    assert GoalEncoding.SPLIT_END_EFFECTOR.token_count == 10
+
+    reference_pos = torch.tensor([[1.0, -2.0, 0.5]], dtype=torch.float32)
+    reference_rot = euler_angles_to_quaternion(
+        torch.tensor([[0.1, -0.2, 0.3]], dtype=torch.float32))
+    reference_R = quaternion_to_matrix(xyzw_to_wxyz(reference_rot))
+    ee_ego = torch.tensor(
+        [[[0.2, 0.3, 0.4],
+          [0.5, -0.1, 0.2],
+          [-0.2, 0.15, -0.5],
+          [0.25, -0.35, -0.45]]],
+        dtype=torch.float32,
+    )
+    world_goal_end_effectors = reference_pos.unsqueeze(-2) + torch.matmul(
+        reference_R.unsqueeze(-3), ee_ego.unsqueeze(-1)).squeeze(-1)
+    time_to_arrival = torch.tensor([4.0], dtype=torch.float32)
+    stats = _split_end_effector_goal_stats_fixture(tmp_path)
+
+    raw = build_ego_split_end_effector_goal(
+        world_goal_pos=reference_pos + torch.tensor([[1.0, 0.0, 0.2]]),
+        world_goal_rot=reference_rot,
+        world_goal_dof=torch.linspace(-1.0, 1.0, 29).reshape(1, 29),
+        world_root_velocity=torch.tensor([[0.2, 0.0, 0.1]], dtype=torch.float32),
+        world_goal_end_effectors=world_goal_end_effectors,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+        time_to_arrival_seconds=time_to_arrival,
+        fps=50.0,
+        distance_scale=stats["s_d"],
+    )
+
+    assert raw.shape == (1, SPLIT_END_EFFECTOR_GOAL_DIM)
+    torch.testing.assert_close(
+        build_ego_end_effector_goal(
+            world_goal_end_effectors, reference_pos, reference_rot),
+        ee_ego.flatten(-2),
+        atol=1e-6,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        raw[:, SPLIT_END_EFFECTOR_SLICE],
+        ee_ego.flatten(-2),
+        atol=1e-6,
+        rtol=0,
+    )
+    assert validate_goal_config(
+        "joint_state",
+        SPLIT_END_EFFECTOR_GOAL_DIM,
+        GoalEncoding.SPLIT_END_EFFECTOR,
+        dof_dim=29,
+        goal_offset_range=(-63, 0),
+        goal_timestep_mode="relative",
+        goal_stats=stats,
+        goal_include_log_d_hor=True,
+    ) is GoalType.JOINT_STATE
+
+    scaled = scale_goal(raw, stats)
+    torch.testing.assert_close(
+        scaled[:, SPLIT_END_EFFECTOR_SLICE],
+        raw[:, SPLIT_END_EFFECTOR_SLICE] * stats["s_ee"],
+        atol=1e-6,
+        rtol=0,
+    )
+    dispatched = build_ego_goal(
+        world_goal_pos=reference_pos + torch.tensor([[1.0, 0.0, 0.2]]),
+        world_goal_yaw=torch.zeros(1),
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+        goal_type=GoalType.JOINT_STATE,
+        goal_encoding=GoalEncoding.SPLIT_END_EFFECTOR,
+        goal_stats=stats,
+        fps=50.0,
+        world_goal_rot=reference_rot,
+        world_goal_dof=torch.linspace(-1.0, 1.0, 29).reshape(1, 29),
+        world_root_velocity=torch.tensor([[0.2, 0.0, 0.1]], dtype=torch.float32),
+        world_goal_end_effectors=world_goal_end_effectors,
         time_to_arrival_seconds=time_to_arrival,
     )
     torch.testing.assert_close(dispatched, scaled, atol=1e-6, rtol=0)
@@ -493,6 +597,61 @@ def test_split_denoisers_use_arrival_pe_as_the_time_token_only():
     torch.testing.assert_close(xseq[1], torch.zeros_like(xseq[1]))
     torch.testing.assert_close(xseq[6], torch.zeros_like(xseq[6]))
     assert y_drop["goal_time_condition_keep_mask"].tolist() == [False, False]
+
+
+def test_split_end_effector_transformer_forward_accepts_four_extra_tokens():
+    model = DenoiserTransformer(
+        h_dim=8,
+        ff_size=16,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        history_shape=(2, 6),
+        noise_shape=(1, 4),
+        goal_dim=SPLIT_END_EFFECTOR_GOAL_DIM,
+        goal_encoding=GoalEncoding.SPLIT_END_EFFECTOR,
+        grid_size=2,
+        cond_text_mask_prob=0.0,
+        text_condition_enabled=False,
+        cond_mask_prob={
+            "goal": {
+                "position": 0.0,
+                "orientation": 0.0,
+                "joint": 0.0,
+                "velocity": 0.0,
+                "time": 0.0,
+                "end_effector": {
+                    "left_hand": 0.0,
+                    "right_hand": 0.0,
+                    "left_foot": 0.0,
+                    "right_foot": 0.0,
+                },
+            },
+            "scene": 0.0,
+        },
+    ).eval()
+    batch_size = 2
+    y = {
+        "goal": torch.ones(batch_size, SPLIT_END_EFFECTOR_GOAL_DIM),
+        "voxel": torch.zeros(batch_size, 8),
+        "history_motion_normalized": torch.zeros(batch_size, 2, 6),
+        "time_to_arrival_frame": torch.tensor([5, 10], dtype=torch.long),
+    }
+    x_t = torch.zeros(batch_size, 1, 4)
+
+    out = model(
+        x_t=x_t,
+        timesteps=torch.zeros(batch_size, dtype=torch.long),
+        y=y,
+    )
+
+    assert out.shape == x_t.shape
+    assert y["goal_end_effector_condition_keep_mask"].shape == (
+        batch_size, 4)
+    assert y["goal_end_effector_condition_keep_mask"].tolist() == [
+        [True, True, True, True],
+        [True, True, True, True],
+    ]
 
 
 def test_split_transformer_keeps_slot_pe_for_masked_goal_tokens():

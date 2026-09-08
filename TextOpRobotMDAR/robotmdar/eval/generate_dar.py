@@ -21,6 +21,7 @@ import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import motion_dict_to_abs_pose
 from robotmdar.utils.goal import (
     EXTENDED_BODY_GOAL_DIM,
+    SPLIT_END_EFFECTOR_GOAL_DIM,
     SPLIT_GOAL_DIM,
     SPLIT_TIME_SLICE,
 )
@@ -230,6 +231,11 @@ def generate_next_motion(
         force_drop_goal_orientation: bool = False,
         force_drop_goal_joint: bool = False,
         force_drop_goal_velocity: bool = False,
+        force_drop_goal_end_effector: bool = False,
+        force_drop_goal_end_effector_left_hand: bool = False,
+        force_drop_goal_end_effector_right_hand: bool = False,
+        force_drop_goal_end_effector_left_foot: bool = False,
+        force_drop_goal_end_effector_right_foot: bool = False,
         force_drop_scene: bool = False,
         force_drop_arrival_time: bool = False,
         time_to_arrival_frame: Optional[torch.Tensor] = None):
@@ -254,6 +260,11 @@ def generate_next_motion(
         force_drop_goal_orientation: Mask the joint_state orientation block.
         force_drop_goal_joint: Mask the joint_state 29-DOF target block.
         force_drop_goal_velocity: Mask the joint_state root-velocity block.
+        force_drop_goal_end_effector: Mask all four end-effector tokens.
+        force_drop_goal_end_effector_left_hand: Mask only left-hand token.
+        force_drop_goal_end_effector_right_hand: Mask only right-hand token.
+        force_drop_goal_end_effector_left_foot: Mask only left-foot token.
+        force_drop_goal_end_effector_right_foot: Mask only right-foot token.
         force_drop_scene: Mask the scene occupancy condition at inference.
         force_drop_arrival_time: Mask the arrival-time PE at inference.
         time_to_arrival_frame: Optional frame index passed to the arrival PE.
@@ -303,7 +314,9 @@ def generate_next_motion(
             time_to_arrival_frame = torch.round(
                 goal[:, 8].clamp_min(0.0) * fps
             ).to(dtype=torch.long)
-        if time_to_arrival_frame is None and goal.shape[-1] == SPLIT_GOAL_DIM:
+        if (time_to_arrival_frame is None
+                and goal.shape[-1]
+                in (SPLIT_GOAL_DIM, SPLIT_END_EFFECTOR_GOAL_DIM)):
             fps = float(getattr(val_data, 'fps', 50.0))
             time_to_arrival_frame = torch.round(
                 goal[:, SPLIT_TIME_SLICE].reshape(-1).clamp_min(0.0) * fps
@@ -319,6 +332,15 @@ def generate_next_motion(
             'force_drop_goal_orientation': force_drop_goal_orientation,
             'force_drop_goal_joint': force_drop_goal_joint,
             'force_drop_goal_velocity': force_drop_goal_velocity,
+            'force_drop_goal_end_effector': force_drop_goal_end_effector,
+            'force_drop_goal_end_effector_left_hand': (
+                force_drop_goal_end_effector_left_hand),
+            'force_drop_goal_end_effector_right_hand': (
+                force_drop_goal_end_effector_right_hand),
+            'force_drop_goal_end_effector_left_foot': (
+                force_drop_goal_end_effector_left_foot),
+            'force_drop_goal_end_effector_right_foot': (
+                force_drop_goal_end_effector_right_foot),
             'force_drop_scene': force_drop_scene,
             'force_drop_arrival_time': force_drop_arrival_time,
         }

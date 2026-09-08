@@ -14,11 +14,11 @@ target_dir: null  # required
 data:
   dof_dim: 29
   goal_type: joint_state
-  goal_encoding: split
+  goal_encoding: split_end_effector
   goal_per_primitive: true
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
-  goal_include_log_d_hor: true
+  goal_include_log_d_hor: false
   # The task recomputes the stats explicitly; keep the dataset init from
   # loading (or silently caching) the datadir copy.
   load_goal_stats: false

@@ -14,7 +14,7 @@ Each test maps to one preflight item that must hold before the first LDM run:
   P5  augmentation order     — V7.1 perturbation touches raw history states
                                before feature conversion; current frame w=0;
                                last-history transition keeps ~1.1% residue
-  P6  frozen config contract — FeatureVersion 6, 44-D features, 55-D goals,
+  P6  frozen config contract — FeatureVersion 6, 44-D features, 67-D goals,
                                pinned loss weights / mask probs / aug schedule,
                                frozen v6 mean/std cache on disk
 """
@@ -48,6 +48,7 @@ from TextOpRobotMDAR.robotmdar.dtype.rotation import (
 )
 from TextOpRobotMDAR.robotmdar.utils import goal as goal_module
 from TextOpRobotMDAR.robotmdar.utils.goal import (
+    SPLIT_END_EFFECTOR_GOAL_DIM,
     SPLIT_GOAL_DIM,
     SPLIT_HORIZONTAL_SLICE,
     SPLIT_JOINT_SLICE,
@@ -414,8 +415,8 @@ def test_augmentation_applied_to_raw_states_before_feature_conversion(monkeypatc
 # ---------------------------------------------------------------------------
 
 def test_train_dar_config_freezes_v6_contract():
-    """Composed train_dar.yaml pins FeatureVersion 6 / 44-D / 55-D and the
-    first-round LDM baseline settings (loss weights, mask probs, aug schedule)."""
+    """Composed train_dar.yaml pins FeatureVersion 6 / 44-D / 67-D and the
+    current LDM settings (loss weights, mask probs, aug schedule)."""
     from hydra import compose, initialize_config_dir
 
     config_dir = str(REPO_ROOT / "robotmdar" / "config")
@@ -428,8 +429,8 @@ def test_train_dar_config_freezes_v6_contract():
     assert cfg.data.nfeats == 44
     assert motion_feature_dim_for_dof(29, feature_version=6) == 44
     assert cfg.data.goal_type == "joint_state"
-    assert cfg.data.goal_encoding == "split"
-    assert cfg.data.goal_include_log_d_hor is True
+    assert cfg.data.goal_encoding == "split_end_effector"
+    assert cfg.data.goal_include_log_d_hor is False
     with initialize_config_dir(version_base=None, config_dir=config_dir):
         cfg_without_log = compose(
             config_name="train_dar",
@@ -439,37 +440,47 @@ def test_train_dar_config_freezes_v6_contract():
     assert cfg_without_log.data.train.goal_include_log_d_hor is False
     assert cfg_without_log.data.val.goal_include_log_d_hor is False
     assert cfg.data.load_scene is False
-    assert cfg.denoiser.goal_dim == SPLIT_GOAL_DIM
+    assert cfg.denoiser.goal_dim == SPLIT_END_EFFECTOR_GOAL_DIM
     assert cfg.data.history_len == 16 and cfg.data.future_len == 64
 
     # The DAR loss weights are split by locomotion/getup so recovery samples
     # can use a distinct objective while sharing the same batch.
+    assert cfg.train.manager.goal_end_effector_loss_beta == 0.05
     loss = cfg.train.manager.loss_weight
     assert set(loss.keys()) == {"locomotion", "getup"}
     assert loss.locomotion.foot_contact == 0.01
-    assert loss.locomotion.support_consistency == 0.01
+    assert loss.locomotion.support_consistency == 1.0
     assert "goal_root_position_hor" not in loss.locomotion
     assert loss.locomotion.goal.g == 0.0
-    assert loss.locomotion.goal.root_position_hor == 0.25
+    assert loss.locomotion.goal.root_position_hor == 0.5
     assert loss.locomotion.goal.root_position_vert == 0.05
-    assert loss.locomotion.goal.root_orientation == 0.005
-    assert loss.locomotion.goal.root_velocity == 0.05
-    assert loss.locomotion.goal.joint_angle == 0.01
+    assert loss.locomotion.goal.root_orientation == 0.002
+    assert loss.locomotion.goal.root_velocity == 0.02
+    assert loss.locomotion.goal.joint_angle == 0.0
+    assert loss.locomotion.goal.end_effector == 0.0
 
     assert loss.getup.foot_contact == 0.01
-    assert loss.getup.support_consistency == 0.01
+    assert loss.getup.support_consistency == 10.0
     assert "goal_root_position_hor" not in loss.getup
-    assert loss.getup.goal.g == 0.05
-    assert loss.getup.goal.root_position_hor == 0.005
-    assert loss.getup.goal.root_position_vert == 0.1
+    assert loss.getup.goal.g == 0.01
+    assert loss.getup.goal.root_position_hor == 0.0
+    assert loss.getup.goal.root_position_vert == 0.05
     assert loss.getup.goal.root_orientation == 0.0
-    assert loss.getup.goal.root_velocity == 0.01
-    assert loss.getup.goal.joint_angle == 0.01
-    assert (cfg.denoiser.cond_goal_root_mask_prob,
-            cfg.denoiser.cond_goal_orientation_mask_prob,
-            cfg.denoiser.cond_goal_joint_mask_prob,
-            cfg.denoiser.cond_goal_velocity_mask_prob,
-            cfg.denoiser.cond_goal_time_mask_prob) == (0.1, 0.1, 0.4, 0.0, 0.2)
+    assert loss.getup.goal.root_velocity == 0.002
+    assert loss.getup.goal.joint_angle == 0.0
+    assert loss.getup.goal.end_effector == 0.0
+    assert "cond_goal_root_mask_prob" not in cfg.denoiser
+    assert cfg.denoiser.text_condition_enabled is True
+    assert cfg.denoiser.cond_mask_prob.text == 0.2
+    assert cfg.denoiser.cond_mask_prob.goal.position == 0.05
+    assert cfg.denoiser.cond_mask_prob.goal.orientation == 0.3
+    assert cfg.denoiser.cond_mask_prob.goal.joint == 0.6
+    assert cfg.denoiser.cond_mask_prob.goal.velocity == 0.1
+    assert cfg.denoiser.cond_mask_prob.goal.time == 0.1
+    assert cfg.denoiser.cond_mask_prob.goal.end_effector.left_hand == 0.3
+    assert cfg.denoiser.cond_mask_prob.goal.end_effector.right_hand == 0.3
+    assert cfg.denoiser.cond_mask_prob.goal.end_effector.left_foot == 0.3
+    assert cfg.denoiser.cond_mask_prob.goal.end_effector.right_foot == 0.3
     assert (cfg.data.augmentation_enabled,
             cfg.data.augmentation_start_step,
             cfg.data.augmentation_prob) == (True, 50000, 0.5)
@@ -514,7 +525,7 @@ def test_train_dar_preflight_allows_no_scene_run_with_gate_after_max_steps():
 
 def test_frozen_vae_statistics_and_goal_stats_on_disk():
     """P6: the 29-dof dataset dir serves the frozen v6 44-D mean/std cache
-    (loaded as-is, never recomputed) and, when present, valid split stats."""
+    (loaded as-is, never recomputed) and, when present, valid 67-D stats."""
     datadir = (REPO_ROOT / "dataset" / "BONES-SEED-29dof-FULL-50fps").resolve()
     if not datadir.exists():
         pytest.skip("29-dof dataset dir not present on this machine")
@@ -547,12 +558,12 @@ def test_frozen_vae_statistics_and_goal_stats_on_disk():
     goal_stats = torch.load(goal_stats_path, map_location="cpu")
     validate_goal_stats(
         goal_stats,
-        goal_encoding="split",
+        goal_encoding="split_end_effector",
         goal_offset_range=[-63, 0],
         goal_per_primitive=True,
         future_len=64,
         fps=50.0,
         goal_timestep_mode="relative",
         datadir=str(datadir),
-        goal_include_log_d_hor=True,
+        goal_include_log_d_hor=False,
     )

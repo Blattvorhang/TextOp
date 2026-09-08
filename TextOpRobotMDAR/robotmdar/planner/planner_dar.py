@@ -143,11 +143,24 @@ def _condition_force_drop_flags(cfg: DictConfig, state_msg,
             bool(cfg.get("force_drop_goal_velocity", False))
             or not _state_bool_field(state_msg, "goal_velocity_valid", True)
         ),
+        "force_drop_goal_end_effector": (
+            bool(cfg.get("force_drop_goal_end_effector", False))
+            or not _state_bool_field(
+                state_msg, "goal_end_effector_valid", True)
+        ),
         "force_drop_scene": (
             bool(cfg.get("force_drop_scene", False))
             or not _state_bool_field(state_msg, "scene_valid", True)
         ),
     }
+    for name in ("left_hand", "right_hand", "left_foot", "right_foot"):
+        key = f"force_drop_goal_end_effector_{name}"
+        flags[key] = (
+            flags["force_drop_goal_end_effector"]
+            or bool(cfg.get(key, False))
+            or not _state_bool_field(
+                state_msg, f"goal_end_effector_{name}_valid", True)
+        )
     if goal_type is GoalType.JOINT_STATE and flags["force_drop_goal_yaw"]:
         flags["force_drop_goal_orientation"] = True
     flags["force_drop_arrival_time"] = (
@@ -588,7 +601,8 @@ def main(cfg: DictConfig) -> None:
                             goal_type=goal_type,
                             goal_reference_path=goal_reference_path,
                             goal_encoding=GoalEncoding.LEGACY40,
-                            goal_clamp=goal_clamp, fps=motion_fps)
+                            goal_clamp=goal_clamp, fps=motion_fps,
+                            val_data=val_data)
                         ego_goal = (
                             ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
                             else state_goal_from_reference(
@@ -599,6 +613,7 @@ def main(cfg: DictConfig) -> None:
                                 goal_encoding=goal_encoding,
                                 goal_stats=goal_stats,
                                 goal_clamp=goal_clamp, fps=motion_fps,
+                                val_data=val_data,
                                 goal_include_log_d_hor=goal_include_log_d_hor)
                         )
                     else:
@@ -613,7 +628,8 @@ def main(cfg: DictConfig) -> None:
                             goal_type=goal_type,
                             goal_reference_path=goal_reference_path,
                             goal_encoding=GoalEncoding.LEGACY40,
-                            goal_clamp=goal_clamp, fps=motion_fps)
+                            goal_clamp=goal_clamp, fps=motion_fps,
+                            val_data=val_data)
                         ego_goal = (
                             ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
                             else state_goal_from_reference(
@@ -624,6 +640,7 @@ def main(cfg: DictConfig) -> None:
                                 goal_encoding=goal_encoding,
                                 goal_stats=goal_stats,
                                 goal_clamp=goal_clamp, fps=motion_fps,
+                                val_data=val_data,
                                 goal_include_log_d_hor=goal_include_log_d_hor)
                         )
                 else:
@@ -646,7 +663,8 @@ def main(cfg: DictConfig) -> None:
                         latest_state, cfg.device, goal_type=goal_type,
                         goal_reference_path=goal_reference_path,
                         goal_encoding=GoalEncoding.LEGACY40,
-                        goal_clamp=goal_clamp, fps=motion_fps)
+                        goal_clamp=goal_clamp, fps=motion_fps,
+                        val_data=val_data)
                     ego_goal = (
                         ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
                         else state_to_ego_goal(
@@ -655,6 +673,7 @@ def main(cfg: DictConfig) -> None:
                             goal_encoding=goal_encoding,
                             goal_stats=goal_stats,
                             goal_clamp=goal_clamp, fps=motion_fps,
+                            val_data=val_data,
                             goal_include_log_d_hor=goal_include_log_d_hor)
                     )
                     history_translation = None
@@ -787,6 +806,20 @@ def main(cfg: DictConfig) -> None:
                         "force_drop_goal_joint"],
                     force_drop_goal_velocity=condition_force_drop[
                         "force_drop_goal_velocity"],
+                    force_drop_goal_end_effector=condition_force_drop[
+                        "force_drop_goal_end_effector"],
+                    force_drop_goal_end_effector_left_hand=(
+                        condition_force_drop[
+                            "force_drop_goal_end_effector_left_hand"]),
+                    force_drop_goal_end_effector_right_hand=(
+                        condition_force_drop[
+                            "force_drop_goal_end_effector_right_hand"]),
+                    force_drop_goal_end_effector_left_foot=(
+                        condition_force_drop[
+                            "force_drop_goal_end_effector_left_foot"]),
+                    force_drop_goal_end_effector_right_foot=(
+                        condition_force_drop[
+                            "force_drop_goal_end_effector_right_foot"]),
                     force_drop_scene=condition_force_drop[
                         "force_drop_scene"],
                     force_drop_arrival_time=condition_force_drop[

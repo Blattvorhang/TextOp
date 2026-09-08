@@ -19,6 +19,10 @@ from robotmdar.utils.goal import (
     quaternion_yaw,
 )
 import robotmdar.dtype.motion as motion_dtype
+from robotmdar.skeleton.end_effector import (
+    extract_end_effector_positions,
+    resolve_end_effector_anchors,
+)
 from robotmdar.dtype.motion import (
     G1_23DOF_FROM_29DOF_INDICES,
     G1_MUJOCO_DOF_JOINT_NAMES,
@@ -339,6 +343,7 @@ def state_to_ego_goal(state_msg: Any,
                       goal_stats: dict | None = None,
                       goal_clamp: GoalClamp | None = None,
                       fps: float | None = None,
+                      val_data: Any = None,
                       goal_include_log_d_hor: bool = True,
                       ) -> torch.Tensor:
     """Convert the root goal relative to the current history-feature pose."""
@@ -353,8 +358,43 @@ def state_to_ego_goal(state_msg: Any,
         state_msg, reference_pos, reference_rot, device,
         goal_type=goal_type, goal_reference_path=goal_reference_path,
         goal_encoding=goal_encoding, goal_stats=goal_stats,
-        goal_clamp=goal_clamp, fps=fps,
+        goal_clamp=goal_clamp, fps=fps, val_data=val_data,
         goal_include_log_d_hor=goal_include_log_d_hor)
+
+
+def _end_effectors_from_goal_state(
+    goal_pos_world: torch.Tensor,
+    world_goal_rot: torch.Tensor,
+    world_goal_dof: torch.Tensor,
+    *,
+    val_data: Any,
+    device: str | torch.device,
+    fps: float | None,
+) -> torch.Tensor:
+    if val_data is None:
+        raise ValueError(
+            "split_end_effector planner goals require val_data so the "
+            "active MJCF FK can resolve hand/foot anchors")
+    goal_motion = {
+        "root_trans_offset": goal_pos_world.reshape(1, 1, 3),
+        "root_rot": world_goal_rot.reshape(1, 1, 4),
+        "dof": world_goal_dof.reshape(1, 1, -1),
+        "contact_mask": torch.ones(
+            1, 1, 2, dtype=torch.float32, device=device),
+    }
+    fk_result = val_data.skeleton.forward_kinematics(
+        goal_motion,
+        fps=float(fps if fps is not None else getattr(val_data, "fps", 50.0)),
+    )
+    mjcf_file = str(val_data.skeleton.fk.mjcf_file)
+    cache_key = getattr(val_data, "_end_effector_anchor_mjcf_file", None)
+    anchors = getattr(val_data, "_end_effector_anchors_cache", None)
+    if anchors is None or cache_key != mjcf_file:
+        anchors = resolve_end_effector_anchors(val_data.skeleton)
+        val_data._end_effector_anchors_cache = anchors
+        val_data._end_effector_anchor_mjcf_file = mjcf_file
+    return extract_end_effector_positions(
+        fk_result, val_data.skeleton, anchors=anchors)[:, 0]
 
 
 def _state_field(state_msg: Any, name: str):
@@ -445,6 +485,7 @@ def state_goal_from_reference(state_msg: Any,
                               goal_stats: dict | None = None,
                               goal_clamp: GoalClamp | None = None,
                               fps: float | None = None,
+                              val_data: Any = None,
                               goal_include_log_d_hor: bool = True,
                               ) -> torch.Tensor:
     """Convert the state goal relative to an explicit generated-history pose."""
@@ -547,6 +588,7 @@ def state_goal_from_reference(state_msg: Any,
     timestep = None
     world_goal_rot = None
     world_goal_dof = None
+    world_goal_end_effectors = None
     if goal_type.uses_arrival_time:
         state_velocity = _state_field(
             state_msg, 'goal_root_velocity_world')
@@ -646,6 +688,15 @@ def state_goal_from_reference(state_msg: Any,
             state_goal_rot, dtype=torch.float32, device=device)
         world_goal_dof = torch.as_tensor(
             state_goal_dof, dtype=torch.float32, device=device).reshape(1, 29)
+        if parsed_encoding is GoalEncoding.SPLIT_END_EFFECTOR:
+            world_goal_end_effectors = _end_effectors_from_goal_state(
+                goal_pos_world,
+                world_goal_rot,
+                world_goal_dof,
+                val_data=val_data,
+                device=device,
+                fps=fps,
+            )
 
     if (goal_type is GoalType.JOINT_STATE
             and motion_dtype.FeatureVersion == 6
@@ -673,6 +724,7 @@ def state_goal_from_reference(state_msg: Any,
         world_root_velocity=world_root_velocity, timestep=timestep,
         time_to_arrival_seconds=timestep,
         world_goal_rot=world_goal_rot, world_goal_dof=world_goal_dof,
+        world_goal_end_effectors=world_goal_end_effectors,
         fps=fps, goal_clamp=goal_clamp,
         goal_include_log_d_hor=goal_include_log_d_hor)
 

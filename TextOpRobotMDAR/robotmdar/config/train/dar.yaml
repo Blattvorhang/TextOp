@@ -29,6 +29,8 @@ manager:
   learning_rate: 0.0001
   anneal_lr: True
   max_grad_norm: 1.0
+  # End-effector goal loss uses SmoothL1 on the 3D position error norm.
+  goal_end_effector_loss_beta: 0.05
 
   # EMA settings
   use_ema: False

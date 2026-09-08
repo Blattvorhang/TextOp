@@ -15,10 +15,17 @@ from robotmdar.dtype.rotation import (
     rot6d_to_matrix,
     xyzw_to_wxyz,
 )
+from robotmdar.skeleton.end_effector import (
+    extract_end_effector_positions,
+    resolve_end_effector_anchors,
+)
 from robotmdar.utils.goal import (
     GoalType,
     JOINT_STATE_GOAL_DIM,
     ROT_MAT_JOINT_STATE_GOAL_DIM,
+    SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_SLICE,
+    SPLIT_END_EFFECTOR_TOKEN_ORDER,
     SPLIT_GOAL_DIM,
     SPLIT_HORIZONTAL_SLICE,
     SPLIT_JOINT_SLICE,
@@ -43,6 +50,8 @@ MOTION_CLASSES = ('walk', 'run', 'fall', 'getup', 'unknown')
 LOSS_WEIGHT_SECTIONS = ('locomotion', 'getup')
 GOAL_LOSS_WEIGHT_NEST = 'goal'
 GOAL_LOSS_WEIGHT_PREFIX = 'goal_'
+SPLIT_GOAL_DIMS = (SPLIT_GOAL_DIM, SPLIT_END_EFFECTOR_GOAL_DIM)
+DEFAULT_GOAL_END_EFFECTOR_LOSS_BETA = 0.05
 
 
 def _mapping_get(mapping, key, default=None):
@@ -154,6 +163,78 @@ def _elementwise_rec_loss(criterion: nn.Module, pred: torch.Tensor,
     return F.huber_loss(pred, target, reduction='none', delta=1.0)
 
 
+def _norm_smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor,
+                         beta: float) -> torch.Tensor:
+    beta = float(beta)
+    if beta <= 0.0:
+        raise ValueError(
+            f"goal_end_effector_loss_beta must be positive, got {beta}"
+        )
+    distance = torch.linalg.vector_norm(pred - target, dim=-1)
+    return F.smooth_l1_loss(
+        distance, torch.zeros_like(distance),
+        beta=beta, reduction='none')
+
+
+def _points_to_reference_frame(points_world: torch.Tensor,
+                               reference_pos: torch.Tensor,
+                               reference_rot: torch.Tensor) -> torch.Tensor:
+    """Express world-frame points in the per-sample reference root frame."""
+    if points_world.ndim < 3 or points_world.shape[-1] != 3:
+        raise ValueError(
+            "points_world must have shape [B, ..., 3], got "
+            f"{tuple(points_world.shape)}"
+        )
+    batch_size = points_world.shape[0]
+    reference_pos = reference_pos.to(
+        device=points_world.device, dtype=points_world.dtype)
+    reference_rot = reference_rot.to(
+        device=points_world.device, dtype=points_world.dtype)
+    if tuple(reference_pos.shape) != (batch_size, 3):
+        raise ValueError(
+            "goal_reference_pos must have shape "
+            f"[B, 3] with B={batch_size}, got {tuple(reference_pos.shape)}"
+        )
+    if tuple(reference_rot.shape) != (batch_size, 4):
+        raise ValueError(
+            "goal_reference_rot must have shape "
+            f"[B, 4] with B={batch_size}, got {tuple(reference_rot.shape)}"
+        )
+    reference_rot = F.normalize(reference_rot, dim=-1)
+    reference_matrix = quaternion_to_matrix(xyzw_to_wxyz(reference_rot))
+    broadcast_shape = (batch_size, *([1] * (points_world.ndim - 2)))
+    reference_pos = reference_pos.reshape(*broadcast_shape, 3)
+    reference_matrix_t = reference_matrix.transpose(-1, -2).reshape(
+        *broadcast_shape, 3, 3)
+    delta = points_world - reference_pos
+    return torch.matmul(reference_matrix_t, delta.unsqueeze(-1)).squeeze(-1)
+
+
+def _motion_dict_at_goal_frame(motion_dict: dict,
+                               goal_step: torch.Tensor) -> dict:
+    """Select a single goal frame from each sample, preserving time dim."""
+    root_trans = motion_dict['root_trans_offset']
+    batch_size, future_len = root_trans.shape[:2]
+    goal_step = goal_step.to(device=root_trans.device, dtype=torch.long)
+    if tuple(goal_step.shape) != (batch_size,):
+        raise ValueError(
+            f"goal_step must have shape [B] with B={batch_size}, got "
+            f"{tuple(goal_step.shape)}"
+        )
+    goal_step = goal_step.clamp(0, future_len - 1)
+    batch_idx = torch.arange(batch_size, device=root_trans.device)
+    selected = {}
+    for key, value in motion_dict.items():
+        if (isinstance(value, torch.Tensor)
+                and value.ndim >= 2
+                and value.shape[0] == batch_size
+                and value.shape[1] == future_len):
+            selected[key] = value[batch_idx, goal_step].unsqueeze(1)
+        else:
+            selected[key] = value
+    return selected
+
+
 def _rec_loss_per_sample(criterion: nn.Module, pred: torch.Tensor,
                          target: torch.Tensor) -> torch.Tensor:
     loss = _elementwise_rec_loss(criterion, pred, target)
@@ -203,10 +284,42 @@ def _weighted_total_from_terms(
         if key == 'total':
             continue
         if key in per_sample_terms:
-            per_values, valid = per_sample_terms[key]
+            entry = per_sample_terms[key]
+            if len(entry) == 3:
+                per_values, valid, reduction = entry
+            else:
+                per_values, valid = entry
+                reduction = None
             weight = _loss_weight_vector(
                 loss_weight, key, is_recovery, batch_size, device,
                 per_values.dtype)
+            if reduction == 'sum_component_means':
+                if per_values.shape[0] != batch_size:
+                    raise ValueError(
+                        f'{key} per-sample values must have batch dimension '
+                        f'{batch_size}, got {tuple(per_values.shape)}'
+                    )
+                weight = weight.reshape(
+                    batch_size, *([1] * (per_values.ndim - 1)))
+                weighted_values = per_values * weight
+                if valid is None:
+                    total = total + weighted_values.mean(dim=0).sum()
+                    continue
+                valid = valid.to(device=per_values.device, dtype=torch.bool)
+                if valid.shape != per_values.shape:
+                    raise ValueError(
+                        f'{key} valid mask must match per-sample values for '
+                        f'sum_component_means, got {tuple(valid.shape)} vs '
+                        f'{tuple(per_values.shape)}'
+                    )
+                if not valid.any():
+                    continue
+                valid_f = valid.to(dtype=per_values.dtype)
+                component_count = valid_f.sum(dim=0)
+                component_mean = (weighted_values * valid_f).sum(dim=0) / (
+                    component_count.clamp_min(1.0))
+                total = total + component_mean[component_count > 0].sum()
+                continue
             if valid is not None:
                 valid = valid.to(
                     device=per_values.device, dtype=torch.bool).reshape(-1)
@@ -851,6 +964,7 @@ class GeometryLoss:
         action_label=None,
         is_recovery=None,
         return_per_sample_loss_terms: bool = False,
+        return_fk_results: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Geometry losses for the gravity + relative-rotation v6 feature."""
         terms = {}
@@ -1200,6 +1314,14 @@ class GeometryLoss:
         terms['dof_vel'] = dof_vel_loss
         terms['foot_contact'] = foot_contact_loss
 
+        if return_fk_results:
+            fk_results = {
+                'future_motion_pred_fk': future_motion_pred_fk,
+                'future_motion_gt_fk': future_motion_gt_fk,
+            }
+            if return_per_sample_loss_terms:
+                return terms, extras, per_sample_loss_terms, fk_results
+            return terms, extras, fk_results
         if return_per_sample_loss_terms:
             return terms, extras, per_sample_loss_terms
         return terms, extras
@@ -1343,14 +1465,14 @@ class GeometryLoss:
         zero = future_motion_pred.sum() * 0.0
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
-                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
             if goal_state is None:
                 goal_state = self._future_goal_state_v6(
                     future_motion_pred, history_motion,
                     goal_time_frame=goal_time_frame)
             predicted_vert = goal_state['height_at_goal'].unsqueeze(-1)
             predicted_hor = goal_state['displacement_at_goal']
-            if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+            if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
                 target_vert = ego_goal[..., SPLIT_VERTICAL_HEIGHT_SLICE][..., :1]
                 target_hor = ego_goal[..., SPLIT_HORIZONTAL_SLICE][..., :3]
             else:
@@ -1411,7 +1533,7 @@ class GeometryLoss:
         """Backward-compatible combined root-position goal metric."""
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
-                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
             goal_state = self._future_goal_state_v6(
                 future_motion_pred, history_motion,
                 goal_time_frame=goal_time_frame)
@@ -1422,7 +1544,7 @@ class GeometryLoss:
                 ),
                 dim=-1,
             )
-            if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+            if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
                 vertical = ego_goal[..., SPLIT_VERTICAL_HEIGHT_SLICE]
                 horizontal = ego_goal[..., SPLIT_HORIZONTAL_SLICE]
                 target = torch.cat(
@@ -1552,13 +1674,13 @@ class GeometryLoss:
         zero = future_motion_pred.sum() * 0.0
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
-                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
             if goal_state is None:
                 goal_state = self._future_goal_state_v6(
                     future_motion_pred, history_motion,
                     goal_time_frame=goal_time_frame)
             predicted = goal_state['rel_rot_at_goal']
-            if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+            if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
                 target_rot6d = ego_goal[..., SPLIT_ORIENTATION_SLICE]
             else:
                 target = ego_goal[..., V6_RAW_ORIENTATION_SLICE]
@@ -1607,7 +1729,7 @@ class GeometryLoss:
         zero = future_motion_pred.sum() * 0.0
         if not (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
-                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
             raise ValueError(
                 "goal_g loss requires feature_version=6 with a rot-matrix "
                 "joint_state goal"
@@ -1617,7 +1739,7 @@ class GeometryLoss:
                 future_motion_pred, history_motion,
                 goal_time_frame=goal_time_frame)
         predicted = goal_state['gravity_at_goal']
-        if ego_goal.shape[-1] == SPLIT_GOAL_DIM:
+        if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
             target = ego_goal[..., SPLIT_VERTICAL_GRAVITY_SLICE]
         else:
             target = ego_goal[..., V6_RAW_ORIENTATION_SLICE][..., :3]
@@ -1650,13 +1772,13 @@ class GeometryLoss:
             )
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
-                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
             selected = self._future_feature_at_goal(
                 future_motion_pred, goal_time_frame, goal_state=goal_state)
             predicted = selected[..., 13:42]
             target = (
                 ego_goal[..., SPLIT_JOINT_SLICE]
-                if ego_goal.shape[-1] == SPLIT_GOAL_DIM
+                if ego_goal.shape[-1] in SPLIT_GOAL_DIMS
                 else ego_goal[..., V6_RAW_JOINT_SLICE]
             )
             valid = self._valid_goal_component_mask(
@@ -1694,7 +1816,7 @@ class GeometryLoss:
         zero = future_motion_pred.sum() * 0.0
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
-                in (ROT_MAT_JOINT_STATE_GOAL_DIM, SPLIT_GOAL_DIM)):
+                in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
             if goal_state is None:
                 goal_state = self._future_goal_state_v6(
                     future_motion_pred, history_motion,
@@ -1702,7 +1824,7 @@ class GeometryLoss:
             predicted = goal_state['velocity_at_goal']
             target = (
                 ego_goal[..., SPLIT_VELOCITY_SLICE]
-                if ego_goal.shape[-1] == SPLIT_GOAL_DIM
+                if ego_goal.shape[-1] in SPLIT_GOAL_DIMS
                 else ego_goal[..., V6_RAW_VELOCITY_SLICE]
             )
             valid = self._valid_goal_component_mask(
@@ -1871,6 +1993,141 @@ class GeometryLoss:
 
         return ego_pos
 
+    def _end_effector_anchors(self):
+        mjcf_file = str(self.dataset.skeleton.fk.mjcf_file)
+        cache_key = getattr(self, '_end_effector_anchor_mjcf_file', None)
+        anchors = getattr(self, '_end_effector_anchors', None)
+        if anchors is None or cache_key != mjcf_file:
+            anchors = resolve_end_effector_anchors(self.dataset.skeleton)
+            self._end_effector_anchors = anchors
+            self._end_effector_anchor_mjcf_file = mjcf_file
+        return anchors
+
+    def calc_goal_end_effector_loss(
+        self,
+        future_motion_pred,
+        ego_goal,
+        goal_end_effector_condition_keep_mask=None,
+        future_motion_pred_fk=None,
+        goal_reference_pos=None,
+        goal_reference_rot=None,
+        goal_time_frame=None,
+        return_per_sample: bool = False,
+    ):
+        """Match four end-effector positions at the selected goal frame."""
+        if not (motion_dtype.FeatureVersion == 6
+                and ego_goal.shape[-1] == SPLIT_END_EFFECTOR_GOAL_DIM):
+            raise ValueError(
+                "goal_end_effector loss requires feature_version=6 with "
+                f"{SPLIT_END_EFFECTOR_GOAL_DIM}-D split_end_effector goal"
+            )
+        has_reference_pose = (
+            goal_reference_pos is not None or goal_reference_rot is not None)
+        if has_reference_pose and (
+                goal_reference_pos is None or goal_reference_rot is None):
+            raise ValueError(
+                "goal_end_effector loss requires both goal_reference_pos and "
+                "goal_reference_rot when either reference tensor is provided"
+            )
+        if has_reference_pose:
+            goal_reference_pos = goal_reference_pos.to(
+                device=future_motion_pred.device,
+                dtype=future_motion_pred.dtype,
+            )
+            goal_reference_rot = goal_reference_rot.to(
+                device=future_motion_pred.device,
+                dtype=future_motion_pred.dtype,
+            )
+            goal_reference_rot = F.normalize(goal_reference_rot, dim=-1)
+            future_motion_pred_dict = self.dataset.reconstruct_motion(
+                future_motion_pred,
+                abs_pose={
+                    'root_trans_offset': goal_reference_pos,
+                    'root_rot': goal_reference_rot,
+                },
+                need_denormalize=True,
+                ret_fk=False,
+            )
+            goal_step = self._future_step_from_goal_time(
+                future_motion_pred, goal_time_frame)
+            selected_motion = _motion_dict_at_goal_frame(
+                future_motion_pred_dict, goal_step)
+            future_motion_pred_fk = self.dataset.skeleton.forward_kinematics(
+                selected_motion,
+                return_full=False,
+                fps=float(self.dataset.fps),
+            )
+        elif future_motion_pred_fk is None:
+            future_motion_pred_fk = self.dataset.reconstruct_motion(
+                future_motion_pred, need_denormalize=True, ret_fk=True)
+
+        anchors = self._end_effector_anchors()
+        pred_all = extract_end_effector_positions(
+            future_motion_pred_fk, self.dataset.skeleton, anchors=anchors)
+        if has_reference_pose:
+            predicted = _points_to_reference_frame(
+                pred_all[:, 0], goal_reference_pos, goal_reference_rot)
+        else:
+            goal_step = self._future_step_from_goal_time(
+                future_motion_pred, goal_time_frame)
+            batch_idx = torch.arange(
+                pred_all.shape[0], device=pred_all.device)
+            predicted = pred_all[batch_idx, goal_step]
+        target = ego_goal[..., SPLIT_END_EFFECTOR_SLICE].reshape(-1, 4, 3)
+        target = target.to(device=predicted.device, dtype=predicted.dtype)
+
+        token_valid = torch.ones(
+            target.shape[:2], dtype=torch.bool, device=target.device)
+        if goal_end_effector_condition_keep_mask is not None:
+            keep_mask = goal_end_effector_condition_keep_mask.to(
+                device=target.device, dtype=torch.bool)
+            if keep_mask.shape != token_valid.shape:
+                raise ValueError(
+                    "goal_end_effector_condition_keep_mask must have shape "
+                    f"{tuple(token_valid.shape)}, got {tuple(keep_mask.shape)}"
+                )
+            token_valid = token_valid & keep_mask
+        zero = future_motion_pred.sum() * 0.0
+        beta = float(getattr(
+            self, 'goal_end_effector_loss_beta',
+            DEFAULT_GOAL_END_EFFECTOR_LOSS_BETA,
+        ))
+        token_loss = _norm_smooth_l1_loss(predicted, target, beta=beta)
+        token_valid_f = token_valid.to(dtype=token_loss.dtype)
+        masked_token_loss = token_loss * token_valid_f
+        token_count = token_valid_f.sum(dim=0)
+        active_tokens = token_count > 0
+        if not active_tokens.any():
+            metrics = {
+                'goal_end_effector': zero.detach(),
+                **{
+                    f'goal_end_effector_{name}': zero.detach()
+                    for name in SPLIT_END_EFFECTOR_TOKEN_ORDER
+                },
+            }
+            if return_per_sample:
+                return zero, masked_token_loss, token_valid, metrics
+            return zero
+
+        per_token_loss = masked_token_loss.sum(dim=0) / (
+            token_count.clamp_min(1.0))
+        loss = per_token_loss[active_tokens].sum()
+
+        with torch.no_grad():
+            token_error_m = torch.linalg.vector_norm(
+                predicted.detach() - target, dim=-1)
+            per_token_error_m = (
+                token_error_m * token_valid_f).sum(dim=0) / (
+                    token_count.clamp_min(1.0))
+            metric = per_token_error_m[active_tokens].mean()
+            metrics = {'goal_end_effector': metric}
+            for idx, name in enumerate(SPLIT_END_EFFECTOR_TOKEN_ORDER):
+                metrics[f'goal_end_effector_{name}'] = per_token_error_m[idx]
+
+        if return_per_sample:
+            return loss, masked_token_loss, token_valid, metrics
+        return loss
+
 
 def calc_mvae_loss(self,
               future_motion_gt,
@@ -1976,6 +2233,9 @@ def calc_dar_loss(
     goal_orientation_condition_keep_mask=None,
     goal_joint_condition_keep_mask=None,
     goal_velocity_condition_keep_mask=None,
+    goal_end_effector_condition_keep_mask=None,
+    goal_reference_pos=None,
+    goal_reference_rot=None,
     goal_time_frame=None,
     is_eval: bool = False,
     action_label=None,
@@ -2017,6 +2277,7 @@ def calc_dar_loss(
 
     # 几何损失
     geometry_per_sample_terms = {}
+    geometry_fk_results = None
     if motion_dtype.FeatureVersion == 4:
         geometry_terms, geometry_extras = self.calc_geometry_loss_v2(
             future_motion_pred, future_motion_gt, history_motion
@@ -2027,7 +2288,12 @@ def calc_dar_loss(
             sliding_mask=sliding_mask,
         )
     elif motion_dtype.FeatureVersion == 6:
-        geometry_terms, geometry_extras, geometry_per_sample_terms = (
+        (
+            geometry_terms,
+            geometry_extras,
+            geometry_per_sample_terms,
+            geometry_fk_results,
+        ) = (
             self.calc_geometry_loss_v6(
                 future_motion_pred,
                 future_motion_gt,
@@ -2037,6 +2303,7 @@ def calc_dar_loss(
                 action_label=action_label,
                 is_recovery=is_recovery,
                 return_per_sample_loss_terms=True,
+                return_fk_results=True,
             )
         )
     else:
@@ -2099,7 +2366,7 @@ def calc_dar_loss(
     joint_goal_dims = (
         JOINT_STATE_GOAL_DIM,
         ROT_MAT_JOINT_STATE_GOAL_DIM,
-        SPLIT_GOAL_DIM,
+        *SPLIT_GOAL_DIMS,
     )
     if ego_goal is not None and ego_goal.shape[-1] in joint_goal_dims:
         compute_goal_root_orientation = (
@@ -2109,7 +2376,7 @@ def calc_dar_loss(
         compute_goal_g = (
             motion_dtype.FeatureVersion == 6
             and ego_goal.shape[-1] in (ROT_MAT_JOINT_STATE_GOAL_DIM,
-                                       SPLIT_GOAL_DIM)
+                                       *SPLIT_GOAL_DIMS)
             and (
                 _loss_weight_any(self.loss_weight, 'goal_g') > 0.0
                 or is_eval
@@ -2186,6 +2453,39 @@ def calc_dar_loss(
             )
             terms['goal_root_velocity'] = loss
             per_sample_terms['goal_root_velocity'] = (per_sample, valid)
+
+        compute_goal_end_effector = (
+            motion_dtype.FeatureVersion == 6
+            and ego_goal.shape[-1] == SPLIT_END_EFFECTOR_GOAL_DIM
+            and (
+                _loss_weight_any(self.loss_weight, 'goal_end_effector') > 0.0
+                or is_eval
+            )
+        )
+        if compute_goal_end_effector:
+            if goal_reference_pos is None or goal_reference_rot is None:
+                raise ValueError(
+                    "goal_end_effector loss requires goal_reference_pos and "
+                    "goal_reference_rot so predictions are aligned to the "
+                    "current state s_t reference frame"
+                )
+            loss, per_sample, valid, metrics = self.calc_goal_end_effector_loss(
+                future_motion_pred,
+                ego_goal,
+                goal_end_effector_condition_keep_mask,
+                future_motion_pred_fk=(
+                    None if geometry_fk_results is None
+                    else geometry_fk_results['future_motion_pred_fk']),
+                goal_reference_pos=goal_reference_pos,
+                goal_reference_rot=goal_reference_rot,
+                goal_time_frame=goal_time_frame,
+                return_per_sample=True,
+            )
+            terms['goal_end_effector'] = loss
+            per_sample_terms['goal_end_effector'] = (
+                per_sample, valid, 'sum_component_means')
+            for key, metric in metrics.items():
+                extras[f'e_{key}'] = metric
 
     total_loss = _weighted_total_from_terms(
         terms,

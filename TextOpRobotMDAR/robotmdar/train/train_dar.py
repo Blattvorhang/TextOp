@@ -13,10 +13,13 @@ from robotmdar.utils.goal import (
     GoalEncoding,
     GoalType,
     ROT_MAT_JOINT_STATE_GOAL_DIM,
+    SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_SLICE,
     SPLIT_GOAL_DIM,
     SPLIT_HORIZONTAL_SLICE,
     build_ego_goal,
     build_ego_joint_state_goal_v6,
+    build_ego_split_end_effector_goal,
     validate_goal_config,
 )
 from robotmdar.utils.occupancy import (
@@ -59,7 +62,8 @@ def _raw_goal_root_target(ego_goal_raw: torch.Tensor) -> torch.Tensor:
             and ego_goal_raw.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM):
         return ego_goal_raw[:, 1:4]
     if (motion_dtype.FeatureVersion == 6
-            and ego_goal_raw.shape[-1] == SPLIT_GOAL_DIM):
+            and ego_goal_raw.shape[-1]
+            in (SPLIT_GOAL_DIM, SPLIT_END_EFFECTOR_GOAL_DIM)):
         return ego_goal_raw[:, SPLIT_HORIZONTAL_SLICE][:, :3]
     return ego_goal_raw[:, :2]
 
@@ -351,16 +355,34 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
     else:
         goal_time = None
     if goal_type is GoalType.JOINT_STATE and motion_dtype.FeatureVersion == 6:
-        ego_goal_raw = build_ego_joint_state_goal_v6(
-            world_goal_pos=primitive['world_goal_pos'].to(cfg.device),
-            world_goal_rot=primitive['world_goal_rot'].to(cfg.device),
-            world_goal_dof=primitive['world_goal_dof'].to(cfg.device),
-            world_root_velocity=primitive['world_goal_vel'].to(cfg.device),
-            reference_pos=reference_pos,
-            reference_rot=reference_rot,
-            time_to_arrival_seconds=goal_time,
-            fps=fps,
-        )
+        if goal_encoding.uses_end_effectors:
+            ego_goal_raw = build_ego_split_end_effector_goal(
+                world_goal_pos=primitive['world_goal_pos'].to(cfg.device),
+                world_goal_rot=primitive['world_goal_rot'].to(cfg.device),
+                world_goal_dof=primitive['world_goal_dof'].to(cfg.device),
+                world_root_velocity=primitive['world_goal_vel'].to(cfg.device),
+                world_goal_end_effectors=primitive[
+                    'world_goal_end_effectors'].to(cfg.device),
+                reference_pos=reference_pos,
+                reference_rot=reference_rot,
+                time_to_arrival_seconds=goal_time,
+                fps=fps,
+                distance_scale=(
+                    goal_stats.get('s_d', 1.0)
+                    if goal_stats is not None else 1.0),
+                goal_include_log_d_hor=goal_include_log_d_hor,
+            )
+        else:
+            ego_goal_raw = build_ego_joint_state_goal_v6(
+                world_goal_pos=primitive['world_goal_pos'].to(cfg.device),
+                world_goal_rot=primitive['world_goal_rot'].to(cfg.device),
+                world_goal_dof=primitive['world_goal_dof'].to(cfg.device),
+                world_root_velocity=primitive['world_goal_vel'].to(cfg.device),
+                reference_pos=reference_pos,
+                reference_rot=reference_rot,
+                time_to_arrival_seconds=goal_time,
+                fps=fps,
+            )
     else:
         ego_goal_raw = build_ego_goal(
             primitive['world_goal_pos'].to(cfg.device),
@@ -407,6 +429,10 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             world_goal_dof=(
                 primitive['world_goal_dof'].to(cfg.device)
                 if goal_type is GoalType.JOINT_STATE else None
+            ),
+            world_goal_end_effectors=(
+                primitive['world_goal_end_effectors'].to(cfg.device)
+                if goal_encoding.uses_end_effectors else None
             ),
             world_root_velocity=(
                 primitive['world_goal_vel'].to(cfg.device)
@@ -455,6 +481,8 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
     conditions = {
         'goal': goal,
         'ego_goal_raw': ego_goal_raw,
+        'goal_reference_pos_world': reference_pos,
+        'goal_reference_rot_world': reference_rot,
         'voxel': voxel,
         'history_motion_normalized': history_motion,
         **(
@@ -465,6 +493,9 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             if time_to_arrival_frame is not None else {}
         ),
     }
+    if goal_encoding.uses_end_effectors:
+        conditions['goal_end_effectors_ego_raw'] = ego_goal_raw[
+            :, SPLIT_END_EFFECTOR_SLICE].reshape(-1, 4, 3)
     if 'text_embedding' in primitive:
         conditions['text_embedding'] = primitive['text_embedding'].to(
             cfg.device)
@@ -950,6 +981,10 @@ def _validate_batch(batch, cfg) -> None:
     num_primitive = int(cfg.data.num_primitive)
     context_len = int(cfg.data.history_len) + int(cfg.data.future_len)
     nfeats = int(cfg.data.nfeats)
+    goal_type = GoalType.parse(cfg.data.goal_type)
+    goal_encoding = GoalEncoding.parse(
+        cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
+    )
     if len(batch) != num_primitive:
         raise ValueError(
             f"Dataset returned {len(batch)} primitives, expected {num_primitive}"
@@ -961,7 +996,6 @@ def _validate_batch(batch, cfg) -> None:
                 f"Primitive {primitive_idx} motion shape is {tuple(motion.shape)}, "
                 f"expected [batch, {context_len}, {nfeats}]"
             )
-        goal_type = GoalType.parse(cfg.data.goal_type)
         if goal_type.uses_keypoints:
             keypoints = primitive.get('world_goal_keypoints')
             num_keypoints = 4 if goal_type is GoalType.BODY_EXT else 5
@@ -986,6 +1020,18 @@ def _validate_batch(batch, cfg) -> None:
                     f"Primitive {primitive_idx} joint_state goal dof has "
                     f"shape {shape}, expected [batch, 29]"
                 )
+            if goal_encoding.uses_end_effectors:
+                end_effectors = primitive.get('world_goal_end_effectors')
+                if (end_effectors is None
+                        or end_effectors.shape[-2:] != (4, 3)):
+                    shape = (
+                        None if end_effectors is None
+                        else tuple(end_effectors.shape)
+                    )
+                    raise ValueError(
+                        f"Primitive {primitive_idx} end-effector goal has "
+                        f"shape {shape}, expected [batch, 4, 3]"
+                    )
         if goal_type.uses_arrival_time:
             velocity = primitive.get('world_goal_vel')
             time_to_arrival = primitive.get(
@@ -1291,6 +1337,10 @@ def main(cfg: DictConfig):
                     'goal_joint_condition_keep_mask'),
                 goal_velocity_condition_keep_mask=y.get(
                     'goal_velocity_condition_keep_mask'),
+                goal_end_effector_condition_keep_mask=y.get(
+                    'goal_end_effector_condition_keep_mask'),
+                goal_reference_pos=y.get('goal_reference_pos_world'),
+                goal_reference_rot=y.get('goal_reference_rot_world'),
                 goal_time_frame=goal_time_frame,
                 action_label=batch[pidx].get('action_label'),
                 is_recovery=batch[pidx].get('is_recovery'),
@@ -1412,6 +1462,10 @@ def main(cfg: DictConfig):
                             'goal_joint_condition_keep_mask'),
                         goal_velocity_condition_keep_mask=y.get(
                             'goal_velocity_condition_keep_mask'),
+                        goal_end_effector_condition_keep_mask=y.get(
+                            'goal_end_effector_condition_keep_mask'),
+                        goal_reference_pos=y.get('goal_reference_pos_world'),
+                        goal_reference_rot=y.get('goal_reference_rot_world'),
                         goal_time_frame=goal_time_frame,
                         is_eval=True,
                         action_label=batch[pidx].get('action_label'),

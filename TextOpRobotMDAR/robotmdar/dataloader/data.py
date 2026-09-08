@@ -26,16 +26,25 @@ from torch import nn
 from torch.utils import data
 from tqdm import tqdm
 from robotmdar.skeleton.robot import RobotSkeleton
+from robotmdar.skeleton.end_effector import (
+    extract_end_effector_positions,
+    resolve_end_effector_anchors,
+)
 from robotmdar.utils.goal import (
     GOAL_CLAMP_QUANTILE_LEVELS,
     GoalEncoding,
     GoalType,
+    SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_GOAL_SCHEMA,
+    SPLIT_END_EFFECTOR_SLICE,
+    SPLIT_END_EFFECTOR_TOKEN_ORDER,
     SPLIT_GOAL_SCHEMA,
     SPLIT_HORIZONTAL_SLICE,
     SPLIT_JOINT_SLICE,
     SPLIT_ORIENTATION_SLICE,
     SPLIT_VERTICAL_SLICE,
     SPLIT_VELOCITY_SLICE,
+    build_ego_split_end_effector_goal,
     build_ego_split_goal,
     SPLIT_GOAL_DIM,
     quaternion_yaw,
@@ -1038,25 +1047,55 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.mean, self.std = mean, std
         self._stats_device_cache.clear()
 
+    def _end_effector_anchors(self):
+        mjcf_file = str(self.skeleton.fk.mjcf_file)
+        cache_key = getattr(self, '_end_effector_anchor_mjcf_file', None)
+        anchors = getattr(self, '_end_effector_anchors_cache', None)
+        if anchors is None or cache_key != mjcf_file:
+            anchors = resolve_end_effector_anchors(self.skeleton)
+            self._end_effector_anchors_cache = anchors
+            self._end_effector_anchor_mjcf_file = mjcf_file
+        return anchors
+
     def _goal_stats_meta(self) -> Dict[str, Any]:
-        return {
+        uses_end_effectors = self.goal_encoding.uses_end_effectors
+        meta = {
             'goal_offset_range': list(self.goal_offset_range),
             'goal_per_primitive': bool(self.goal_per_primitive),
             'future_len': int(self.future_len),
             'fps': float(self.fps),
             'goal_timestep_mode': self.goal_timestep_mode,
-            'encodings': [
-                GoalEncoding.SINGLE.value,
-                GoalEncoding.SPLIT.value,
-            ],
+            'encodings': (
+                [GoalEncoding.SPLIT_END_EFFECTOR.value]
+                if uses_end_effectors else [
+                    GoalEncoding.SINGLE.value,
+                    GoalEncoding.SPLIT.value,
+                ]
+            ),
             'dataset_path': str(self.datadir),
             'goal_type': self.goal_type.value,
-            'goal_dim': SPLIT_GOAL_DIM,
-            'goal_schema': SPLIT_GOAL_SCHEMA,
+            'goal_dim': (
+                SPLIT_END_EFFECTOR_GOAL_DIM
+                if uses_end_effectors else SPLIT_GOAL_DIM
+            ),
+            'goal_schema': (
+                SPLIT_END_EFFECTOR_GOAL_SCHEMA
+                if uses_end_effectors else SPLIT_GOAL_SCHEMA
+            ),
             'goal_include_log_d_hor': bool(self.goal_include_log_d_hor),
             'feature_version': motion_dtype.FeatureVersion,
             'dof_dim': int(self.dof_dim),
         }
+        if uses_end_effectors:
+            meta.update({
+                'end_effector_source': 'active_mjcf',
+                'end_effector_token_order': list(SPLIT_END_EFFECTOR_TOKEN_ORDER),
+                'resolved_end_effector_anchors': [
+                    anchor.meta() for anchor in self._end_effector_anchors()
+                ],
+                'mjcf_file': str(self.skeleton.fk.mjcf_file),
+            })
+        return meta
 
     def _goal_stats_from_batch(self, batch_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         pos_terms = []
@@ -1065,28 +1104,46 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         velocity_terms = []
         orientation_terms = []
         pose_terms = []
+        end_effector_terms = []
         # Raw per-window clamp distribution: the ego goal XY radius at the
         # window start (the goal as issued) and the implied speed r/T.
         clamp_dist_terms = []
         clamp_speed_terms = []
 
         for primitive in batch_data:
-            goal = build_ego_split_goal(
-                world_goal_pos=primitive['world_goal_pos'],
-                world_goal_rot=primitive['world_goal_rot'],
-                world_goal_dof=primitive['world_goal_dof'],
-                world_root_velocity=primitive['world_goal_vel'],
-                reference_pos=primitive['gt_ref_pos'],
-                reference_rot=primitive['gt_ref_rot'],
-                time_to_arrival_seconds=primitive['time_to_arrival'],
-                fps=float(self.fps),
-                goal_include_log_d_hor=self.goal_include_log_d_hor,
-            )
+            if self.goal_encoding.uses_end_effectors:
+                goal = build_ego_split_end_effector_goal(
+                    world_goal_pos=primitive['world_goal_pos'],
+                    world_goal_rot=primitive['world_goal_rot'],
+                    world_goal_dof=primitive['world_goal_dof'],
+                    world_root_velocity=primitive['world_goal_vel'],
+                    world_goal_end_effectors=primitive[
+                        'world_goal_end_effectors'],
+                    reference_pos=primitive['gt_ref_pos'],
+                    reference_rot=primitive['gt_ref_rot'],
+                    time_to_arrival_seconds=primitive['time_to_arrival'],
+                    fps=float(self.fps),
+                    goal_include_log_d_hor=self.goal_include_log_d_hor,
+                )
+            else:
+                goal = build_ego_split_goal(
+                    world_goal_pos=primitive['world_goal_pos'],
+                    world_goal_rot=primitive['world_goal_rot'],
+                    world_goal_dof=primitive['world_goal_dof'],
+                    world_root_velocity=primitive['world_goal_vel'],
+                    reference_pos=primitive['gt_ref_pos'],
+                    reference_rot=primitive['gt_ref_rot'],
+                    time_to_arrival_seconds=primitive['time_to_arrival'],
+                    fps=float(self.fps),
+                    goal_include_log_d_hor=self.goal_include_log_d_hor,
+                )
             hor = goal[:, SPLIT_HORIZONTAL_SLICE]
             vert = goal[:, SPLIT_VERTICAL_SLICE]
             orientation = goal[:, SPLIT_ORIENTATION_SLICE]
             pose = goal[:, SPLIT_JOINT_SLICE]
             velocity = goal[:, SPLIT_VELOCITY_SLICE]
+            if self.goal_encoding.uses_end_effectors:
+                end_effector_terms.append(goal[:, SPLIT_END_EFFECTOR_SLICE])
 
             pos_terms.append(torch.cat((hor[:, 0:4], vert[:, 0:2]), dim=-1))
             d_hor_terms.append(hor[:, 3:4])
@@ -1123,10 +1180,17 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         orientation = torch.cat(orientation_terms, dim=0)
         pose = torch.cat(pose_terms, dim=0)
         velocity = torch.cat(velocity_terms, dim=0)
+        end_effector = (
+            torch.cat(end_effector_terms, dim=0)
+            if end_effector_terms else None
+        )
 
         pos = pos.clone().clamp(
             -_GOAL_STATS_POSITION_CLIP, _GOAL_STATS_POSITION_CLIP
         )
+        if end_effector is not None:
+            end_effector = end_effector.clone().clamp(
+                -_GOAL_STATS_POSITION_CLIP, _GOAL_STATS_POSITION_CLIP)
         urgency = urgency.clone().clamp(
             -_GOAL_STATS_VELOCITY_CLIP, _GOAL_STATS_VELOCITY_CLIP
         )
@@ -1147,6 +1211,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         s_o = 1.0 / torch.clamp(
             orientation.std(dim=0, unbiased=False), min=1e-6
         )
+        s_ee = None
+        if end_effector is not None:
+            s_ee = 1.0 / torch.clamp(
+                end_effector.std(dim=0, unbiased=False), min=1e-6)
 
         q_start = 13 if motion_dtype.FeatureVersion == 6 else 11
         q_mean = self.mean[q_start:q_start + 29].detach().cpu().clone()
@@ -1159,25 +1227,44 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         orientation_scaled = orientation * s_o
         pose_scaled = (pose - q_mean.to(pose.device, pose.dtype)) / q_std.to(
             pose.device, pose.dtype).clamp_min(1e-6)
+        end_effector_scaled = (
+            end_effector * s_ee.to(end_effector.device, end_effector.dtype)
+            if end_effector is not None else None
+        )
         pos_p50, pos_p99 = _abs_p50_p99(pos_scaled)
         log_p50, log_p99 = _abs_p50_p99(log_scaled)
         urgency_p50, urgency_p99 = _abs_p50_p99(urgency_scaled)
         velocity_p50, velocity_p99 = _abs_p50_p99(velocity_scaled)
         orientation_p50, orientation_p99 = _abs_p50_p99(orientation_scaled)
         pose_p50, pose_p99 = _abs_p50_p99(pose_scaled)
+        ee_p50, ee_p99 = (
+            _abs_p50_p99(end_effector_scaled)
+            if end_effector_scaled is not None else (0.0, 0.0)
+        )
         s_o_list = [round(float(value), 4) for value in s_o.tolist()]
-        logger.info(
-            "Goal stats (split55) scales: s_p={:.4f} s_l={:.4f} "
-            "s_v={:.4f} s_d={:.4f} s_o={}",
-            float(s_p), float(s_l), float(s_v), float(s_d), s_o_list,
+        schema_name = (
+            "split67_end_effector"
+            if self.goal_encoding.uses_end_effectors else "split55"
         )
         logger.info(
-            "Goal stats (split55) scaled |p50/p99|: pos={:.3f}/{:.3f} "
+            "Goal stats ({}) scales: s_p={:.4f} s_l={:.4f} "
+            "s_v={:.4f} s_d={:.4f} s_o={}{}",
+            schema_name, float(s_p), float(s_l), float(s_v), float(s_d),
+            s_o_list,
+            (
+                " s_ee="
+                + str([round(float(value), 4) for value in s_ee.tolist()])
+                if s_ee is not None else ""
+            ),
+        )
+        logger.info(
+            "Goal stats ({}) scaled |p50/p99|: pos={:.3f}/{:.3f} "
             "log={:.3f}/{:.3f} urg={:.3f}/{:.3f} vel={:.3f}/{:.3f} "
-            "ori={:.3f}/{:.3f} pose={:.3f}/{:.3f}",
-            pos_p50, pos_p99, log_p50, log_p99, urgency_p50, urgency_p99,
-            velocity_p50, velocity_p99, orientation_p50, orientation_p99,
-            pose_p50, pose_p99,
+            "ori={:.3f}/{:.3f} pose={:.3f}/{:.3f} ee={:.3f}/{:.3f}",
+            schema_name, pos_p50, pos_p99, log_p50, log_p99,
+            urgency_p50, urgency_p99, velocity_p50, velocity_p99,
+            orientation_p50, orientation_p99, pose_p50, pose_p99,
+            ee_p50, ee_p99,
         )
         clamp_dist = torch.cat(clamp_dist_terms, dim=0)
         clamp_speed = torch.cat(clamp_speed_terms, dim=0)
@@ -1186,14 +1273,15 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         clamp_speed_quantiles = torch.quantile(clamp_speed, clamp_levels)
         clamp_levels_percent = clamp_levels * 100.0
         logger.info(
-            "Goal stats (split55) clamp distribution over {} windows: "
+            "Goal stats ({}) clamp distribution over {} windows: "
             "dist quantiles {} m / speed quantiles {} m/s at percentiles {}",
+            schema_name,
             int(clamp_dist.numel()),
             [round(float(v), 3) for v in clamp_dist_quantiles],
             [round(float(v), 3) for v in clamp_speed_quantiles],
             [round(float(v), 1) for v in clamp_levels_percent],
         )
-        return {
+        stats = {
             's_p': torch.as_tensor(float(s_p)),
             's_l': torch.as_tensor(float(s_l)),
             's_v': torch.as_tensor(float(s_v)),
@@ -1209,6 +1297,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             },
             'meta': self._goal_stats_meta(),
         }
+        if s_ee is not None:
+            stats['s_ee'] = s_ee.detach().cpu()
+        return stats
 
     def _compute_goal_stats(self) -> Dict[str, Any]:
         if self.goal_type is not GoalType.JOINT_STATE:
@@ -1463,6 +1554,25 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         )
         return goal_fk['global_translation_extend'][0, 0, keypoint_ids]
 
+    def _world_goal_end_effectors(self, raw_motion: Dict[str, Any],
+                                  goal_frame: int) -> torch.Tensor:
+        goal_motion = {
+            'dof': self._select_model_dof(torch.as_tensor(
+                raw_motion['dof'][goal_frame:goal_frame + 1],
+                dtype=torch.float32)),
+            'root_trans_offset': torch.as_tensor(
+                raw_motion['root_trans_offset'][goal_frame:goal_frame + 1],
+                dtype=torch.float32),
+            'root_rot': torch.as_tensor(
+                raw_motion['root_rot'][goal_frame:goal_frame + 1],
+                dtype=torch.float32),
+        }
+        goal_fk = self.skeleton.forward_kinematics(
+            goal_motion, fps=self.fps)
+        return extract_end_effector_positions(
+            goal_fk, self.skeleton,
+            anchors=self._end_effector_anchors())[0, 0]
+
     def _world_goal_velocity(self, raw_motion: Dict[str, Any],
                              goal_frame: int) -> torch.Tensor:
         root_position = raw_motion['root_trans_offset']
@@ -1493,6 +1603,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
     def _extract_single_primitive(
         self, sample: Dict[str, Any], prim_start: int, prim_end: int,
         goal_frame: int, world_goal_keypoints: torch.Tensor | None = None,
+        world_goal_end_effectors: torch.Tensor | None = None,
     ) -> Dict[str, Any]:
         """Extract a single primitive from motion data, plus goal+scene fields.
 
@@ -1563,6 +1674,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             primitive['world_goal_dof'] = self._select_model_dof(
                 torch.as_tensor(
                     raw_motion['dof'][goal_frame], dtype=torch.float32))
+            if self.goal_encoding.uses_end_effectors:
+                if world_goal_end_effectors is None:
+                    world_goal_end_effectors = self._world_goal_end_effectors(
+                        raw_motion, goal_frame)
+                primitive['world_goal_end_effectors'] = (
+                    world_goal_end_effectors.float())
         if goal_type.uses_arrival_time:
             primitive['world_goal_vel'] = self._world_goal_velocity(
                 raw_motion, goal_frame)
@@ -1585,6 +1702,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # as the goal; otherwise, the last frame of the entire snippet is shared.
         snippet_goal_frame = seg_start + self.segment_len - 1 + goal_offset
         world_goal_keypoints = None
+        world_goal_end_effectors = None
         primitives = []
 
         for primitive_idx in range(self.num_primitive):
@@ -1606,6 +1724,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     + goal_offset
                 )
                 world_goal_keypoints = None
+                world_goal_end_effectors = None
             else:
                 goal_frame = snippet_goal_frame
 
@@ -1630,10 +1749,16 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             if goal_type.uses_keypoints and world_goal_keypoints is None:
                 world_goal_keypoints = self._world_goal_keypoints(
                     sample['motion'], goal_frame)
+            if (goal_type is GoalType.JOINT_STATE
+                    and self.goal_encoding.uses_end_effectors
+                    and world_goal_end_effectors is None):
+                world_goal_end_effectors = self._world_goal_end_effectors(
+                    sample['motion'], goal_frame)
 
             primitives.append(self._extract_single_primitive(
                 sample, prim_start, prim_end, goal_frame,
-                world_goal_keypoints=world_goal_keypoints))
+                world_goal_keypoints=world_goal_keypoints,
+                world_goal_end_effectors=world_goal_end_effectors))
 
         return primitives
 
@@ -1706,6 +1831,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             tensor_keys += ('world_goal_keypoints',)
         if goal_type is GoalType.JOINT_STATE:
             tensor_keys += ('world_goal_rot', 'world_goal_dof')
+            if self.goal_encoding.uses_end_effectors:
+                tensor_keys += ('world_goal_end_effectors',)
         if goal_type.uses_arrival_time:
             tensor_keys += ('world_goal_vel', 'time_to_arrival',
                             'goal_timestep')
