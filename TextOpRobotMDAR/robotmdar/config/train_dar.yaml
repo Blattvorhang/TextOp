@@ -32,7 +32,7 @@ data:
   goal_include_log_d_hor: false
   # Keep clean histories for the warm-up, then enable V7.1 history DR in the
   # dataloader. The server training launch may override this threshold.
-  augmentation_enabled: true
+  augmentation_enabled: false
   augmentation_start_step: 50000
   augmentation_prob: 0.5
   val:
@@ -67,11 +67,11 @@ train:
         goal:
           g: 0.0
           root_position_hor: 0.5
-          root_position_vert: 0.05
+          root_position_vert: 0.02
           root_velocity: 0.02
-          root_orientation: 0.002
+          root_orientation: 0.001
           joint_angle: 0.0
-          end_effector: 0.0
+          end_effector: 0.05
       getup:
         rec: 1.5
         foot_contact: 0.01

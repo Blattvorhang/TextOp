@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 echo "Working directory: $(pwd)"
 
 # ---- Required: pretrained VAE checkpoint ----
-VAE_CKPT="./logs/RobotMDAR/BONES-SEED-FUTURE-64-29DOF-RECOVERY/train-mvae-20260813_050039/ckpt_100000.pth"
+VAE_CKPT="./logs/RobotMDAR/BONES-SEED-FUTURE-64-ROT-MAT-VAE/train-mvae-20260901_144822/ckpt_100000.pth"
 if [ -z "${VAE_CKPT}" ]; then
     echo "ERROR: VAE_CKPT is required. Set it to the pretrained VAE checkpoint path."
     echo "Example:"
@@ -20,10 +20,10 @@ if [ -z "${VAE_CKPT}" ]; then
 fi
 
 # ---- GPU configuration ----
-CUDA_VISIBLE_DEVICES=1,4,5,7 #2,0,1,3,4,5,6,7
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Number of GPUs to use
-NUM_GPUS=4
+NUM_GPUS=8
 
 # Count actually visible GPUs
 NUM_GPUS_AVAILABLE=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
@@ -43,20 +43,20 @@ echo "Experiment timestamp: ${TIMESTAMP}"
 echo "Master port: ${MASTER_PORT}"
 
 # Optional: Resume from a DAR checkpoint
-# CKPT_PATH="./logs/RobotMDAR/BONES-SEED-FUTURE-64/train-dar-20260730_112611/ckpt_15000.pth"
+# CKPT_PATH="./logs/RobotMDAR/BONES-SEED-FUTURE-64-ROT-MAT/train-dar-20260902_221121/ckpt_20000.pth"
 # CKPT_OVERRIDE="ckpt.dar=${CKPT_PATH}"
 
 # Scale stages by NUM_GPUS.
-SCALE_FACTOR=1
-STAGE0=$((100000 / NUM_GPUS * SCALE_FACTOR))
-STAGE1=$((50000 / NUM_GPUS * SCALE_FACTOR))
-STAGE2=$((50000 / NUM_GPUS * SCALE_FACTOR))
+SCALE_FACTOR=2
+STAGE0=25000
+STAGE1=15000
+STAGE2=10000
 TOTAL_STEPS=$((STAGE0 + STAGE1 + STAGE2))
 
-SAVE_EVERY=$((20000 / NUM_GPUS * SCALE_FACTOR))
-EVAL_EVERY=$((2000 / NUM_GPUS * SCALE_FACTOR))
+SAVE_EVERY=5000
+EVAL_EVERY=500
 
-AUGMENTATION_START_STEP=$((60000 / NUM_GPUS * SCALE_FACTOR))
+AUGMENTATION_START_STEP=15000
 # SCENE_START_STEP=$((120000 / NUM_GPUS * SCALE_FACTOR))
 SCENE_START_STEP=$((TOTAL_STEPS + 1))  # disable scene occupancy
 
