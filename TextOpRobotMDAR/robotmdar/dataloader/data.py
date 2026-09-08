@@ -892,11 +892,22 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 self.clip_dim, dtype=torch.float32)
 
     @staticmethod
+    def _ann_text_labels(ann: Any) -> List[str]:
+        raw_text = ann[2]
+        if isinstance(raw_text, (list, tuple)):
+            return [
+                str(text) for text in raw_text
+                if str(text).strip()
+            ]
+        text = str(raw_text)
+        return [text] if text.strip() else []
+
+    @staticmethod
     def _collect_text_labels(raw_data: List[Dict[str, Any]]) -> set[str]:
         all_texts = set()
         for item in raw_data:
             for ann in item.get('frame_ann', []):
-                all_texts.add(str(ann[2]))
+                all_texts.update(SkeletonPrimitiveDataset._ann_text_labels(ann))
         return all_texts
 
     @staticmethod
@@ -1505,24 +1516,35 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _primitive_action_label(self, sample: Dict[str, Any],
                                 prim_start: int, prim_end: int) -> str:
-        """Best-overlap BABEL verb for the primitive window; 'unknown' fallback.
+        """Random BABEL verb overlapping the primitive future window.
 
         frame_ann entries are (start_s, end_s, verb, [desc, ...]) in seconds.
-        The window is [prim_start, prim_end) frames; units match via fps.
+        This mirrors the original TextOp behavior: labels are eligible when
+        they overlap the future portion, and one eligible label is sampled.
         """
         frame_ann = sample.get('frame_ann')
         if not frame_ann:
-            return 'unknown'
-        start_t = prim_start / float(self.fps)
-        end_t = (prim_end - 1) / float(self.fps)
-        best_ann = None
-        best_overlap = 0.0
+            return ''
+
+        future_start = prim_start + self.history_len
+        future_end = prim_end - 1
+        prim_labels = []
         for ann in frame_ann:
-            overlap = self._get_overlap([ann[0], ann[1]], [start_t, end_t])
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_ann = ann
-        return str(best_ann[2]) if best_ann is not None else 'unknown'
+            ann_frames = [float(ann[0]) * self.fps, float(ann[1]) * self.fps]
+            if self.have_overlap(ann_frames, [future_start, future_end]):
+                prim_labels.extend(self._ann_text_labels(ann))
+
+        if not prim_labels:
+            return ''
+        if len(prim_labels) == 1:
+            return prim_labels[0]
+
+        generator = getattr(self, '_sampling_generator', None)
+        if generator is None:
+            return random.choice(prim_labels)
+        idx = int(torch.randint(
+            0, len(prim_labels), (1,), generator=generator).item())
+        return prim_labels[idx]
 
     def have_overlap(self, seg1, seg2):
         if seg1[0] > seg2[1] or seg2[0] > seg1[1]:
@@ -1804,8 +1826,16 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     (1, ),
                     generator=generator,
                 ).item())
-            motion_primitives = self._generate_motion_primitives(
-                sample, seg_start, goal_offset)
+            prev_generator = getattr(self, '_sampling_generator', None)
+            self._sampling_generator = generator
+            try:
+                motion_primitives = self._generate_motion_primitives(
+                    sample, seg_start, goal_offset)
+            finally:
+                if prev_generator is None:
+                    self.__dict__.pop('_sampling_generator', None)
+                else:
+                    self._sampling_generator = prev_generator
             all_motion_primitives.append(motion_primitives)
 
         return all_motion_primitives

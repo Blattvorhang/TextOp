@@ -97,6 +97,7 @@ def test_parallel_packer_matches_serial_output(tmp_path):
     source_dir = tmp_path / "source"
     source_dir.mkdir()
     source_pkls = []
+    metadata_lookup = {}
     for idx in range(3):
         dof = np.full((frames, 29), idx, dtype=np.float32)
         entry = {
@@ -107,8 +108,14 @@ def test_parallel_packer_matches_serial_output(tmp_path):
             "fps": 50,
         }
         source_path = source_dir / f"motion_{idx}.pkl"
-        joblib.dump({f"idle_{idx}": entry}, source_path)
+        motion_name = f"idle_{idx}"
+        joblib.dump({motion_name: entry}, source_path)
         source_pkls.append((source_path, source_dir))
+        metadata_lookup[motion_name] = {
+            "filename": motion_name,
+            "content_short_description": "standing idle",
+            "content_type_of_movement": "standing idle",
+        }
 
     outputs = []
     for workers in (1, 2):
@@ -116,7 +123,8 @@ def test_parallel_packer_matches_serial_output(tmp_path):
         (out / "samples").mkdir(parents=True)
         outputs.append(packer.pack_source_files(
             source_pkls, out, min_frames=0, sample_compress=0,
-            workers=workers,
+            workers=workers, metadata_lookup=metadata_lookup,
+            temporal_lookup={},
         ))
 
     serial_manifest, serial_skipped, serial_fps = outputs[0]
@@ -147,6 +155,25 @@ def test_directory_packer_uses_folder_prefix_without_repeating_motion_name(tmp_p
     }
     source_path = session_dir / "walk_ff_loop_180_R_003__A045_M.pkl"
     joblib.dump({"walk_ff_loop_180_R_003__A045_M": entry}, source_path)
+    metadata_lookup = {
+        "walk_ff_loop_180_R_003__A045_M": {
+            "filename": "walk_ff_loop_180_R_003__A045_M",
+            "content_short_description": "walk forward",
+            "content_type_of_movement": "walking",
+        }
+    }
+    temporal_lookup = {
+        "walk_ff_loop_180_R_003__A045_M": {
+            "filename": "walk_ff_loop_180_R_003__A045_M",
+            "events": [
+                {
+                    "start_time": 0.013,
+                    "end_time": 0.087,
+                    "description": "A person walks forward.",
+                }
+            ],
+        }
+    }
 
     out = tmp_path / "out"
     (out / "samples").mkdir(parents=True)
@@ -156,16 +183,79 @@ def test_directory_packer_uses_folder_prefix_without_repeating_motion_name(tmp_p
         min_frames=0,
         sample_compress=0,
         workers=1,
+        metadata_lookup=metadata_lookup,
+        temporal_lookup=temporal_lookup,
     )
 
     assert skipped == 0
     assert fps_values == {50}
     assert manifest[0]["_source"] == "221010__walk_ff_loop_180_R_003__A045_M"
-    assert manifest[0]["frame_ann"] == [(0.0, frames / 50, "walk", ["walk"])]
+    assert manifest[0]["frame_ann"] == [
+        (0.0, frames / 50, ["walk forward"], ["walk"]),
+        (0.0, 0.1, ["A person walks forward.", "walks forward", "walk forward"], ["walk"]),
+    ]
     stored = joblib.load(out / manifest[0]["_data_path"])
     assert stored["_source"] == manifest[0]["_source"]
     assert stored["frame_ann"] == manifest[0]["frame_ann"]
     assert stored["length"] == frames
+
+
+def test_temporal_times_snap_to_50hz_frame_grid():
+    assert packer._snap_event_times_to_fps(0.0, 1.88, 50, 120) == (0.0, 1.88)
+    assert packer._snap_event_times_to_fps(0.013, 0.087, 50, 120) == (0.0, 0.1)
+
+
+def test_augmented_motion_uses_base_metadata_lookup(tmp_path):
+    frames = 8
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    entry = {
+        "root_trans_offset": np.zeros((frames, 3), dtype=np.float32),
+        "root_rot": np.tile([0, 0, 0, 1], (frames, 1)).astype(np.float32),
+        "dof": np.zeros((frames, 29), dtype=np.float32),
+        "contact_mask": np.ones((frames, 2), dtype=np.float32),
+        "fps": 50,
+    }
+    source_name = "walk_ff_loop_180_R_003__A045_M_aug_003"
+    source_path = source_dir / f"{source_name}.pkl"
+    joblib.dump({source_name: entry}, source_path)
+
+    metadata_lookup = {
+        "walk_ff_loop_180_R_003__A045_M": {
+            "filename": "walk_ff_loop_180_R_003__A045_M",
+            "content_short_description": "walk forward",
+            "content_type_of_movement": "walking",
+        }
+    }
+    temporal_lookup = {
+        "walk_ff_loop_180_R_003__A045_M": {
+            "filename": "walk_ff_loop_180_R_003__A045_M",
+            "events": [
+                {
+                    "start_time": 0.0,
+                    "end_time": 0.2,
+                    "description": "A person walks forward.",
+                }
+            ],
+        }
+    }
+
+    out = tmp_path / "out"
+    (out / "samples").mkdir(parents=True)
+    manifest, skipped, fps_values = packer.pack_source_files(
+        [(source_path, source_dir)],
+        out,
+        min_frames=0,
+        sample_compress=0,
+        workers=1,
+        metadata_lookup=metadata_lookup,
+        temporal_lookup=temporal_lookup,
+    )
+
+    assert skipped == 0
+    assert fps_values == {50}
+    assert manifest[0]["_source"] == f"walk_ff_loop_180_R_003__A045_M_aug_003"
+    assert manifest[0]["frame_ann"][0][2] == ["walk forward"]
 
 
 def test_motion_split_key_groups_original_and_mirror_sources():

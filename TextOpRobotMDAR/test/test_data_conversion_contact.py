@@ -15,7 +15,7 @@ from dataset.data_process.pack_motion_lib_to_textop import (
     motion_lib_entry_to_textop,
 )
 from TextOpRobotMDAR.robotmdar.dataloader.data import SkeletonPrimitiveDataset
-from TextOpRobotMDAR.robotmdar.utils.goal import GoalType
+from TextOpRobotMDAR.robotmdar.utils.goal import GoalEncoding, GoalType
 from TextOpRobotMDAR.robotmdar.train.manager import GeometryLoss
 
 
@@ -45,6 +45,8 @@ def _length_only_dataset(datadir: Path, *, weighted_sample: bool = False):
     dataset.num_primitive = 1
     dataset.batch_size = 1
     dataset.weighted_sample = weighted_sample
+    dataset.load_text_embeddings = False
+    dataset.clip_dim = 512
     dataset._load_statistics = lambda: None
     return dataset
 
@@ -120,6 +122,35 @@ def test_weighted_sampling_indexes_only_valid_sequences():
     assert sampled == [["valid"]]
 
 
+def test_primitive_action_label_randomly_samples_future_overlap_labels():
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.fps = 1
+    dataset.history_len = 2
+    dataset._sampling_generator = torch.Generator().manual_seed(0)
+    sample = {
+        "frame_ann": [
+            (0.0, 1.0, "history_only", ["idle"]),
+            (2.0, 3.0, ["walk", "walk forward"], ["walk"]),
+            (4.0, 5.0, "turn", ["turn"]),
+        ],
+    }
+
+    assert SkeletonPrimitiveDataset._collect_text_labels([sample]) == {
+        "history_only",
+        "walk",
+        "walk forward",
+        "turn",
+    }
+
+    labels = [
+        dataset._primitive_action_label(sample, prim_start=0, prim_end=6)
+        for _ in range(4)
+    ]
+
+    assert labels == ["turn", "walk", "turn", "walk"]
+    assert "history_only" not in labels
+
+
 @pytest.mark.parametrize(
     ("goal_per_primitive", "expected_goal_frames"),
     [
@@ -142,7 +173,7 @@ def test_negative_goal_offset_is_bounded_for_both_goal_modes(
     observed = []
 
     def extract(sample, prim_start, prim_end, goal_frame,
-                world_goal_keypoints=None):
+                world_goal_keypoints=None, world_goal_end_effectors=None):
         observed.append((prim_start, prim_end, goal_frame))
         return {"goal_frame": goal_frame}
 
@@ -163,10 +194,15 @@ def test_joint_state_goal_extraction_uses_direct_gt_frame_without_keypoints():
     dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
     dataset.history_len = 2
     dataset.goal_type = GoalType.JOINT_STATE
+    dataset.goal_encoding = GoalEncoding.LEGACY40
     dataset.goal_timestep_mode = "relative"
     dataset.fps = 50
     dataset._select_model_dof = lambda value: value
     dataset._primitive_action_label = lambda sample, start, end: "synthetic"
+    dataset.text_embeddings_dict = {
+        "": torch.zeros(512),
+        "synthetic": torch.ones(512),
+    }
 
     def fail_keypoints(*args, **kwargs):
         raise AssertionError("joint_state goal must not extract FK keypoints")
@@ -407,6 +443,8 @@ def test_motion_packer_and_reconstruction_surface_sliding_mask():
         "history_start_rot": torch.zeros(4),
         "gt_ref_pos": torch.zeros(3),
         "gt_ref_rot": torch.zeros(4),
+        "action_label": "",
+        "text_embedding": torch.zeros(512),
     }
     batch = dataset._organize_primitives_by_index([[primitive]])[0]
     assert batch["sliding_mask"].shape == (1, 3, 2)

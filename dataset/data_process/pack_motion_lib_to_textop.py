@@ -29,8 +29,11 @@ Usage:
 """
 
 import argparse
+import csv
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import json
+import math
 import os
 import random
 import re
@@ -42,8 +45,16 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
+try:
+    from dataset.data_analyze.analyze_action_distribution import (  # noqa: E402
+        classify_coarse as _shared_classify_coarse,
+    )
+except Exception:  # pragma: no cover - optional fallback
+    _shared_classify_coarse = None
+
 TARGET_DOF = 29
 FEATURE_DIM_V3 = 11 + 2 * TARGET_DOF
+CLIP_ALIGN_FPS = 50
 TARGET_DOF_NAMES = (
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
     "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
@@ -59,145 +70,171 @@ TARGET_DOF_NAMES = (
 )
 assert len(TARGET_DOF_NAMES) == TARGET_DOF
 
+_SOURCE_EXT_RE = re.compile(r"\.(?:csv|pkl)$", flags=re.IGNORECASE)
+_DATE_PREFIX_RE = re.compile(r"^\d{6}__")
+_AUG_SUFFIX_RE = re.compile(r"_aug_\d+$", flags=re.IGNORECASE)
+SUBJECT_PREFIX_RE = re.compile(
+    r"^(?:a|an|the)\s+"
+    r"(?:(?:standing|seated|upright|injured|wounded|crouched|kneeling|sitting|lying|bent)\s+)*"
+    r"(?:person(?:'s)?|character(?:'s)?|individual(?:'s)?|figure(?:'s)?|man|woman|dancer|player|actor|someone|somebody)\b[\s,]*"
+)
+COPULA_PREFIX_RE = re.compile(r"^(?:is|are|was|were|be|been|being)\s+")
+
 
 # ---------------------------------------------------------------------------
-# Coarse action classification (mirrors analyze_action_distribution.py)
+# Metadata-driven text annotations
 # ---------------------------------------------------------------------------
-def _extract_action_name(filename: str) -> str:
-    """Extract fine-grained action name from a BONES-SEED filename stem.
+def compact_text(text: object) -> str:
+    return " ".join(str(text).strip().split())
 
-    Handles both raw CSV names and prefixed motion_lib dict keys:
-      walk_ff_stop_180_R_003__A047           →  walk_ff_stop_180_R
-      210531__jump_and_land_heavy_001__A001  →  jump_and_land_heavy
-      idle_one_foot_left__003__A023          →  idle_one_foot_left
-      brush_of_dust__A029                    →  brush_of_dust
-    """
-    stem = filename.replace(".csv", "")
 
-    # 1. Strip trailing camera ID (last "__A" + digits)
-    stem = re.sub(r'__A\d+$', '', stem)
+def normalize_text(text: object) -> str:
+    return compact_text(text).lower()
 
-    # 2. Strip leading date prefix (YYMMDD__) added by load_motion_lib_dicts
-    stem = re.sub(r'^\d{6}__', '', stem)
 
-    # 3. Strip trailing sequence number: action_001, action_001o, action_007_ns
-    m = re.match(r'^(.+)_(\d+(?:[a-z_]\w*)?)$', stem)
-    if m:
-        return m.group(1)
+def normalize_motion_text(text: object) -> str:
+    text = normalize_text(text)
+    text = SUBJECT_PREFIX_RE.sub("", text)
+    text = COPULA_PREFIX_RE.sub("", text)
+    return text.strip(" ,;:.!?\"'")
 
-    # 4. Double-underscore pattern: action__003
-    m = re.match(r'^(.+?)__(\d+)$', stem)
-    if m:
-        return m.group(1)
 
-    # 5. Sequence number directly appended (no underscore): nameR001
-    m = re.match(r'^(.+[a-zA-Z])(\d+[a-z_]*\w*)$', stem)
-    if m:
-        return m.group(1)
-
+def _canonical_motion_name(name: str) -> str:
+    stem = compact_text(name)
+    stem = stem.replace("\\", "/").split("/")[-1]
+    stem = _SOURCE_EXT_RE.sub("", stem)
+    stem = _DATE_PREFIX_RE.sub("", stem)
+    stem = _AUG_SUFFIX_RE.sub("", stem)
     return stem
 
 
-# Keyword rules in priority order — first match wins.
-# See dataset/data_analyze/analyze_action_distribution.py for the full taxonomy.
-_COARSE_RULES = [
-    ("injured",       ["injured"]),
-    ("crutch",        ["crutch", "crutches"]),
-    ("jump",          ["jump", "hop", "leap", "flip", "vault_over",
-                       "jump_and_land", "jump_over", "jump_twice",
-                       "high_jump", "jump_ff", "jump_sideway",
-                       "jump_and_down", "turn_jump", "fire_in_the_hole"]),
-    ("jog",           ["jog", "jogging", "run_"]),
-    ("walk",          ["walk", "moonwalk", "step_forward", "step_backward"]),
-    ("dance",         ["dance", "dancing", "choreography", "macarena",
-                       "dancecard", "expressionism", "krakowiak"]),
-    ("climb",         ["climb", "ladder", "come_up_", "come_down_",
-                       "crouch_cupboard"]),
-    ("fall",          ["fall", "faint", "toxic_gas", "postmortem",
-                       "death", "lying", "lie_", "flying_",
-                       "stand_up_lying", "on_ground"]),
-    ("crouch",        ["crouch", "crawl", "on_all_fours",
-                       "crouch_idle", "crouch_walk", "stoop"]),
-    ("kneel",         ["kneel", "sit_on_heels"]),
-    ("sit",           ["sitting", "sit_cross", "sit_",
-                       "read_newspaper_sitting", "eat_hotdog_sitting",
-                       "play_guitar_sitting", "having_a_sit"]),
-    ("carry",         ["carry", "lift", "crate", "heavy_", "light_",
-                       "pick_up", "put_down", "hold_",
-                       "moving_object", "pass_",
-                       "item_give", "item_take", "item_pick", "item_put",
-                       "item_switch", "item_hold",
-                       "lasso_catch", "lasso_dance", "lasso_pull",
-                       "watering_plants", "walk_the_dog",
-                       "medium_big", "small_heavy", "small_light",
-                       "big_heavy", "big_light",
-                       "medium_heavy", "medium_light"]),
-    ("reach",         ["reach", "reaching"]),
-    ("push",          ["push", "pull", "crank", "valve", "handle", "lever",
-                       "_knob_", "door_", "shut", "slam",
-                       "open_walk", "close_",
-                       "horizontal_lever", "vertical_lever",
-                       "neutral_button", "operating"]),
-    ("step_over",     ["step_over", "step_in", "avoid_obstacle",
-                       "bump_into", "jump_over_obstacle", "neutral_avoid"]),
-    ("turn",          ["turn_handstand", "mohak", "step_rotate",
-                       "idle_turn", "spin_"]),
-    ("idle",          ["idle", "stand", "standing", "legs_relax",
-                       "looking_around", "looking_in_the_mirror",
-                       "look_around", "looking_R", "looking_",
-                       "neutral_sit", "neutral_stand",
-                       "neutral_idle", "neutral_laugh", "neutral_fear",
-                       "neutral_cry", "neutral_looking",
-                       "neutral_dancecard_idle", "neutral_dancecard_looking",
-                       "idle_hands", "idle_one_foot",
-                       "idle_to_", "one_leg_idle"]),
-    ("gesture",       ["wave", "salute", "clap", "cheer", "triumph",
-                       "thumbs", "point", "welcome", "greet", "bye",
-                       "raise_your_hand", "show_", "shhh", "rock_out",
-                       "mic_drop", "count_it", "i_got_this", "eureka",
-                       "fist_pump", "bicep", "body_check",
-                       "pray", "cross_your", "no_see", "no_hear",
-                       "lament", "scream", "confusion", "think",
-                       "don_t_know", "omg_", "yawn", "listen",
-                       "checking_time", "looking_at",
-                       "itching", "scratch", "brush_of_dust",
-                       "dusting", "wipe", "rub", "fixing",
-                       "body_stretch", "body_search", "pocket_search",
-                       "freezing_cold", "shiver", "cough", "sneeze",
-                       "puke", "boss_dust", "dust_brushing",
-                       "chefs_kiss", "shoulder_clap", "step_in_shit",
-                       "meditate", "horse_riding", "shuffle_cards",
-                       "drinking_bottle", "eat_burger",
-                       "zippo", "smoke", "drink_",
-                       "clear_ear", "rubbing_",
-                       "neutral_cry", "neutral_fear",
-                       "rage_", "proud_", "neutral_laugh",
-                       "looking_in_the_mirror",
-                       "wiping_shoes", "maybe", "just_realised",
-                       "tasty", "no_speak", "no_say",
-                       "on_the_edge", "eating", "painting",
-                       "stinky", "binoculars", "brush_off",
-                       "tarzan", "cry_", "laugh",
-                       "welcom", "clear", "alone",
-                       "playing", "grating", "peeling", "looting",
-                       "chainsaw", "cutting",
-                       ]),
-    ("sport",         ["swim", "throw_", "catch_", "kick_", "punch_",
-                       "dodge_", "play_tennis", "play_guitar",
-                       "petting_dog", "dribble", "shoot_",
-                       "ib_combat", "ib_dodge", "exercise",
-                       "cartwheel"]),
-]
+def _lookup_by_motion_name(lookup: dict[str, dict], name: str) -> dict | None:
+    raw = compact_text(name)
+    if not raw:
+        return None
+    for candidate in (raw, _canonical_motion_name(raw)):
+        if candidate and candidate in lookup:
+            return lookup[candidate]
+    return None
 
 
-def classify_coarse(fine_name: str) -> str:
-    """Map a fine-grained action name to a coarse category (~20 classes)."""
-    name_lower = fine_name.lower()
-    for category, keywords in _COARSE_RULES:
+def load_metadata_lookup(metadata_csv: str) -> dict[str, dict[str, str]]:
+    lookup: dict[str, dict[str, str]] = {}
+    with open(metadata_csv, "r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            short_text = compact_text(row.get("content_short_description", ""))
+            if not short_text:
+                continue
+            row["content_short_description"] = short_text
+            key = compact_text(row.get("filename") or row.get("move_name") or "")
+            if not key:
+                continue
+            lookup[key] = row
+            lookup[_canonical_motion_name(key)] = row
+    return lookup
+
+
+def load_temporal_lookup(jsonl_path: str) -> dict[str, dict]:
+    lookup: dict[str, dict] = {}
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            key = compact_text(obj.get("filename", ""))
+            if not key:
+                continue
+            lookup[key] = obj
+            lookup[_canonical_motion_name(key)] = obj
+    return lookup
+
+
+def build_text_candidates(*texts: object) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        candidate = compact_text(text)
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+    return candidates
+
+
+def _fallback_classify_coarse(label: str) -> str:
+    label_space = re.sub(r"[^a-z0-9]+", " ", str(label).lower()).strip()
+    label_underscore = label_space.replace(" ", "_")
+    coarse_rules = (
+        ("injured", ["injured"]),
+        ("crutch", ["crutch", "crutches"]),
+        ("jump", ["jump", "hop", "leap", "flip", "vault_over", "jump_and_land"]),
+        ("jog", ["jog", "jogging", "run"]),
+        ("walk", ["walk", "moonwalk", "step_forward", "step_backward", "stroll"]),
+        ("dance", ["dance", "dancing", "choreography", "macarena"]),
+        ("climb", ["climb", "ladder", "box"]),
+        ("fall", ["fall", "faint", "lying", "lie"]),
+        ("crouch", ["crouch", "crawl", "on_all_fours", "stoop"]),
+        ("kneel", ["kneel"]),
+        ("sit", ["sit", "sitting"]),
+        ("carry", ["carry", "lift", "hold", "pick_up", "put_down", "crate"]),
+        ("reach", ["reach", "reaching"]),
+        ("push", ["push", "pull", "crank", "valve", "handle", "lever", "knob", "door"]),
+        ("step_over", ["step_over", "step_in", "avoid_obstacle"]),
+        ("turn", ["turn", "spin"]),
+        ("idle", ["idle", "stand", "standing", "neutral"]),
+        ("gesture", ["wave", "salute", "clap", "cheer", "thumbs", "point", "scratch", "wipe", "rub"]),
+        ("sport", ["swim", "throw", "catch", "kick", "punch", "dribble", "shoot", "exercise", "cartwheel"]),
+    )
+    for category, keywords in coarse_rules:
         for kw in keywords:
-            if kw in name_lower:
+            kw_space = re.sub(r"[^a-z0-9]+", " ", kw.lower()).strip()
+            kw_underscore = kw_space.replace(" ", "_")
+            if kw_space and (kw_space in label_space or kw_underscore in label_underscore):
                 return category
     return "other"
+
+
+def classify_coarse_text(label: object) -> str:
+    text = compact_text(label)
+    if not text:
+        return "other"
+    if _shared_classify_coarse is not None:
+        try:
+            coarse = _shared_classify_coarse(text)
+            if coarse != "other":
+                return coarse
+        except Exception:
+            pass
+    return _fallback_classify_coarse(text)
+
+
+def _metadata_act_cat(row: dict[str, str]) -> list[str]:
+    candidates = [
+        row.get("content_type_of_movement", ""),
+        row.get("content_short_description", ""),
+        row.get("content_short_description_2", ""),
+    ]
+    for candidate in candidates:
+        coarse = classify_coarse_text(candidate)
+        if coarse != "other":
+            return [coarse]
+
+    return ["other"]
+
+
+def _snap_event_times_to_fps(
+    start_time: float | int | str | None,
+    end_time: float | int | str | None,
+    fps: int,
+    max_frames: int,
+) -> tuple[float, float] | None:
+    if start_time is None or end_time is None:
+        return None
+    start_f = int(math.floor(float(start_time) * fps + 1e-9))
+    end_f = int(math.ceil(float(end_time) * fps - 1e-9))
+    start_f = max(0, min(start_f, max_frames))
+    end_f = max(start_f + 1, min(end_f, max_frames))
+    return start_f / float(fps), end_f / float(fps)
 
 
 # ── Flat-lying fall recovery detection ──
@@ -443,7 +480,7 @@ def _pack_source_file(task: tuple) -> tuple[list[dict], int, set[int], str | Non
     This function is thread-safe: every source index owns a disjoint output
     filename prefix. Returning metadata only keeps executor memory bounded.
     """
-    source_idx, pkl_f, root, out, min_frames, sample_compress = task
+    source_idx, pkl_f, root, out, min_frames, sample_compress, metadata_lookup, temporal_lookup = task
     try:
         data = joblib.load(pkl_f)
     except Exception as exc:
@@ -460,12 +497,32 @@ def _pack_source_file(task: tuple) -> tuple[list[dict], int, set[int], str | Non
     for entry_idx, (raw_name, entry) in enumerate(data.items()):
         label_name = str(raw_name)
         source_name = prefix + label_name if prefix else label_name
+        metadata_row = (
+            _lookup_by_motion_name(metadata_lookup, source_name)
+            if metadata_lookup is not None else None
+        )
+        temporal_obj = (
+            _lookup_by_motion_name(temporal_lookup, source_name)
+            if temporal_lookup is not None else None
+        )
         try:
-            item = motion_lib_entry_to_textop(label_name, entry)
+            item = motion_lib_entry_to_textop(
+                source_name,
+                entry,
+                metadata_row=metadata_row,
+                temporal_obj=temporal_obj,
+            )
         except (TypeError, ValueError) as exc:
             warning = f"invalid motion {source_name}: {exc}"
             item = None
-        if item is None or (min_frames and item["length"] < min_frames):
+        if item is None:
+            skipped += 1
+            continue
+        if not item.get("frame_ann"):
+            skipped += 1
+            warning = f"missing metadata labels for {source_name}"
+            continue
+        if min_frames and item["length"] < min_frames:
             skipped += 1
             continue
 
@@ -493,10 +550,12 @@ def pack_source_files(
     min_frames: int,
     sample_compress: int,
     workers: int,
+    metadata_lookup: dict[str, dict[str, str]] | None = None,
+    temporal_lookup: dict[str, dict] | None = None,
 ) -> tuple[list[dict], int, set[int]]:
     """Pack source files with a bounded number of in-flight tasks."""
     tasks = (
-        (idx, pkl_f, root, out, min_frames, sample_compress)
+        (idx, pkl_f, root, out, min_frames, sample_compress, metadata_lookup, temporal_lookup)
         for idx, (pkl_f, root) in enumerate(source_pkls)
     )
     manifest: list[dict] = []
@@ -537,7 +596,13 @@ def pack_source_files(
     return manifest, skipped, fps_values
 
 
-def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
+def motion_lib_entry_to_textop(
+    name: str,
+    entry: dict,
+    *,
+    metadata_row: dict[str, str] | None = None,
+    temporal_obj: dict | None = None,
+) -> dict | None:
     """Convert one motion_lib entry to TextOp SkeletonPrimitiveDataset format.
 
     motion_lib entry (from convert_soma_csv_to_motion_lib.py):
@@ -613,11 +678,44 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
     if fps_val <= 0:
         return None
 
-    # ── Coarse action label from filename ──
     duration = T / fps_val
-    fine = _extract_action_name(str(name))
-    coarse = classify_coarse(fine)
-    recovery_boost = _is_flat_recovery(fine)
+    recovery_boost = _is_flat_recovery(str(name))
+
+    frame_ann: list[tuple[float, float, list[str], list[str]]] = []
+    if metadata_row is not None:
+        short_text = compact_text(metadata_row.get("content_short_description", ""))
+        if short_text:
+            sequence_texts = build_text_candidates(
+                short_text,
+                normalize_motion_text(short_text),
+            )
+            frame_ann.append(
+                (0.0, duration, sequence_texts, _metadata_act_cat(metadata_row))
+            )
+
+            if temporal_obj is not None:
+                events = temporal_obj.get("events") or []
+                for event in events:
+                    temporal_raw = compact_text(event.get("description", ""))
+                    if not temporal_raw:
+                        continue
+                    snapped = _snap_event_times_to_fps(
+                        event.get("start_time"),
+                        event.get("end_time"),
+                        fps_val,
+                        T,
+                    )
+                    if snapped is None:
+                        continue
+                    event_core = normalize_motion_text(temporal_raw) or normalize_text(temporal_raw)
+                    event_texts = build_text_candidates(
+                        temporal_raw,
+                        event_core,
+                        short_text,
+                    )
+                    frame_ann.append(
+                        (snapped[0], snapped[1], event_texts, _metadata_act_cat(metadata_row))
+                    )
 
     return {
         "length": T,
@@ -636,8 +734,7 @@ def motion_lib_entry_to_textop(name: str, entry: dict) -> dict | None:
         # inferred pseudo-obstacles: vacant space treated as occupied
         # (computed by convert_soma_csv_to_motion_lib.py --mob)
         "scene": entry.get("scene", {}),
-        # Coarse category → weighted_sample via cal_weighted_statistics.py
-        "frame_ann": [(0.0, duration, coarse, [coarse])],
+        "frame_ann": frame_ann,
     }
 
 
@@ -655,6 +752,16 @@ def main():
     parser.add_argument(
         "--output", required=True,
         help="Output directory for train.pkl, val.pkl, statistics.yaml",
+    )
+    parser.add_argument(
+        "--metadata-csv",
+        default="/home/lenovo/data/bones-seed/metadata/seed_metadata_v004.csv",
+        help="BONES-SEED metadata CSV with content_short_description",
+    )
+    parser.add_argument(
+        "--temporal-jsonl",
+        default="/home/lenovo/data/bones-seed/metadata/seed_metadata_v002_temporal_labels.jsonl",
+        help="BONES-SEED temporal label JSONL with per-event descriptions",
     )
     parser.add_argument("--val_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
@@ -685,10 +792,19 @@ def main():
         print("ERROR: No input PKL files found")
         sys.exit(1)
     print(f"Found {len(source_pkls):,} PKL files from {len(args.input)} input(s)")
+    print(f"Metadata CSV: {args.metadata_csv}")
+    print(f"Temporal JSONL: {args.temporal_jsonl}")
     effective_workers = min(args.workers, len(source_pkls))
     print(
         f"Packing with {effective_workers} worker(s), "
         f"joblib compression={args.sample_compress}"
+    )
+
+    metadata_lookup = load_metadata_lookup(args.metadata_csv)
+    temporal_lookup = load_temporal_lookup(args.temporal_jsonl)
+    print(
+        f"Loaded {len(metadata_lookup):,} metadata keys and "
+        f"{len(temporal_lookup):,} temporal keys"
     )
 
     out = Path(args.output)
@@ -703,6 +819,8 @@ def main():
         min_frames=args.min_frames,
         sample_compress=args.sample_compress,
         workers=effective_workers,
+        metadata_lookup=metadata_lookup,
+        temporal_lookup=temporal_lookup,
     )
 
     print(f"Converted {len(manifest)} (skipped {skipped} - too short or invalid)")
