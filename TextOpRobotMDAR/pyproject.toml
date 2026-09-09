@@ -46,6 +46,7 @@ dependencies = [
     "wandb==0.16.6",
     'einops==0.8.1',
     "tensorboard",
+    "setuptools<=81.0",
     "umap-learn"
 ]
 
