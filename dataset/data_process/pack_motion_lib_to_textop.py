@@ -73,6 +73,10 @@ assert len(TARGET_DOF_NAMES) == TARGET_DOF
 _SOURCE_EXT_RE = re.compile(r"\.(?:csv|pkl)$", flags=re.IGNORECASE)
 _DATE_PREFIX_RE = re.compile(r"^\d{6}__")
 _AUG_SUFFIX_RE = re.compile(r"_aug_\d+$", flags=re.IGNORECASE)
+_AUG_FALL_RECOVERY_PREFIX_RE = re.compile(
+    r"^(?:.*__)?aug_fall_recovery__",
+    flags=re.IGNORECASE,
+)
 SUBJECT_PREFIX_RE = re.compile(
     r"^(?:a|an|the)\s+"
     r"(?:(?:standing|seated|upright|injured|wounded|crouched|kneeling|sitting|lying|bent)\s+)*"
@@ -103,6 +107,7 @@ def _canonical_motion_name(name: str) -> str:
     stem = compact_text(name)
     stem = stem.replace("\\", "/").split("/")[-1]
     stem = _SOURCE_EXT_RE.sub("", stem)
+    stem = _AUG_FALL_RECOVERY_PREFIX_RE.sub("", stem)
     stem = _DATE_PREFIX_RE.sub("", stem)
     stem = _AUG_SUFFIX_RE.sub("", stem)
     return stem
@@ -349,12 +354,14 @@ def _motion_split_key(source: str) -> str:
     """Return a canonical key for split-only grouping.
 
     Only the BONES-SEED suffix conventions are normalized:
+      - date folder prefixes: ``221010__motion`` -> ``motion``
+      - fall-recovery augmentation folder prefix:
+        ``aug_fall_recovery__motion_aug_003`` -> ``motion``
       - mirrored files: ``motion_M`` -> ``motion``
       - augmented files: ``motion_aug_003`` -> ``motion``
       - mirrored augmented files: ``motion_M_aug_003`` -> ``motion``
     """
-    stem = _SOURCE_EXT_RE.sub("", str(source))
-    stem = _AUG_SUFFIX_RE.sub("", stem)
+    stem = _canonical_motion_name(source)
     return _MIRROR_SUFFIX_RE.sub("", stem)
 
 

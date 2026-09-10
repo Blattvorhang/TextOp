@@ -258,16 +258,75 @@ def test_augmented_motion_uses_base_metadata_lookup(tmp_path):
     assert manifest[0]["frame_ann"][0][2] == ["walk forward"]
 
 
+def test_augmented_recovery_subdir_uses_base_metadata_lookup(tmp_path):
+    frames = 120
+    source_dir = tmp_path / "motion_lib_filtered"
+    aug_dir = source_dir / "aug_fall_recovery"
+    aug_dir.mkdir(parents=True)
+    entry = {
+        "root_trans_offset": np.zeros((frames, 3), dtype=np.float32),
+        "root_rot": np.tile([0, 0, 0, 1], (frames, 1)).astype(np.float32),
+        "dof": np.zeros((frames, 29), dtype=np.float32),
+        "contact_mask": np.ones((frames, 2), dtype=np.float32),
+        "fps": 50,
+    }
+    source_name = "stand_up_lying_R_002__A472_aug_003"
+    source_path = aug_dir / f"{source_name}.pkl"
+    joblib.dump({source_name: entry}, source_path)
+
+    metadata_lookup = {
+        "stand_up_lying_R_002__A472": {
+            "filename": "stand_up_lying_R_002__A472",
+            "content_short_description": "stand up from lying",
+            "content_type_of_movement": "fall",
+        }
+    }
+    temporal_lookup = {
+        "stand_up_lying_R_002__A472": {
+            "filename": "stand_up_lying_R_002__A472",
+            "events": [
+                {
+                    "start_time": 0.0,
+                    "end_time": 1.0,
+                    "description": "A person stands up from lying down.",
+                }
+            ],
+        }
+    }
+
+    out = tmp_path / "out"
+    (out / "samples").mkdir(parents=True)
+    manifest, skipped, fps_values = packer.pack_source_files(
+        [(source_path, source_dir)],
+        out,
+        min_frames=0,
+        sample_compress=0,
+        workers=1,
+        metadata_lookup=metadata_lookup,
+        temporal_lookup=temporal_lookup,
+    )
+
+    assert skipped == 0
+    assert fps_values == {50}
+    assert manifest[0]["_source"] == (
+        "aug_fall_recovery__stand_up_lying_R_002__A472_aug_003"
+    )
+    assert manifest[0]["_recovery_boost"] is True
+    assert manifest[0]["frame_ann"][0][2] == ["stand up from lying"]
+
+
 def test_motion_split_key_groups_original_and_mirror_sources():
     original = "221010__walk_ff_loop_180_R_003__A045"
     mirrored = "221010__walk_ff_loop_180_R_003__A045_M"
     augmented_original = "221010__walk_ff_loop_180_R_003__A045_aug_003"
     augmented_mirror = "221010__walk_ff_loop_180_R_003__A045_M_aug_003"
+    prefixed_augmented = "aug_fall_recovery__walk_ff_loop_180_R_003__A045_aug_003"
 
     split_key = packer._motion_split_key(original)
     assert split_key == packer._motion_split_key(mirrored)
     assert split_key == packer._motion_split_key(augmented_original)
     assert split_key == packer._motion_split_key(augmented_mirror)
+    assert split_key == packer._motion_split_key(prefixed_augmented)
 
 
 def test_grouped_train_val_split_keeps_mirrors_together():
