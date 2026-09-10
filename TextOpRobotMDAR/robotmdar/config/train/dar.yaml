@@ -10,6 +10,7 @@ manager:
     - 50000
 
   use_rollout: True
+  rollout_max_prob: 0.8  # Stage 1 ramps to this value; stage 2 holds it.
   use_static_pose: False
 
   static_prob: 0.001

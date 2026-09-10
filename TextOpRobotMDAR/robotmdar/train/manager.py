@@ -36,7 +36,8 @@ from robotmdar.train.loss import (
 #   meta          -> meta/<k>                         (schedule state, no phase)
 _META_KEYS = frozenset(
     {'stage', 'scene_active', 'augmentation_active', 'feature_version',
-     'lr', 'grad_norm', 'eval_time'})
+     'lr', 'grad_norm', 'eval_time', 'self_rollout_prob',
+     'self_rollout_used'})
 
 
 def _classify_extra(name: str, phase: str) -> Tuple[str, str]:
@@ -181,6 +182,7 @@ class BaseManager(ABC):
     stage_idx: int
     # -1 for not started, 0 for first stage, 1 for second stage, etc.
     use_rollout: bool
+    rollout_max_prob: float
 
     use_static_pose: bool
 
@@ -237,6 +239,14 @@ class BaseManager(ABC):
 
         # History选择相关
         self.static_prob = getattr(self, 'static_prob', 0.0)
+        self.rollout_max_prob = float(
+            getattr(self, 'rollout_max_prob', 1.0)
+        )
+        if not 0.0 <= self.rollout_max_prob <= 1.0:
+            raise ValueError(
+                'rollout_max_prob must be between 0.0 and 1.0, got '
+                f'{self.rollout_max_prob}'
+            )
 
     def pre_step(self, is_eval: bool = False) -> None:
         """每步训练前调用"""
@@ -247,6 +257,9 @@ class BaseManager(ABC):
             len(self.stages) - 1,
         )  # type:ignore
         self.extra['stage'] = self.stage_idx
+        self.extra['self_rollout_prob'] = self.rollout_prob()
+        self.extra['self_rollout_used'] = 0.0
+        self.extra['self_rollout_ref_gt_dist_m'] = 0.0
         self.extra['scene_active'] = float(self.should_use_scene())
         self.extra['augmentation_active'] = float(self.should_use_augmentation())
         self.extra['feature_version'] = float(motion_dtype.FeatureVersion)
@@ -514,6 +527,21 @@ class BaseManager(ABC):
             and self.step >= int(getattr(dataset, 'augmentation_start_step', 0))
         )
 
+    def rollout_prob(self) -> float:
+        """Return the scheduled probability of using generated history."""
+        if (not getattr(self, 'use_rollout', False)
+                or self.stage_idx < 1 or len(self.stages) < 2):
+            return 0.0
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (self.step - self.stages[0])
+                / max(float(self.stages[1]), 1e-6),
+            ),
+        )
+        return self.rollout_max_prob * progress
+
     def should_rollout(self) -> bool:
         """
         Determine whether to use rollout history instead of ground truth.
@@ -521,12 +549,7 @@ class BaseManager(ABC):
         Returns:
             True if should use rollout history, False otherwise
         """
-        if not self.use_rollout:
-            return False
-        if self.stage_idx < 1:
-            return False
-        prob = min(1.0, (self.step - self.stages[0]) / max(float(self.stages[1]), 1e-6))
-        return torch.rand(1).item() < prob
+        return torch.rand(1).item() < self.rollout_prob()
 
     def should_static_pose(self) -> bool:
         """
