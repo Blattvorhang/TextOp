@@ -254,19 +254,6 @@ def _add_batch_data_diagnostics(extras, primitive, y) -> None:
     _add_condition_keep_diagnostics(extras, y, recovery)
 
 
-def _report_dataset_audit_stats(manager, datasets) -> None:
-    if not is_main_process():
-        return
-    for split, dataset in datasets:
-        stats = getattr(dataset, 'audit_stats', None)
-        if not stats:
-            continue
-        for key, value in stats.items():
-            if isinstance(value, (int, float)):
-                manager.platform.report_scalar(
-                    f'{split}/{key}', float(value), 0, group_name='data')
-
-
 def _make_root_xy_figure(
     generated_trajectory: torch.Tensor,
     goal_xy: torch.Tensor,
@@ -1442,8 +1429,6 @@ def main(cfg: DictConfig):
     manager.hold_model(vae, denoiser, optimizer, train_data)
     manager.rank = rank
     manager.world_size = world_size
-    _report_dataset_audit_stats(
-        manager, [('train', train_data), ('val', val_data)])
 
     num_primitive: int = cfg.data.num_primitive
     future_len: int = cfg.data.future_len

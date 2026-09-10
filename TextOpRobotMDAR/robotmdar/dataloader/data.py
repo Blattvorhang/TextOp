@@ -19,6 +19,7 @@ import sys
 import os
 import time
 import random
+import re
 from omegaconf import DictConfig
 from loguru import logger
 
@@ -72,6 +73,10 @@ _GOAL_STATS_VELOCITY_CLIP = 5.0
 _RECOVERY_SOURCE_PATTERNS = (
     "stand_up_lying",
     "faint_stand_up_lying",
+)
+_OFFLINE_AUGMENTED_SOURCE_RE = re.compile(
+    r"_aug_\d+(?:\.(?:pkl|csv))?$",
+    flags=re.IGNORECASE,
 )
 
 _HISTORY_JOINT_AUG_AMPS = (
@@ -472,6 +477,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         return ''
 
     @staticmethod
+    def _is_offline_augmented_record(record: Dict[str, Any]) -> bool:
+        """Identify preprocessing-time augmentation by its source suffix."""
+        return bool(_OFFLINE_AUGMENTED_SOURCE_RE.search(
+            SkeletonPrimitiveDataset._source_name(record)
+        ))
+
+    @staticmethod
     def _looks_like_recovery_source(name: str) -> bool:
         lower = str(name).lower()
         if "lying_side" in lower:
@@ -516,15 +528,75 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     if yielded >= budget:
                         break
 
+    def _dataset_quantity_stats(
+        self, records: List[Dict[str, Any]]
+    ) -> Dict[str, float]:
+        """Return sequence, valid-window, and duration totals for records."""
+        fps_default = float(getattr(self, 'fps', 50.0))
+        hours = 0.0
+        windows = 0
+        for record in records:
+            fps = record.get('_fps')
+            if fps is None:
+                motion = record.get('motion')
+                if isinstance(motion, dict):
+                    fps = motion.get('fps')
+            try:
+                fps_value = float(fps) if fps else fps_default
+            except (TypeError, ValueError):
+                fps_value = fps_default
+            hours += float(record.get('length', 0)) / max(fps_value, 1.0) / 3600.0
+            windows += self._valid_window_count(record)
+        return {
+            'sequences': float(len(records)),
+            'windows': float(windows),
+            'hours': hours,
+        }
+
+    @staticmethod
+    def _quantity_share(
+        quantity: Dict[str, float],
+        denominator: Dict[str, float],
+        key: str,
+    ) -> float:
+        return quantity[key] / max(denominator[key], 1.0e-12)
+
     def _build_audit_stats(self) -> Dict[str, Any]:
         """Build low-cost data/text/recovery diagnostics once per dataset."""
         valid_records = [self.raw_data[i] for i in self.valid_indices]
         fps = float(getattr(self, 'fps', 50.0))
         total = len(valid_records)
+        augmented_records = [
+            record for record in valid_records
+            if self._is_offline_augmented_record(record)
+        ]
+        original_records = [
+            record for record in valid_records
+            if not self._is_offline_augmented_record(record)
+        ]
+        total_quantity = self._dataset_quantity_stats(valid_records)
+        original_quantity = self._dataset_quantity_stats(original_records)
+        augmented_quantity = self._dataset_quantity_stats(augmented_records)
+
         recovery_records = [
             record for record in valid_records
             if bool(record.get('_recovery_boost', False))
         ]
+        original_recovery_records = [
+            record for record in original_records
+            if bool(record.get('_recovery_boost', False))
+        ]
+        augmented_recovery_records = [
+            record for record in augmented_records
+            if bool(record.get('_recovery_boost', False))
+        ]
+        recovery_quantity = self._dataset_quantity_stats(recovery_records)
+        original_recovery_quantity = self._dataset_quantity_stats(
+            original_recovery_records
+        )
+        augmented_recovery_quantity = self._dataset_quantity_stats(
+            augmented_recovery_records
+        )
         source_match = [
             self._looks_like_recovery_source(self._source_name(record))
             for record in recovery_records
@@ -610,6 +682,51 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 / max(float(primitive_windows - recovery_primitive_windows), 1.0)),
             'recovery_top_action_labels': label_counter.most_common(20),
             'recovery_top_sources': source_counter.most_common(20),
+            'offline_augmentation': {
+                'before': original_quantity,
+                'after': total_quantity,
+                'added': augmented_quantity,
+                'added_sequence_fraction_of_after': self._quantity_share(
+                    augmented_quantity, total_quantity, 'sequences'),
+                'added_window_fraction_of_after': self._quantity_share(
+                    augmented_quantity, total_quantity, 'windows'),
+                'added_hour_fraction_of_after': self._quantity_share(
+                    augmented_quantity, total_quantity, 'hours'),
+            },
+            'fall_recovery': {
+                # `_recovery_boost` is the existing flat-lying fall/recovery
+                # marker and includes the get-up clips used by training.
+                'before': original_recovery_quantity,
+                'after': recovery_quantity,
+                'added': augmented_recovery_quantity,
+                'before_sequence_fraction_of_data': self._quantity_share(
+                    original_recovery_quantity, original_quantity, 'sequences'),
+                'before_window_fraction_of_data': self._quantity_share(
+                    original_recovery_quantity, original_quantity, 'windows'),
+                'before_hour_fraction_of_data': self._quantity_share(
+                    original_recovery_quantity, original_quantity, 'hours'),
+                'after_sequence_fraction_of_data': self._quantity_share(
+                    recovery_quantity, total_quantity, 'sequences'),
+                'after_window_fraction_of_data': self._quantity_share(
+                    recovery_quantity, total_quantity, 'windows'),
+                'after_hour_fraction_of_data': self._quantity_share(
+                    recovery_quantity, total_quantity, 'hours'),
+                'added_sequence_fraction_of_after_recovery': (
+                    self._quantity_share(
+                        augmented_recovery_quantity,
+                        recovery_quantity,
+                        'sequences')),
+                'added_window_fraction_of_after_recovery': (
+                    self._quantity_share(
+                        augmented_recovery_quantity,
+                        recovery_quantity,
+                        'windows')),
+                'added_hour_fraction_of_after_recovery': (
+                    self._quantity_share(
+                        augmented_recovery_quantity,
+                        recovery_quantity,
+                        'hours')),
+            },
         }
 
     def _log_audit_stats(self) -> None:
@@ -645,6 +762,56 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self.split,
             stats.get('recovery_top_sources', []),
         )
+        offline = stats.get('offline_augmentation', {})
+        recovery = stats.get('fall_recovery', {})
+        if offline and recovery:
+            before = offline['before']
+            after = offline['after']
+            added = offline['added']
+            logger.info(
+                " Offline augmentation [{}] (valid data): before(original)={} seq/{} "
+                "windows/{:.3f} h; after(all)={} seq/{} windows/{:.3f} h; "
+                "added(_aug_)={} seq/{} windows/{:.3f} h "
+                "({:.3%} of after seq, {:.3%} of after hours)",
+                self.split,
+                int(before['sequences']),
+                int(before['windows']),
+                before['hours'],
+                int(after['sequences']),
+                int(after['windows']),
+                after['hours'],
+                int(added['sequences']),
+                int(added['windows']),
+                added['hours'],
+                offline['added_sequence_fraction_of_after'],
+                offline['added_hour_fraction_of_after'],
+            )
+            recovery_before = recovery['before']
+            recovery_after = recovery['after']
+            recovery_added = recovery['added']
+            logger.info(
+                " Fall-recovery [{}] (_recovery_boost=True): "
+                "before={} seq/{} windows/{:.3f} h ({:.3%} of data); "
+                "after={} seq/{} windows/{:.3f} h ({:.3%} of data); "
+                "added(_aug_)={} seq/{} windows/{:.3f} h "
+                "({:.3%} seq/{:.3%} h of after recovery, "
+                "{:.3%} h of after data)",
+                self.split,
+                int(recovery_before['sequences']),
+                int(recovery_before['windows']),
+                recovery_before['hours'],
+                recovery['before_hour_fraction_of_data'],
+                int(recovery_after['sequences']),
+                int(recovery_after['windows']),
+                recovery_after['hours'],
+                recovery['after_hour_fraction_of_data'],
+                int(recovery_added['sequences']),
+                int(recovery_added['windows']),
+                recovery_added['hours'],
+                recovery['added_sequence_fraction_of_after_recovery'],
+                recovery['added_hour_fraction_of_after_recovery'],
+                offline['added_hour_fraction_of_after'],
+            )
 
     def _strip_scene_if_needed(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         if getattr(self, 'load_scene', True) or 'scene' not in sample:
