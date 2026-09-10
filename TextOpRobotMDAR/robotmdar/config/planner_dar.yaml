@@ -63,7 +63,7 @@ generated_history:
   # Recompute alignment once every N generated-history replans. The first
   # generated-history replan always aligns; skipped replans inherit the last
   # correction while the controller is still on the source plan.
-  align_every: 2
+  align_every: 1
 
 # Single-step denoising is the real-time path. Full diffusion can be enabled
 # explicitly for offline experiments, but is not expected to meet the online
