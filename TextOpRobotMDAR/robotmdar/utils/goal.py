@@ -1412,6 +1412,19 @@ def validate_goal_stats(
     return goal_stats
 
 
+def _goal_stats_no_log_layout(meta: dict, goal_schema: str | None = None) -> bool:
+    """Return whether cached goal stats describe a split goal without log_d_hor."""
+    schema = goal_schema or meta.get("goal_schema")
+    if schema in (SPLIT_GOAL_NO_LOG_SCHEMA, SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA):
+        return True
+    if meta.get("goal_include_log_d_hor", None) is False:
+        return int(meta.get("goal_dim", -1)) in (
+            SPLIT_GOAL_NO_LOG_DIM,
+            SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+        )
+    return False
+
+
 def build_ego_goal(world_goal_pos: torch.Tensor,
                    world_goal_yaw: torch.Tensor,
                    reference_pos: torch.Tensor,
@@ -1476,14 +1489,20 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
             and goal_stats.get("meta", {}).get("goal_schema")
             == LEGACY_SPLIT_GOAL_SCHEMA
         )
-        no_log_split_layout = goal_stats.get("meta", {}).get(
-            "goal_schema") in (
-                SPLIT_GOAL_NO_LOG_SCHEMA,
-                SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
-            )
-        stored_include_log = bool(
-            goal_stats.get("meta", {}).get("goal_include_log_d_hor", True))
-        if (not legacy_split_layout and not no_log_split_layout
+        meta = goal_stats.get("meta", {})
+        no_log_schema = meta.get("goal_schema") in (
+            SPLIT_GOAL_NO_LOG_SCHEMA,
+            SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
+        )
+        no_log_split_layout = _goal_stats_no_log_layout(meta) and (
+            no_log_schema or not bool(goal_include_log_d_hor))
+        stored_include_log_raw = meta.get("goal_include_log_d_hor", None)
+        stored_include_log = (
+            True if stored_include_log_raw is None
+            else bool(stored_include_log_raw)
+        )
+        if (not legacy_split_layout and not no_log_schema
+                and stored_include_log_raw is not None
                 and stored_include_log != bool(goal_include_log_d_hor)):
             raise ValueError(
                 "goal_stats were computed with goal_include_log_d_hor="

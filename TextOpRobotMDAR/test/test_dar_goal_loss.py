@@ -87,6 +87,63 @@ def test_end_effector_anchor_cache_does_not_shadow_resolver(monkeypatch):
     assert geometry._end_effector_anchors_cache is anchors
 
 
+def test_train_conditions_use_no_log_goal_stats_without_schema():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        cfg = OmegaConf.create({
+            'device': 'cpu',
+            'data': {
+                'goal_type': 'joint_state',
+                'goal_encoding': 'split_end_effector',
+                'occupancy_unit': 0.1,
+            },
+            'denoiser': {
+                'grid_size': 1,
+            },
+        })
+        goal_stats = {
+            's_p': torch.tensor(1.0),
+            's_v': torch.tensor(1.0),
+            's_d': torch.tensor(1.0),
+            's_o': torch.ones(9),
+            'q_mean': torch.zeros(29),
+            'q_std': torch.ones(29),
+            's_ee': torch.ones(12),
+            'meta': {
+                'fps': 50.0,
+                'goal_dim': SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+                'goal_include_log_d_hor': False,
+            },
+        }
+        primitive = {
+            'world_goal_pos': torch.tensor([[1.0, 0.0, 0.8]]),
+            'world_goal_yaw': torch.zeros(1),
+            'world_goal_rot': torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            'world_goal_dof': torch.zeros((1, 29)),
+            'world_goal_vel': torch.zeros((1, 3)),
+            'world_goal_end_effectors': torch.zeros((1, 4, 3)),
+            'time_to_arrival': torch.tensor([1.0]),
+        }
+
+        conditions = _conditions(
+            primitive,
+            reference_pos=torch.zeros((1, 3)),
+            reference_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            history_motion=torch.zeros((1, 2, 44)),
+            cfg=cfg,
+            fps=50.0,
+            goal_stats=goal_stats,
+            use_scene=False,
+        )
+
+        assert conditions['ego_goal_raw'].shape[-1] == (
+            SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM)
+        assert conditions['goal'].shape[-1] == SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
 def _empty_geometry_loss_v6(*args, **kwargs):
     if kwargs.get("return_fk_results", False):
         return {}, {}, {}, None

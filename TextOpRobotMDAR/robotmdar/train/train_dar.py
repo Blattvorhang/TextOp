@@ -605,6 +605,7 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
                 if goal_type.uses_arrival_time else None
             ),
             time_to_arrival_seconds=goal_time,
+            goal_include_log_d_hor=False,
         )
     else:
         goal = ego_goal_raw
