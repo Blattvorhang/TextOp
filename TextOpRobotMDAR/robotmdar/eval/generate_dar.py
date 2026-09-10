@@ -223,6 +223,10 @@ def generate_next_motion(
         use_vae=True,
         use_ddim=False,
         text_embedding: Optional[torch.Tensor] = None,
+        text_valid: Optional[Union[bool, torch.Tensor]] = None,
+        goal_valid: Optional[Dict[str, Any]] = None,
+        scene_valid: Optional[Union[bool, torch.Tensor]] = None,
+        is_recovery: Optional[Union[bool, torch.Tensor]] = None,
         force_drop_text: bool = False,
         force_drop_goal_root: bool = False,
         force_drop_goal_yaw: bool = False,
@@ -241,6 +245,10 @@ def generate_next_motion(
         time_to_arrival_frame: Optional[torch.Tensor] = None):
     """
     Generate next motion segment using DAR model.
+
+    Controller integrations should pass ``*_valid`` values below. The
+    ``force_drop_*`` arguments remain for legacy/offline callers that
+    explicitly request inference-time ablations.
 
     Args:
         vae: VAE model for encoding/decoding
@@ -267,6 +275,11 @@ def generate_next_motion(
         force_drop_goal_end_effector_right_foot: Mask only right-foot token.
         force_drop_scene: Mask the scene occupancy condition at inference.
         force_drop_arrival_time: Mask the arrival-time PE at inference.
+        text_valid: Controller-owned text validity passed to the denoiser.
+        goal_valid: Controller-owned validity flags for goal components.
+        scene_valid: Controller-owned scene occupancy validity.
+        is_recovery: Optional per-sample get-up profile selector.  This is
+            omitted by default so deployment keeps the locomotion profile.
         time_to_arrival_frame: Optional frame index passed to the arrival PE.
 
     Returns:
@@ -346,6 +359,14 @@ def generate_next_motion(
         }
         if text_embedding is not None:
             y['text_embedding'] = text_embedding.to(device=device)
+        if text_valid is not None:
+            y['text_valid'] = text_valid
+        if goal_valid is not None:
+            y['goal_valid'] = goal_valid
+        if scene_valid is not None:
+            y['scene_valid'] = scene_valid
+        if is_recovery is not None:
+            y['is_recovery'] = is_recovery
         if time_to_arrival_frame is not None:
             y['time_to_arrival_frame'] = time_to_arrival_frame
             y['arrival_time_frame'] = time_to_arrival_frame
