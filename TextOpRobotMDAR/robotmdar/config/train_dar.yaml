@@ -29,7 +29,6 @@ data:
   # future frame inside each primitive window.
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
-  goal_include_log_d_hor: false
   # Keep clean histories for the warm-up, then enable V7.1 history DR in the
   # dataloader. The server training launch may override this threshold.
   augmentation_enabled: false
@@ -41,21 +40,46 @@ data:
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
-  goal_dim: 67
-  text_condition_enabled: true
+  goal_dim: 66
+  text_condition_enabled: false
   cond_mask_prob:
-    text: 0.2
-    goal:
-      position: 0.05
-      velocity: 0.1
-      orientation: 0.3
-      joint: 0.6
-      end_effector:
-        left_hand: 0.3
-        right_hand: 0.3
-        left_foot: 0.3
-        right_foot: 0.3
-      time: 0.1
+    # The two profiles are selected per sample from batch[pidx]["is_recovery"]
+    locomotion:
+      text: 1.0
+      goal:
+        position:
+          hor: 0.05
+          vert: 0.4
+        velocity: 0.1
+        orientation:
+          rot6d: 0.4
+          gravity: 0.4
+        joint: 0.8
+        end_effector:
+          left_hand: 0.3
+          right_hand: 0.3
+          left_foot: 0.3
+          right_foot: 0.3
+        time: 0.1
+      scene: 1.0
+    getup:
+      text: 1.0
+      goal:
+        position:
+          hor: 0.95
+          vert: 0.05
+        velocity: 0.95
+        orientation:
+          rot6d: 0.95
+          gravity: 0.05
+        joint: 0.95
+        end_effector:
+          left_hand: 0.95
+          right_hand: 0.95
+          left_foot: 0.95
+          right_foot: 0.95
+        time: 0.1
+      scene: 1.0
 
 train:
   manager:
@@ -66,21 +90,21 @@ train:
         support_consistency: 1.0
         goal:
           g: 0.0
-          root_position_hor: 0.5
-          root_position_vert: 0.02
+          root_position_hor: 0.25
+          root_position_vert: 0.01
           root_velocity: 0.02
-          root_orientation: 0.001
+          root_orientation: 0.0
           joint_angle: 0.0
           end_effector: 0.05
       getup:
-        rec: 1.5
+        rec: 1.2
         foot_contact: 0.01
-        support_consistency: 10.0
+        support_consistency: 1.0
         goal:
-          g: 0.01
+          g: 0.0
           root_position_hor: 0.0
-          root_position_vert: 0.05
-          root_velocity: 0.002
+          root_position_vert: 0.0
+          root_velocity: 0.0
           root_orientation: 0.0
           joint_angle: 0.0
           end_effector: 0.0
