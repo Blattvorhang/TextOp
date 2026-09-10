@@ -7,7 +7,7 @@ This is a clean, well-structured implementation with:
 3. 100% interface compatibility with original
 """
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import pickle
@@ -36,17 +36,23 @@ from robotmdar.utils.goal import (
     GoalEncoding,
     GoalType,
     SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+    SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
     SPLIT_END_EFFECTOR_GOAL_SCHEMA,
     SPLIT_END_EFFECTOR_SLICE,
     SPLIT_END_EFFECTOR_TOKEN_ORDER,
     SPLIT_GOAL_SCHEMA,
+    SPLIT_GOAL_NO_LOG_DIM,
+    SPLIT_GOAL_NO_LOG_SCHEMA,
     SPLIT_HORIZONTAL_SLICE,
     SPLIT_JOINT_SLICE,
     SPLIT_ORIENTATION_SLICE,
     SPLIT_VERTICAL_SLICE,
     SPLIT_VELOCITY_SLICE,
     build_ego_split_end_effector_goal,
+    build_ego_split_end_effector_goal_no_log,
     build_ego_split_goal,
+    build_ego_split_goal_no_log,
     SPLIT_GOAL_DIM,
     quaternion_yaw,
     validate_goal_stats,
@@ -63,6 +69,10 @@ import json
 
 _GOAL_STATS_POSITION_CLIP = 3.0
 _GOAL_STATS_VELOCITY_CLIP = 5.0
+_RECOVERY_SOURCE_PATTERNS = (
+    "stand_up_lying",
+    "faint_stand_up_lying",
+)
 
 _HISTORY_JOINT_AUG_AMPS = (
     ("shoulder", 0.30),
@@ -246,7 +256,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         goal_encoding: GoalEncoding | str | None = None,
         goal_per_primitive: bool = False,
         goal_timestep_mode: str = "relative",
-        goal_include_log_d_hor: bool = True,
+        goal_include_log_d_hor: bool = False,
         time_to_arrival_mode: Optional[str] = None,
         weighted_sample: bool = False,
         frame_weight: bool = False,
@@ -351,6 +361,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         self.load_scene = bool(kwargs.get('load_scene', True))
         self.load_text_embeddings = bool(
             kwargs.get('load_text_embeddings', True))
+        self.audit_primitive_windows = max(
+            0, int(kwargs.get('audit_primitive_windows', 4096)))
         self.clip_version = str(kwargs.get('clip_version', 'ViT-B/32'))
         self.clip_model_path = kwargs.get('clip_model_path')
         self.clip_dim = int(kwargs.get('clip_dim', 512))
@@ -448,6 +460,191 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             self.text_embeddings_dict = {
                 '': torch.zeros(self.clip_dim, dtype=torch.float32)
             }
+        self.audit_stats = self._build_audit_stats()
+        self._log_audit_stats()
+
+    @staticmethod
+    def _source_name(record: Dict[str, Any]) -> str:
+        for key in ('_source', 'source', 'name', '_name', '_data_path'):
+            value = record.get(key)
+            if value:
+                return str(value)
+        return ''
+
+    @staticmethod
+    def _looks_like_recovery_source(name: str) -> bool:
+        lower = str(name).lower()
+        if "lying_side" in lower:
+            return False
+        return any(pattern in lower for pattern in _RECOVERY_SOURCE_PATTERNS)
+
+    @staticmethod
+    def _looks_like_recovery_text(text: str) -> bool:
+        lower = str(text).lower()
+        return any(token in lower for token in (
+            'lying', 'lie down', 'stand up', 'stand-up', 'get up', 'faint'))
+
+    def _valid_window_count(self, record: Dict[str, Any]) -> int:
+        return max(0, int(record.get('length', 0)) - self.required_length + 1)
+
+    def _sample_audit_windows(self, valid_records: List[Dict[str, Any]]):
+        """Yield a bounded set of primitive windows for startup diagnostics."""
+        budget = int(getattr(self, 'audit_primitive_windows', 0))
+        if budget <= 0 or not valid_records:
+            return
+        yielded = 0
+        stride = max(1, len(valid_records) // min(len(valid_records), budget))
+        for record in valid_records[::stride]:
+            if yielded >= budget:
+                break
+            count = self._valid_window_count(record)
+            if count <= 0:
+                continue
+            starts = (0,) if count == 1 else (0, count // 2, count - 1)
+            seen = set()
+            for start in starts:
+                if yielded >= budget or start in seen:
+                    continue
+                seen.add(start)
+                for pidx in range(self.num_primitive):
+                    prim_start = start + pidx * self.future_len
+                    prim_end = prim_start + self.history_len + self.future_len + 1
+                    if prim_end > int(record.get('length', 0)):
+                        continue
+                    yield record, prim_start, prim_end
+                    yielded += 1
+                    if yielded >= budget:
+                        break
+
+    def _build_audit_stats(self) -> Dict[str, Any]:
+        """Build low-cost data/text/recovery diagnostics once per dataset."""
+        valid_records = [self.raw_data[i] for i in self.valid_indices]
+        fps = float(getattr(self, 'fps', 50.0))
+        total = len(valid_records)
+        recovery_records = [
+            record for record in valid_records
+            if bool(record.get('_recovery_boost', False))
+        ]
+        source_match = [
+            self._looks_like_recovery_source(self._source_name(record))
+            for record in recovery_records
+        ]
+        false_source_matches = [
+            record for record in valid_records
+            if (not bool(record.get('_recovery_boost', False))
+                and self._looks_like_recovery_source(self._source_name(record)))
+        ]
+        missing_frame_ann = [
+            record for record in recovery_records
+            if not record.get('frame_ann')
+        ]
+        recovery_hours = sum(
+            float(record.get('length', 0)) / max(fps, 1.0)
+            for record in recovery_records
+        ) / 3600.0
+        total_hours = sum(
+            float(record.get('length', 0)) / max(fps, 1.0)
+            for record in valid_records
+        ) / 3600.0
+        primitive_windows = 0
+        recovery_primitive_windows = 0
+        empty_action = 0
+        empty_embedding = 0
+        recovery_text_like = 0
+        non_recovery_text_like = 0
+        label_counter = Counter()
+        source_counter = Counter()
+        empty_embedding_ref = self.text_embeddings_dict.get('')
+        for record in recovery_records:
+            source = self._source_name(record)
+            source_counter[Path(source).stem if source else '<unknown>'] += 1
+        for record, prim_start, prim_end in self._sample_audit_windows(
+                valid_records):
+            primitive_windows += 1
+            is_recovery = bool(record.get('_recovery_boost', False))
+            recovery_primitive_windows += int(is_recovery)
+            action_label = self._primitive_action_label(
+                record, prim_start, prim_end)
+            if not action_label:
+                empty_action += int(is_recovery)
+            elif is_recovery:
+                label_counter[action_label] += 1
+            text_like = self._looks_like_recovery_text(action_label)
+            if is_recovery:
+                recovery_text_like += int(text_like)
+            else:
+                non_recovery_text_like += int(text_like)
+            embedding = self.text_embeddings_dict.get(action_label)
+            missing_or_empty = embedding is None
+            if (not missing_or_empty and empty_embedding_ref is not None
+                    and embedding.shape == empty_embedding_ref.shape):
+                missing_or_empty = bool(torch.equal(embedding, empty_embedding_ref))
+            empty_embedding += int(is_recovery and missing_or_empty)
+
+        recovery_sampled = max(recovery_primitive_windows, 1)
+        return {
+            'total_sequences': float(total),
+            'recovery_sequences': float(len(recovery_records)),
+            'recovery_sequence_fraction': (
+                float(len(recovery_records)) / max(float(total), 1.0)),
+            'recovery_hours': recovery_hours,
+            'recovery_hour_fraction': recovery_hours / max(total_hours, 1e-12),
+            'recovery_source_match_rate': (
+                float(sum(source_match)) / max(float(len(source_match)), 1.0)),
+            'non_recovery_source_match_count': float(len(false_source_matches)),
+            'recovery_missing_frame_ann_rate': (
+                float(len(missing_frame_ann))
+                / max(float(len(recovery_records)), 1.0)),
+            'audit_primitive_windows': float(primitive_windows),
+            'recovery_primitive_fraction': (
+                float(recovery_primitive_windows)
+                / max(float(primitive_windows), 1.0)),
+            'recovery_action_label_empty_rate': (
+                float(empty_action) / recovery_sampled),
+            'recovery_text_embedding_empty_rate': (
+                float(empty_embedding) / recovery_sampled),
+            'recovery_text_like_rate': (
+                float(recovery_text_like) / recovery_sampled),
+            'non_recovery_text_like_rate': (
+                float(non_recovery_text_like)
+                / max(float(primitive_windows - recovery_primitive_windows), 1.0)),
+            'recovery_top_action_labels': label_counter.most_common(20),
+            'recovery_top_sources': source_counter.most_common(20),
+        }
+
+    def _log_audit_stats(self) -> None:
+        stats = getattr(self, 'audit_stats', None)
+        if not stats:
+            return
+        logger.info(
+            " Data audit [{}]: sequences={} recovery={} ({:.3%}), "
+            "recovery_hours={:.3f}, source_match={:.3%}, "
+            "missing_frame_ann={:.3%}, sampled_primitives={} "
+            "recovery_primitives={:.3%}, empty_action={:.3%}, "
+            "empty_text_embedding={:.3%}, non_recovery_text_like={:.3%}",
+            self.split,
+            int(stats['total_sequences']),
+            int(stats['recovery_sequences']),
+            stats['recovery_sequence_fraction'],
+            stats['recovery_hours'],
+            stats['recovery_source_match_rate'],
+            stats['recovery_missing_frame_ann_rate'],
+            int(stats['audit_primitive_windows']),
+            stats['recovery_primitive_fraction'],
+            stats['recovery_action_label_empty_rate'],
+            stats['recovery_text_embedding_empty_rate'],
+            stats['non_recovery_text_like_rate'],
+        )
+        logger.info(
+            " Data audit [{}]: top recovery labels={}",
+            self.split,
+            stats.get('recovery_top_action_labels', []),
+        )
+        logger.info(
+            " Data audit [{}]: top recovery sources={}",
+            self.split,
+            stats.get('recovery_top_sources', []),
+        )
 
     def _strip_scene_if_needed(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         if getattr(self, 'load_scene', True) or 'scene' not in sample:
@@ -1169,6 +1366,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _goal_stats_meta(self) -> Dict[str, Any]:
         uses_end_effectors = self.goal_encoding.uses_end_effectors
+        no_log = not self.goal_include_log_d_hor
         meta = {
             'goal_offset_range': list(self.goal_offset_range),
             'goal_per_primitive': bool(self.goal_per_primitive),
@@ -1185,14 +1383,21 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'dataset_path': str(self.datadir),
             'goal_type': self.goal_type.value,
             'goal_dim': (
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM
+                if uses_end_effectors and no_log else
                 SPLIT_END_EFFECTOR_GOAL_DIM
-                if uses_end_effectors else SPLIT_GOAL_DIM
+                if uses_end_effectors else
+                SPLIT_GOAL_NO_LOG_DIM
+                if no_log else SPLIT_GOAL_DIM
             ),
             'goal_schema': (
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA
+                if uses_end_effectors and no_log else
                 SPLIT_END_EFFECTOR_GOAL_SCHEMA
-                if uses_end_effectors else SPLIT_GOAL_SCHEMA
+                if uses_end_effectors else
+                SPLIT_GOAL_NO_LOG_SCHEMA
+                if no_log else SPLIT_GOAL_SCHEMA
             ),
-            'goal_include_log_d_hor': bool(self.goal_include_log_d_hor),
             'feature_version': motion_dtype.FeatureVersion,
             'dof_dim': int(self.dof_dim),
         }
@@ -1222,7 +1427,12 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         for primitive in batch_data:
             if self.goal_encoding.uses_end_effectors:
-                goal = build_ego_split_end_effector_goal(
+                goal_builder = (
+                    build_ego_split_end_effector_goal
+                    if self.goal_include_log_d_hor
+                    else build_ego_split_end_effector_goal_no_log
+                )
+                goal = goal_builder(
                     world_goal_pos=primitive['world_goal_pos'],
                     world_goal_rot=primitive['world_goal_rot'],
                     world_goal_dof=primitive['world_goal_dof'],
@@ -1233,10 +1443,14 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     reference_rot=primitive['gt_ref_rot'],
                     time_to_arrival_seconds=primitive['time_to_arrival'],
                     fps=float(self.fps),
-                    goal_include_log_d_hor=self.goal_include_log_d_hor,
                 )
             else:
-                goal = build_ego_split_goal(
+                goal_builder = (
+                    build_ego_split_goal
+                    if self.goal_include_log_d_hor
+                    else build_ego_split_goal_no_log
+                )
+                goal = goal_builder(
                     world_goal_pos=primitive['world_goal_pos'],
                     world_goal_rot=primitive['world_goal_rot'],
                     world_goal_dof=primitive['world_goal_dof'],
@@ -1245,19 +1459,36 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     reference_rot=primitive['gt_ref_rot'],
                     time_to_arrival_seconds=primitive['time_to_arrival'],
                     fps=float(self.fps),
-                    goal_include_log_d_hor=self.goal_include_log_d_hor,
                 )
-            hor = goal[:, SPLIT_HORIZONTAL_SLICE]
-            vert = goal[:, SPLIT_VERTICAL_SLICE]
-            orientation = goal[:, SPLIT_ORIENTATION_SLICE]
-            pose = goal[:, SPLIT_JOINT_SLICE]
-            velocity = goal[:, SPLIT_VELOCITY_SLICE]
+            if self.goal_include_log_d_hor:
+                hor_slice = SPLIT_HORIZONTAL_SLICE
+                vert_slice = SPLIT_VERTICAL_SLICE
+                orientation_slice = SPLIT_ORIENTATION_SLICE
+                joint_slice = SPLIT_JOINT_SLICE
+                velocity_slice = SPLIT_VELOCITY_SLICE
+            else:
+                hor_slice = slice(0, 8)
+                vert_slice = slice(8, 14)
+                orientation_slice = slice(14, 20)
+                joint_slice = slice(20, 49)
+                velocity_slice = slice(49, 53)
+            hor = goal[:, hor_slice]
+            vert = goal[:, vert_slice]
+            orientation = goal[:, orientation_slice]
+            pose = goal[:, joint_slice]
+            velocity = goal[:, velocity_slice]
             if self.goal_encoding.uses_end_effectors:
-                end_effector_terms.append(goal[:, SPLIT_END_EFFECTOR_SLICE])
+                end_effector_terms.append(
+                    goal[:, SPLIT_END_EFFECTOR_SLICE]
+                    if self.goal_include_log_d_hor
+                    else goal[:, slice(54, 66)]
+                )
 
             pos_terms.append(torch.cat((hor[:, 0:4], vert[:, 0:2]), dim=-1))
             d_hor_terms.append(hor[:, 3:4])
-            urgency_terms.append(torch.cat((hor[:, 5:9], vert[:, 5:6]), dim=-1))
+            urgency_terms.append(torch.cat(
+                (hor[:, 5:9] if self.goal_include_log_d_hor else hor[:, 4:8],
+                 vert[:, 5:6]), dim=-1))
             orientation_terms.append(torch.cat((vert[:, 2:5], orientation), dim=-1))
             pose_terms.append(pose)
             velocity_terms.append(velocity)
@@ -1284,8 +1515,6 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             log_terms = torch.log1p(
                 d_hor / s_d.to(device=d_hor.device, dtype=d_hor.dtype)
             )
-        else:
-            log_terms = torch.zeros_like(d_hor)
         urgency = torch.cat(urgency_terms, dim=0)
         orientation = torch.cat(orientation_terms, dim=0)
         pose = torch.cat(pose_terms, dim=0)
@@ -1312,8 +1541,6 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if self.goal_include_log_d_hor:
             s_l = 1.0 / torch.clamp(
                 log_terms.reshape(-1).std(unbiased=False), min=1e-6)
-        else:
-            s_l = log_terms.new_tensor(1.0)
         s_v = 1.0 / torch.clamp(
             torch.cat((urgency.reshape(-1), velocity.reshape(-1)), dim=0).std(unbiased=False),
             min=1e-6,
@@ -1331,7 +1558,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         q_std = self.std[q_start:q_start + 29].detach().cpu().clone()
 
         pos_scaled = pos * s_p
-        log_scaled = log_terms * s_l
+        log_scaled = (
+            log_terms * s_l if self.goal_include_log_d_hor
+            else torch.zeros_like(d_hor)
+        )
         urgency_scaled = urgency * s_v
         velocity_scaled = velocity * s_v
         orientation_scaled = orientation * s_o
@@ -1353,13 +1583,24 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         )
         s_o_list = [round(float(value), 4) for value in s_o.tolist()]
         schema_name = (
+            "split66_end_effector_no_log"
+            if self.goal_encoding.uses_end_effectors
+            and not self.goal_include_log_d_hor else
             "split67_end_effector"
-            if self.goal_encoding.uses_end_effectors else "split55"
+            if self.goal_encoding.uses_end_effectors else
+            "split54_no_log"
+            if not self.goal_include_log_d_hor else "split55"
         )
         logger.info(
-            "Goal stats ({}) scales: s_p={:.4f} s_l={:.4f} "
+            "Goal stats ({}) scales: s_p={:.4f}{} "
             "s_v={:.4f} s_d={:.4f} s_o={}{}",
-            schema_name, float(s_p), float(s_l), float(s_v), float(s_d),
+            schema_name,
+            float(s_p),
+            (
+                f" s_l={float(s_l):.4f}"
+                if self.goal_include_log_d_hor else ""
+            ),
+            float(s_v), float(s_d),
             s_o_list,
             (
                 " s_ee="
@@ -1369,9 +1610,13 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         )
         logger.info(
             "Goal stats ({}) scaled |p50/p99|: pos={:.3f}/{:.3f} "
-            "log={:.3f}/{:.3f} urg={:.3f}/{:.3f} vel={:.3f}/{:.3f} "
+            "{}urg={:.3f}/{:.3f} vel={:.3f}/{:.3f} "
             "ori={:.3f}/{:.3f} pose={:.3f}/{:.3f} ee={:.3f}/{:.3f}",
-            schema_name, pos_p50, pos_p99, log_p50, log_p99,
+            schema_name, pos_p50, pos_p99,
+            (
+                f"log={log_p50:.3f}/{log_p99:.3f} "
+                if self.goal_include_log_d_hor else ""
+            ),
             urgency_p50, urgency_p99, velocity_p50, velocity_p99,
             orientation_p50, orientation_p99, pose_p50, pose_p99,
             ee_p50, ee_p99,
@@ -1393,7 +1638,6 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         )
         stats = {
             's_p': torch.as_tensor(float(s_p)),
-            's_l': torch.as_tensor(float(s_l)),
             's_v': torch.as_tensor(float(s_v)),
             's_d': torch.as_tensor(float(s_d)),
             's_o': s_o.detach().cpu(),
@@ -1407,6 +1651,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             },
             'meta': self._goal_stats_meta(),
         }
+        if self.goal_include_log_d_hor:
+            stats['s_l'] = torch.as_tensor(float(s_l))
+            stats['meta']['goal_include_log_d_hor'] = True
         if s_ee is not None:
             stats['s_ee'] = s_ee.detach().cpu()
         return stats
@@ -1671,8 +1918,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         future_start = prim_start + self.history_len
         future_end = prim_end - 1
         prim_labels = []
+        fps = float(getattr(self, 'fps', 50.0))
         for ann in frame_ann:
-            ann_frames = [float(ann[0]) * self.fps, float(ann[1]) * self.fps]
+            ann_frames = [float(ann[0]) * fps, float(ann[1]) * fps]
             if self.have_overlap(ann_frames, [future_start, future_end]):
                 prim_labels.extend(self._ann_text_labels(ann))
 

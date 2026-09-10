@@ -12,16 +12,23 @@ from TextOpRobotMDAR.robotmdar.dtype.rotation import (
     xyzw_to_wxyz,
 )
 from TextOpRobotMDAR.robotmdar.skeleton.end_effector import EndEffectorAnchor
+from TextOpRobotMDAR.robotmdar.train.loss import GeometryLoss
 from TextOpRobotMDAR.robotmdar.train.manager import DARManager
 from TextOpRobotMDAR.robotmdar.train.train_dar import (
+    _conditions,
     _make_root_xy_figure,
+    _next_rollout_poses,
     _raw_goal_root_target,
     _validate_goal_root_position_contract,
 )
 from TextOpRobotMDAR.robotmdar.utils.goal import (
     SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+    SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
     SPLIT_END_EFFECTOR_SLICE,
     SPLIT_GOAL_DIM,
+    SPLIT_NO_LOG_VERTICAL_HEIGHT_SLICE,
+    SPLIT_HORIZONTAL_SLICE,
     SPLIT_VERTICAL_GRAVITY_SLICE,
 )
 
@@ -55,6 +62,29 @@ def _set_both_feature_versions(version: int):
     runtime_motion_dtype.set_feature_version(version)
     package_motion_dtype.set_feature_version(version)
     return old_runtime, old_package
+
+
+def test_end_effector_anchor_cache_does_not_shadow_resolver(monkeypatch):
+    geometry = object.__new__(GeometryLoss)
+    geometry.dataset = SimpleNamespace(
+        skeleton=SimpleNamespace(
+            fk=SimpleNamespace(mjcf_file="robot.xml")))
+    anchors = (object(),)
+    calls = []
+
+    def resolve(skeleton):
+        calls.append(skeleton)
+        return anchors
+
+    monkeypatch.setattr(
+        "TextOpRobotMDAR.robotmdar.train.loss.resolve_end_effector_anchors",
+        resolve,
+    )
+
+    assert geometry._end_effector_anchors() is anchors
+    assert geometry._end_effector_anchors() is anchors
+    assert len(calls) == 1
+    assert geometry._end_effector_anchors_cache is anchors
 
 
 def _empty_geometry_loss_v6(*args, **kwargs):
@@ -454,6 +484,230 @@ def test_v6_split_goal_root_position_loss_reports_hor_and_vert_separately():
             torch.tensor(0.5 * 0.03**2),
             atol=1e-7,
             rtol=0,
+        )
+
+        split_components = manager.calc_goal_root_position_loss_components(
+            future,
+            goal,
+            history_motion=history,
+            goal_position_hor_condition_keep_mask=torch.tensor([False]),
+            goal_position_vert_condition_keep_mask=torch.tensor([True]),
+            goal_time_frame=goal_time_frame,
+        )
+        torch.testing.assert_close(
+            split_components['goal_root_position_hor'],
+            torch.tensor(0.0),
+            atol=1e-7,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            split_components['goal_root_position_vert'],
+            torch.tensor(0.5 * 0.03**2),
+            atol=1e-7,
+            rtol=0,
+        )
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_self_rollout_goal_loss_uses_pred_current_state_reference():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        manager = _manager()
+        manager.dataset.dof_dim = 29
+        manager.dataset.fps = 50
+        manager.loss_weight = {
+            'goal': {
+                'root_position_hor': 1.0,
+                'root_position_vert': 1.0,
+            }
+        }
+        manager.calc_geometry_loss_v6 = lambda *args, **kwargs: ({}, {}, {}, None)
+
+        cfg = OmegaConf.create({
+            'device': 'cpu',
+            'data': {
+                'goal_type': 'joint_state',
+                'goal_encoding': 'split_end_effector',
+                'occupancy_unit': 0.1,
+            },
+            'denoiser': {
+                'grid_size': 1,
+            },
+        })
+        goal_stats = {
+            's_p': torch.tensor(1.0),
+            's_v': torch.tensor(1.0),
+            's_d': torch.tensor(1.0),
+            's_o': torch.ones(9),
+            'q_mean': torch.zeros(29),
+            'q_std': torch.ones(29),
+            's_ee': torch.ones(12),
+            'meta': {
+                'fps': 50.0,
+                    'goal_dim': SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+                    'goal_schema': SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
+            },
+        }
+
+        rot6d_identity = matrix_to_rot6d(torch.eye(3)).reshape(6)
+        history = torch.zeros((1, 2, 44), dtype=torch.float32)
+        future = torch.zeros((1, 4, 44), dtype=torch.float32)
+        for motion in (history, future):
+            motion[..., 0] = 0.77
+            motion[..., 1:4] = torch.tensor([0.0, 0.0, -1.0])
+            motion[..., 7:13] = rot6d_identity
+            motion[..., 42:44] = 1.0
+        future[0, 0:2, 4] = 0.25
+
+        pred_ref_pos = torch.tensor([[10.0, -3.0, 0.77]], dtype=torch.float32)
+        gt_ref_pos = torch.tensor([[0.0, -3.0, 0.77]], dtype=torch.float32)
+        reference_rot = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
+        world_goal_pos = pred_ref_pos + torch.tensor(
+            [[0.5, 0.0, 0.0]], dtype=torch.float32)
+        primitive = {
+            'world_goal_pos': world_goal_pos,
+            'world_goal_yaw': torch.zeros(1),
+            'world_goal_rot': reference_rot,
+            'world_goal_dof': torch.zeros((1, 29), dtype=torch.float32),
+            'world_goal_vel': torch.zeros((1, 3), dtype=torch.float32),
+            'world_goal_end_effectors': world_goal_pos[:, None].expand(
+                -1, 4, -1).clone(),
+            'time_to_arrival': torch.tensor([2.0 / 50.0], dtype=torch.float32),
+        }
+
+        conditions = _conditions(
+            primitive,
+            pred_ref_pos,
+            reference_rot,
+            history,
+            cfg,
+            fps=50.0,
+            goal_stats=goal_stats,
+            use_scene=False,
+        )
+        goal_time_frame = conditions['time_to_arrival_frame']
+
+        torch.testing.assert_close(
+            conditions['ego_goal_raw'][:, SPLIT_HORIZONTAL_SLICE][:, :3],
+            torch.tensor([[0.5, 0.0, 0.0]]),
+        )
+        torch.testing.assert_close(
+            conditions['ego_goal_raw'][
+                :, SPLIT_NO_LOG_VERTICAL_HEIGHT_SLICE][:, :1],
+            torch.tensor([[0.77]]),
+        )
+
+        loss_dict, _ = manager.calc_loss(
+            torch.zeros_like(future),
+            future,
+            None,
+            None,
+            None,
+            None,
+            history_motion=history,
+            ego_goal=conditions['ego_goal_raw'],
+            goal_type='joint_state',
+            goal_time_frame=goal_time_frame,
+        )
+
+        torch.testing.assert_close(
+            loss_dict['goal_root_position_hor'],
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            loss_dict['goal_root_position_vert'],
+            torch.tensor(0.0),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            loss_dict['total'], torch.tensor(0.0), atol=1e-6, rtol=0)
+
+        gt_conditions = _conditions(
+            primitive,
+            gt_ref_pos,
+            reference_rot,
+            history,
+            cfg,
+            fps=50.0,
+            goal_stats=goal_stats,
+            use_scene=False,
+        )
+        wrong_reference_loss = manager.calc_goal_root_position_loss(
+            future,
+            gt_conditions['ego_goal_raw'],
+            history_motion=history,
+            goal_time_frame=goal_time_frame,
+        )
+        assert wrong_reference_loss > 1.0
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_rollout_pose_chain_integrates_from_segment_start_anchor():
+    old_runtime, old_package = _set_both_feature_versions(6)
+    try:
+        class CumulativeHorizontalDataset:
+            def __init__(self):
+                self.anchor_positions = []
+
+            def reconstruct_motion(self, motion, abs_pose=None, ret_fk=False):
+                assert abs_pose is not None
+                assert ret_fk is False
+                self.anchor_positions.append(
+                    abs_pose['root_trans_offset'].detach().clone())
+                delta = motion[..., 4:7]
+                trans = (
+                    abs_pose['root_trans_offset'].unsqueeze(1)
+                    + delta.cumsum(dim=1)
+                )
+                root_rot = abs_pose['root_rot'].unsqueeze(1).expand(
+                    -1, motion.shape[1], -1).clone()
+                return {'root_trans_offset': trans, 'root_rot': root_rot}
+
+        dataset = CumulativeHorizontalDataset()
+        history_len = 2
+        future_len = 3
+        motion = torch.zeros((1, history_len + future_len, 44),
+                             dtype=torch.float32)
+        motion[..., 4] = 1.0
+        start_pos = torch.tensor([[100.0, 200.0, 0.0]], dtype=torch.float32)
+        start_rot = torch.tensor([[0.0, 0.0, 0.0, 1.0]],
+                                 dtype=torch.float32)
+
+        history_start_pos, history_start_rot, ref_pos, ref_rot = (
+            _next_rollout_poses(
+                dataset, motion, start_pos, start_rot, history_len))
+        torch.testing.assert_close(
+            history_start_pos, torch.tensor([[103.0, 200.0, 0.0]]))
+        torch.testing.assert_close(
+            ref_pos, torch.tensor([[105.0, 200.0, 0.0]]))
+
+        history_start_pos, history_start_rot, ref_pos, ref_rot = (
+            _next_rollout_poses(
+                dataset, motion, history_start_pos, history_start_rot,
+                history_len))
+        torch.testing.assert_close(
+            history_start_pos, torch.tensor([[106.0, 200.0, 0.0]]))
+        torch.testing.assert_close(
+            ref_pos, torch.tensor([[108.0, 200.0, 0.0]]))
+
+        _, _, ref_pos, _ = _next_rollout_poses(
+            dataset, motion, history_start_pos, history_start_rot, history_len)
+        torch.testing.assert_close(
+            ref_pos, torch.tensor([[111.0, 200.0, 0.0]]))
+        torch.testing.assert_close(
+            torch.cat(dataset.anchor_positions, dim=0),
+            torch.tensor([
+                [100.0, 200.0, 0.0],
+                [103.0, 200.0, 0.0],
+                [106.0, 200.0, 0.0],
+            ]),
         )
     finally:
         runtime_motion_dtype.set_feature_version(old_runtime)

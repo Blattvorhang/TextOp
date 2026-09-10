@@ -22,10 +22,17 @@ JOINT_STATE_GOAL_DIM = 40
 ROT_MAT_JOINT_STATE_GOAL_DIM = 47
 SPLIT_GOAL_DIM = 55
 SPLIT_END_EFFECTOR_GOAL_DIM = 67
+SPLIT_GOAL_NO_LOG_DIM = 54
+SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM = 66
 SPLIT_END_EFFECTOR_DIM = 12
 EXTENDED_BODY_GOAL_DIM = 21
 SPLIT_GOAL_SCHEMA = "rotmat_v7_hor_vert"
+SPLIT_GOAL_NO_LOG_SCHEMA = "rotmat_v7_hor_vert_no_log"
+LEGACY_SPLIT_GOAL_SCHEMA = "rotmat_v7"
 SPLIT_END_EFFECTOR_GOAL_SCHEMA = "rotmat_v10_hor_vert_joint_ee"
+SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA = (
+    "rotmat_v10_hor_vert_joint_ee_no_log"
+)
 
 V6_RAW_POSITION_SLICE = slice(0, 4)
 V6_RAW_ORIENTATION_SLICE = slice(4, 13)
@@ -59,6 +66,22 @@ SPLIT_END_EFFECTOR_SUBSLICES = {
     "right_hand": SPLIT_END_EFFECTOR_RIGHT_HAND_SLICE,
     "left_foot": SPLIT_END_EFFECTOR_LEFT_FOOT_SLICE,
     "right_foot": SPLIT_END_EFFECTOR_RIGHT_FOOT_SLICE,
+}
+
+SPLIT_NO_LOG_HORIZONTAL_SLICE = slice(0, 8)
+SPLIT_NO_LOG_HORIZONTAL_URGENCY_SLICE = slice(4, 8)
+SPLIT_NO_LOG_VERTICAL_SLICE = slice(8, 14)
+SPLIT_NO_LOG_VERTICAL_HEIGHT_SLICE = slice(8, 10)
+SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE = slice(10, 13)
+SPLIT_NO_LOG_VERTICAL_URGENCY_SLICE = slice(13, 14)
+SPLIT_NO_LOG_ORIENTATION_SLICE = slice(14, 20)
+SPLIT_NO_LOG_JOINT_SLICE = slice(20, 49)
+SPLIT_NO_LOG_VELOCITY_SLICE = slice(49, 53)
+SPLIT_NO_LOG_TIME_SLICE = slice(53, 54)
+SPLIT_NO_LOG_END_EFFECTOR_SLICE = slice(54, 66)
+SPLIT_NO_LOG_END_EFFECTOR_SUBSLICES = {
+    name: slice(value.start - 1, value.stop - 1)
+    for name, value in SPLIT_END_EFFECTOR_SUBSLICES.items()
 }
 
 # Backward-compatible name for callers that still treat the first split goal
@@ -186,6 +209,7 @@ def validate_goal_config(
     goal_timestep_mode: str | None = None,
     goal_stats: Optional[dict] = None,
     goal_include_log_d_hor: bool | None = None,
+    goal_schema: str | None = None,
 ) -> GoalType:
     """Validate and return the configured goal type."""
     parsed = GoalType.parse(goal_type)
@@ -216,25 +240,35 @@ def validate_goal_config(
     if parsed_encoding is None:
         if int(goal_dim) == JOINT_STATE_GOAL_DIM:
             parsed_encoding = GoalEncoding.LEGACY40
-        elif int(goal_dim) == SPLIT_GOAL_DIM:
+        elif int(goal_dim) in (SPLIT_GOAL_DIM, SPLIT_GOAL_NO_LOG_DIM):
             raise ValueError(
-                f"goal_encoding is required when goal_dim={SPLIT_GOAL_DIM}")
-        elif int(goal_dim) == SPLIT_END_EFFECTOR_GOAL_DIM:
+                "goal_encoding is required for split joint_state goals")
+        elif int(goal_dim) in (
+                SPLIT_END_EFFECTOR_GOAL_DIM,
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM):
             raise ValueError(
-                "goal_encoding is required when goal_dim="
-                f"{SPLIT_END_EFFECTOR_GOAL_DIM}")
+                "goal_encoding is required for split_end_effector goals")
         else:
             raise ValueError(
                 f"goal_type={parsed.value!r} requires goal_dim="
-                f"{JOINT_STATE_GOAL_DIM}, {SPLIT_GOAL_DIM}, or "
-                f"{SPLIT_END_EFFECTOR_GOAL_DIM}, got {goal_dim}"
+                f"{JOINT_STATE_GOAL_DIM}, {SPLIT_GOAL_DIM}, "
+                f"{SPLIT_GOAL_NO_LOG_DIM}, "
+                f"{SPLIT_END_EFFECTOR_GOAL_DIM}, or "
+                f"{SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM}, got {goal_dim}"
             )
 
-    expected_dim = parsed_encoding.dimension
-    if int(goal_dim) != expected_dim:
+    expected_dims = (
+        (SPLIT_GOAL_DIM, SPLIT_GOAL_NO_LOG_DIM)
+        if parsed_encoding in (GoalEncoding.SINGLE, GoalEncoding.SPLIT)
+        else (SPLIT_END_EFFECTOR_GOAL_DIM,
+              SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM)
+        if parsed_encoding is GoalEncoding.SPLIT_END_EFFECTOR
+        else (JOINT_STATE_GOAL_DIM,)
+    )
+    if int(goal_dim) not in expected_dims:
         raise ValueError(
             f"goal_encoding={parsed_encoding.value!r} requires goal_dim="
-            f"{expected_dim}, got {goal_dim}"
+            f"{expected_dims}, got {goal_dim}"
         )
 
     parsed_offsets = _parse_goal_offset_range(goal_offset_range)
@@ -254,6 +288,7 @@ def validate_goal_config(
             goal_offset_range=parsed_offsets,
             goal_timestep_mode=goal_timestep_mode,
             goal_include_log_d_hor=goal_include_log_d_hor,
+            goal_schema=goal_schema,
         )
 
     return parsed
@@ -847,6 +882,122 @@ def build_ego_split_goal(
         (f_hor, f_vert, rel_rot6d, dof, velocity, raw[..., 46:47]), dim=-1)
 
 
+def build_ego_split_goal_no_log(
+    world_goal_pos: torch.Tensor,
+    world_goal_rot: torch.Tensor,
+    world_goal_dof: torch.Tensor,
+    world_root_velocity: torch.Tensor,
+    reference_pos: torch.Tensor,
+    reference_rot: torch.Tensor,
+    time_to_arrival_seconds: torch.Tensor,
+    fps: float,
+    goal_clamp: Optional[GoalClamp] = None,
+    distance_scale: Optional[float | torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the current 54-D split goal without ``log_d_hor``."""
+    goal = build_ego_split_goal(
+        world_goal_pos=world_goal_pos,
+        world_goal_rot=world_goal_rot,
+        world_goal_dof=world_goal_dof,
+        world_root_velocity=world_root_velocity,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+        time_to_arrival_seconds=time_to_arrival_seconds,
+        fps=fps,
+        goal_clamp=goal_clamp,
+        distance_scale=distance_scale,
+        goal_include_log_d_hor=False,
+    )
+    return torch.cat((goal[..., :4], goal[..., 5:]), dim=-1)
+
+
+def build_ego_legacy_split_goal(
+    world_goal_pos: torch.Tensor,
+    world_goal_rot: torch.Tensor,
+    world_goal_dof: torch.Tensor,
+    world_root_velocity: torch.Tensor,
+    reference_pos: torch.Tensor,
+    reference_rot: torch.Tensor,
+    time_to_arrival_seconds: torch.Tensor,
+    fps: float,
+    goal_clamp: Optional[GoalClamp] = None,
+    distance_scale: Optional[float | torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the pre-horizontal/vertical-split 55-D goal layout.
+
+    This is the layout used by the early heading-free DAR checkpoints:
+    ``trans(12) | rot(9) | dof(29) | velocity(4) | time(1)``.
+    """
+    raw = build_ego_joint_state_goal_v6(
+        world_goal_pos=world_goal_pos,
+        world_goal_rot=world_goal_rot,
+        world_goal_dof=world_goal_dof,
+        world_root_velocity=world_root_velocity,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+        time_to_arrival_seconds=time_to_arrival_seconds,
+        fps=fps,
+        goal_clamp=goal_clamp,
+    )
+    delta_hor = raw[..., 1:4]
+    d_hor = torch.linalg.vector_norm(delta_hor, dim=-1, keepdim=True)
+    distance_scale_tensor = torch.as_tensor(
+        1.0 if distance_scale is None else distance_scale,
+        device=raw.device,
+        dtype=raw.dtype,
+    )
+    log_d_hor = torch.log1p(
+        d_hor / distance_scale_tensor.clamp_min(1e-6))
+    delta_h = raw[..., 0:1] - reference_pos.to(
+        device=raw.device, dtype=raw.dtype)[..., 2:3]
+    time_to_arrival_seconds = raw[..., 46]
+    T_eff = _goal_time_budget(time_to_arrival_seconds, fps, goal_clamp)
+    urgency = torch.where(
+        time_to_arrival_seconds[..., None] > 0.0,
+        torch.cat((delta_hor, d_hor, delta_h), dim=-1)
+        / T_eff[..., None],
+        torch.zeros_like(torch.cat((delta_hor, d_hor, delta_h), dim=-1)),
+    )
+    f_trans = torch.cat(
+        (raw[..., 0:1], delta_hor, d_hor, torch.zeros_like(log_d_hor),
+         delta_h, urgency),
+        dim=-1,
+    )
+    return torch.cat(
+        (f_trans, raw[..., 4:13], raw[..., 13:42],
+         raw[..., 42:46], raw[..., 46:47]),
+        dim=-1,
+    )
+
+
+def build_ego_legacy_split_goal_no_log(
+    world_goal_pos: torch.Tensor,
+    world_goal_rot: torch.Tensor,
+    world_goal_dof: torch.Tensor,
+    world_root_velocity: torch.Tensor,
+    reference_pos: torch.Tensor,
+    reference_rot: torch.Tensor,
+    time_to_arrival_seconds: torch.Tensor,
+    fps: float,
+    goal_clamp: Optional[GoalClamp] = None,
+    distance_scale: Optional[float | torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the historical 54-D layout with its log slot removed."""
+    goal = build_ego_legacy_split_goal(
+        world_goal_pos=world_goal_pos,
+        world_goal_rot=world_goal_rot,
+        world_goal_dof=world_goal_dof,
+        world_root_velocity=world_root_velocity,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+        time_to_arrival_seconds=time_to_arrival_seconds,
+        fps=fps,
+        goal_clamp=goal_clamp,
+        distance_scale=distance_scale,
+    )
+    return torch.cat((goal[..., :7], goal[..., 8:]), dim=-1)
+
+
 def build_ego_end_effector_goal(
     world_goal_end_effectors: torch.Tensor,
     reference_pos: torch.Tensor,
@@ -945,6 +1096,40 @@ def build_ego_split_end_effector_goal(
     return torch.cat((split_goal, ee_goal), dim=-1)
 
 
+def build_ego_split_end_effector_goal_no_log(
+    world_goal_pos: torch.Tensor,
+    world_goal_rot: torch.Tensor,
+    world_goal_dof: torch.Tensor,
+    world_root_velocity: torch.Tensor,
+    world_goal_end_effectors: torch.Tensor,
+    reference_pos: torch.Tensor,
+    reference_rot: torch.Tensor,
+    time_to_arrival_seconds: torch.Tensor,
+    fps: float,
+    goal_clamp: Optional[GoalClamp] = None,
+    distance_scale: Optional[float | torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the current 66-D split_end_effector goal without log distance."""
+    split_goal = build_ego_split_goal_no_log(
+        world_goal_pos=world_goal_pos,
+        world_goal_rot=world_goal_rot,
+        world_goal_dof=world_goal_dof,
+        world_root_velocity=world_root_velocity,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+        time_to_arrival_seconds=time_to_arrival_seconds,
+        fps=fps,
+        goal_clamp=goal_clamp,
+        distance_scale=distance_scale,
+    )
+    ee_goal = build_ego_end_effector_goal(
+        world_goal_end_effectors=world_goal_end_effectors,
+        reference_pos=reference_pos,
+        reference_rot=reference_rot,
+    )
+    return torch.cat((split_goal, ee_goal), dim=-1)
+
+
 def scale_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
     """Scale a 55-D split or 67-D split_end_effector goal."""
     if goal.shape[-1] not in (SPLIT_GOAL_DIM, SPLIT_END_EFFECTOR_GOAL_DIM):
@@ -1011,6 +1196,82 @@ def scale_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
     return scaled
 
 
+def scale_legacy_split_goal(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
+    """Scale the pre-horizontal/vertical-split 55-D goal layout."""
+    if goal.shape[-1] != SPLIT_GOAL_DIM:
+        raise ValueError(
+            f"scale_legacy_split_goal expects {SPLIT_GOAL_DIM}-D goals, got "
+            f"{tuple(goal.shape)}"
+        )
+    if goal_stats is None:
+        raise ValueError("goal_stats is required to scale split goals")
+
+    scaled = goal.clone()
+    s_p = torch.as_tensor(
+        goal_stats["s_p"], device=goal.device, dtype=goal.dtype)
+    s_l = torch.as_tensor(
+        goal_stats["s_l"], device=goal.device, dtype=goal.dtype)
+    s_v = torch.as_tensor(
+        goal_stats["s_v"], device=goal.device, dtype=goal.dtype)
+    s_o = torch.as_tensor(
+        goal_stats["s_o"], device=goal.device, dtype=goal.dtype)
+    q_mean = torch.as_tensor(
+        goal_stats["q_mean"], device=goal.device, dtype=goal.dtype)
+    q_std = torch.as_tensor(
+        goal_stats["q_std"], device=goal.device, dtype=goal.dtype)
+    if s_o.numel() != 9:
+        raise ValueError(
+            f"goal_stats['s_o'] must contain 9 orientation scales, got "
+            f"{s_o.numel()}"
+        )
+    scaled[..., 0:5] = scaled[..., 0:5] * s_p
+    scaled[..., 5:6] = scaled[..., 5:6] * s_l
+    scaled[..., 6:7] = scaled[..., 6:7] * s_p
+    scaled[..., 7:12] = scaled[..., 7:12] * s_v
+    scaled[..., 12:21] = scaled[..., 12:21] * s_o
+    scaled[..., 21:50] = (
+        scaled[..., 21:50] - q_mean) / q_std.clamp_min(1e-6)
+    scaled[..., 50:54] = scaled[..., 50:54] * s_v
+    return scaled
+
+
+def scale_split_goal_no_log(goal: torch.Tensor, goal_stats: dict) -> torch.Tensor:
+    """Scale the current 54-D split goal without ``log_d_hor``."""
+    if goal.shape[-1] not in (
+            SPLIT_GOAL_NO_LOG_DIM, SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM):
+        raise ValueError(
+            "scale_split_goal_no_log expects 54-D or 66-D goals, got "
+            f"{tuple(goal.shape)}"
+        )
+    scaled = goal.clone()
+    s_p = torch.as_tensor(
+        goal_stats["s_p"], device=goal.device, dtype=goal.dtype)
+    s_v = torch.as_tensor(
+        goal_stats["s_v"], device=goal.device, dtype=goal.dtype)
+    s_o = torch.as_tensor(
+        goal_stats["s_o"], device=goal.device, dtype=goal.dtype)
+    q_mean = torch.as_tensor(
+        goal_stats["q_mean"], device=goal.device, dtype=goal.dtype)
+    q_std = torch.as_tensor(
+        goal_stats["q_std"], device=goal.device, dtype=goal.dtype)
+    scaled[..., 0:4] = scaled[..., 0:4] * s_p
+    scaled[..., 4:8] = scaled[..., 4:8] * s_v
+    scaled[..., 8:10] = scaled[..., 8:10] * s_p
+    scaled[..., 10:13] = scaled[..., 10:13] * s_o[:3]
+    scaled[..., 13:14] = scaled[..., 13:14] * s_v
+    scaled[..., 14:20] = scaled[..., 14:20] * s_o[3:9]
+    scaled[..., 20:49] = (
+        scaled[..., 20:49] - q_mean) / q_std.clamp_min(1e-6)
+    scaled[..., 49:53] = scaled[..., 49:53] * s_v
+    if goal.shape[-1] == SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM:
+        if "s_ee" not in goal_stats:
+            raise ValueError("no-log goal_stats missing 's_ee'")
+        s_ee = torch.as_tensor(
+            goal_stats["s_ee"], device=goal.device, dtype=goal.dtype)
+        scaled[..., 54:66] = scaled[..., 54:66] * s_ee.reshape(-1)
+    return scaled
+
+
 def validate_goal_stats(
     goal_stats: dict,
     *,
@@ -1022,6 +1283,7 @@ def validate_goal_stats(
     goal_timestep_mode: str | None = None,
     datadir: str | None = None,
     goal_include_log_d_hor: bool | None = None,
+    goal_schema: str | None = None,
 ) -> dict:
     """Validate the cached goal statistics against the active config."""
     if goal_stats is None:
@@ -1031,6 +1293,11 @@ def validate_goal_stats(
         return goal_stats
 
     meta = goal_stats.get("meta", {})
+    if goal_schema is None and meta.get("goal_schema") in (
+            SPLIT_GOAL_NO_LOG_SCHEMA,
+            SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
+    ):
+        goal_schema = meta["goal_schema"]
     mismatches = []
     parsed_offsets = _parse_goal_offset_range(goal_offset_range)
     if parsed_offsets is not None:
@@ -1070,7 +1337,11 @@ def validate_goal_stats(
             f"encodings: expected {parsed_encoding.value!r} in {encodings!r}"
         )
     expected_dim = parsed_encoding.dimension
-    expected_schema = (
+    if goal_schema == SPLIT_GOAL_NO_LOG_SCHEMA:
+        expected_dim = SPLIT_GOAL_NO_LOG_DIM
+    elif goal_schema == SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA:
+        expected_dim = SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM
+    expected_schema = goal_schema or (
         SPLIT_END_EFFECTOR_GOAL_SCHEMA
         if parsed_encoding.uses_end_effectors else SPLIT_GOAL_SCHEMA
     )
@@ -1083,14 +1354,23 @@ def validate_goal_stats(
             f"goal_schema: expected {expected_schema!r}, got "
             f"{meta.get('goal_schema')!r}"
         )
-    if goal_include_log_d_hor is not None:
+    if (goal_include_log_d_hor is not None
+            and goal_schema not in (
+                LEGACY_SPLIT_GOAL_SCHEMA,
+                SPLIT_GOAL_NO_LOG_SCHEMA,
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
+            )):
         stored_include_log = bool(meta.get("goal_include_log_d_hor", True))
         if stored_include_log != bool(goal_include_log_d_hor):
             mismatches.append(
                 "goal_include_log_d_hor: expected "
                 f"{bool(goal_include_log_d_hor)}, got {stored_include_log}"
             )
-    required_keys = ["s_p", "s_l", "s_v", "s_o", "s_d", "q_mean", "q_std"]
+    required_keys = ["s_p", "s_v", "s_o", "s_d", "q_mean", "q_std"]
+    if goal_schema not in (
+            SPLIT_GOAL_NO_LOG_SCHEMA,
+            SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA):
+        required_keys.insert(1, "s_l")
     if parsed_encoding.uses_end_effectors:
         required_keys.append("s_ee")
         stored_order = tuple(meta.get("end_effector_token_order", ()))
@@ -1191,15 +1471,53 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
             raise ValueError(
                 "fps is required for split/single joint_state goals"
             )
+        legacy_split_layout = (
+            encoding is GoalEncoding.SPLIT
+            and goal_stats.get("meta", {}).get("goal_schema")
+            == LEGACY_SPLIT_GOAL_SCHEMA
+        )
+        no_log_split_layout = goal_stats.get("meta", {}).get(
+            "goal_schema") in (
+                SPLIT_GOAL_NO_LOG_SCHEMA,
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
+            )
         stored_include_log = bool(
             goal_stats.get("meta", {}).get("goal_include_log_d_hor", True))
-        if stored_include_log != bool(goal_include_log_d_hor):
+        if (not legacy_split_layout and not no_log_split_layout
+                and stored_include_log != bool(goal_include_log_d_hor)):
             raise ValueError(
                 "goal_stats were computed with goal_include_log_d_hor="
                 f"{stored_include_log}, but the active goal builder requested "
                 f"{bool(goal_include_log_d_hor)}"
             )
-        if encoding is GoalEncoding.SPLIT_END_EFFECTOR:
+        if encoding is GoalEncoding.SPLIT_END_EFFECTOR and no_log_split_layout:
+            split_goal = build_ego_split_end_effector_goal_no_log(
+                world_goal_pos=world_goal_pos,
+                world_goal_rot=world_goal_rot,
+                world_goal_dof=world_goal_dof,
+                world_root_velocity=world_root_velocity,
+                world_goal_end_effectors=world_goal_end_effectors,
+                reference_pos=reference_pos,
+                reference_rot=reference_rot,
+                time_to_arrival_seconds=time_to_arrival_seconds,
+                fps=resolved_fps,
+                goal_clamp=goal_clamp,
+                distance_scale=goal_stats.get("s_d", 1.0),
+            )
+        elif encoding is GoalEncoding.SPLIT and no_log_split_layout:
+            split_goal = build_ego_split_goal_no_log(
+                world_goal_pos=world_goal_pos,
+                world_goal_rot=world_goal_rot,
+                world_goal_dof=world_goal_dof,
+                world_root_velocity=world_root_velocity,
+                reference_pos=reference_pos,
+                reference_rot=reference_rot,
+                time_to_arrival_seconds=time_to_arrival_seconds,
+                fps=resolved_fps,
+                goal_clamp=goal_clamp,
+                distance_scale=goal_stats.get("s_d", 1.0),
+            )
+        elif encoding is GoalEncoding.SPLIT_END_EFFECTOR:
             split_goal = build_ego_split_end_effector_goal(
                 world_goal_pos=world_goal_pos,
                 world_goal_rot=world_goal_rot,
@@ -1213,6 +1531,19 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
                 goal_clamp=goal_clamp,
                 distance_scale=goal_stats.get("s_d", 1.0),
                 goal_include_log_d_hor=goal_include_log_d_hor,
+            )
+        elif legacy_split_layout:
+            split_goal = build_ego_legacy_split_goal(
+                world_goal_pos=world_goal_pos,
+                world_goal_rot=world_goal_rot,
+                world_goal_dof=world_goal_dof,
+                world_root_velocity=world_root_velocity,
+                reference_pos=reference_pos,
+                reference_rot=reference_rot,
+                time_to_arrival_seconds=time_to_arrival_seconds,
+                fps=resolved_fps,
+                goal_clamp=goal_clamp,
+                distance_scale=goal_stats.get("s_d", 1.0),
             )
         else:
             split_goal = build_ego_split_goal(
@@ -1228,6 +1559,10 @@ def build_ego_goal(world_goal_pos: torch.Tensor,
                 distance_scale=goal_stats.get("s_d", 1.0),
                 goal_include_log_d_hor=goal_include_log_d_hor,
             )
+        if legacy_split_layout:
+            return scale_legacy_split_goal(split_goal, goal_stats)
+        if no_log_split_layout:
+            return scale_split_goal_no_log(split_goal, goal_stats)
         return scale_goal(split_goal, goal_stats)
 
     if goal_type is GoalType.ROOT:

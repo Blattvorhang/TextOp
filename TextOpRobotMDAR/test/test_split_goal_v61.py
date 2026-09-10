@@ -856,8 +856,10 @@ def test_split_goal_stats_records_log_distance_ablation(tmp_path):
 
     stats = SkeletonPrimitiveDataset._goal_stats_from_batch(dataset, batch_data)
 
-    assert stats["meta"]["goal_include_log_d_hor"] is False
-    torch.testing.assert_close(stats["s_l"], torch.tensor(1.0))
+    assert stats["meta"]["goal_schema"] == "rotmat_v7_hor_vert_no_log"
+    assert stats["meta"]["goal_dim"] == 54
+    assert "goal_include_log_d_hor" not in stats["meta"]
+    assert "s_l" not in stats
 
 
 def test_split_goal_stats_meta_validation_rejects_mismatch(tmp_path):

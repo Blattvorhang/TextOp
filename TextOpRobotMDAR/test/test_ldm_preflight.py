@@ -49,6 +49,7 @@ from TextOpRobotMDAR.robotmdar.dtype.rotation import (
 from TextOpRobotMDAR.robotmdar.utils import goal as goal_module
 from TextOpRobotMDAR.robotmdar.utils.goal import (
     SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
     SPLIT_GOAL_DIM,
     SPLIT_HORIZONTAL_SLICE,
     SPLIT_JOINT_SLICE,
@@ -430,17 +431,9 @@ def test_train_dar_config_freezes_v6_contract():
     assert motion_feature_dim_for_dof(29, feature_version=6) == 44
     assert cfg.data.goal_type == "joint_state"
     assert cfg.data.goal_encoding == "split_end_effector"
-    assert cfg.data.goal_include_log_d_hor is False
-    with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg_without_log = compose(
-            config_name="train_dar",
-            overrides=["data.goal_include_log_d_hor=false"],
-        )
-    assert cfg_without_log.data.goal_include_log_d_hor is False
-    assert cfg_without_log.data.train.goal_include_log_d_hor is False
-    assert cfg_without_log.data.val.goal_include_log_d_hor is False
+    assert "goal_include_log_d_hor" not in cfg.data
     assert cfg.data.load_scene is False
-    assert cfg.denoiser.goal_dim == SPLIT_END_EFFECTOR_GOAL_DIM
+    assert cfg.denoiser.goal_dim == SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM
     assert cfg.data.history_len == 16 and cfg.data.future_len == 64
 
     # The DAR loss weights are split by locomotion/getup so recovery samples
@@ -471,16 +464,28 @@ def test_train_dar_config_freezes_v6_contract():
     assert loss.getup.goal.end_effector == 0.0
     assert "cond_goal_root_mask_prob" not in cfg.denoiser
     assert cfg.denoiser.text_condition_enabled is True
-    assert cfg.denoiser.cond_mask_prob.text == 0.2
-    assert cfg.denoiser.cond_mask_prob.goal.position == 0.05
-    assert cfg.denoiser.cond_mask_prob.goal.orientation == 0.3
-    assert cfg.denoiser.cond_mask_prob.goal.joint == 0.6
-    assert cfg.denoiser.cond_mask_prob.goal.velocity == 0.1
-    assert cfg.denoiser.cond_mask_prob.goal.time == 0.1
-    assert cfg.denoiser.cond_mask_prob.goal.end_effector.left_hand == 0.3
-    assert cfg.denoiser.cond_mask_prob.goal.end_effector.right_hand == 0.3
-    assert cfg.denoiser.cond_mask_prob.goal.end_effector.left_foot == 0.3
-    assert cfg.denoiser.cond_mask_prob.goal.end_effector.right_foot == 0.3
+    locomotion_mask = cfg.denoiser.cond_mask_prob.locomotion
+    getup_mask = cfg.denoiser.cond_mask_prob.getup
+    assert locomotion_mask.text == 0.2
+    assert locomotion_mask.goal.position.hor == 0.05
+    assert locomotion_mask.goal.position.vert == 0.05
+    assert locomotion_mask.goal.orientation.rot6d == 0.3
+    assert locomotion_mask.goal.orientation.gravity == 0.3
+    assert locomotion_mask.goal.joint == 0.6
+    assert locomotion_mask.goal.velocity == 0.1
+    assert locomotion_mask.goal.time == 0.1
+    assert locomotion_mask.goal.end_effector.left_hand == 0.3
+    assert locomotion_mask.goal.end_effector.right_hand == 0.3
+    assert locomotion_mask.goal.end_effector.left_foot == 0.3
+    assert locomotion_mask.goal.end_effector.right_foot == 0.3
+    assert getup_mask.text == 1.0
+    assert getup_mask.goal.position.hor == 1.0
+    assert getup_mask.goal.position.vert == 0.05
+    assert getup_mask.goal.orientation.rot6d == 1.0
+    assert getup_mask.goal.orientation.gravity == 0.05
+    assert getup_mask.goal.joint == 1.0
+    assert getup_mask.goal.velocity == 1.0
+    assert getup_mask.goal.time == 0.1
     assert (cfg.data.augmentation_enabled,
             cfg.data.augmentation_start_step,
             cfg.data.augmentation_prob) == (True, 50000, 0.5)

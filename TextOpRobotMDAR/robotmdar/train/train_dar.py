@@ -16,12 +16,15 @@ from robotmdar.utils.goal import (
     GoalType,
     ROT_MAT_JOINT_STATE_GOAL_DIM,
     SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+    SPLIT_NO_LOG_END_EFFECTOR_SLICE,
     SPLIT_END_EFFECTOR_SLICE,
     SPLIT_GOAL_DIM,
+    SPLIT_GOAL_NO_LOG_DIM,
     SPLIT_HORIZONTAL_SLICE,
     build_ego_goal,
     build_ego_joint_state_goal_v6,
-    build_ego_split_end_effector_goal,
+    build_ego_split_end_effector_goal_no_log,
     validate_goal_config,
 )
 from robotmdar.utils.occupancy import (
@@ -111,7 +114,12 @@ def _raw_goal_root_target(ego_goal_raw: torch.Tensor) -> torch.Tensor:
         return ego_goal_raw[:, 1:4]
     if (motion_dtype.FeatureVersion == 6
             and ego_goal_raw.shape[-1]
-            in (SPLIT_GOAL_DIM, SPLIT_END_EFFECTOR_GOAL_DIM)):
+            in (
+                SPLIT_GOAL_DIM,
+                SPLIT_END_EFFECTOR_GOAL_DIM,
+                SPLIT_GOAL_NO_LOG_DIM,
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+            )):
         return ego_goal_raw[:, SPLIT_HORIZONTAL_SLICE][:, :3]
     return ego_goal_raw[:, :2]
 
@@ -145,6 +153,118 @@ def _loss_weight_config_value_from_mapping(loss_weight, key: str) -> float:
             if value is not None:
                 return float(value)
     return 0.0
+
+
+def _as_recovery_mask(value, batch_size: int, device) -> torch.Tensor:
+    mask = torch.as_tensor(value, device=device, dtype=torch.bool).reshape(-1)
+    if mask.numel() == 1:
+        return mask.expand(batch_size)
+    if mask.numel() != batch_size:
+        raise ValueError(
+            f"is_recovery must be scalar or [B]={batch_size}, "
+            f"got {mask.numel()} values")
+    return mask
+
+
+def _masked_mean(mask: torch.Tensor, selector: torch.Tensor) -> torch.Tensor:
+    if selector.any():
+        return mask.to(dtype=torch.float32)[selector].mean()
+    return mask.new_zeros((), dtype=torch.float32)
+
+
+def _add_condition_keep_diagnostics(extras, y, is_recovery) -> None:
+    mask_keys = {
+        'position_hor': 'goal_position_hor_condition_keep_mask',
+        'position_vert': 'goal_position_vert_condition_keep_mask',
+        'gravity': 'goal_gravity_condition_keep_mask',
+        'orientation_rot6d': 'goal_orientation_condition_keep_mask',
+        'joint': 'goal_joint_condition_keep_mask',
+        'velocity': 'goal_velocity_condition_keep_mask',
+        'time': 'goal_time_condition_keep_mask',
+    }
+    batch_size = None
+    device = None
+    for key in mask_keys.values():
+        value = y.get(key)
+        if isinstance(value, torch.Tensor):
+            batch_size = int(value.shape[0])
+            device = value.device
+            break
+    ee_mask = y.get('goal_end_effector_condition_keep_mask')
+    if batch_size is None and isinstance(ee_mask, torch.Tensor):
+        batch_size = int(ee_mask.shape[0])
+        device = ee_mask.device
+    if batch_size is None:
+        return
+    recovery = _as_recovery_mask(is_recovery, batch_size, device)
+    locomotion = ~recovery
+    extras['data/batch_recovery_fraction'] = recovery.float().mean()
+    for name, key in mask_keys.items():
+        value = y.get(key)
+        if not isinstance(value, torch.Tensor):
+            continue
+        keep = value.to(device=device, dtype=torch.bool).reshape(batch_size)
+        extras[f'condition/{name}_keep_ratio'] = keep.float().mean()
+        extras[f'condition/recovery_{name}_keep_ratio'] = (
+            _masked_mean(keep, recovery))
+        extras[f'condition/locomotion_{name}_keep_ratio'] = (
+            _masked_mean(keep, locomotion))
+    if isinstance(ee_mask, torch.Tensor):
+        keep = ee_mask.to(device=device, dtype=torch.bool)
+        if keep.ndim != 2 or keep.shape[0] != batch_size:
+            raise ValueError(
+                "goal_end_effector_condition_keep_mask must be [B, N], "
+                f"got {tuple(keep.shape)}")
+        per_sample = keep.float().mean(dim=1)
+        extras['condition/end_effector_keep_ratio'] = per_sample.mean()
+        extras['condition/recovery_end_effector_keep_ratio'] = (
+            per_sample[recovery].mean()
+            if recovery.any() else per_sample.new_zeros(()))
+        extras['condition/locomotion_end_effector_keep_ratio'] = (
+            per_sample[locomotion].mean()
+            if locomotion.any() else per_sample.new_zeros(()))
+
+
+def _add_batch_data_diagnostics(extras, primitive, y) -> None:
+    goal = y.get('goal')
+    device = goal.device if isinstance(goal, torch.Tensor) else torch.device('cpu')
+    if isinstance(goal, torch.Tensor):
+        batch_size = int(goal.shape[0])
+    else:
+        recovery_value = primitive.get('is_recovery', False)
+        batch_size = int(torch.as_tensor(recovery_value).numel())
+    recovery = _as_recovery_mask(
+        primitive.get('is_recovery', False), batch_size, device)
+    labels = primitive.get('action_label')
+    if labels is not None:
+        empty = torch.as_tensor(
+            [not str(label).strip() for label in labels],
+            device=device, dtype=torch.bool)
+        extras['data/batch_action_label_empty_rate'] = empty.float().mean()
+        extras['data/recovery_action_label_empty_rate'] = (
+            _masked_mean(empty, recovery))
+    embeddings = primitive.get('text_embedding')
+    if isinstance(embeddings, torch.Tensor):
+        emb = embeddings.to(device=device)
+        empty_embedding = emb.reshape(emb.shape[0], -1).abs().sum(dim=1) == 0
+        extras['data/batch_text_embedding_empty_rate'] = (
+            empty_embedding.float().mean())
+        extras['data/recovery_text_embedding_empty_rate'] = (
+            _masked_mean(empty_embedding, recovery))
+    _add_condition_keep_diagnostics(extras, y, recovery)
+
+
+def _report_dataset_audit_stats(manager, datasets) -> None:
+    if not is_main_process():
+        return
+    for split, dataset in datasets:
+        stats = getattr(dataset, 'audit_stats', None)
+        if not stats:
+            continue
+        for key, value in stats.items():
+            if isinstance(value, (int, float)):
+                manager.platform.report_scalar(
+                    f'{split}/{key}', float(value), 0, group_name='data')
 
 
 def _make_root_xy_figure(
@@ -391,8 +511,6 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
     goal_encoding = GoalEncoding.parse(
         cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
     )
-    goal_include_log_d_hor = bool(
-        cfg.data.get('goal_include_log_d_hor', True))
     time_to_arrival = primitive.get(
         'time_to_arrival', primitive.get('goal_timestep'))
     if goal_type.uses_arrival_time:
@@ -405,7 +523,7 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         goal_time = None
     if goal_type is GoalType.JOINT_STATE and motion_dtype.FeatureVersion == 6:
         if goal_encoding.uses_end_effectors:
-            ego_goal_raw = build_ego_split_end_effector_goal(
+            ego_goal_raw = build_ego_split_end_effector_goal_no_log(
                 world_goal_pos=primitive['world_goal_pos'].to(cfg.device),
                 world_goal_rot=primitive['world_goal_rot'].to(cfg.device),
                 world_goal_dof=primitive['world_goal_dof'].to(cfg.device),
@@ -419,7 +537,6 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
                 distance_scale=(
                     goal_stats.get('s_d', 1.0)
                     if goal_stats is not None else 1.0),
-                goal_include_log_d_hor=goal_include_log_d_hor,
             )
         else:
             ego_goal_raw = build_ego_joint_state_goal_v6(
@@ -488,7 +605,6 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
                 if goal_type.uses_arrival_time else None
             ),
             time_to_arrival_seconds=goal_time,
-            goal_include_log_d_hor=goal_include_log_d_hor,
         )
     else:
         goal = ego_goal_raw
@@ -534,6 +650,10 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         'goal_reference_rot_world': reference_rot,
         'voxel': voxel,
         'history_motion_normalized': history_motion,
+        # Condition dropout is selected per sample.  The dataset already
+        # batches this flag as [B] for each primitive; scalar callers (for
+        # example an external evaluator) are expanded by the denoiser.
+        'is_recovery': primitive.get('is_recovery', False),
         **(
             {
                 'time_to_arrival_frame': time_to_arrival_frame,
@@ -543,8 +663,13 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         ),
     }
     if goal_encoding.uses_end_effectors:
+        ee_slice = (
+            SPLIT_NO_LOG_END_EFFECTOR_SLICE
+            if ego_goal_raw.shape[-1] == SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM
+            else SPLIT_END_EFFECTOR_SLICE
+        )
         conditions['goal_end_effectors_ego_raw'] = ego_goal_raw[
-            :, SPLIT_END_EFFECTOR_SLICE].reshape(-1, 4, 3)
+            :, ee_slice].reshape(-1, 4, 3)
     if text_embedding is None and 'text_embedding' in primitive:
         text_embedding = primitive['text_embedding'].to(
             cfg.device, non_blocking=True)
@@ -558,7 +683,16 @@ def _prepare_batch_text_embeddings(batch, cfg, device):
     if not bool(cfg.denoiser.get('text_condition_enabled', False)):
         return None
     cond_mask_prob = cfg.denoiser.get('cond_mask_prob', {})
-    if float(cond_mask_prob.get('text', 0.0)) >= 1.0:
+    text_mask_probs = []
+    if any(cond_mask_prob.get(name) is not None
+           for name in ('locomotion', 'getup')):
+        for name in ('locomotion', 'getup'):
+            profile = cond_mask_prob.get(name)
+            if profile is not None and profile.get('text') is not None:
+                text_mask_probs.append(float(profile.get('text')))
+    elif cond_mask_prob.get('text') is not None:
+        text_mask_probs.append(float(cond_mask_prob.get('text')))
+    if text_mask_probs and min(text_mask_probs) >= 1.0:
         # Text is guaranteed to be dropped during training; avoid the
         # otherwise unnecessary CPU -> GPU transfer for this condition.
         return None
@@ -571,6 +705,8 @@ def _prepare_batch_text_embeddings(batch, cfg, device):
 
 def _next_rollout_poses(dataset, motion, history_start_pos, history_start_rot, history_len):
     with torch.no_grad():
+        # Keep rollout windows chained from the segment's first GT history
+        # anchor by reconstructing the full used [history + future] window.
         reconstructed = dataset.reconstruct_motion(
             motion,
             abs_pose=_pose_dict(history_start_pos, history_start_rot),
@@ -624,7 +760,7 @@ def _sample_segment_rollout(batch, dataset, vae, denoiser, diffusion,
     Stage policy is delegated to manager.choose_history:
       stage 0 -> always GT history (should_rollout False)
       stage 1 -> probabilistic GT/predicted history (linear ramp)
-      stage 2 -> always predicted history from primitive 1 on (prob=1)
+      stage 2 -> predicted-history probability held at rollout_max_prob
     window 0 always uses GT history (prev_motion is None).  Visualization
     only: no loss/extras writes, no manager state mutation.
 
@@ -653,6 +789,15 @@ def _sample_segment_rollout(batch, dataset, vae, denoiser, diffusion,
             gt_history, prev_motion, history_len, return_rollout=True)
 
         if used_rollout:
+            if any(value is None for value in (
+                rollout_history_start_pos,
+                rollout_history_start_rot,
+                rollout_ref_pos,
+                rollout_ref_rot,
+            )):
+                raise RuntimeError(
+                    "Self-rollout history selected before rollout poses "
+                    "were initialized")
             history_start_pos = rollout_history_start_pos
             history_start_rot = rollout_history_start_rot
             reference_pos = rollout_ref_pos
@@ -1238,7 +1383,6 @@ def main(cfg: DictConfig):
         goal_offset_range=cfg.data.goal_offset_range,
         goal_timestep_mode=cfg.data.goal_timestep_mode,
         goal_stats=getattr(train_data, 'goal_stats', None),
-        goal_include_log_d_hor=cfg.data.get('goal_include_log_d_hor', True),
     )
     _validate_joint_state_contract(cfg)
     _validate_goal_root_position_contract(cfg)
@@ -1297,6 +1441,8 @@ def main(cfg: DictConfig):
     manager.hold_model(vae, denoiser, optimizer, train_data)
     manager.rank = rank
     manager.world_size = world_size
+    _report_dataset_audit_stats(
+        manager, [('train', train_data), ('val', val_data)])
 
     num_primitive: int = cfg.data.num_primitive
     future_len: int = cfg.data.future_len
@@ -1344,8 +1490,18 @@ def main(cfg: DictConfig):
             # 使用统一的history选择函数
             history_motion, used_rollout = manager.choose_history(
                 gt_history, prev_motion, history_len, return_rollout=True)
+            manager.extra['self_rollout_used'] = float(used_rollout)
 
             if used_rollout:
+                if any(value is None for value in (
+                    rollout_history_start_pos,
+                    rollout_history_start_rot,
+                    rollout_ref_pos,
+                    rollout_ref_rot,
+                )):
+                    raise RuntimeError(
+                        "Self-rollout history selected before rollout poses "
+                        "were initialized")
                 history_start_pos = rollout_history_start_pos
                 history_start_rot = rollout_history_start_rot
                 reference_pos = rollout_ref_pos
@@ -1355,6 +1511,17 @@ def main(cfg: DictConfig):
                 history_start_rot = primitive['history_start_rot'].to(cfg.device)
                 reference_pos = primitive['gt_ref_pos'].to(cfg.device)
                 reference_rot = primitive['gt_ref_rot'].to(cfg.device)
+
+            gt_reference_pos = primitive['gt_ref_pos'].to(cfg.device)
+            if used_rollout:
+                manager.extra['self_rollout_ref_gt_dist_m'] = (
+                    torch.linalg.vector_norm(
+                        (reference_pos - gt_reference_pos).detach(),
+                        dim=-1,
+                    ).mean()
+                )
+            else:
+                manager.extra['self_rollout_ref_gt_dist_m'] = 0.0
 
             y = _conditions(primitive, reference_pos, reference_rot,
                             history_motion, cfg, train_data.fps,
@@ -1411,8 +1578,14 @@ def main(cfg: DictConfig):
                 ego_goal=y['ego_goal_raw'],
                 goal_type=cfg.data.goal_type,
                 goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
+                goal_position_hor_condition_keep_mask=y.get(
+                    'goal_position_hor_condition_keep_mask'),
+                goal_position_vert_condition_keep_mask=y.get(
+                    'goal_position_vert_condition_keep_mask'),
                 goal_orientation_condition_keep_mask=y.get(
                     'goal_orientation_condition_keep_mask'),
+                goal_gravity_condition_keep_mask=y.get(
+                    'goal_gravity_condition_keep_mask'),
                 goal_joint_condition_keep_mask=y.get(
                     'goal_joint_condition_keep_mask'),
                 goal_velocity_condition_keep_mask=y.get(
@@ -1425,6 +1598,7 @@ def main(cfg: DictConfig):
                 action_label=batch[pidx].get('action_label'),
                 is_recovery=batch[pidx].get('is_recovery'),
             )
+            _add_batch_data_diagnostics(extras, primitive, y)
             loss = loss_dict['total']
 
             optimizer.zero_grad()
@@ -1542,8 +1716,14 @@ def main(cfg: DictConfig):
                         ego_goal=y['ego_goal_raw'],
                         goal_condition_keep_mask=y.get('goal_condition_keep_mask'),
                         goal_type=cfg.data.goal_type,
+                        goal_position_hor_condition_keep_mask=y.get(
+                            'goal_position_hor_condition_keep_mask'),
+                        goal_position_vert_condition_keep_mask=y.get(
+                            'goal_position_vert_condition_keep_mask'),
                         goal_orientation_condition_keep_mask=y.get(
                             'goal_orientation_condition_keep_mask'),
+                        goal_gravity_condition_keep_mask=y.get(
+                            'goal_gravity_condition_keep_mask'),
                         goal_joint_condition_keep_mask=y.get(
                             'goal_joint_condition_keep_mask'),
                         goal_velocity_condition_keep_mask=y.get(
@@ -1556,6 +1736,7 @@ def main(cfg: DictConfig):
                         is_eval=True,
                         action_label=batch[pidx].get('action_label'),
                         is_recovery=batch[pidx].get('is_recovery'))
+                    _add_batch_data_diagnostics(extras, primitive, y)
 
                     if getattr(manager, 'eval_full_sample', False):
                         sample_latent = diffusion.p_sample_loop(

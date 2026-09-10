@@ -37,13 +37,15 @@ clip_version: ViT-B/32
 # and download behavior is used; TEXTOP_CLIP_PATH is also supported.
 clip_model_path: null
 clip_dim: 512
+# Bounded startup audit for recovery/text metadata. Set to 0 to skip primitive
+# window sampling; sequence-level manifest counts are still cheap.
+audit_primitive_windows: 4096
 goal_offset: 0
 goal_offset_range: null
 goal_type: joint_state
 goal_encoding: split
 goal_per_primitive: true
 goal_timestep_mode: relative
-goal_include_log_d_hor: true
 occupancy_unit: 0.08
 
 # Planner V7.1 history augmentation (LDM-only). This explicit opt-in keeps VAE
@@ -96,13 +98,13 @@ common: &common
   clip_version: ${..clip_version}
   clip_model_path: ${..clip_model_path}
   clip_dim: ${..clip_dim}
+  audit_primitive_windows: ${..audit_primitive_windows}
   goal_offset: ${..goal_offset}
   goal_offset_range: ${..goal_offset_range}
   goal_type: ${..goal_type}
   goal_encoding: ${..goal_encoding}
   goal_per_primitive: ${..goal_per_primitive}
   goal_timestep_mode: ${..goal_timestep_mode}
-  goal_include_log_d_hor: ${..goal_include_log_d_hor}
   augmentation_start_step: ${..augmentation_start_step}
   augmentation_prob: ${..augmentation_prob}
   augmentation_enabled: ${..augmentation_enabled}
