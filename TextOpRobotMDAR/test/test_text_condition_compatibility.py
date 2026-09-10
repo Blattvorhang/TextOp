@@ -1,8 +1,10 @@
 import torch
+from types import SimpleNamespace
 
 from robotmdar.eval.generate_dar import denoiser_supports_text_guidance
 from robotmdar.model.mld_denoiser import DenoiserTransformer
 from robotmdar.train.manager import DARManager
+from robotmdar.train.train_dar import _prepare_batch_text_embeddings
 
 
 class _RaisingTextEmbed(torch.nn.Module):
@@ -81,3 +83,29 @@ def test_inference_load_disables_text_for_checkpoint_without_text_weights(
     assert model.text_condition_enabled is False
     assert model.cond_text_mask_prob == 0.0
     assert denoiser_supports_text_guidance(model) is False
+
+
+def test_batch_text_embeddings_are_moved_once_for_all_primitives():
+    cfg = SimpleNamespace(
+        denoiser={'text_condition_enabled': True},
+    )
+    batch = [
+        {'text_embedding': torch.ones(2, 512)},
+        {'text_embedding': torch.full((2, 512), 2.0)},
+        {'text_embedding': torch.full((2, 512), 3.0)},
+    ]
+
+    embeddings = _prepare_batch_text_embeddings(batch, cfg, 'cpu')
+
+    assert embeddings.shape == (3, 2, 512)
+    torch.testing.assert_close(embeddings[0], batch[0]['text_embedding'])
+    torch.testing.assert_close(embeddings[2], batch[2]['text_embedding'])
+
+
+def test_batch_text_embeddings_are_skipped_when_text_is_disabled():
+    cfg = SimpleNamespace(
+        denoiser={'text_condition_enabled': False},
+    )
+    batch = [{'text_embedding': torch.ones(2, 512)}]
+
+    assert _prepare_batch_text_embeddings(batch, cfg, 'cpu') is None

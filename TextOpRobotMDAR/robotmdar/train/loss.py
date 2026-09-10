@@ -24,15 +24,24 @@ from robotmdar.utils.goal import (
     JOINT_STATE_GOAL_DIM,
     ROT_MAT_JOINT_STATE_GOAL_DIM,
     SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
     SPLIT_END_EFFECTOR_SLICE,
     SPLIT_END_EFFECTOR_TOKEN_ORDER,
     SPLIT_GOAL_DIM,
+    SPLIT_GOAL_NO_LOG_DIM,
     SPLIT_HORIZONTAL_SLICE,
     SPLIT_JOINT_SLICE,
     SPLIT_ORIENTATION_SLICE,
     SPLIT_VELOCITY_SLICE,
     SPLIT_VERTICAL_GRAVITY_SLICE,
     SPLIT_VERTICAL_HEIGHT_SLICE,
+    SPLIT_NO_LOG_HORIZONTAL_SLICE,
+    SPLIT_NO_LOG_JOINT_SLICE,
+    SPLIT_NO_LOG_ORIENTATION_SLICE,
+    SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE,
+    SPLIT_NO_LOG_VERTICAL_HEIGHT_SLICE,
+    SPLIT_NO_LOG_VELOCITY_SLICE,
+    SPLIT_NO_LOG_END_EFFECTOR_SLICE,
     V6_RAW_JOINT_SLICE,
     V6_RAW_ORIENTATION_SLICE,
     V6_RAW_POSITION_SLICE,
@@ -50,7 +59,33 @@ MOTION_CLASSES = ('walk', 'run', 'fall', 'getup', 'unknown')
 LOSS_WEIGHT_SECTIONS = ('locomotion', 'getup')
 GOAL_LOSS_WEIGHT_NEST = 'goal'
 GOAL_LOSS_WEIGHT_PREFIX = 'goal_'
-SPLIT_GOAL_DIMS = (SPLIT_GOAL_DIM, SPLIT_END_EFFECTOR_GOAL_DIM)
+SPLIT_GOAL_DIMS = (
+    SPLIT_GOAL_DIM, SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_GOAL_NO_LOG_DIM, SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+)
+
+
+def _split_goal_slices(goal):
+    if goal.shape[-1] in (
+            SPLIT_GOAL_NO_LOG_DIM, SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM):
+        return {
+            'horizontal': SPLIT_NO_LOG_HORIZONTAL_SLICE,
+            'vertical_height': SPLIT_NO_LOG_VERTICAL_HEIGHT_SLICE,
+            'vertical_gravity': SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE,
+            'orientation': SPLIT_NO_LOG_ORIENTATION_SLICE,
+            'joint': SPLIT_NO_LOG_JOINT_SLICE,
+            'velocity': SPLIT_NO_LOG_VELOCITY_SLICE,
+            'end_effector': SPLIT_NO_LOG_END_EFFECTOR_SLICE,
+        }
+    return {
+        'horizontal': SPLIT_HORIZONTAL_SLICE,
+        'vertical_height': SPLIT_VERTICAL_HEIGHT_SLICE,
+        'vertical_gravity': SPLIT_VERTICAL_GRAVITY_SLICE,
+        'orientation': SPLIT_ORIENTATION_SLICE,
+        'joint': SPLIT_JOINT_SLICE,
+        'velocity': SPLIT_VELOCITY_SLICE,
+        'end_effector': SPLIT_END_EFFECTOR_SLICE,
+    }
 DEFAULT_GOAL_END_EFFECTOR_LOSS_BETA = 0.05
 
 
@@ -1456,6 +1491,8 @@ class GeometryLoss:
         future_motion_pred,
         ego_goal,
         goal_condition_keep_mask=None,
+        goal_position_hor_condition_keep_mask=None,
+        goal_position_vert_condition_keep_mask=None,
         history_motion=None,
         goal_time_frame=None,
         goal_state=None,
@@ -1473,27 +1510,40 @@ class GeometryLoss:
             predicted_vert = goal_state['height_at_goal'].unsqueeze(-1)
             predicted_hor = goal_state['displacement_at_goal']
             if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
-                target_vert = ego_goal[..., SPLIT_VERTICAL_HEIGHT_SLICE][..., :1]
-                target_hor = ego_goal[..., SPLIT_HORIZONTAL_SLICE][..., :3]
+                slices = _split_goal_slices(ego_goal)
+                target_vert = ego_goal[..., slices['vertical_height']][..., :1]
+                target_hor = ego_goal[..., slices['horizontal']][..., :3]
             else:
                 target = ego_goal[..., V6_RAW_POSITION_SLICE]
                 target_vert = target[..., :1]
                 target_hor = target[..., 1:4]
-            valid = torch.ones(
+            hor_valid = torch.ones(
                 target_hor.shape[0], dtype=torch.bool, device=target_hor.device)
-            if goal_condition_keep_mask is not None:
-                valid = valid & goal_condition_keep_mask.to(
-                    device=valid.device, dtype=torch.bool)
+            vert_valid = torch.ones(
+                target_vert.shape[0], dtype=torch.bool,
+                device=target_vert.device)
+            if goal_position_hor_condition_keep_mask is not None:
+                hor_valid &= goal_position_hor_condition_keep_mask.to(
+                    device=target_hor.device, dtype=torch.bool)
+            elif goal_condition_keep_mask is not None:
+                hor_valid &= goal_condition_keep_mask.to(
+                    device=target_hor.device, dtype=torch.bool)
+            if goal_position_vert_condition_keep_mask is not None:
+                vert_valid &= goal_position_vert_condition_keep_mask.to(
+                    device=target_vert.device, dtype=torch.bool)
+            elif goal_condition_keep_mask is not None:
+                vert_valid &= goal_condition_keep_mask.to(
+                    device=target_vert.device, dtype=torch.bool)
             hor_per = _rec_loss_per_sample(
                 self.rec_criterion, predicted_hor, target_hor)
             vert_per = _rec_loss_per_sample(
                 self.rec_criterion, predicted_vert, target_vert)
-            hor = _masked_scalar_from_per_sample(hor_per, valid, zero)
-            vert = _masked_scalar_from_per_sample(vert_per, valid, zero)
+            hor = _masked_scalar_from_per_sample(hor_per, hor_valid, zero)
+            vert = _masked_scalar_from_per_sample(vert_per, vert_valid, zero)
             if return_per_sample:
                 return {
-                    'goal_root_position_hor': (hor, hor_per, valid),
-                    'goal_root_position_vert': (vert, vert_per, valid),
+                    'goal_root_position_hor': (hor, hor_per, hor_valid),
+                    'goal_root_position_vert': (vert, vert_per, vert_valid),
                 }
             return {
                 'goal_root_position_hor': hor,
@@ -1504,22 +1554,24 @@ class GeometryLoss:
             future_motion_pred, history_motion,
             goal_time_frame=goal_time_frame)
         goal_root_position = ego_goal[..., :2]
-        valid = torch.ones(
+        hor_valid = torch.ones(
             goal_root_position.shape[0], dtype=torch.bool,
             device=goal_root_position.device)
-        if goal_condition_keep_mask is not None:
-            valid = valid & goal_condition_keep_mask.to(
-                device=valid.device, dtype=torch.bool
-            )
+        if goal_position_hor_condition_keep_mask is not None:
+            hor_valid &= goal_position_hor_condition_keep_mask.to(
+                device=goal_root_position.device, dtype=torch.bool)
+        elif goal_condition_keep_mask is not None:
+            hor_valid &= goal_condition_keep_mask.to(
+                device=goal_root_position.device, dtype=torch.bool)
         hor_per = _rec_loss_per_sample(
             self.rec_criterion, root_displacement, goal_root_position)
-        hor = _masked_scalar_from_per_sample(hor_per, valid, zero)
+        hor = _masked_scalar_from_per_sample(hor_per, hor_valid, zero)
         vert_per = future_motion_pred.new_zeros(future_motion_pred.shape[0])
         vert = zero
         if return_per_sample:
             return {
-                'goal_root_position_hor': (hor, hor_per, valid),
-                'goal_root_position_vert': (vert, vert_per, valid),
+                'goal_root_position_hor': (hor, hor_per, hor_valid),
+                'goal_root_position_vert': (vert, vert_per, hor_valid),
             }
         return {
             'goal_root_position_hor': hor,
@@ -1545,8 +1597,9 @@ class GeometryLoss:
                 dim=-1,
             )
             if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
-                vertical = ego_goal[..., SPLIT_VERTICAL_HEIGHT_SLICE]
-                horizontal = ego_goal[..., SPLIT_HORIZONTAL_SLICE]
+                slices = _split_goal_slices(ego_goal)
+                vertical = ego_goal[..., slices['vertical_height']]
+                horizontal = ego_goal[..., slices['horizontal']]
                 target = torch.cat(
                     (vertical[..., :1], horizontal[..., :3]),
                     dim=-1,
@@ -1681,7 +1734,8 @@ class GeometryLoss:
                     goal_time_frame=goal_time_frame)
             predicted = goal_state['rel_rot_at_goal']
             if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
-                target_rot6d = ego_goal[..., SPLIT_ORIENTATION_SLICE]
+                target_rot6d = ego_goal[
+                    ..., _split_goal_slices(ego_goal)['orientation']]
             else:
                 target = ego_goal[..., V6_RAW_ORIENTATION_SLICE]
                 target_rot6d = target[..., 3:9]
@@ -1740,7 +1794,8 @@ class GeometryLoss:
                 goal_time_frame=goal_time_frame)
         predicted = goal_state['gravity_at_goal']
         if ego_goal.shape[-1] in SPLIT_GOAL_DIMS:
-            target = ego_goal[..., SPLIT_VERTICAL_GRAVITY_SLICE]
+            target = ego_goal[
+                ..., _split_goal_slices(ego_goal)['vertical_gravity']]
         else:
             target = ego_goal[..., V6_RAW_ORIENTATION_SLICE][..., :3]
         target = F.normalize(target, dim=-1, eps=1e-8)
@@ -1777,7 +1832,7 @@ class GeometryLoss:
                 future_motion_pred, goal_time_frame, goal_state=goal_state)
             predicted = selected[..., 13:42]
             target = (
-                ego_goal[..., SPLIT_JOINT_SLICE]
+                ego_goal[..., _split_goal_slices(ego_goal)['joint']]
                 if ego_goal.shape[-1] in SPLIT_GOAL_DIMS
                 else ego_goal[..., V6_RAW_JOINT_SLICE]
             )
@@ -1823,7 +1878,7 @@ class GeometryLoss:
                     goal_time_frame=goal_time_frame)
             predicted = goal_state['velocity_at_goal']
             target = (
-                ego_goal[..., SPLIT_VELOCITY_SLICE]
+                ego_goal[..., _split_goal_slices(ego_goal)['velocity']]
                 if ego_goal.shape[-1] in SPLIT_GOAL_DIMS
                 else ego_goal[..., V6_RAW_VELOCITY_SLICE]
             )
@@ -2016,10 +2071,15 @@ class GeometryLoss:
     ):
         """Match four end-effector positions at the selected goal frame."""
         if not (motion_dtype.FeatureVersion == 6
-                and ego_goal.shape[-1] == SPLIT_END_EFFECTOR_GOAL_DIM):
+                and ego_goal.shape[-1] in (
+                    SPLIT_END_EFFECTOR_GOAL_DIM,
+                    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+                )):
             raise ValueError(
                 "goal_end_effector loss requires feature_version=6 with "
-                f"{SPLIT_END_EFFECTOR_GOAL_DIM}-D split_end_effector goal"
+                f"{SPLIT_END_EFFECTOR_GOAL_DIM}-D or "
+                f"{SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM}-D "
+                "split_end_effector goal"
             )
         has_reference_pose = (
             goal_reference_pos is not None or goal_reference_rot is not None)
@@ -2073,7 +2133,9 @@ class GeometryLoss:
             batch_idx = torch.arange(
                 pred_all.shape[0], device=pred_all.device)
             predicted = pred_all[batch_idx, goal_step]
-        target = ego_goal[..., SPLIT_END_EFFECTOR_SLICE].reshape(-1, 4, 3)
+        target = ego_goal[
+            ..., _split_goal_slices(ego_goal)['end_effector']
+        ].reshape(-1, 4, 3)
         target = target.to(device=predicted.device, dtype=predicted.dtype)
 
         token_valid = torch.ones(
@@ -2229,8 +2291,11 @@ def calc_dar_loss(
     sliding_mask=None,
     ego_goal=None,
     goal_condition_keep_mask=None,
+    goal_position_hor_condition_keep_mask=None,
+    goal_position_vert_condition_keep_mask=None,
     goal_type: GoalType | str = GoalType.ROOT,
     goal_orientation_condition_keep_mask=None,
+    goal_gravity_condition_keep_mask=None,
     goal_joint_condition_keep_mask=None,
     goal_velocity_condition_keep_mask=None,
     goal_end_effector_condition_keep_mask=None,
@@ -2349,6 +2414,10 @@ def calc_dar_loss(
             )
         root_position_components = self.calc_goal_root_position_loss_components(
             future_motion_pred, ego_goal, goal_condition_keep_mask,
+            goal_position_hor_condition_keep_mask=(
+                goal_position_hor_condition_keep_mask),
+            goal_position_vert_condition_keep_mask=(
+                goal_position_vert_condition_keep_mask),
             history_motion=history_motion,
             goal_time_frame=goal_time_frame,
             return_per_sample=True,
@@ -2420,7 +2489,11 @@ def calc_dar_loss(
             loss, per_sample, valid = self.calc_goal_g_loss(
                 future_motion_pred,
                 ego_goal,
-                goal_orientation_condition_keep_mask,
+                (
+                    goal_gravity_condition_keep_mask
+                    if goal_gravity_condition_keep_mask is not None
+                    else goal_orientation_condition_keep_mask
+                ),
                 history_motion=history_motion,
                 goal_time_frame=goal_time_frame,
                 goal_state=goal_state,
@@ -2456,7 +2529,10 @@ def calc_dar_loss(
 
         compute_goal_end_effector = (
             motion_dtype.FeatureVersion == 6
-            and ego_goal.shape[-1] == SPLIT_END_EFFECTOR_GOAL_DIM
+            and ego_goal.shape[-1] in (
+                SPLIT_END_EFFECTOR_GOAL_DIM,
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+            )
             and (
                 _loss_weight_any(self.loss_weight, 'goal_end_effector') > 0.0
                 or is_eval
