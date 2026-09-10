@@ -1290,7 +1290,8 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
     return conditions
 
 
-def _prepare_batch_text_embeddings(batch, cfg, device):
+def _prepare_batch_text_embeddings(
+        batch, cfg, device, optimize_always_dropped: bool = False):
     """Move all primitive text embeddings to the training device once."""
     if not bool(cfg.denoiser.get('text_condition_enabled', False)):
         return None
@@ -1304,7 +1305,7 @@ def _prepare_batch_text_embeddings(batch, cfg, device):
                 text_mask_probs.append(float(profile.get('text')))
     elif cond_mask_prob.get('text') is not None:
         text_mask_probs.append(float(cond_mask_prob.get('text')))
-    if text_mask_probs and min(text_mask_probs) >= 1.0:
+    if optimize_always_dropped and text_mask_probs and min(text_mask_probs) >= 1.0:
         # Text is guaranteed to be dropped during training; avoid the
         # otherwise unnecessary CPU -> GPU transfer for this condition.
         return None
@@ -2101,7 +2102,7 @@ def main(cfg: DictConfig):
             train_batch_validated = True
 
         batch_text_embeddings = _prepare_batch_text_embeddings(
-            batch, cfg, device)
+            batch, cfg, device, optimize_always_dropped=True)
         prev_motion = None
         rollout_history_start_pos = None
         rollout_history_start_rot = None

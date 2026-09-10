@@ -1520,6 +1520,7 @@ class GeometryLoss:
         goal_state=None,
         return_per_sample: bool = False,
         enabled_components=None,
+        skip_if_dropped: bool = False,
     ):
         """Match root-position goal as separate horizontal and vertical terms."""
         zero = future_motion_pred.sum() * 0.0
@@ -1543,7 +1544,7 @@ class GeometryLoss:
         )
         hor_maybe_active = enable_hor and _keep_mask_maybe_active(hor_keep)
         vert_maybe_active = enable_vert and _keep_mask_maybe_active(vert_keep)
-        if not hor_maybe_active and not vert_maybe_active:
+        if skip_if_dropped and not hor_maybe_active and not vert_maybe_active:
             empty_valid = torch.zeros(
                 future_motion_pred.shape[0],
                 dtype=torch.bool,
@@ -1653,9 +1654,11 @@ class GeometryLoss:
     def calc_goal_root_position_loss(self, future_motion_pred, ego_goal,
                                      goal_condition_keep_mask=None,
                                      history_motion=None,
-                                     goal_time_frame=None):
+                                     goal_time_frame=None,
+                                     skip_if_dropped: bool = False):
         """Backward-compatible combined root-position goal metric."""
-        if not _keep_mask_maybe_active(goal_condition_keep_mask):
+        if (skip_if_dropped
+                and not _keep_mask_maybe_active(goal_condition_keep_mask)):
             return future_motion_pred.sum() * 0.0
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
@@ -1796,11 +1799,13 @@ class GeometryLoss:
         goal_time_frame=None,
         goal_state=None,
         return_per_sample: bool = False,
+        skip_if_dropped: bool = False,
     ):
         """Match TextOp-style root orientation at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
-        if not _keep_mask_maybe_active(
-                goal_orientation_condition_keep_mask):
+        if (skip_if_dropped
+                and not _keep_mask_maybe_active(
+                    goal_orientation_condition_keep_mask)):
             return _empty_goal_component_result(
                 future_motion_pred, return_per_sample)
         if (motion_dtype.FeatureVersion == 6
@@ -1856,11 +1861,13 @@ class GeometryLoss:
         goal_time_frame=None,
         goal_state=None,
         return_per_sample: bool = False,
+        skip_if_dropped: bool = False,
     ):
         """Match the target gravity direction at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
-        if not _keep_mask_maybe_active(
-                goal_orientation_condition_keep_mask):
+        if (skip_if_dropped
+                and not _keep_mask_maybe_active(
+                    goal_orientation_condition_keep_mask)):
             return _empty_goal_component_result(
                 future_motion_pred, return_per_sample)
         if not (motion_dtype.FeatureVersion == 6
@@ -1898,10 +1905,12 @@ class GeometryLoss:
         goal_time_frame=None,
         goal_state=None,
         return_per_sample: bool = False,
+        skip_if_dropped: bool = False,
     ):
         """Match the 29-DOF joint angles at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
-        if not _keep_mask_maybe_active(goal_joint_condition_keep_mask):
+        if (skip_if_dropped
+                and not _keep_mask_maybe_active(goal_joint_condition_keep_mask)):
             return _empty_goal_component_result(
                 future_motion_pred, return_per_sample)
         dof_dim = int(self.dataset.dof_dim)
@@ -1951,11 +1960,13 @@ class GeometryLoss:
         goal_time_frame=None,
         goal_state=None,
         return_per_sample: bool = False,
+        skip_if_dropped: bool = False,
     ):
         """Match reference-ego root velocity at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
-        if not _keep_mask_maybe_active(
-                goal_velocity_condition_keep_mask):
+        if (skip_if_dropped
+                and not _keep_mask_maybe_active(
+                    goal_velocity_condition_keep_mask)):
             return _empty_goal_component_result(
                 future_motion_pred, return_per_sample)
         if (motion_dtype.FeatureVersion == 6
@@ -2157,6 +2168,7 @@ class GeometryLoss:
         goal_reference_rot=None,
         goal_time_frame=None,
         return_per_sample: bool = False,
+        skip_if_dropped: bool = False,
     ):
         """Match four end-effector positions at the selected goal frame."""
         if not (motion_dtype.FeatureVersion == 6
@@ -2198,7 +2210,7 @@ class GeometryLoss:
                     f"{tuple(token_valid.shape)}, got {tuple(keep_mask.shape)}"
                 )
             token_valid = token_valid & keep_mask
-        if not token_valid.any():
+        if skip_if_dropped and not token_valid.any():
             metrics = {
                 'goal_end_effector': zero.detach(),
                 **{
@@ -2271,6 +2283,17 @@ class GeometryLoss:
         masked_token_loss = token_loss * token_valid_f
         token_count = token_valid_f.sum(dim=0)
         active_tokens = token_count > 0
+        if not active_tokens.any():
+            metrics = {
+                'goal_end_effector': zero.detach(),
+                **{
+                    f'goal_end_effector_{name}': zero.detach()
+                    for name in SPLIT_END_EFFECTOR_TOKEN_ORDER
+                },
+            }
+            if return_per_sample:
+                return zero, masked_token_loss, token_valid, metrics
+            return zero
 
         per_token_loss = masked_token_loss.sum(dim=0) / (
             token_count.clamp_min(1.0))
@@ -2553,6 +2576,7 @@ def calc_dar_loss(
                 'vertical': goal_position_vert_enabled,
             },
             return_per_sample=True,
+            skip_if_dropped=not is_eval,
         )
         for key, (loss, per_sample, valid) in root_position_components.items():
             terms[key] = loss
@@ -2563,6 +2587,7 @@ def calc_dar_loss(
                 future_motion_pred, ego_goal, goal_condition_keep_mask,
                 history_motion=history_motion,
                 goal_time_frame=goal_time_frame,
+                skip_if_dropped=not is_eval,
             )
 
     joint_goal_dims = (
@@ -2635,6 +2660,7 @@ def calc_dar_loss(
                 goal_time_frame=goal_time_frame,
                 goal_state=goal_state,
                 return_per_sample=True,
+                skip_if_dropped=not is_eval,
             )
             terms['goal_root_orientation'] = loss
             per_sample_terms['goal_root_orientation'] = (per_sample, valid)
@@ -2647,6 +2673,7 @@ def calc_dar_loss(
                 goal_time_frame=goal_time_frame,
                 goal_state=goal_state,
                 return_per_sample=True,
+                skip_if_dropped=not is_eval,
             )
             terms['goal_g'] = loss
             per_sample_terms['goal_g'] = (per_sample, valid)
@@ -2658,6 +2685,7 @@ def calc_dar_loss(
                 goal_time_frame=goal_time_frame,
                 goal_state=goal_state,
                 return_per_sample=True,
+                skip_if_dropped=not is_eval,
             )
             terms['goal_joint_angle'] = loss
             per_sample_terms['goal_joint_angle'] = (per_sample, valid)
@@ -2670,6 +2698,7 @@ def calc_dar_loss(
                 goal_time_frame=goal_time_frame,
                 goal_state=goal_state,
                 return_per_sample=True,
+                skip_if_dropped=not is_eval,
             )
             terms['goal_root_velocity'] = loss
             per_sample_terms['goal_root_velocity'] = (per_sample, valid)
@@ -2711,6 +2740,7 @@ def calc_dar_loss(
                 goal_reference_rot=goal_reference_rot,
                 goal_time_frame=goal_time_frame,
                 return_per_sample=True,
+                skip_if_dropped=not is_eval,
             )
             terms['goal_end_effector'] = loss
             per_sample_terms['goal_end_effector'] = (

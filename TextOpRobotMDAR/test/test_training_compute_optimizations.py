@@ -545,6 +545,7 @@ def test_goal_losses_return_before_state_or_fk_when_condition_is_fully_dropped(
             torch.zeros(2, dtype=torch.bool),
             history_motion=history,
             return_per_sample=True,
+            skip_if_dropped=True,
         )
         assert loss is not None
         assert per_sample.shape == (2,)
@@ -562,12 +563,57 @@ def test_goal_losses_return_before_state_or_fk_when_condition_is_fully_dropped(
                 goal,
                 torch.zeros(2, 4, dtype=torch.bool),
                 return_per_sample=True,
+                skip_if_dropped=True,
             )
         )
         assert ee_loss is not None
         assert ee_per_sample.shape == (2, 4)
         assert ee_valid.shape == (2, 4)
         assert all(value == 0 for value in metrics.values())
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_eval_goal_loss_keeps_goal_state_compute_when_condition_is_dropped(
+        monkeypatch):
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(6)
+    package_motion_dtype.set_feature_version(6)
+    try:
+        geometry = object.__new__(GeometryLoss)
+        geometry.rec_criterion = torch.nn.HuberLoss(
+            reduction='mean', delta=1.0)
+        future = torch.randn(2, 4, 44)
+        goal = torch.zeros(2, 66)
+        goal[:, SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE] = torch.tensor(
+            [0.0, 0.0, -1.0])
+        history = torch.zeros(2, 2, 44)
+        calls = []
+
+        def fake_goal_state(*args, **kwargs):
+            calls.append(True)
+            return {
+                'gravity_at_goal': torch.tensor(
+                    [[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]]),
+            }
+
+        monkeypatch.setattr(
+            geometry, '_future_goal_state_v6', fake_goal_state)
+        loss, per_sample, valid = geometry.calc_goal_g_loss(
+            future,
+            goal,
+            torch.zeros(2, dtype=torch.bool),
+            history_motion=history,
+            return_per_sample=True,
+            skip_if_dropped=False,
+        )
+
+        assert calls == [True]
+        assert loss is not None
+        assert per_sample.shape == (2,)
+        assert valid.tolist() == [False, False]
     finally:
         runtime_motion_dtype.set_feature_version(old_runtime)
         package_motion_dtype.set_feature_version(old_package)
