@@ -10,6 +10,7 @@ import TextOpRobotMDAR.robotmdar.dtype.motion as package_motion_dtype
 from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
     G1_ISAACLAB_DOF_JOINT_NAMES,
     align_generated_history_pose,
+    apply_generated_history_alignment_correction,
     generated_history_at_frame,
     isaaclab_to_mujoco_dof,
     motion_dict_to_g1data,
@@ -538,13 +539,13 @@ def test_generated_history_alignment_v6_corrects_h_and_g_only():
         real_rot = euler_angles_to_quaternion(
             torch.tensor([[0.8, -0.35, 0.25]]))
         real_pos = torch.tensor([[10.0, 20.0, 0.25]])
-        state = SimpleNamespace(raw={
-            "g1_pos": real_pos.numpy(),
-            "g1_root_rot": _xyzw_to_wxyz_np(real_rot.numpy()),
-        })
+        state = SimpleNamespace(states=SimpleNamespace(
+            g1_pos=real_pos.numpy(),
+            g1_root_rot=_xyzw_to_wxyz_np(real_rot.numpy()),
+        ))
 
         (aligned_pose, goal_reference_pos, goal_reference_rot, _,
-         aligned_history) = align_generated_history_pose(
+         aligned_history, correction) = align_generated_history_pose(
             abs_pose,
             generated_pos[:, -1],
             generated_rot[:, -1],
@@ -552,7 +553,26 @@ def test_generated_history_alignment_v6_corrects_h_and_g_only():
             "cpu",
             history_motion=history,
             val_data=IdentityNormalization(),
+            return_correction=True,
         )
+        inherited_pose, inherited_history = (
+            apply_generated_history_alignment_correction(
+                abs_pose,
+                correction,
+                history_motion=history,
+                val_data=IdentityNormalization()))
+        torch.testing.assert_close(
+            inherited_pose["root_trans_offset"],
+            aligned_pose["root_trans_offset"],
+            atol=1e-5,
+            rtol=1e-5)
+        torch.testing.assert_close(
+            inherited_pose["root_rot"],
+            aligned_pose["root_rot"],
+            atol=1e-5,
+            rtol=1e-5)
+        torch.testing.assert_close(
+            inherited_history, aligned_history, atol=1e-5, rtol=1e-5)
 
         delta_h = real_pos[:, 2] - history_before[:, -1, 0]
         torch.testing.assert_close(
@@ -633,6 +653,86 @@ def test_generated_history_ends_at_tracked_future_frame():
     torch.testing.assert_close(
         abs_pose["root_trans_offset"], torch.tensor([[4.0, 0.0, 0.0]]))
     torch.testing.assert_close(reference_pos, torch.tensor([[5.0, 0.0, 0.0]]))
+
+
+def test_generated_history_phase_lag_selects_earlier_frame_and_clamps():
+    features = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
+    root_pos = torch.zeros((1, 10, 3), dtype=torch.float32)
+    root_pos[0, :, 0] = torch.arange(10, dtype=torch.float32)
+    root_rot = torch.zeros((1, 10, 4), dtype=torch.float32)
+    root_rot[..., 3] = 1.0
+    plan = {"features": features, "root_pos": root_pos, "root_rot": root_rot}
+
+    history, abs_pose, reference_pos, _ = generated_history_at_frame(
+        plan, tracked_frame=3, history_len=2, phase_lag_offset=2)
+    torch.testing.assert_close(history.flatten(), torch.tensor([2.0, 3.0]))
+    torch.testing.assert_close(
+        abs_pose["root_trans_offset"], torch.tensor([[2.0, 0.0, 0.0]]))
+    torch.testing.assert_close(reference_pos, torch.tensor([[3.0, 0.0, 0.0]]))
+
+    history, _, reference_pos, _ = generated_history_at_frame(
+        plan, tracked_frame=1, history_len=2, phase_lag_offset=4)
+    torch.testing.assert_close(history.flatten(), torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(reference_pos, torch.tensor([[2.0, 0.0, 0.0]]))
+
+
+def test_generated_history_alignment_correction_can_be_inherited():
+    old_runtime, old_package = _set_both_feature_versions(3)
+    try:
+        generated_pos = torch.tensor([
+            [[1.0, 2.0, 0.7], [1.2, 2.1, 0.8], [1.4, 2.2, 0.9]],
+        ])
+        generated_rot = euler_angles_to_quaternion(torch.tensor([
+            [[0.0, 0.0, 0.0], [0.1, -0.2, 0.3], [0.2, -0.3, 0.4]],
+        ]))
+        generated_dof = torch.zeros((1, 3, 29))
+        generated_contact = torch.ones((1, 3, 2))
+        history, abs_pose = motion_dict_to_feature_v3({
+            "root_trans_offset": generated_pos,
+            "root_rot": generated_rot,
+            "dof": generated_dof,
+            "contact_mask": generated_contact,
+        })
+        real_pos = torch.tensor([[10.0, 20.0, 0.25]])
+        real_rot = euler_angles_to_quaternion(
+            torch.tensor([[0.9, -0.4, 0.3]]))
+        state = SimpleNamespace(states=SimpleNamespace(
+            g1_pos=real_pos.numpy(),
+            g1_root_rot=_xyzw_to_wxyz_np(real_rot.numpy()),
+        ))
+
+        (aligned_pose, _, _, _, aligned_history, correction) = (
+            align_generated_history_pose(
+                abs_pose,
+                generated_pos[:, 1],
+                generated_rot[:, 1],
+                state,
+                "cpu",
+                history_motion=history,
+                val_data=IdentityNormalization(),
+                return_correction=True))
+        inherited_pose, inherited_history = (
+            apply_generated_history_alignment_correction(
+                abs_pose,
+                correction,
+                history_motion=history,
+                val_data=IdentityNormalization()))
+
+        torch.testing.assert_close(
+            inherited_pose["root_trans_offset"],
+            aligned_pose["root_trans_offset"],
+            atol=1e-5,
+            rtol=1e-5)
+        torch.testing.assert_close(
+            inherited_pose["root_rot"],
+            aligned_pose["root_rot"],
+            atol=1e-5,
+            rtol=1e-5)
+        torch.testing.assert_close(
+            inherited_history, aligned_history, atol=1e-5, rtol=1e-5)
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
 
 
 def test_generated_history_v6_anchor_is_state_before_selected_features():

@@ -392,8 +392,11 @@ task: planner-dar
 infer_period_ms: 50          # inference period (ms), i.e. 20 Hz
 pub_all_frames: false        # false = 8 frames (future only), true = 10 frames
 use_full_sample: false       # single-step denoising for the 20 Hz deadline
-use_generated_history: true
-align_generated_history_to_g1: false  # pure autoregressive debug mode
+generated_history:
+  enabled: true
+  align_to_g1: false         # pure autoregressive debug mode
+  phase_lag_offset: 0        # compare to predicted frame t - phase_lag_offset
+  align_every: 1             # realign every N replans; inherit between
 
 # Communication
 comm_config: "robotmdar/config/communication/pubsub.yaml"

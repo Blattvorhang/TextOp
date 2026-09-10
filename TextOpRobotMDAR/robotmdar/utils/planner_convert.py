@@ -220,10 +220,12 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
     required_states = (
         history_len + 1 if motion_dtype.FeatureVersion == 6 else history_len
     )
-    raw = state_msg.raw
-    positions = np.array(raw["g1_pos"], dtype=np.float32, copy=True)
-    rotations = _normalized_wire_quaternions_wxyz_as_xyzw(raw["g1_root_rot"])
-    joints = np.array(raw["g1_joint_pos"], dtype=np.float32, copy=True)
+    positions = np.array(
+        state_msg.states.g1_pos, dtype=np.float32, copy=True)
+    rotations = _normalized_wire_quaternions_wxyz_as_xyzw(
+        state_msg.states.g1_root_rot)
+    joints = np.array(
+        state_msg.states.g1_joint_pos, dtype=np.float32, copy=True)
 
     if positions.ndim != 2 or positions.shape[-1] != 3:
         raise ValueError(f"Expected position history [n, 3], got {positions.shape}")
@@ -348,10 +350,10 @@ def state_to_ego_goal(state_msg: Any,
                       ) -> torch.Tensor:
     """Convert the root goal relative to the current history-feature pose."""
     reference_pos = torch.tensor(
-        state_msg.raw["g1_pos"][-1], dtype=torch.float32,
+        state_msg.states.g1_pos[-1], dtype=torch.float32,
         device=device).reshape(1, 3)
     reference_rot_np = _normalized_wire_quaternions_wxyz_as_xyzw(
-        np.asarray(state_msg.raw["g1_root_rot"][-1:], dtype=np.float32))
+        np.asarray(state_msg.states.g1_root_rot[-1:], dtype=np.float32))
     reference_rot = torch.as_tensor(
         reference_rot_np, dtype=torch.float32, device=device)
     return state_goal_from_reference(
@@ -398,13 +400,71 @@ def _end_effectors_from_goal_state(
 
 
 def _state_field(state_msg: Any, name: str):
-    value = getattr(state_msg, name, None)
-    if value is not None:
-        return value
-    raw = getattr(state_msg, 'raw', {})
-    if isinstance(raw, dict):
-        return raw.get(name)
-    return None
+    """Read a field from the latest protocol-11 nested StateMessage."""
+    state_fields = {
+        "g1_pos": state_msg.states.g1_pos,
+        "g1_root_rot": state_msg.states.g1_root_rot,
+        "g1_joint_pos": state_msg.states.g1_joint_pos,
+    }
+    if name in state_fields:
+        return state_fields[name]
+
+    if name == "timestamps_ns":
+        return state_msg.history_meta.timestamps_ns
+    if name == "publish_t_ns":
+        return state_msg.history_meta.publish_t_ns
+    if name == "tracked_plan_seq":
+        return state_msg.tracking.seq
+    if name == "tracked_plan_start_t_ns":
+        return state_msg.tracking.start_t_ns
+    if name == "text":
+        return state_msg.condition.text
+    if name == "ego_occ":
+        return state_msg.condition.ego_occ
+    validity = state_msg.condition.valid
+    goal_validity = validity.goal
+    validity_fields = {
+        "scene_valid": validity.scene,
+        "text_valid": validity.text,
+        "goal_root_valid": goal_validity.root,
+        "goal_yaw_valid": goal_validity.yaw,
+        "goal_body_valid": goal_validity.body,
+        "goal_orientation_valid": goal_validity.orientation,
+        "goal_joint_valid": goal_validity.joint,
+        "goal_velocity_valid": goal_validity.velocity,
+        "goal_time_valid": goal_validity.time,
+        "goal_end_effector_valid": goal_validity.end_effector.valid,
+        "goal_end_effector_left_hand_valid": (
+            goal_validity.end_effector.left_hand),
+        "goal_end_effector_right_hand_valid": (
+            goal_validity.end_effector.right_hand),
+        "goal_end_effector_left_foot_valid": (
+            goal_validity.end_effector.left_foot),
+        "goal_end_effector_right_foot_valid": (
+            goal_validity.end_effector.right_foot),
+    }
+    if name in validity_fields:
+        return validity_fields[name]
+
+    goal_fields = {
+        "goal_type": state_msg.condition.goal.goal_type,
+        "goal_root_pos_world": state_msg.condition.goal.root_pos_world,
+        "goal_yaw_world": state_msg.condition.goal.yaw_world,
+        "goal_root_velocity_world": (
+            state_msg.condition.goal.root_velocity_world),
+        "goal_timestamp_ns": state_msg.condition.goal.timestamp_ns,
+        "goal_keypoints_world": state_msg.condition.goal.keypoints_world,
+        "goal_root_rot_world": state_msg.condition.goal.root_rot_world,
+        "goal_root_euler_world": state_msg.condition.goal.root_euler_world,
+        "goal_dof_pos": state_msg.condition.goal.dof_pos,
+        "goal_joint_pos": state_msg.condition.goal.dof_pos,
+        "goal_end_effectors_world": (
+            state_msg.condition.goal.end_effectors_world),
+    }
+    if name in goal_fields:
+        return goal_fields[name]
+
+    raise KeyError(f"Unknown protocol-11 state field: {name}")
 
 
 def _state_bool_field(state_msg: Any, name: str, default: bool = True) -> bool:
@@ -545,10 +605,7 @@ def state_goal_from_reference(state_msg: Any,
         goal_yaw_world.detach().cpu().numpy().reshape(-1)[0])
 
     if goal_type.uses_keypoints:
-        raw = getattr(state_msg, 'raw', {})
         state_keypoints_world = _state_field(state_msg, 'goal_keypoints_world')
-        if state_keypoints_world is None:
-            state_keypoints_world = raw.get('goal_keypoints_world')
         if state_keypoints_world is None:
             num_keypoints = 4 if goal_type is GoalType.BODY_EXT else 5
             if not goal_body_valid:
@@ -644,14 +701,10 @@ def state_goal_from_reference(state_msg: Any,
         if state_goal_dof is None:
             if goal_joint_valid:
                 raise ValueError("joint_state goal requires goal_dof_pos [29]")
-            raw = getattr(state_msg, 'raw', {})
-            raw_joint_pos = raw.get('g1_joint_pos') if isinstance(raw, dict) else None
-            if raw_joint_pos is None:
-                raise ValueError(
-                    "joint_state goal with goal_joint_valid=false requires "
-                    "controller g1_joint_pos history for fallback")
             state_goal_dof = isaaclab_to_mujoco_dof(
-                np.asarray(raw_joint_pos, dtype=np.float32)[-1:].reshape(1, 29)
+                np.asarray(
+                    state_msg.states.g1_joint_pos,
+                    dtype=np.float32)[-1:].reshape(1, 29)
             )[0]
         if state_goal_rot is None:
             state_goal_euler = np.asarray(state_goal_euler, dtype=np.float32)
@@ -689,14 +742,34 @@ def state_goal_from_reference(state_msg: Any,
         world_goal_dof = torch.as_tensor(
             state_goal_dof, dtype=torch.float32, device=device).reshape(1, 29)
         if parsed_encoding is GoalEncoding.SPLIT_END_EFFECTOR:
-            world_goal_end_effectors = _end_effectors_from_goal_state(
-                goal_pos_world,
-                world_goal_rot,
-                world_goal_dof,
-                val_data=val_data,
-                device=device,
-                fps=fps,
-            )
+            state_goal_end_effectors = _state_field(
+                state_msg, 'goal_end_effectors_world')
+            if state_goal_end_effectors is not None:
+                state_goal_end_effectors = np.asarray(
+                    state_goal_end_effectors, dtype=np.float32)
+                if state_goal_end_effectors.shape != (4, 3):
+                    raise ValueError(
+                        "joint_state goal_end_effectors_world must have "
+                        f"shape (4, 3), got {state_goal_end_effectors.shape}")
+                if not np.isfinite(state_goal_end_effectors).all():
+                    raise ValueError(
+                        "joint_state goal_end_effectors_world must be finite")
+                world_goal_end_effectors = torch.as_tensor(
+                    state_goal_end_effectors,
+                    dtype=torch.float32,
+                    device=device,
+                ).reshape(1, 4, 3)
+            else:
+                # The payload may be omitted when the end-effector block is
+                # invalid; FK keeps the 67-D goal finite before masking.
+                world_goal_end_effectors = _end_effectors_from_goal_state(
+                    goal_pos_world,
+                    world_goal_rot,
+                    world_goal_dof,
+                    val_data=val_data,
+                    device=device,
+                    fps=fps,
+                )
 
     if (goal_type is GoalType.JOINT_STATE
             and motion_dtype.FeatureVersion == 6
@@ -780,18 +853,194 @@ def _rotation_matrix_between_vectors(source: torch.Tensor,
     return torch.where(antiparallel.view(batch_size, 1, 1), fallback, result)
 
 
+def apply_generated_history_alignment_correction(
+        abs_pose: dict,
+        correction: dict[str, torch.Tensor | None],
+        history_motion: torch.Tensor | None = None,
+        val_data: Any = None):
+    """Apply a previously computed alignment correction without re-anchoring.
+
+    This is used while the controller is still tracking an older plan.  The
+    correction is a fixed frame transform, so it can be applied to a newly
+    selected history window without comparing that window to the current
+    measured state again.
+    """
+    from robotmdar.dtype.rotation import (
+        euler_angles_to_quaternion,
+        get_euler_xyz,
+        quat_apply,
+        quat_inverse,
+        quat_mul,
+    )
+
+    device = (
+        history_motion.device
+        if history_motion is not None
+        else abs_pose["root_trans_offset"].device
+    )
+    source_abs_pos = abs_pose["root_trans_offset"].to(device)
+    source_abs_rot = abs_pose["root_rot"].to(device)
+    if source_abs_pos.ndim == 1:
+        source_abs_pos = source_abs_pos.unsqueeze(0)
+    if source_abs_rot.ndim == 1:
+        source_abs_rot = source_abs_rot.unsqueeze(0)
+    pose_rotation = correction["pose_rotation"].to(device)
+    pose_translation = correction["pose_translation"].to(device)
+    aligned_abs_pose = {
+        "root_trans_offset": (
+            quat_apply(
+                pose_rotation,
+                source_abs_pos,
+                w_last=True,
+            )
+            + pose_translation
+        ),
+        "root_rot": quat_mul(
+            pose_rotation,
+            source_abs_rot,
+            w_last=True,
+        ),
+    }
+
+    if history_motion is None or val_data is None:
+        return aligned_abs_pose, history_motion
+
+    raw = val_data.denormalize(history_motion.to(device)).clone()
+    batch_size, num_frames = raw.shape[:2]
+    if num_frames <= 0:
+        raise ValueError("Generated history must contain at least one feature")
+
+    if motion_dtype.FeatureVersion == 6:
+        height_delta = correction["feature_height_delta"]
+        gravity_rotation = correction["feature_gravity_rotation"]
+        if height_delta is None or gravity_rotation is None:
+            raise ValueError(
+                "FeatureVersion 6 alignment correction is missing its "
+                "height/gravity transform")
+        raw[..., 0] = raw[..., 0] + height_delta.to(
+            device=device, dtype=raw.dtype).reshape(-1, 1)
+        raw[..., 1:4] = torch.matmul(
+            gravity_rotation.to(device=device, dtype=raw.dtype)
+            .unsqueeze(1),
+            raw[..., 1:4].unsqueeze(-1),
+        ).squeeze(-1)
+        raw[..., 1:4] = F.normalize(
+            raw[..., 1:4], dim=-1, eps=1e-8)
+        return aligned_abs_pose, val_data.normalize(raw)
+
+    if motion_dtype.FeatureVersion != 3:
+        return aligned_abs_pose, history_motion
+
+    feature_rotation = correction["feature_rotation"].to(device)
+    feature_translation = correction["feature_translation"].to(device)
+
+    sin_roll = raw[..., 0]
+    cos_roll = raw[..., 1] + 1
+    sin_pitch = raw[..., 2]
+    cos_pitch = raw[..., 3] + 1
+    delta_yaw = raw[..., 4]
+
+    init_euler = get_euler_xyz(
+        source_abs_rot, w_last=True)
+    ref_yaw = init_euler[2]
+    yaw_old = torch.zeros(
+        batch_size, num_frames, device=device, dtype=raw.dtype)
+    yaw_old[:, 0] = ref_yaw
+    if num_frames > 1:
+        yaw_old[:, 1:] = (
+            torch.cumsum(delta_yaw[:, :num_frames - 1], dim=1)
+            + ref_yaw.reshape(-1, 1)
+        )
+
+    euler = torch.stack([sin_roll.atan2(cos_roll),
+                         sin_pitch.atan2(cos_pitch),
+                         yaw_old], dim=-1)
+    rot_orig = euler_angles_to_quaternion(euler)
+    rot_corrected = quat_mul(
+        feature_rotation.expand(batch_size * num_frames, 4),
+        rot_orig.reshape(-1, 4),
+        w_last=True,
+    ).reshape(batch_size, num_frames, 4)
+
+    roll_new, pitch_new, yaw_new = get_euler_xyz(
+        rot_corrected.reshape(-1, 4), w_last=True)
+    roll_new = roll_new.reshape(batch_size, num_frames)
+    pitch_new = pitch_new.reshape(batch_size, num_frames)
+    yaw_new = yaw_new.reshape(batch_size, num_frames)
+    raw[..., 0] = torch.sin(roll_new)
+    raw[..., 1] = torch.cos(roll_new) - 1
+    raw[..., 2] = torch.sin(pitch_new)
+    raw[..., 3] = torch.cos(pitch_new) - 1
+    if num_frames > 1:
+        raw[..., :num_frames - 1, 4] = (
+            yaw_new[:, 1:] - yaw_new[:, :-1])
+
+    delta_trans_local = raw[..., 7:10].clone()
+    yaw_quat_old = euler_angles_to_quaternion(
+        torch.stack([
+            torch.zeros_like(yaw_old),
+            torch.zeros_like(yaw_old),
+            yaw_old,
+        ], dim=-1),
+    )
+    world_disp = quat_apply(
+        yaw_quat_old[:, :-1].reshape(-1, 4),
+        delta_trans_local[:, :-1].reshape(-1, 3),
+        w_last=True,
+    ).reshape(batch_size, num_frames - 1, 3)
+    world_disp_corr = quat_apply(
+        feature_rotation.expand(batch_size * (num_frames - 1), 4),
+        world_disp.reshape(-1, 3),
+        w_last=True,
+    ).reshape(batch_size, num_frames - 1, 3)
+    yaw_quat_new = euler_angles_to_quaternion(
+        torch.stack([
+            torch.zeros_like(yaw_new),
+            torch.zeros_like(yaw_new),
+            yaw_new,
+        ], dim=-1),
+    )
+    delta_trans_new = quat_apply(
+        quat_inverse(yaw_quat_new[:, :-1], w_last=True).reshape(-1, 4),
+        world_disp_corr.reshape(-1, 3),
+        w_last=True,
+    ).reshape(batch_size, num_frames - 1, 3)
+    if num_frames > 1:
+        raw[..., :num_frames - 1, 7:10] = delta_trans_new
+
+    root_pos_old = torch.zeros(
+        batch_size, num_frames, 3, device=device, dtype=raw.dtype)
+    root_pos_old[:, 0] = source_abs_pos.to(dtype=raw.dtype)
+    if num_frames > 1:
+        root_pos_old[:, 1:] = (
+            torch.cumsum(world_disp, dim=1) + root_pos_old[:, :1]
+        )
+    root_pos_old[..., 2] = raw[..., 10]
+    root_pos_corrected = quat_apply(
+        feature_rotation.unsqueeze(1).expand(batch_size, num_frames, 4),
+        root_pos_old,
+        w_last=True,
+    ) + feature_translation.unsqueeze(1)
+    raw[..., 10] = root_pos_corrected[..., 2]
+    return aligned_abs_pose, val_data.normalize(raw)
+
+
 def align_generated_history_pose(abs_pose: dict,
                                  generated_reference_pos: torch.Tensor,
                                  generated_reference_rot: torch.Tensor,
                                  state_msg: Any,
                                  device: str | torch.device,
                                  history_motion: torch.Tensor | None = None,
-                                 val_data: Any = None):
+                                 val_data: Any = None,
+                                 return_correction: bool = False):
     """Translate and rotate generated history so its reference pose matches the real G1 root.
 
     When *history_motion* and *val_data* are provided, version-specific
     absolute pose channels are also corrected so every reconstructed frame
     carries the current G1 seam state.
+
+    If *return_correction* is true, append the fixed correction transform to
+    the return tuple so later replans can inherit it without re-anchoring.
     """
     from robotmdar.dtype.rotation import (
         euler_angles_to_quaternion,
@@ -802,12 +1051,12 @@ def align_generated_history_pose(abs_pose: dict,
     )
 
     real_current_pos = torch.tensor(
-        state_msg.raw["g1_pos"][-1], dtype=torch.float32,
+        state_msg.states.g1_pos[-1], dtype=torch.float32,
         device=device).reshape(1, 3)
     # Normalise the real quaternion defensively (ZMQ decoding may produce
     # views with non-unit norm).
     real_current_rot_q = _normalized_wire_quaternions_wxyz_as_xyzw(
-        np.asarray(state_msg.raw["g1_root_rot"][-1:], dtype=np.float32))
+        np.asarray(state_msg.states.g1_root_rot[-1:], dtype=np.float32))
     real_current_rot = torch.as_tensor(
         real_current_rot_q, dtype=torch.float32, device=device).reshape(1, 4)
 
@@ -817,6 +1066,12 @@ def align_generated_history_pose(abs_pose: dict,
     # Rotation delta: q_delta = q_real * q_gen^{-1}
     q_gen_inv = quat_inverse(generated_reference_rot, w_last=True)
     q_delta = quat_mul(real_current_rot, q_gen_inv, w_last=True)
+    feature_translation = (
+        real_current_pos
+        - quat_apply(q_delta, generated_reference_pos, w_last=True)
+    )
+    feature_height_delta = None
+    feature_gravity_rotation = None
 
     # Rotate the generated position *around* the reference pivot, then add
     # the real translation.
@@ -837,7 +1092,7 @@ def align_generated_history_pose(abs_pose: dict,
             and history_motion is not None and val_data is not None):
         from robotmdar.dtype.rotation import quaternion_to_matrix, xyzw_to_wxyz
 
-        raw = val_data.denormalize(history_motion.to(device))
+        raw = val_data.denormalize(history_motion.to(device)).clone()
         B, T = raw.shape[:2]
         if T <= 0:
             raise ValueError("Generated history must contain at least one feature")
@@ -868,10 +1123,12 @@ def align_generated_history_pose(abs_pose: dict,
         # FeatureVersion 6 has no absolute XY channel.  Its endpoint state is
         # represented by the final feature's absolute height and gravity.
         delta_h = real_height - raw[:, -1, 0]
+        feature_height_delta = delta_h.detach().clone()
         raw[..., 0] = raw[..., 0] + delta_h.reshape(B, 1)
 
         gravity_delta = _rotation_matrix_between_vectors(
             raw[:, -1, 1:4], real_gravity)
+        feature_gravity_rotation = gravity_delta.detach().clone()
         raw[..., 1:4] = torch.matmul(
             gravity_delta.unsqueeze(1),
             raw[..., 1:4].unsqueeze(-1),
@@ -952,7 +1209,7 @@ def align_generated_history_pose(abs_pose: dict,
         aligned_history_motion = val_data.normalize(raw)
     elif history_motion is not None and val_data is not None:
         raw = val_data.denormalize(
-            history_motion.to(device))          # (B, T, 57 or 69)
+            history_motion.to(device)).clone()  # (B, T, 57 or 69)
         B, T = raw.shape[:2]
 
         # V3 stores absolute roll/pitch sincos and a forward delta_yaw.
@@ -1052,13 +1309,46 @@ def align_generated_history_pose(abs_pose: dict,
 
         aligned_history_motion = val_data.normalize(raw)
 
-    # goal reference pose is the *real* G1 pose so ego-goal is computed
+    pose_rotation = quat_mul(
+        aligned_abs_pose["root_rot"].to(device),
+        quat_inverse(abs_pose["root_rot"].to(device), w_last=True),
+        w_last=True,
+    )
+    pose_translation = (
+        aligned_abs_pose["root_trans_offset"].to(device)
+        - quat_apply(
+            pose_rotation,
+            abs_pose["root_trans_offset"].to(device),
+            w_last=True,
+        )
+    )
+    correction = {
+        "pose_rotation": pose_rotation.detach().clone(),
+        "pose_translation": pose_translation.detach().clone(),
+        "feature_rotation": q_delta.detach().clone(),
+        "feature_translation": feature_translation.detach().clone(),
+        "feature_height_delta": (
+            feature_height_delta.detach().clone()
+            if feature_height_delta is not None else None
+        ),
+        "feature_gravity_rotation": (
+            feature_gravity_rotation.detach().clone()
+            if feature_gravity_rotation is not None else None
+        ),
+    }
+
+    # Goal reference pose is the *real* G1 pose so ego-goal is computed
     # relative to where the robot actually is.
-    return (aligned_abs_pose,
-            real_current_pos,       # goal_reference_pos
-            real_current_rot,       # goal_reference_rot
-            real_current_pos - generated_reference_pos,  # translation
-            aligned_history_motion)
+    result = (
+        aligned_abs_pose,
+        real_current_pos,       # goal_reference_pos
+        real_current_rot,       # goal_reference_rot
+        real_current_pos - generated_reference_pos,  # translation
+        aligned_history_motion,
+    )
+    if return_correction:
+        return result + (correction,)
+    return result
 
 
 def tracked_frame_from_timestamps(state_msg: Any, fps: float,
@@ -1068,8 +1358,8 @@ def tracked_frame_from_timestamps(state_msg: Any, fps: float,
         raise ValueError(f"Motion fps must be positive, got {fps}")
     if future_len <= 0:
         raise ValueError(f"future_len must be positive, got {future_len}")
-    start_t_ns = int(state_msg.tracked_plan_start_t_ns)
-    state_t_ns = int(state_msg.publish_t_ns)
+    start_t_ns = int(state_msg.tracking.start_t_ns)
+    state_t_ns = int(state_msg.history_meta.publish_t_ns)
     if start_t_ns <= 0:
         raise ValueError("Controller has not reported an active plan start time")
     if state_t_ns < start_t_ns:
@@ -1080,8 +1370,14 @@ def tracked_frame_from_timestamps(state_msg: Any, fps: float,
 
 
 def generated_history_at_frame(plan: dict, tracked_frame: int,
-                               history_len: int):
-    """Select model history ending at a tracked published-future frame."""
+                               history_len: int, *,
+                               phase_lag_offset: int = 0):
+    """Select history at a tracked frame, compensating for tracker phase lag.
+
+    ``phase_lag_offset`` shifts the selected generated frame earlier in the
+    plan, so a measured state at ``tracked_frame`` is compared with the
+    predicted state at ``tracked_frame - phase_lag_offset``.
+    """
     features = plan["features"]
     root_pos = plan["root_pos"]
     root_rot = plan["root_rot"]
@@ -1089,11 +1385,16 @@ def generated_history_at_frame(plan: dict, tracked_frame: int,
         raise ValueError(f"history_len must be positive, got {history_len}")
     if tracked_frame < 0:
         raise ValueError(f"tracked_frame must be non-negative, got {tracked_frame}")
-    feature_end = history_len + tracked_frame
+    phase_lag_offset = int(phase_lag_offset)
+    if phase_lag_offset < 0:
+        raise ValueError(
+            f"phase_lag_offset must be non-negative, got {phase_lag_offset}")
+    selected_frame = max(0, tracked_frame - phase_lag_offset)
+    feature_end = history_len + selected_frame
     feature_start = feature_end - history_len + 1
     if feature_end >= features.shape[1]:
         raise ValueError(
-            f"Tracked frame {tracked_frame} exceeds cached plan with "
+            f"Selected frame {selected_frame} exceeds cached plan with "
             f"{features.shape[1] - history_len} future frames")
     if root_pos.shape[1] <= feature_end or root_rot.shape[1] <= feature_end:
         raise ValueError("Cached plan poses do not cover the selected history")

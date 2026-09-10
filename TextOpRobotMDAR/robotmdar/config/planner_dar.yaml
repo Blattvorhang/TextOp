@@ -38,17 +38,32 @@ motion_start_frame: 0
 # Clip name inside the pkl (required when pkl has >1 clip; auto-detected otherwise).
 motion_clip: null
 
-# Optional CLIP prompt for action style conditioning. Set to null to disable.
-text_prompt: null
+# Text conditioning is supplied by the controller in each TextOp state.
+# `text_valid: false` masks this condition; there is no static prompt fallback.
 
-# Bootstrap from controller history once, then autoregress on generated history.
-# Before each replan, translate the generated history endpoint to the measured
-# G1 root position; local features and generated orientation remain unchanged.
-use_generated_history: false
+# Optional fixed profile selector for offline recovery tests.  Leave false for
+# normal SONIC locomotion.  A dynamic controller-owned recovery signal can be
+# forwarded through the same `is_recovery` field in generate_next_motion().
+is_recovery: false
 
-# Keep false while debugging pure autoregressive history. When enabled, the
-# selected generated-history endpoint is translated onto the measured G1 root.
-align_generated_history_to_g1: false
+# Generated-history autoregressive chain and state-alignment policy.
+generated_history:
+  # Bootstrap from controller history once, then autoregress on generated
+  # history.
+  enabled: true
+  # Keep false while debugging pure autoregressive history. When enabled, the
+  # selected generated-history endpoint is translated onto the measured G1
+  # root; skipped cycles inherit the latest correction.
+  align_to_g1: true
+  # Number of generated-motion frames by which the tracker lags the reference.
+  # Alignment compares the current measured state with the earlier predicted
+  # frame (tracked_frame - phase_lag_offset). Values beyond plan start clamp
+  # to 0.
+  phase_lag_offset: 0
+  # Recompute alignment once every N generated-history replans. The first
+  # generated-history replan always aligns; skipped replans inherit the last
+  # correction while the controller is still on the source plan.
+  align_every: 2
 
 # Single-step denoising is the real-time path. Full diffusion can be enabled
 # explicitly for offline experiments, but is not expected to meet the online
@@ -63,33 +78,30 @@ occ_grid: null
 data:
   dof_dim: 29
   goal_type: joint_state
-  goal_encoding: split
+  # Current 67-D joint_state contract:
+  # root position/yaw/urgency + orientation + joints + velocity + four EEs.
+  goal_encoding: split_end_effector
   goal_per_primitive: true
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
   goal_include_log_d_hor: false
+  # Text is encoded online from controller-provided descriptions; the
+  # planner does not need dataset annotation embeddings at startup.
+  load_text_embeddings: false
   history_len: 16
   future_len: 64
   load_goal_stats: false
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
-  goal_dim: 55
-  cond_text_mask_prob: 0.1
+  goal_dim: 67
+  # Do not inherit the training-time condition-dropout schedule.
+  cond_mask_prob: null
 
-# V6 uses the TextOp-style root orientation block. Dropping yaw is treated as
-# dropping the whole orientation block for joint_state.
-force_drop_text: false
-force_drop_goal_root: false
-force_drop_goal_yaw: false
-force_drop_goal_body: false
-force_drop_goal_orientation: false
-force_drop_goal_joint: false
-force_drop_goal_velocity: false
-force_drop_scene: false
-
-# V6 arrival time is a separate positional encoding.
-force_drop_goal_time: false
+# Condition dropout probabilities belong to training. At inference the
+# controller's `*_valid` fields are passed to the denoiser as real masks.
+# Text architecture support is inferred from the loaded checkpoint; the
+# per-state `text_valid` flag controls whether its text condition is present.
 
 # Clamp the controller goal back into the training distribution before it is
 # encoded: r_max(T) = clip(speed_max * clip(T, 1/fps, time_max), r_min, r_max).
