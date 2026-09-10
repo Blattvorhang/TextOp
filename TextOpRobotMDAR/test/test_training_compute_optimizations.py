@@ -27,6 +27,10 @@ from TextOpRobotMDAR.robotmdar.train.manager import (
     GeometryLoss,
     _standard_normal_kl_mean,
 )
+from TextOpRobotMDAR.robotmdar.train.train_dar import (
+    _BackgroundPrefetchIterator,
+    _add_batch_data_diagnostics,
+)
 from TextOpRobotMDAR.robotmdar.utils.occupancy import (
     _local_grid_offsets,
     compute_scene_surface,
@@ -114,6 +118,69 @@ def test_clip_grad_and_check_matches_old_finite_path():
     torch.testing.assert_close(manager.extra['grad_norm'], expected_norm)
     for old_param, new_param in zip(old_model.parameters(), new_model.parameters()):
         torch.testing.assert_close(old_param.grad, new_param.grad)
+
+
+def test_background_prefetch_iterator_preserves_batches():
+    prefetched = _BackgroundPrefetchIterator(
+        iter([{"segment": 0}, {"segment": 1}, {"segment": 2}]))
+    try:
+        assert next(prefetched) == {"segment": 0}
+        assert next(prefetched) == {"segment": 1}
+        assert next(prefetched) == {"segment": 2}
+    finally:
+        prefetched.close()
+
+
+def test_batch_data_diagnostics_split_recovery_condition_keep_ratios():
+    extras = {}
+    primitive = {
+        "is_recovery": torch.tensor([False, True, True]),
+        "action_label": ["walk", "", "stand up"],
+        "text_embedding": torch.tensor([
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [0.5, 0.5],
+        ]),
+    }
+    y = {
+        "goal": torch.zeros(3, 66),
+        "goal_position_hor_condition_keep_mask": torch.tensor(
+            [True, False, True]),
+        "goal_position_vert_condition_keep_mask": torch.tensor(
+            [True, True, True]),
+        "goal_gravity_condition_keep_mask": torch.tensor(
+            [False, True, False]),
+        "goal_orientation_condition_keep_mask": torch.tensor(
+            [True, False, False]),
+        "goal_joint_condition_keep_mask": torch.tensor(
+            [True, False, False]),
+        "goal_velocity_condition_keep_mask": torch.tensor(
+            [True, False, True]),
+        "goal_time_condition_keep_mask": torch.tensor(
+            [True, True, False]),
+        "goal_end_effector_condition_keep_mask": torch.tensor([
+            [True, True, False, False],
+            [False, False, False, False],
+            [True, False, True, False],
+        ]),
+    }
+
+    _add_batch_data_diagnostics(extras, primitive, y)
+
+    torch.testing.assert_close(
+        extras["data/batch_recovery_fraction"], torch.tensor(2.0 / 3.0))
+    torch.testing.assert_close(
+        extras["data/recovery_action_label_empty_rate"], torch.tensor(0.5))
+    torch.testing.assert_close(
+        extras["data/recovery_text_embedding_empty_rate"], torch.tensor(0.5))
+    torch.testing.assert_close(
+        extras["condition/recovery_position_hor_keep_ratio"], torch.tensor(0.5))
+    torch.testing.assert_close(
+        extras["condition/locomotion_position_hor_keep_ratio"], torch.tensor(1.0))
+    torch.testing.assert_close(
+        extras["condition/recovery_gravity_keep_ratio"], torch.tensor(0.5))
+    torch.testing.assert_close(
+        extras["condition/recovery_end_effector_keep_ratio"], torch.tensor(0.25))
 
 
 @pytest.mark.parametrize('bad_value', [float('nan'), float('inf')])
