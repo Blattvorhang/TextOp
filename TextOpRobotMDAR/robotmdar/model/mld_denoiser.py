@@ -586,11 +586,29 @@ def _mask_split_goal(model, goal, y):
         layout["horizontal"].start,
         layout["horizontal_urgency"].start,
     )
+    force_position_hor = (
+        y.get('force_drop_goal_position_hor', False)
+        or y.get('force_drop_goal_root', False)
+    )
+    force_position_vert = (
+        y.get('force_drop_goal_position_vert', False)
+        or y.get('force_drop_goal_root', False)
+    )
+    force_gravity = (
+        y.get('force_drop_goal_gravity', False)
+        or y.get('force_drop_goal_orientation', False)
+        or y.get('force_drop_goal_yaw', False)
+    )
+    force_orientation = (
+        y.get('force_drop_goal_orientation_rot6d', False)
+        or y.get('force_drop_goal_orientation', False)
+        or y.get('force_drop_goal_yaw', False)
+    )
     horizontal, horizontal_keep = model.mask_condition(
         goal[:, horizontal_content],
         _condition_mask_probability(
             model, y, 'goal_position_hor', batch_size, device),
-        force_mask=y.get('force_drop_goal_root', False),
+        force_mask=force_position_hor,
         valid_mask=root_valid,
         return_keep_mask=True,
     )
@@ -598,7 +616,7 @@ def _mask_split_goal(model, goal, y):
         goal[:, layout["vertical_height"]],
         _condition_mask_probability(
             model, y, 'goal_position_vert', batch_size, device),
-        force_mask=y.get('force_drop_goal_root', False),
+        force_mask=force_position_vert,
         valid_mask=root_valid,
         return_keep_mask=True,
     )
@@ -606,9 +624,7 @@ def _mask_split_goal(model, goal, y):
         goal[:, layout["vertical_gravity"]],
         _condition_mask_probability(
             model, y, 'goal_gravity', batch_size, device),
-        force_mask=(
-            y.get('force_drop_goal_orientation', False)
-            or y.get('force_drop_goal_yaw', False)),
+        force_mask=force_gravity,
         valid_mask=orientation_valid,
         return_keep_mask=True,
     )
@@ -616,9 +632,7 @@ def _mask_split_goal(model, goal, y):
         goal[:, layout["orientation"]],
         _condition_mask_probability(
             model, y, 'goal_orientation_rot6d', batch_size, device),
-        force_mask=(
-            y.get('force_drop_goal_orientation', False)
-            or y.get('force_drop_goal_yaw', False)),
+        force_mask=force_orientation,
         valid_mask=orientation_valid,
         return_keep_mask=True,
     )
@@ -760,6 +774,10 @@ def _mask_legacy_split_goal(model, goal, y):
         model, y, 'time', batch_size, device)
     if 'arrival_time_condition_keep_mask' in y:
         time_keep = y['arrival_time_condition_keep_mask']
+    elif y.get('force_drop_goal_time', False) or y.get(
+            'force_drop_arrival_time', False):
+        time_keep = torch.zeros(
+            batch_size, dtype=torch.bool, device=device)
     elif time_valid is not None:
         time_keep = time_valid
     else:
@@ -847,7 +865,11 @@ def _mask_goal(model, goal, y):
             goal[:, root_slice],
             _condition_mask_probability(
                 model, y, 'goal_position', batch_size, device),
-            force_mask=y.get('force_drop_goal_root', False),
+            force_mask=(
+                y.get('force_drop_goal_root', False)
+                or y.get('force_drop_goal_position_hor', False)
+                or y.get('force_drop_goal_position_vert', False)
+            ),
             valid_mask=root_valid,
             return_keep_mask=True,
         )
@@ -857,6 +879,7 @@ def _mask_goal(model, goal, y):
                 model, y, 'goal_orientation', batch_size, device),
             force_mask=(
                 y.get('force_drop_goal_orientation', False)
+                or y.get('force_drop_goal_orientation_rot6d', False)
                 or y.get('force_drop_goal_yaw', False)),
             valid_mask=orientation_valid,
             return_keep_mask=True,
@@ -1181,13 +1204,21 @@ class DenoiserMLP(nn.Module):
 
         goal, goal_keep_mask = _mask_goal(self, y['goal'], y)
         y['goal_condition_keep_mask'] = goal_keep_mask
+        voxel = y.get('voxel')
+        if voxel is None:
+            voxel = torch.zeros(
+                batch_size,
+                self.scene_dim,
+                device=goal.device,
+                dtype=goal.dtype,
+            )
         voxel = self.mask_condition(
-            y['voxel'],
+            voxel,
             _condition_mask_probability(
-                self, y, 'scene', batch_size, y['voxel'].device),
+                self, y, 'scene', batch_size, voxel.device),
             force_mask=y.get('force_drop_scene', False),
             valid_mask=_deployment_valid_mask(
-                self, y.get('scene_valid'), batch_size, y['voxel'].device))
+                self, y.get('scene_valid'), batch_size, voxel.device))
         arrival_time_frame = y.get(
             'time_to_arrival_frame', y.get('arrival_time_frame'))
         if _goal_dim_uses_arrival_pe(self.goal_dim):

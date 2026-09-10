@@ -2144,7 +2144,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         """Compute multiple end-effector goals with one batched FK call."""
         if not goal_frames:
             return torch.empty((0, 4, 3), dtype=torch.float32)
-        frame_index = torch.as_tensor(goal_frames, dtype=torch.long)
+        # A one-element torch index collapses NumPy arrays to 1-D; keep a
+        # Python integer list so singleton and batched goals have one shape.
+        frame_index = [int(frame) for frame in goal_frames]
         goal_motion = {
             'dof': self._select_model_dof(torch.as_tensor(
                 raw_motion['dof'][frame_index], dtype=torch.float32

@@ -14,17 +14,44 @@ from hydra.utils import instantiate
 from robotmdar.utils.goal import (
     GoalEncoding,
     GoalType,
+    JOINT_STATE_GOAL_DIM,
     ROT_MAT_JOINT_STATE_GOAL_DIM,
     SPLIT_END_EFFECTOR_GOAL_DIM,
     SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+    SPLIT_END_EFFECTOR_TOKEN_ORDER,
     SPLIT_NO_LOG_END_EFFECTOR_SLICE,
+    SPLIT_NO_LOG_END_EFFECTOR_SUBSLICES,
+    SPLIT_NO_LOG_HORIZONTAL_SLICE,
+    SPLIT_NO_LOG_HORIZONTAL_URGENCY_SLICE,
+    SPLIT_NO_LOG_JOINT_SLICE,
+    SPLIT_NO_LOG_ORIENTATION_SLICE,
+    SPLIT_NO_LOG_TIME_SLICE,
+    SPLIT_NO_LOG_VELOCITY_SLICE,
+    SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE,
+    SPLIT_NO_LOG_VERTICAL_HEIGHT_SLICE,
+    SPLIT_NO_LOG_VERTICAL_URGENCY_SLICE,
     SPLIT_END_EFFECTOR_SLICE,
+    SPLIT_END_EFFECTOR_SUBSLICES,
     SPLIT_GOAL_DIM,
     SPLIT_GOAL_NO_LOG_DIM,
     SPLIT_HORIZONTAL_SLICE,
+    SPLIT_HORIZONTAL_URGENCY_SLICE,
+    SPLIT_JOINT_SLICE,
+    SPLIT_ORIENTATION_SLICE,
+    SPLIT_TIME_SLICE,
+    SPLIT_VELOCITY_SLICE,
+    SPLIT_VERTICAL_GRAVITY_SLICE,
+    SPLIT_VERTICAL_HEIGHT_SLICE,
+    SPLIT_VERTICAL_URGENCY_SLICE,
+    V6_RAW_JOINT_SLICE,
+    V6_RAW_ORIENTATION_SLICE,
+    V6_RAW_POSITION_SLICE,
+    V6_RAW_TIME_SLICE,
+    V6_RAW_VELOCITY_SLICE,
     build_ego_goal,
     build_ego_joint_state_goal_v6,
     build_ego_split_end_effector_goal_no_log,
+    scale_split_goal_no_log,
     validate_goal_config,
 )
 from robotmdar.utils.occupancy import (
@@ -153,6 +180,425 @@ def _loss_weight_config_value_from_mapping(loss_weight, key: str) -> float:
             if value is not None:
                 return float(value)
     return 0.0
+
+
+def _mapping_get(mapping, key, default=None):
+    if mapping is None:
+        return default
+    getter = getattr(mapping, 'get', None)
+    if getter is not None:
+        return getter(key, default)
+    try:
+        return mapping[key]
+    except (KeyError, TypeError):
+        return default
+
+
+def _loss_weight_config_value_for_section(loss_weight, key: str,
+                                          section: str) -> float:
+    """Resolve one loss weight exactly as DARManager does for a profile."""
+    if loss_weight is None:
+        return 0.0
+    sections = ('locomotion', 'getup')
+    has_sections = any(
+        _mapping_get(loss_weight, name, None) is not None
+        for name in sections
+    )
+    if has_sections:
+        section_weights = _mapping_get(loss_weight, section, None)
+        if (_mapping_get(section_weights, key, None) is not None
+                or (key.startswith('goal_')
+                    and _mapping_get(section_weights, 'goal', None) is not None
+                    and _mapping_get(
+                        _mapping_get(section_weights, 'goal', None),
+                        key[len('goal_'):],
+                        None,
+                    ) is not None)):
+            return _loss_weight_config_value_from_mapping(
+                section_weights, key)
+        top_value = _mapping_get(loss_weight, key, None)
+        top_goal = _mapping_get(loss_weight, 'goal', None)
+        if top_value is not None or (
+                key.startswith('goal_')
+                and _mapping_get(top_goal, key[len('goal_'):], None)
+                is not None):
+            return _loss_weight_config_value_from_mapping(loss_weight, key)
+        if section == 'locomotion':
+            return 0.0
+        return 0.0
+    return _loss_weight_config_value_from_mapping(loss_weight, key)
+
+
+def _condition_profile_value(denoiser, profile: str, name: str,
+                             index: int | None = None) -> float:
+    profiles = getattr(denoiser, 'cond_mask_prob_profiles', None)
+    if profiles is not None:
+        profile_config = _mapping_get(profiles, profile, None)
+        value = _mapping_get(profile_config, name, 0.0)
+    else:
+        value = getattr(denoiser, name, 0.0)
+    if index is not None:
+        value = value[index]
+    return float(value)
+
+
+def _condition_active_for_training(
+    loss_weight,
+    denoiser,
+    loss_keys,
+    mask_name: str,
+    index: int | None = None,
+) -> bool:
+    """Whether a condition can contribute for at least one training profile."""
+    for profile in ('locomotion', 'getup'):
+        profile_weight = max(
+            _loss_weight_config_value_for_section(
+                loss_weight, key, profile)
+            for key in loss_keys
+        )
+        if (profile_weight > 0.0
+                and _condition_profile_value(
+                    denoiser, profile, mask_name, index=index) < 1.0):
+            return True
+    return False
+
+
+def _condition_can_be_kept(denoiser, name: str, index: int | None = None) -> bool:
+    return any(
+        _condition_profile_value(denoiser, profile, name, index=index) < 1.0
+        for profile in ('locomotion', 'getup')
+    )
+
+
+def _uses_split_goal_masking_for_conditions(goal_encoding: GoalEncoding) -> bool:
+    return goal_encoding in (
+        GoalEncoding.SINGLE,
+        GoalEncoding.SPLIT,
+        GoalEncoding.SPLIT_END_EFFECTOR,
+    )
+
+
+def _build_train_condition_plan(cfg, denoiser):
+    """Build static training gates for conditions and their loss terms.
+
+    The plan is global because a batch can mix locomotion and get-up samples.
+    A component is retained when at least one profile has a non-zero loss
+    weight and can keep the corresponding condition.  Per-sample stochastic
+    dropout is still handled by the denoiser keep masks.
+    """
+    if denoiser is None:
+        return None
+
+    loss_weight = _mapping_get(
+        _mapping_get(_mapping_get(cfg, 'train', None), 'manager', None),
+        'loss_weight',
+        None,
+    )
+    goal_type = GoalType.parse(_mapping_get(
+        _mapping_get(cfg, 'data', None), 'goal_type', GoalType.ROOT))
+    goal_encoding = GoalEncoding.parse(_mapping_get(
+        _mapping_get(cfg, 'data', None), 'goal_encoding',
+        GoalEncoding.LEGACY40))
+
+    position = _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_root_position', 'goal_root_position_hor',
+         'goal_root_position_vert'),
+        'goal_position',
+    )
+    position_hor = _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_root_position', 'goal_root_position_hor'),
+        'goal_position_hor',
+    )
+    position_vert = _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_root_position', 'goal_root_position_vert'),
+        'goal_position_vert',
+    )
+    orientation = _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_root_orientation',),
+        'goal_orientation_rot6d',
+    )
+    orientation_source = orientation or _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_g',),
+        'goal_gravity',
+    )
+    gravity = _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_g',),
+        'goal_gravity',
+    )
+    joint = _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_joint_angle',),
+        'goal_joint',
+    )
+    velocity = _condition_active_for_training(
+        loss_weight,
+        denoiser,
+        ('goal_root_velocity',),
+        'goal_velocity',
+    )
+    end_effector = tuple(
+        _condition_active_for_training(
+            loss_weight,
+            denoiser,
+            ('goal_end_effector',),
+            'goal_end_effector',
+            index=index,
+        )
+        for index, _ in enumerate(SPLIT_END_EFFECTOR_TOKEN_ORDER)
+    )
+
+    # Legacy40 and non-joint goals use one root/orientation condition rather
+    # than the current split condition names.
+    if goal_type is GoalType.JOINT_STATE and goal_encoding is GoalEncoding.LEGACY40:
+        position_hor = position_vert = position
+        orientation = _condition_active_for_training(
+            loss_weight,
+            denoiser,
+            ('goal_root_orientation',),
+            'goal_orientation',
+        )
+        orientation_source = orientation
+        gravity = False
+        joint = _condition_active_for_training(
+            loss_weight,
+            denoiser,
+            ('goal_joint_angle',),
+            'goal_joint',
+        )
+        velocity = _condition_active_for_training(
+            loss_weight,
+            denoiser,
+            ('goal_root_velocity',),
+            'goal_velocity',
+        )
+        end_effector = (False,) * len(SPLIT_END_EFFECTOR_TOKEN_ORDER)
+    elif goal_type is not GoalType.JOINT_STATE:
+        position_hor = position_vert = position
+        orientation = False
+        orientation_source = False
+        gravity = False
+        joint = False
+        velocity = False
+        end_effector = (False,) * len(SPLIT_END_EFFECTOR_TOKEN_ORDER)
+
+    goal_any = any((
+        position_hor,
+        position_vert,
+        orientation,
+        gravity,
+        joint,
+        velocity,
+        *end_effector,
+    ))
+    time_condition = (
+        goal_type.uses_arrival_time
+        and goal_any
+        and _condition_can_be_kept(denoiser, 'goal_time')
+    )
+    return {
+        'goal_position': position,
+        'goal_position_hor': position_hor,
+        'goal_position_vert': position_vert,
+        'goal_orientation': orientation,
+        'goal_orientation_source': orientation_source,
+        'goal_gravity': gravity,
+        'goal_joint': joint,
+        'goal_velocity': velocity,
+        'goal_end_effector': end_effector,
+        'goal_any': goal_any,
+        'goal_time': time_condition,
+        'scene': (
+            bool(_mapping_get(_mapping_get(cfg, 'denoiser', None),
+                              'scene_condition_enabled', True))
+            and _condition_can_be_kept(denoiser, 'scene')
+        ),
+        'text': (
+            bool(_mapping_get(_mapping_get(cfg, 'denoiser', None),
+                              'text_condition_enabled', False))
+            and _condition_can_be_kept(denoiser, 'text')
+        ),
+        'legacy_split_goal_layout': bool(
+            getattr(denoiser, 'legacy_split_goal_layout', False)),
+    }
+
+
+def _zero_goal_components(goal: torch.Tensor, plan: dict) -> torch.Tensor:
+    """Zero disabled channels after scaling, whose offsets may be non-zero."""
+    if goal is None:
+        return goal
+    goal = goal.clone()
+    goal_dim = int(goal.shape[-1])
+    if goal_dim == JOINT_STATE_GOAL_DIM:
+        if not plan['goal_position_hor']:
+            goal[..., 0:3] = 0.0
+        if not plan['goal_orientation']:
+            goal[..., 3:8] = 0.0
+        if not plan['goal_joint']:
+            goal[..., 8:37] = 0.0
+        if not plan['goal_velocity']:
+            goal[..., 37:40] = 0.0
+        return goal
+    if (goal_dim == SPLIT_GOAL_DIM
+            and plan.get('legacy_split_goal_layout', False)):
+        if not plan['goal_position_hor']:
+            goal[..., 1:6] = 0.0
+            goal[..., 7:11] = 0.0
+        if not plan['goal_position_vert']:
+            goal[..., 0:1] = 0.0
+            goal[..., 6:7] = 0.0
+            goal[..., 11:12] = 0.0
+        if not plan['goal_gravity']:
+            goal[..., 12:15] = 0.0
+        if not plan['goal_orientation']:
+            goal[..., 15:21] = 0.0
+        if not plan['goal_joint']:
+            goal[..., 21:50] = 0.0
+        if not plan['goal_velocity']:
+            goal[..., 50:54] = 0.0
+        if not plan['goal_time']:
+            goal[..., 7:12] = 0.0
+            goal[..., 54:55] = 0.0
+        return goal
+    if goal_dim in (SPLIT_GOAL_NO_LOG_DIM,
+                    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM):
+        horizontal = SPLIT_NO_LOG_HORIZONTAL_SLICE
+        horizontal_urgency = SPLIT_NO_LOG_HORIZONTAL_URGENCY_SLICE
+        vertical_height = SPLIT_NO_LOG_VERTICAL_HEIGHT_SLICE
+        vertical_gravity = SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE
+        vertical_urgency = SPLIT_NO_LOG_VERTICAL_URGENCY_SLICE
+        orientation = SPLIT_NO_LOG_ORIENTATION_SLICE
+        joint = SPLIT_NO_LOG_JOINT_SLICE
+        velocity = SPLIT_NO_LOG_VELOCITY_SLICE
+        time = SPLIT_NO_LOG_TIME_SLICE
+        end_effectors = SPLIT_NO_LOG_END_EFFECTOR_SUBSLICES
+    else:
+        horizontal = SPLIT_HORIZONTAL_SLICE
+        horizontal_urgency = SPLIT_HORIZONTAL_URGENCY_SLICE
+        vertical_height = SPLIT_VERTICAL_HEIGHT_SLICE
+        vertical_gravity = SPLIT_VERTICAL_GRAVITY_SLICE
+        vertical_urgency = SPLIT_VERTICAL_URGENCY_SLICE
+        orientation = SPLIT_ORIENTATION_SLICE
+        joint = SPLIT_JOINT_SLICE
+        velocity = SPLIT_VELOCITY_SLICE
+        time = SPLIT_TIME_SLICE
+        end_effectors = SPLIT_END_EFFECTOR_SUBSLICES
+
+    if not plan['goal_position_hor']:
+        goal[..., horizontal] = 0.0
+    if not plan['goal_position_vert']:
+        goal[..., vertical_height] = 0.0
+    if not plan['goal_gravity']:
+        goal[..., vertical_gravity] = 0.0
+    if not plan['goal_orientation']:
+        goal[..., orientation] = 0.0
+    if not plan['goal_joint']:
+        goal[..., joint] = 0.0
+    if not plan['goal_velocity']:
+        goal[..., velocity] = 0.0
+    if not plan['goal_time']:
+        goal[..., horizontal_urgency] = 0.0
+        goal[..., vertical_urgency] = 0.0
+        goal[..., time] = 0.0
+    if goal_dim in (SPLIT_END_EFFECTOR_GOAL_DIM,
+                    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM):
+        for enabled, name in zip(
+                plan['goal_end_effector'],
+                SPLIT_END_EFFECTOR_TOKEN_ORDER):
+            if not enabled:
+                goal[..., end_effectors[name]] = 0.0
+    return goal
+
+
+def _zero_raw_goal_components(goal: torch.Tensor, plan: dict) -> torch.Tensor:
+    if goal is None:
+        return goal
+    goal = goal.clone()
+    if not plan['goal_position_hor'] and not plan['goal_position_vert']:
+        goal[..., V6_RAW_POSITION_SLICE] = 0.0
+    elif not plan['goal_position_hor']:
+        goal[..., 1:4] = 0.0
+    elif not plan['goal_position_vert']:
+        goal[..., 0:1] = 0.0
+    if not plan['goal_gravity'] and not plan['goal_orientation']:
+        goal[..., V6_RAW_ORIENTATION_SLICE] = 0.0
+    elif not plan['goal_gravity']:
+        goal[..., 4:7] = 0.0
+    elif not plan['goal_orientation']:
+        goal[..., 7:13] = 0.0
+    if not plan['goal_joint']:
+        goal[..., V6_RAW_JOINT_SLICE] = 0.0
+    if not plan['goal_velocity']:
+        goal[..., V6_RAW_VELOCITY_SLICE] = 0.0
+    if not plan['goal_time']:
+        goal[..., V6_RAW_TIME_SLICE] = 0.0
+    return goal
+
+
+def _split_no_log_goal_from_v6_raw(raw_goal: torch.Tensor,
+                                   reference_pos: torch.Tensor,
+                                   fps: float) -> torch.Tensor:
+    """Convert an unscaled v6 raw goal without rebuilding it from world data."""
+    h_goal = raw_goal[..., 0:1]
+    delta_hor = raw_goal[..., 1:4]
+    goal_g = raw_goal[..., 4:7]
+    rel_rot6d = raw_goal[..., 7:13]
+    dof = raw_goal[..., 13:42]
+    velocity = raw_goal[..., 42:46]
+    time_to_arrival = raw_goal[..., 46:47]
+    d_hor = torch.linalg.vector_norm(delta_hor, dim=-1, keepdim=True)
+    delta_h = h_goal - reference_pos.to(
+        device=raw_goal.device, dtype=raw_goal.dtype)[..., 2:3]
+    time_scalar = time_to_arrival[..., 0]
+    time_budget = time_scalar.clamp_min(1.0 / float(fps))
+    urgency_source = torch.cat((delta_hor, d_hor, delta_h), dim=-1)
+    urgency = torch.where(
+        time_scalar[..., None] > 0.0,
+        urgency_source / time_budget[..., None],
+        torch.zeros_like(urgency_source),
+    )
+    horizontal = torch.cat(
+        (delta_hor, d_hor, urgency[..., :4]),
+        dim=-1,
+    )
+    vertical = torch.cat(
+        (h_goal, delta_h, goal_g, urgency[..., 4:5]),
+        dim=-1,
+    )
+    if raw_goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM:
+        return torch.cat(
+            (horizontal, vertical, rel_rot6d, dof, velocity, time_to_arrival),
+            dim=-1,
+        )
+    if raw_goal.shape[-1] != ROT_MAT_JOINT_STATE_GOAL_DIM + 19:
+        raise ValueError(
+            "Expected v6 raw joint-state or split-end-effector raw goal, got "
+            f"shape {tuple(raw_goal.shape)}"
+        )
+    return torch.cat(
+        (
+            horizontal,
+            vertical,
+            rel_rot6d,
+            dof,
+            velocity,
+            time_to_arrival,
+            raw_goal[..., ROT_MAT_JOINT_STATE_GOAL_DIM:],
+        ),
+        dim=-1,
+    )
 
 
 def _as_recovery_mask(value, batch_size: int, device) -> torch.Tensor:
@@ -487,17 +933,25 @@ def _goal_time_frame_for_loss(conditions, cfg):
     ).lower()
     if goal_timestep_mode == 'zero':
         return None
-    return conditions.get('time_to_arrival_frame',
-                          conditions.get('arrival_time_frame'))
+    return conditions.get(
+        'goal_time_frame_for_loss',
+        conditions.get(
+            'time_to_arrival_frame',
+            conditions.get('arrival_time_frame'),
+        ),
+    )
 
 
 def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
                 fps: float, goal_stats=None, use_scene: bool = True,
-                text_embedding=None):
+                text_embedding=None, condition_plan=None):
     goal_type = GoalType.parse(cfg.data.goal_type)
     goal_encoding = GoalEncoding.parse(
         cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
     )
+    planned = condition_plan is not None
+    batch_size = reference_pos.shape[0]
+    device = reference_pos.device
     time_to_arrival = primitive.get(
         'time_to_arrival', primitive.get('goal_timestep'))
     if goal_type.uses_arrival_time:
@@ -505,102 +959,232 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             raise ValueError(
                 f"{goal_type.value} training requires "
                 "primitive['time_to_arrival']")
-        goal_time = time_to_arrival.to(cfg.device)
+        if not planned or condition_plan['goal_any']:
+            goal_time = time_to_arrival.to(device)
+        else:
+            goal_time = torch.zeros(
+                batch_size,
+                device=device,
+                dtype=reference_pos.dtype,
+            )
     else:
         goal_time = None
-    if goal_type is GoalType.JOINT_STATE and motion_dtype.FeatureVersion == 6:
+
+    build_goal = not planned or condition_plan['goal_any']
+    if build_goal and planned and goal_type is GoalType.JOINT_STATE:
+        actual_world_goal_pos = primitive['world_goal_pos'].to(device)
+        if condition_plan['goal_position_hor']:
+            world_goal_pos = actual_world_goal_pos
+        else:
+            world_goal_pos = reference_pos.clone()
+            if condition_plan['goal_position_vert']:
+                world_goal_pos[..., 2:3] = actual_world_goal_pos[..., 2:3]
+        world_goal_rot = (
+            primitive['world_goal_rot'].to(device)
+            if condition_plan['goal_orientation_source']
+            else reference_rot
+        )
+        world_goal_dof = (
+            primitive['world_goal_dof'].to(device)
+            if condition_plan['goal_joint']
+            else torch.zeros(
+                batch_size, 29, device=device, dtype=reference_pos.dtype)
+        )
+        world_root_velocity = (
+            primitive['world_goal_vel'].to(device)
+            if condition_plan['goal_velocity']
+            else torch.zeros(
+                batch_size, 3, device=device, dtype=reference_pos.dtype)
+        )
+        world_goal_end_effectors = (
+            primitive['world_goal_end_effectors'].to(device)
+            if any(condition_plan['goal_end_effector'])
+            else torch.zeros(
+                batch_size, 4, 3, device=device, dtype=reference_pos.dtype)
+        )
+        world_goal_yaw = torch.zeros(
+            batch_size, device=device, dtype=reference_pos.dtype)
+    elif build_goal:
+        world_goal_pos = primitive['world_goal_pos'].to(device)
+        world_goal_yaw = primitive['world_goal_yaw'].to(device)
+        world_goal_rot = (
+            primitive['world_goal_rot'].to(device)
+            if goal_type is GoalType.JOINT_STATE else None
+        )
+        world_goal_dof = (
+            primitive['world_goal_dof'].to(device)
+            if goal_type is GoalType.JOINT_STATE else None
+        )
+        world_goal_end_effectors = (
+            primitive['world_goal_end_effectors'].to(device)
+            if goal_type is GoalType.JOINT_STATE
+            and goal_encoding.uses_end_effectors else None
+        )
+        world_root_velocity = (
+            primitive['world_goal_vel'].to(device)
+            if goal_type.uses_arrival_time else None
+        )
+    else:
+        world_goal_pos = None
+        world_goal_yaw = None
+        world_goal_rot = None
+        world_goal_dof = None
+        world_goal_end_effectors = None
+        world_root_velocity = None
+
+    if not build_goal:
+        ego_goal_raw = None
+        goal = torch.zeros(
+            batch_size,
+            int(cfg.denoiser.goal_dim),
+            device=device,
+            dtype=reference_pos.dtype,
+        )
+    elif goal_type is GoalType.JOINT_STATE and motion_dtype.FeatureVersion == 6:
         if goal_encoding.uses_end_effectors:
-            ego_goal_raw = build_ego_split_end_effector_goal_no_log(
-                world_goal_pos=primitive['world_goal_pos'].to(cfg.device),
-                world_goal_rot=primitive['world_goal_rot'].to(cfg.device),
-                world_goal_dof=primitive['world_goal_dof'].to(cfg.device),
-                world_root_velocity=primitive['world_goal_vel'].to(cfg.device),
-                world_goal_end_effectors=primitive[
-                    'world_goal_end_effectors'].to(cfg.device),
-                reference_pos=reference_pos,
-                reference_rot=reference_rot,
-                time_to_arrival_seconds=goal_time,
-                fps=fps,
-                distance_scale=(
-                    goal_stats.get('s_d', 1.0)
-                    if goal_stats is not None else 1.0),
-            )
+            if not planned or any(condition_plan['goal_end_effector']):
+                ego_goal_raw = build_ego_split_end_effector_goal_no_log(
+                    world_goal_pos=world_goal_pos,
+                    world_goal_rot=world_goal_rot,
+                    world_goal_dof=world_goal_dof,
+                    world_root_velocity=world_root_velocity,
+                    world_goal_end_effectors=world_goal_end_effectors,
+                    reference_pos=reference_pos,
+                    reference_rot=reference_rot,
+                    time_to_arrival_seconds=goal_time,
+                    fps=fps,
+                    distance_scale=(
+                        goal_stats.get('s_d', 1.0)
+                        if goal_stats is not None else 1.0),
+                )
+            else:
+                # The model still needs the fixed 66-D shape, but no EE
+                # coordinate transform is needed when all EE tokens are off.
+                base_goal_raw = build_ego_joint_state_goal_v6(
+                    world_goal_pos=world_goal_pos,
+                    world_goal_rot=world_goal_rot,
+                    world_goal_dof=world_goal_dof,
+                    world_root_velocity=world_root_velocity,
+                    reference_pos=reference_pos,
+                    reference_rot=reference_rot,
+                    time_to_arrival_seconds=goal_time,
+                    fps=fps,
+                )
+                base_goal_raw = _zero_raw_goal_components(
+                    base_goal_raw, condition_plan)
+                base_goal = _split_no_log_goal_from_v6_raw(
+                    base_goal_raw, reference_pos, fps)
+                zero_end_effectors = torch.zeros(
+                    batch_size,
+                    SPLIT_NO_LOG_END_EFFECTOR_SLICE.stop
+                    - SPLIT_NO_LOG_END_EFFECTOR_SLICE.start,
+                    device=device,
+                    dtype=base_goal.dtype,
+                )
+                ego_goal_raw = torch.cat(
+                    (base_goal, zero_end_effectors), dim=-1)
         else:
             ego_goal_raw = build_ego_joint_state_goal_v6(
-                world_goal_pos=primitive['world_goal_pos'].to(cfg.device),
-                world_goal_rot=primitive['world_goal_rot'].to(cfg.device),
-                world_goal_dof=primitive['world_goal_dof'].to(cfg.device),
-                world_root_velocity=primitive['world_goal_vel'].to(cfg.device),
+                world_goal_pos=world_goal_pos,
+                world_goal_rot=world_goal_rot,
+                world_goal_dof=world_goal_dof,
+                world_root_velocity=world_root_velocity,
                 reference_pos=reference_pos,
                 reference_rot=reference_rot,
                 time_to_arrival_seconds=goal_time,
                 fps=fps,
+            )
+        if planned:
+            if goal_encoding.uses_end_effectors:
+                ego_goal_raw = _zero_goal_components(
+                    ego_goal_raw, condition_plan)
+            else:
+                ego_goal_raw = _zero_raw_goal_components(
+                    ego_goal_raw, condition_plan)
+        if goal_encoding is not GoalEncoding.LEGACY40:
+            if goal_stats is None:
+                raise ValueError(
+                    "joint_state goal_encoding requires goal_stats")
+            configured_goal_dim = _mapping_get(
+                _mapping_get(cfg, 'denoiser', None), 'goal_dim', None)
+            if (planned
+                    and configured_goal_dim is not None
+                    and int(configured_goal_dim) in (
+                    SPLIT_GOAL_NO_LOG_DIM,
+                    SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM)):
+                if goal_encoding.uses_end_effectors:
+                    goal = ego_goal_raw
+                else:
+                    goal = _split_no_log_goal_from_v6_raw(
+                        ego_goal_raw, reference_pos, fps)
+                goal = scale_split_goal_no_log(goal, goal_stats)
+            else:
+                goal = build_ego_goal(
+                    world_goal_pos,
+                    world_goal_yaw,
+                    reference_pos,
+                    reference_rot,
+                    goal_type=goal_type,
+                    goal_encoding=goal_encoding,
+                    goal_stats=goal_stats,
+                    fps=fps,
+                    world_goal_rot=world_goal_rot,
+                    world_goal_dof=world_goal_dof,
+                    world_goal_end_effectors=world_goal_end_effectors,
+                    world_root_velocity=world_root_velocity,
+                    time_to_arrival_seconds=goal_time,
+                    goal_include_log_d_hor=False,
+                )
+        else:
+            goal = ego_goal_raw
+        if planned:
+            goal = (
+                _zero_raw_goal_components(goal, condition_plan)
+                if goal.shape[-1] == ROT_MAT_JOINT_STATE_GOAL_DIM
+                else _zero_goal_components(goal, condition_plan)
             )
     else:
         ego_goal_raw = build_ego_goal(
-            primitive['world_goal_pos'].to(cfg.device),
-            primitive['world_goal_yaw'].to(cfg.device),
+            world_goal_pos,
+            world_goal_yaw,
             reference_pos,
             reference_rot,
             goal_type=goal_type,
             goal_encoding=GoalEncoding.LEGACY40,
             world_goal_keypoints=(
-                primitive['world_goal_keypoints'].to(cfg.device)
+                primitive['world_goal_keypoints'].to(device)
                 if goal_type.uses_keypoints else None
             ),
-            world_root_velocity=(
-                primitive['world_goal_vel'].to(cfg.device)
-                if goal_type.uses_arrival_time else None
-            ),
+            world_root_velocity=world_root_velocity,
             timestep=goal_time,
-            world_goal_rot=(
-                primitive['world_goal_rot'].to(cfg.device)
-                if goal_type is GoalType.JOINT_STATE else None
-            ),
-            world_goal_dof=(
-                primitive['world_goal_dof'].to(cfg.device)
-                if goal_type is GoalType.JOINT_STATE else None
-            ),
+            world_goal_rot=world_goal_rot,
+            world_goal_dof=world_goal_dof,
         )
-    if goal_type is GoalType.JOINT_STATE and goal_encoding is not GoalEncoding.LEGACY40:
-        if goal_stats is None:
-            raise ValueError(
-                "joint_state goal_encoding requires goal_stats")
-        goal = build_ego_goal(
-            primitive['world_goal_pos'].to(cfg.device),
-            primitive['world_goal_yaw'].to(cfg.device),
-            reference_pos,
-            reference_rot,
-            goal_type=goal_type,
-            goal_encoding=goal_encoding,
-            goal_stats=goal_stats,
-            fps=fps,
-            world_goal_rot=(
-                primitive['world_goal_rot'].to(cfg.device)
-                if goal_type is GoalType.JOINT_STATE else None
-            ),
-            world_goal_dof=(
-                primitive['world_goal_dof'].to(cfg.device)
-                if goal_type is GoalType.JOINT_STATE else None
-            ),
-            world_goal_end_effectors=(
-                primitive['world_goal_end_effectors'].to(cfg.device)
-                if goal_encoding.uses_end_effectors else None
-            ),
-            world_root_velocity=(
-                primitive['world_goal_vel'].to(cfg.device)
-                if goal_type.uses_arrival_time else None
-            ),
-            time_to_arrival_seconds=goal_time,
-            goal_include_log_d_hor=False,
-        )
-    else:
+        if planned and goal_type is GoalType.JOINT_STATE:
+            ego_goal_raw = _zero_goal_components(
+                ego_goal_raw, condition_plan)
         goal = ego_goal_raw
+
     time_to_arrival_frame = None
+    goal_time_frame_for_loss = None
     if goal_type.uses_arrival_time:
-        time_to_arrival_frame = _time_to_arrival_frame(
-            time_to_arrival, fps=fps, device=cfg.device)
-    if use_scene:
+        if not planned or condition_plan['goal_any']:
+            goal_time_frame_for_loss = _time_to_arrival_frame(
+                time_to_arrival, fps=fps, device=device)
+        if goal_time_frame_for_loss is None:
+            time_to_arrival_frame = torch.zeros(
+                batch_size, device=device, dtype=torch.long)
+        elif not planned or condition_plan['goal_time']:
+            time_to_arrival_frame = goal_time_frame_for_loss
+        else:
+            # Position urgency still depends on the true arrival time, but
+            # the standalone time condition is dropped from the model.
+            time_to_arrival_frame = torch.zeros_like(
+                goal_time_frame_for_loss)
+
+    scene_enabled = (
+        condition_plan is None or condition_plan['scene'])
+    if use_scene and scene_enabled:
         voxel = query_local_occupancy(
             primitive['scene'],
             reference_pos,
@@ -627,9 +1211,10 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         # Pre-scene curriculum phase (step < manager.scene_start_step): the
         # denoiser learns basic goal-driven motion on a blank occupancy grid.
         voxel = torch.zeros(
-            reference_pos.shape[0],
+            batch_size,
             int(cfg.denoiser.grid_size) ** 3,
-            device=reference_pos.device,
+            device=device,
+            dtype=reference_pos.dtype,
         )
     conditions = {
         'goal': goal,
@@ -650,7 +1235,45 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             if time_to_arrival_frame is not None else {}
         ),
     }
-    if goal_encoding.uses_end_effectors:
+    if goal_time_frame_for_loss is not None:
+        conditions['goal_time_frame_for_loss'] = goal_time_frame_for_loss
+    if planned:
+        conditions.update({
+            'force_drop_goal_position_hor': (
+                not condition_plan['goal_position_hor']),
+            'force_drop_goal_position_vert': (
+                not condition_plan['goal_position_vert']),
+            'force_drop_goal_gravity': not condition_plan['goal_gravity'],
+            'force_drop_goal_orientation_rot6d': (
+                not condition_plan['goal_orientation']),
+            'force_drop_goal_joint': not condition_plan['goal_joint'],
+            'force_drop_goal_velocity': not condition_plan['goal_velocity'],
+            'force_drop_goal_time': not condition_plan['goal_time'],
+            'force_drop_scene': not condition_plan['scene'],
+        })
+        if (goal_type is GoalType.JOINT_STATE
+                and (
+                    not _uses_split_goal_masking_for_conditions(goal_encoding)
+                    or condition_plan.get(
+                        'legacy_split_goal_layout', False)
+                )):
+            conditions.update({
+                # The legacy split layout shares horizontal and vertical
+                # position in one token, so only drop it when both are off.
+                'force_drop_goal_root': not (
+                    condition_plan['goal_position_hor']
+                    or condition_plan['goal_position_vert']
+                ),
+                'force_drop_goal_orientation': (
+                    not condition_plan['goal_orientation']),
+            })
+        elif goal_type is not GoalType.JOINT_STATE:
+            conditions['force_drop_goal_root'] = (
+                not condition_plan['goal_position'])
+        if not condition_plan['text']:
+            text_embedding = None
+    if (goal_encoding.uses_end_effectors
+            and isinstance(ego_goal_raw, torch.Tensor)):
         ee_slice = (
             SPLIT_NO_LOG_END_EFFECTOR_SLICE
             if ego_goal_raw.shape[-1] == SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM
@@ -658,9 +1281,10 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         )
         conditions['goal_end_effectors_ego_raw'] = ego_goal_raw[
             :, ee_slice].reshape(-1, 4, 3)
-    if text_embedding is None and 'text_embedding' in primitive:
+    if (text_embedding is None and 'text_embedding' in primitive
+            and (not planned or condition_plan['text'])):
         text_embedding = primitive['text_embedding'].to(
-            cfg.device, non_blocking=True)
+            device, non_blocking=True)
     if text_embedding is not None:
         conditions['text_embedding'] = text_embedding
     return conditions
@@ -1074,7 +1698,7 @@ def _build_segment_figure(batch, dataset, vae, denoiser, diffusion,
         scenes=scenes)
 
 
-def ddp_setup():
+def ddp_setup(requested_device: str = 'cuda'):
     """Initialize DDP environment variables and process group."""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
@@ -1085,10 +1709,21 @@ def ddp_setup():
         world_size = 1
         local_rank = 0
 
+    use_cuda = str(requested_device).startswith('cuda')
     if world_size > 1:
+        if not use_cuda or not torch.cuda.is_available():
+            raise RuntimeError(
+                "DAR distributed training requires CUDA/NCCL; use a single "
+                "process with device=cpu for a CPU smoke test."
+            )
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend='nccl')
-    else:
+    elif use_cuda:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested but no CUDA GPU is available. "
+                "Retry with device=cpu for a single-process smoke test."
+            )
         torch.cuda.set_device(local_rank)
 
     return rank, world_size, local_rank
@@ -1340,8 +1975,13 @@ def _validate_scene_curriculum_contract(cfg) -> None:
 
 def main(cfg: DictConfig):
     # Initialize DDP
-    rank, world_size, local_rank = ddp_setup()
-    device = torch.device(f'cuda:{local_rank}')
+    requested_device = str(cfg.get('device', 'cuda'))
+    rank, world_size, local_rank = ddp_setup(requested_device)
+    device = (
+        torch.device(f'cuda:{local_rank}')
+        if requested_device.startswith('cuda')
+        else torch.device(requested_device)
+    )
 
     configure_dof_contract(cfg)
     seed.set(cfg.seed + rank)
@@ -1349,6 +1989,9 @@ def main(cfg: DictConfig):
 
     # Override device in config for downstream components.
     cfg.device = str(device)
+    for split in ('train', 'val'):
+        if split in cfg.data:
+            cfg.data[split].device = str(device)
     _validate_scene_curriculum_contract(cfg)
 
     train_data: Dataset = instantiate(cfg.data.train)
@@ -1429,6 +2072,8 @@ def main(cfg: DictConfig):
     manager.hold_model(vae, denoiser, optimizer, train_data)
     manager.rank = rank
     manager.world_size = world_size
+    train_condition_plan = _build_train_condition_plan(
+        cfg, denoiser_raw)
 
     num_primitive: int = cfg.data.num_primitive
     future_len: int = cfg.data.future_len
@@ -1516,7 +2161,9 @@ def main(cfg: DictConfig):
                             text_embedding=(
                                 batch_text_embeddings[pidx]
                                 if batch_text_embeddings is not None else None
-                            ))
+                            ),
+                            condition_plan=train_condition_plan,
+                            )
             goal_time_frame = _goal_time_frame_for_loss(y, cfg)
 
             # Sample timesteps
@@ -1581,6 +2228,7 @@ def main(cfg: DictConfig):
                 goal_reference_pos=y.get('goal_reference_pos_world'),
                 goal_reference_rot=y.get('goal_reference_rot_world'),
                 goal_time_frame=goal_time_frame,
+                goal_condition_enabled=train_condition_plan,
                 action_label=batch[pidx].get('action_label'),
                 is_recovery=batch[pidx].get('is_recovery'),
             )

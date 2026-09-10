@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import robotmdar.dtype.motion as runtime_motion_dtype
+import TextOpRobotMDAR.robotmdar.dtype.motion as package_motion_dtype
+import TextOpRobotMDAR.robotmdar.train.train_dar as train_dar_module
 import TextOpRobotMDAR.robotmdar.train.manager as manager_module
 from TextOpRobotMDAR.robotmdar.dataloader.data import SkeletonPrimitiveDataset
 from TextOpRobotMDAR.robotmdar.diffusion.gaussian_diffusion import (
@@ -30,6 +34,12 @@ from TextOpRobotMDAR.robotmdar.train.manager import (
 from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _BackgroundPrefetchIterator,
     _add_batch_data_diagnostics,
+    _build_train_condition_plan,
+    _conditions,
+)
+from TextOpRobotMDAR.robotmdar.utils.goal import (
+    SPLIT_NO_LOG_ORIENTATION_SLICE,
+    SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE,
 )
 from TextOpRobotMDAR.robotmdar.utils.occupancy import (
     _local_grid_offsets,
@@ -181,6 +191,386 @@ def test_batch_data_diagnostics_split_recovery_condition_keep_ratios():
         extras["condition/recovery_gravity_keep_ratio"], torch.tensor(0.5))
     torch.testing.assert_close(
         extras["condition/recovery_end_effector_keep_ratio"], torch.tensor(0.25))
+
+
+def _goal_condition_test_config(loss_weight, goal_dim=66):
+    return OmegaConf.create({
+        'device': 'cpu',
+        'data': {
+            'goal_type': 'joint_state',
+            'goal_encoding': 'split_end_effector',
+            'occupancy_unit': 0.1,
+        },
+        'denoiser': {
+            'goal_dim': goal_dim,
+            'goal_encoding': 'split_end_effector',
+            'grid_size': 1,
+            'text_condition_enabled': True,
+        },
+        'train': {
+            'manager': {
+                'loss_weight': loss_weight,
+            },
+        },
+    })
+
+
+def _goal_condition_test_profiles(mask_value=1.0, gravity=None):
+    names = ('left_hand', 'right_hand', 'left_foot', 'right_foot')
+    profile = {
+        'text': mask_value,
+        'goal': {
+            'position': {'hor': mask_value, 'vert': mask_value},
+            'velocity': mask_value,
+            'orientation': {
+                'rot6d': mask_value,
+                'gravity': mask_value if gravity is None else gravity,
+            },
+            'joint': mask_value,
+            'end_effector': {name: mask_value for name in names},
+            'time': mask_value,
+        },
+        'scene': mask_value,
+    }
+    return {
+        'locomotion': profile,
+        'getup': profile,
+    }
+
+
+def test_train_condition_plan_skips_zero_weight_and_always_dropped_inputs():
+    cfg = _goal_condition_test_config({
+        'locomotion': {'goal': {
+            'root_position_hor': 0.0,
+            'root_position_vert': 0.0,
+            'root_velocity': 0.0,
+            'root_orientation': 0.0,
+            'g': 0.0,
+            'joint_angle': 0.0,
+            'end_effector': 0.0,
+        }},
+        'getup': {'goal': {
+            'root_position_hor': 0.0,
+            'root_position_vert': 0.0,
+            'root_velocity': 0.0,
+            'root_orientation': 0.0,
+            'g': 0.0,
+            'joint_angle': 0.0,
+            'end_effector': 0.0,
+        }},
+    })
+    denoiser = SimpleNamespace(
+        cond_mask_prob_profiles=_goal_condition_test_profiles())
+
+    plan = _build_train_condition_plan(cfg, denoiser)
+
+    assert plan['goal_any'] is False
+    assert plan['goal_end_effector'] == (False, False, False, False)
+    assert plan['scene'] is False
+    assert plan['text'] is False
+    assert plan['goal_time'] is False
+
+
+def test_train_condition_plan_keeps_orientation_source_for_gravity_only():
+    loss_weight = {
+        'locomotion': {'goal': {'root_orientation': 0.0, 'g': 1.0}},
+        'getup': {'goal': {'root_orientation': 0.0, 'g': 1.0}},
+    }
+    cfg = _goal_condition_test_config(loss_weight)
+    denoiser = SimpleNamespace(
+        cond_mask_prob_profiles=_goal_condition_test_profiles(
+            mask_value=1.0, gravity=0.2))
+
+    plan = _build_train_condition_plan(cfg, denoiser)
+
+    assert plan['goal_orientation'] is False
+    assert plan['goal_orientation_source'] is True
+    assert plan['goal_gravity'] is True
+    assert plan['goal_any'] is True
+
+
+def test_conditions_do_not_build_disabled_goal_or_scene(monkeypatch):
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(6)
+    package_motion_dtype.set_feature_version(6)
+    try:
+        cfg = _goal_condition_test_config({
+            'locomotion': {'goal': {
+                'root_position_hor': 0.0,
+                'root_position_vert': 0.0,
+                'root_velocity': 0.0,
+                'root_orientation': 0.0,
+                'g': 0.0,
+                'joint_angle': 0.0,
+                'end_effector': 0.0,
+            }},
+            'getup': {'goal': {
+                'root_position_hor': 0.0,
+                'root_position_vert': 0.0,
+                'root_velocity': 0.0,
+                'root_orientation': 0.0,
+                'g': 0.0,
+                'joint_angle': 0.0,
+                'end_effector': 0.0,
+            }},
+        })
+        plan = {
+            'goal_position': False,
+            'goal_position_hor': False,
+            'goal_position_vert': False,
+            'goal_orientation': False,
+            'goal_orientation_source': False,
+            'goal_gravity': False,
+            'goal_joint': False,
+            'goal_velocity': False,
+            'goal_end_effector': (False, False, False, False),
+            'goal_any': False,
+            'goal_time': False,
+            'scene': False,
+            'text': False,
+        }
+        primitive = {
+            'world_goal_pos': torch.ones(1, 3),
+            'world_goal_rot': torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            'world_goal_dof': torch.ones(1, 29),
+            'world_goal_vel': torch.ones(1, 3),
+            'world_goal_end_effectors': torch.ones(1, 4, 3),
+            'time_to_arrival': torch.ones(1),
+            'scene': [],
+        }
+        for name in (
+                'build_ego_joint_state_goal_v6',
+                'build_ego_split_end_effector_goal_no_log'):
+            monkeypatch.setattr(
+                train_dar_module,
+                name,
+                lambda *args, builder_name=name, **kwargs: pytest.fail(
+                    f'{builder_name} should not be called'),
+            )
+        monkeypatch.setattr(
+            train_dar_module,
+            'query_local_occupancy',
+            lambda *args, **kwargs: pytest.fail(
+                'scene occupancy should not be queried'),
+        )
+
+        conditions = _conditions(
+            primitive,
+            torch.zeros(1, 3),
+            torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            torch.zeros(1, 2, 44),
+            cfg,
+            fps=50.0,
+            goal_stats=None,
+            use_scene=True,
+            condition_plan=plan,
+        )
+
+        assert conditions['ego_goal_raw'] is None
+        assert conditions['goal'].shape == (1, 66)
+        assert conditions['goal'].abs().sum() == 0
+        assert conditions['voxel'].abs().sum() == 0
+        assert conditions['force_drop_scene'] is True
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_conditions_build_gravity_source_without_rot6d_condition():
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(6)
+    package_motion_dtype.set_feature_version(6)
+    try:
+        cfg = _goal_condition_test_config({
+            'locomotion': {'goal': {'g': 1.0}},
+            'getup': {'goal': {'g': 1.0}},
+        })
+        plan = {
+            'goal_position': False,
+            'goal_position_hor': False,
+            'goal_position_vert': False,
+            'goal_orientation': False,
+            'goal_orientation_source': True,
+            'goal_gravity': True,
+            'goal_joint': False,
+            'goal_velocity': False,
+            'goal_end_effector': (False, False, False, False),
+            'goal_any': True,
+            'goal_time': False,
+            'scene': False,
+            'text': False,
+        }
+        primitive = {
+            'world_goal_pos': torch.zeros(1, 3),
+            'world_goal_rot': torch.tensor(
+                [[0.0, 0.70710677, 0.0, 0.70710677]]),
+            'world_goal_dof': torch.zeros(1, 29),
+            'world_goal_vel': torch.zeros(1, 3),
+            'world_goal_end_effectors': torch.zeros(1, 4, 3),
+            'time_to_arrival': torch.ones(1),
+            'scene': [],
+        }
+        stats = {
+            's_p': torch.tensor(1.0),
+            's_v': torch.tensor(1.0),
+            's_d': torch.tensor(1.0),
+            's_o': torch.ones(9),
+            'q_mean': torch.zeros(29),
+            'q_std': torch.ones(29),
+            's_ee': torch.ones(12),
+            'meta': {
+                'fps': 50.0,
+                'goal_dim': 66,
+                'goal_schema': (
+                    'rotmat_v10_hor_vert_joint_ee_no_log'),
+            },
+        }
+        conditions = _conditions(
+            primitive,
+            torch.zeros(1, 3),
+            torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            torch.zeros(1, 2, 44),
+            cfg,
+            fps=50.0,
+            goal_stats=stats,
+            use_scene=False,
+            condition_plan=plan,
+        )
+
+        assert conditions['goal'][:, SPLIT_NO_LOG_ORIENTATION_SLICE].abs().sum() == 0
+        assert conditions['goal'][
+            :, SPLIT_NO_LOG_VERTICAL_GRAVITY_SLICE].abs().sum() > 0.5
+        assert conditions['force_drop_goal_orientation_rot6d'] is True
+        assert conditions['force_drop_goal_gravity'] is False
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_conditions_skip_end_effector_transform_when_all_ee_tokens_are_off(
+        monkeypatch):
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(6)
+    package_motion_dtype.set_feature_version(6)
+    try:
+        loss_weight = {
+            'locomotion': {'goal': {'root_position_hor': 1.0}},
+            'getup': {'goal': {'root_position_hor': 1.0}},
+        }
+        cfg = _goal_condition_test_config(loss_weight)
+        profiles = _goal_condition_test_profiles(mask_value=1.0)
+        for profile in profiles.values():
+            profile['goal']['position']['hor'] = 0.0
+        denoiser = SimpleNamespace(cond_mask_prob_profiles=profiles)
+        plan = _build_train_condition_plan(cfg, denoiser)
+        assert plan['goal_position_hor'] is True
+        assert plan['goal_end_effector'] == (False, False, False, False)
+
+        primitive = {
+            'world_goal_pos': torch.tensor([[1.0, 0.0, 0.8]]),
+            'world_goal_rot': torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            'world_goal_dof': torch.ones(1, 29),
+            'world_goal_vel': torch.ones(1, 3),
+            'world_goal_end_effectors': torch.ones(1, 4, 3),
+            'time_to_arrival': torch.ones(1),
+            'scene': [],
+        }
+        stats = {
+            's_p': torch.tensor(1.0),
+            's_v': torch.tensor(1.0),
+            's_d': torch.tensor(1.0),
+            's_o': torch.ones(9),
+            'q_mean': torch.zeros(29),
+            'q_std': torch.ones(29),
+            's_ee': torch.ones(12),
+            'meta': {
+                'fps': 50.0,
+                'goal_dim': 66,
+                'goal_schema': (
+                    'rotmat_v10_hor_vert_joint_ee_no_log'),
+            },
+        }
+        monkeypatch.setattr(
+            train_dar_module,
+            'build_ego_split_end_effector_goal_no_log',
+            lambda *args, **kwargs: pytest.fail(
+                'disabled end-effector tokens should skip EE transform'),
+        )
+
+        conditions = _conditions(
+            primitive,
+            torch.zeros(1, 3),
+            torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            torch.zeros(1, 2, 44),
+            cfg,
+            fps=50.0,
+            goal_stats=stats,
+            use_scene=False,
+            condition_plan=plan,
+        )
+
+        assert conditions['goal'].shape == (1, 66)
+        assert conditions['goal'][:, 54:].abs().sum() == 0
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
+
+
+def test_goal_losses_return_before_state_or_fk_when_condition_is_fully_dropped(
+        monkeypatch):
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(6)
+    package_motion_dtype.set_feature_version(6)
+    try:
+        geometry = object.__new__(GeometryLoss)
+        geometry.rec_criterion = torch.nn.HuberLoss(
+            reduction='mean', delta=1.0)
+        future = torch.randn(2, 4, 44, requires_grad=True)
+        goal = torch.zeros(2, 66)
+        history = torch.zeros(2, 2, 44)
+
+        monkeypatch.setattr(
+            geometry,
+            '_future_goal_state_v6',
+            lambda *args, **kwargs: pytest.fail(
+                'fully dropped gravity should skip goal-state reconstruction'),
+        )
+        loss, per_sample, valid = geometry.calc_goal_g_loss(
+            future,
+            goal,
+            torch.zeros(2, dtype=torch.bool),
+            history_motion=history,
+            return_per_sample=True,
+        )
+        assert loss is not None
+        assert per_sample.shape == (2,)
+        assert valid.tolist() == [False, False]
+
+        monkeypatch.setattr(
+            geometry,
+            '_end_effector_anchors',
+            lambda: pytest.fail(
+                'fully dropped end-effectors should skip FK/anchor lookup'),
+        )
+        ee_loss, ee_per_sample, ee_valid, metrics = (
+            geometry.calc_goal_end_effector_loss(
+                future,
+                goal,
+                torch.zeros(2, 4, dtype=torch.bool),
+                return_per_sample=True,
+            )
+        )
+        assert ee_loss is not None
+        assert ee_per_sample.shape == (2, 4)
+        assert ee_valid.shape == (2, 4)
+        assert all(value == 0 for value in metrics.values())
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
 
 
 @pytest.mark.parametrize('bad_value', [float('nan'), float('inf')])

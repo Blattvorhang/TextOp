@@ -302,6 +302,28 @@ def _masked_scalar_from_per_sample(values: torch.Tensor,
     return values[valid].mean()
 
 
+def _keep_mask_maybe_active(keep_mask) -> bool:
+    if keep_mask is None:
+        return True
+    return bool(torch.as_tensor(keep_mask, dtype=torch.bool).any().item())
+
+
+def _empty_goal_component_result(reference: torch.Tensor,
+                                 return_per_sample: bool):
+    zero = reference.sum() * 0.0
+    if return_per_sample:
+        return (
+            zero,
+            reference.new_zeros(reference.shape[0]),
+            torch.zeros(
+                reference.shape[0],
+                dtype=torch.bool,
+                device=reference.device,
+            ),
+        )
+    return zero
+
+
 def _weighted_total_from_terms(
     terms: Dict[str, torch.Tensor],
     loss_weight,
@@ -1497,9 +1519,49 @@ class GeometryLoss:
         goal_time_frame=None,
         goal_state=None,
         return_per_sample: bool = False,
+        enabled_components=None,
     ):
         """Match root-position goal as separate horizontal and vertical terms."""
         zero = future_motion_pred.sum() * 0.0
+        enable_hor = (
+            True if enabled_components is None
+            else bool(enabled_components.get('horizontal', True))
+        )
+        enable_vert = (
+            True if enabled_components is None
+            else bool(enabled_components.get('vertical', True))
+        )
+        hor_keep = (
+            goal_position_hor_condition_keep_mask
+            if goal_position_hor_condition_keep_mask is not None
+            else goal_condition_keep_mask
+        )
+        vert_keep = (
+            goal_position_vert_condition_keep_mask
+            if goal_position_vert_condition_keep_mask is not None
+            else goal_condition_keep_mask
+        )
+        hor_maybe_active = enable_hor and _keep_mask_maybe_active(hor_keep)
+        vert_maybe_active = enable_vert and _keep_mask_maybe_active(vert_keep)
+        if not hor_maybe_active and not vert_maybe_active:
+            empty_valid = torch.zeros(
+                future_motion_pred.shape[0],
+                dtype=torch.bool,
+                device=future_motion_pred.device,
+            )
+            empty_per_sample = future_motion_pred.new_zeros(
+                future_motion_pred.shape[0])
+            if return_per_sample:
+                return {
+                    'goal_root_position_hor': (
+                        zero, empty_per_sample, empty_valid),
+                    'goal_root_position_vert': (
+                        zero, empty_per_sample, empty_valid),
+                }
+            return {
+                'goal_root_position_hor': zero,
+                'goal_root_position_vert': zero,
+            }
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
@@ -1522,22 +1584,26 @@ class GeometryLoss:
             vert_valid = torch.ones(
                 target_vert.shape[0], dtype=torch.bool,
                 device=target_vert.device)
-            if goal_position_hor_condition_keep_mask is not None:
-                hor_valid &= goal_position_hor_condition_keep_mask.to(
+            if hor_keep is not None:
+                hor_valid &= hor_keep.to(
                     device=target_hor.device, dtype=torch.bool)
-            elif goal_condition_keep_mask is not None:
-                hor_valid &= goal_condition_keep_mask.to(
-                    device=target_hor.device, dtype=torch.bool)
-            if goal_position_vert_condition_keep_mask is not None:
-                vert_valid &= goal_position_vert_condition_keep_mask.to(
+            if vert_keep is not None:
+                vert_valid &= vert_keep.to(
                     device=target_vert.device, dtype=torch.bool)
-            elif goal_condition_keep_mask is not None:
-                vert_valid &= goal_condition_keep_mask.to(
-                    device=target_vert.device, dtype=torch.bool)
-            hor_per = _rec_loss_per_sample(
-                self.rec_criterion, predicted_hor, target_hor)
-            vert_per = _rec_loss_per_sample(
-                self.rec_criterion, predicted_vert, target_vert)
+            if enable_hor:
+                hor_per = _rec_loss_per_sample(
+                    self.rec_criterion, predicted_hor, target_hor)
+            else:
+                hor_per = future_motion_pred.new_zeros(
+                    future_motion_pred.shape[0])
+                hor_valid = torch.zeros_like(hor_valid)
+            if enable_vert:
+                vert_per = _rec_loss_per_sample(
+                    self.rec_criterion, predicted_vert, target_vert)
+            else:
+                vert_per = future_motion_pred.new_zeros(
+                    future_motion_pred.shape[0])
+                vert_valid = torch.zeros_like(vert_valid)
             hor = _masked_scalar_from_per_sample(hor_per, hor_valid, zero)
             vert = _masked_scalar_from_per_sample(vert_per, vert_valid, zero)
             if return_per_sample:
@@ -1550,21 +1616,27 @@ class GeometryLoss:
                 'goal_root_position_vert': vert,
             }
 
-        root_displacement = self.root_displacement_ego(
-            future_motion_pred, history_motion,
-            goal_time_frame=goal_time_frame)
-        goal_root_position = ego_goal[..., :2]
+        if not enable_hor:
+            root_displacement = None
+            goal_root_position = None
+        else:
+            root_displacement = self.root_displacement_ego(
+                future_motion_pred, history_motion,
+                goal_time_frame=goal_time_frame)
+            goal_root_position = ego_goal[..., :2]
         hor_valid = torch.ones(
-            goal_root_position.shape[0], dtype=torch.bool,
-            device=goal_root_position.device)
-        if goal_position_hor_condition_keep_mask is not None:
-            hor_valid &= goal_position_hor_condition_keep_mask.to(
-                device=goal_root_position.device, dtype=torch.bool)
-        elif goal_condition_keep_mask is not None:
-            hor_valid &= goal_condition_keep_mask.to(
-                device=goal_root_position.device, dtype=torch.bool)
-        hor_per = _rec_loss_per_sample(
-            self.rec_criterion, root_displacement, goal_root_position)
+            future_motion_pred.shape[0], dtype=torch.bool,
+            device=future_motion_pred.device)
+        if hor_keep is not None:
+            hor_valid &= hor_keep.to(
+                device=future_motion_pred.device, dtype=torch.bool)
+        if enable_hor:
+            hor_per = _rec_loss_per_sample(
+                self.rec_criterion, root_displacement, goal_root_position)
+        else:
+            hor_per = future_motion_pred.new_zeros(
+                future_motion_pred.shape[0])
+            hor_valid = torch.zeros_like(hor_valid)
         hor = _masked_scalar_from_per_sample(hor_per, hor_valid, zero)
         vert_per = future_motion_pred.new_zeros(future_motion_pred.shape[0])
         vert = zero
@@ -1583,6 +1655,8 @@ class GeometryLoss:
                                      history_motion=None,
                                      goal_time_frame=None):
         """Backward-compatible combined root-position goal metric."""
+        if not _keep_mask_maybe_active(goal_condition_keep_mask):
+            return future_motion_pred.sum() * 0.0
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
@@ -1725,6 +1799,10 @@ class GeometryLoss:
     ):
         """Match TextOp-style root orientation at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
+        if not _keep_mask_maybe_active(
+                goal_orientation_condition_keep_mask):
+            return _empty_goal_component_result(
+                future_motion_pred, return_per_sample)
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
@@ -1781,6 +1859,10 @@ class GeometryLoss:
     ):
         """Match the target gravity direction at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
+        if not _keep_mask_maybe_active(
+                goal_orientation_condition_keep_mask):
+            return _empty_goal_component_result(
+                future_motion_pred, return_per_sample)
         if not (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
@@ -1819,6 +1901,9 @@ class GeometryLoss:
     ):
         """Match the 29-DOF joint angles at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
+        if not _keep_mask_maybe_active(goal_joint_condition_keep_mask):
+            return _empty_goal_component_result(
+                future_motion_pred, return_per_sample)
         dof_dim = int(self.dataset.dof_dim)
         if dof_dim != 29:
             raise ValueError(
@@ -1869,6 +1954,10 @@ class GeometryLoss:
     ):
         """Match reference-ego root velocity at the selected goal frame."""
         zero = future_motion_pred.sum() * 0.0
+        if not _keep_mask_maybe_active(
+                goal_velocity_condition_keep_mask):
+            return _empty_goal_component_result(
+                future_motion_pred, return_per_sample)
         if (motion_dtype.FeatureVersion == 6
                 and ego_goal.shape[-1]
                 in (ROT_MAT_JOINT_STATE_GOAL_DIM, *SPLIT_GOAL_DIMS)):
@@ -2081,6 +2170,50 @@ class GeometryLoss:
                 f"{SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM}-D "
                 "split_end_effector goal"
             )
+        zero = future_motion_pred.sum() * 0.0
+        beta = float(getattr(
+            self, 'goal_end_effector_loss_beta',
+            DEFAULT_GOAL_END_EFFECTOR_LOSS_BETA,
+        ))
+        if beta <= 0.0:
+            raise ValueError(
+                "goal_end_effector_loss_beta must be positive, "
+                f"got {beta}"
+            )
+        target = ego_goal[
+            ..., _split_goal_slices(ego_goal)['end_effector']
+        ].reshape(-1, 4, 3)
+        target = target.to(
+            device=future_motion_pred.device,
+            dtype=future_motion_pred.dtype,
+        )
+        token_valid = torch.ones(
+            target.shape[:2], dtype=torch.bool, device=target.device)
+        if goal_end_effector_condition_keep_mask is not None:
+            keep_mask = goal_end_effector_condition_keep_mask.to(
+                device=target.device, dtype=torch.bool)
+            if keep_mask.shape != token_valid.shape:
+                raise ValueError(
+                    "goal_end_effector_condition_keep_mask must have shape "
+                    f"{tuple(token_valid.shape)}, got {tuple(keep_mask.shape)}"
+                )
+            token_valid = token_valid & keep_mask
+        if not token_valid.any():
+            metrics = {
+                'goal_end_effector': zero.detach(),
+                **{
+                    f'goal_end_effector_{name}': zero.detach()
+                    for name in SPLIT_END_EFFECTOR_TOKEN_ORDER
+                },
+            }
+            if return_per_sample:
+                return (
+                    zero,
+                    future_motion_pred.new_zeros(target.shape[:2]),
+                    token_valid,
+                    metrics,
+                )
+            return zero
         has_reference_pose = (
             goal_reference_pos is not None or goal_reference_rot is not None)
         if has_reference_pose and (
@@ -2133,43 +2266,11 @@ class GeometryLoss:
             batch_idx = torch.arange(
                 pred_all.shape[0], device=pred_all.device)
             predicted = pred_all[batch_idx, goal_step]
-        target = ego_goal[
-            ..., _split_goal_slices(ego_goal)['end_effector']
-        ].reshape(-1, 4, 3)
-        target = target.to(device=predicted.device, dtype=predicted.dtype)
-
-        token_valid = torch.ones(
-            target.shape[:2], dtype=torch.bool, device=target.device)
-        if goal_end_effector_condition_keep_mask is not None:
-            keep_mask = goal_end_effector_condition_keep_mask.to(
-                device=target.device, dtype=torch.bool)
-            if keep_mask.shape != token_valid.shape:
-                raise ValueError(
-                    "goal_end_effector_condition_keep_mask must have shape "
-                    f"{tuple(token_valid.shape)}, got {tuple(keep_mask.shape)}"
-                )
-            token_valid = token_valid & keep_mask
-        zero = future_motion_pred.sum() * 0.0
-        beta = float(getattr(
-            self, 'goal_end_effector_loss_beta',
-            DEFAULT_GOAL_END_EFFECTOR_LOSS_BETA,
-        ))
         token_loss = _norm_smooth_l1_loss(predicted, target, beta=beta)
         token_valid_f = token_valid.to(dtype=token_loss.dtype)
         masked_token_loss = token_loss * token_valid_f
         token_count = token_valid_f.sum(dim=0)
         active_tokens = token_count > 0
-        if not active_tokens.any():
-            metrics = {
-                'goal_end_effector': zero.detach(),
-                **{
-                    f'goal_end_effector_{name}': zero.detach()
-                    for name in SPLIT_END_EFFECTOR_TOKEN_ORDER
-                },
-            }
-            if return_per_sample:
-                return zero, masked_token_loss, token_valid, metrics
-            return zero
 
         per_token_loss = masked_token_loss.sum(dim=0) / (
             token_count.clamp_min(1.0))
@@ -2305,10 +2406,16 @@ def calc_dar_loss(
     is_eval: bool = False,
     action_label=None,
     is_recovery=None,
+    goal_condition_enabled=None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     terms = {}
     extras = {}
     per_sample_terms = {}
+
+    def _goal_enabled(name: str, default: bool = True) -> bool:
+        if is_eval or goal_condition_enabled is None:
+            return default
+        return bool(goal_condition_enabled.get(name, default))
 
     # 重构损失
     rec_per_sample = _rec_loss_per_sample(
@@ -2400,10 +2507,31 @@ def calc_dar_loss(
     extras.update(geometry_extras)
 
     goal_type = GoalType.parse(goal_type)
+    goal_position_hor_weight = max(
+        _loss_weight_any(self.loss_weight, 'goal_root_position_hor'),
+        _loss_weight_any(self.loss_weight, 'goal_root_position'),
+    )
+    goal_position_vert_weight = max(
+        _loss_weight_any(self.loss_weight, 'goal_root_position_vert'),
+        _loss_weight_any(self.loss_weight, 'goal_root_position'),
+    )
+    goal_position_hor_enabled = (
+        is_eval
+        or (
+            goal_position_hor_weight > 0.0
+            and _goal_enabled('goal_position_hor')
+        )
+    )
+    goal_position_vert_enabled = (
+        is_eval
+        or (
+            goal_position_vert_weight > 0.0
+            and _goal_enabled('goal_position_vert')
+        )
+    )
     compute_goal_root_position = (
-        _loss_weight_any(self.loss_weight, 'goal_root_position_hor') > 0.0
-        or _loss_weight_any(self.loss_weight, 'goal_root_position_vert') > 0.0
-        or _loss_weight_any(self.loss_weight, 'goal_root_position') > 0.0
+        goal_position_hor_enabled
+        or goal_position_vert_enabled
         or is_eval
     )
     if compute_goal_root_position:
@@ -2420,12 +2548,17 @@ def calc_dar_loss(
                 goal_position_vert_condition_keep_mask),
             history_motion=history_motion,
             goal_time_frame=goal_time_frame,
+            enabled_components={
+                'horizontal': goal_position_hor_enabled,
+                'vertical': goal_position_vert_enabled,
+            },
             return_per_sample=True,
         )
         for key, (loss, per_sample, valid) in root_position_components.items():
             terms[key] = loss
             per_sample_terms[key] = (per_sample, valid)
-        if _loss_weight_any(self.loss_weight, 'goal_root_position') > 0.0:
+        if (_loss_weight_any(self.loss_weight, 'goal_root_position') > 0.0
+                and (is_eval or _goal_enabled('goal_position'))):
             terms['goal_root_position'] = self.calc_goal_root_position_loss(
                 future_motion_pred, ego_goal, goal_condition_keep_mask,
                 history_motion=history_motion,
@@ -2438,8 +2571,19 @@ def calc_dar_loss(
         *SPLIT_GOAL_DIMS,
     )
     if ego_goal is not None and ego_goal.shape[-1] in joint_goal_dims:
+        goal_gravity_keep_mask = (
+            goal_gravity_condition_keep_mask
+            if goal_gravity_condition_keep_mask is not None
+            else goal_orientation_condition_keep_mask
+        )
         compute_goal_root_orientation = (
-            _loss_weight_any(self.loss_weight, 'goal_root_orientation') > 0.0
+            (
+                _loss_weight_any(
+                    self.loss_weight, 'goal_root_orientation') > 0.0
+                and _goal_enabled('goal_orientation')
+                and _keep_mask_maybe_active(
+                    goal_orientation_condition_keep_mask)
+            )
             or is_eval
         )
         compute_goal_g = (
@@ -2448,15 +2592,25 @@ def calc_dar_loss(
                                        *SPLIT_GOAL_DIMS)
             and (
                 _loss_weight_any(self.loss_weight, 'goal_g') > 0.0
+                and _goal_enabled('goal_gravity')
+                and _keep_mask_maybe_active(goal_gravity_keep_mask)
                 or is_eval
             )
         )
         compute_goal_joint_angle = (
-            _loss_weight_any(self.loss_weight, 'goal_joint_angle') > 0.0
+            (
+                _loss_weight_any(self.loss_weight, 'goal_joint_angle') > 0.0
+                and _goal_enabled('goal_joint')
+                and _keep_mask_maybe_active(goal_joint_condition_keep_mask)
+            )
             or is_eval
         )
         compute_goal_root_velocity = (
-            _loss_weight_any(self.loss_weight, 'goal_root_velocity') > 0.0
+            (
+                _loss_weight_any(self.loss_weight, 'goal_root_velocity') > 0.0
+                and _goal_enabled('goal_velocity')
+                and _keep_mask_maybe_active(goal_velocity_condition_keep_mask)
+            )
             or is_eval
         )
         goal_state = None
@@ -2472,8 +2626,7 @@ def calc_dar_loss(
                     or compute_goal_root_velocity
                 ),
             )
-        if (_loss_weight_any(self.loss_weight, 'goal_root_orientation') > 0.0
-                or is_eval):
+        if compute_goal_root_orientation:
             loss, per_sample, valid = self.calc_goal_root_orientation_loss(
                 future_motion_pred,
                 ego_goal,
@@ -2489,11 +2642,7 @@ def calc_dar_loss(
             loss, per_sample, valid = self.calc_goal_g_loss(
                 future_motion_pred,
                 ego_goal,
-                (
-                    goal_gravity_condition_keep_mask
-                    if goal_gravity_condition_keep_mask is not None
-                    else goal_orientation_condition_keep_mask
-                ),
+                goal_gravity_keep_mask,
                 history_motion=history_motion,
                 goal_time_frame=goal_time_frame,
                 goal_state=goal_state,
@@ -2501,8 +2650,7 @@ def calc_dar_loss(
             )
             terms['goal_g'] = loss
             per_sample_terms['goal_g'] = (per_sample, valid)
-        if (_loss_weight_any(self.loss_weight, 'goal_joint_angle') > 0.0
-                or is_eval):
+        if compute_goal_joint_angle:
             loss, per_sample, valid = self.calc_goal_joint_angle_loss(
                 future_motion_pred,
                 ego_goal,
@@ -2513,8 +2661,7 @@ def calc_dar_loss(
             )
             terms['goal_joint_angle'] = loss
             per_sample_terms['goal_joint_angle'] = (per_sample, valid)
-        if (_loss_weight_any(self.loss_weight, 'goal_root_velocity') > 0.0
-                or is_eval):
+        if compute_goal_root_velocity:
             loss, per_sample, valid = self.calc_goal_root_velocity_loss(
                 future_motion_pred,
                 ego_goal,
@@ -2535,6 +2682,14 @@ def calc_dar_loss(
             )
             and (
                 _loss_weight_any(self.loss_weight, 'goal_end_effector') > 0.0
+                and (
+                    is_eval
+                    or (
+                        goal_condition_enabled is None
+                        or any(goal_condition_enabled.get(
+                            'goal_end_effector', (True,)))
+                    )
+                )
                 or is_eval
             )
         )
