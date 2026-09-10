@@ -6,8 +6,8 @@
 #     bash run_full_pipeline.sh
 #
 # Env vars (all optional):
-#     BONES_SEED_DIR     path to BONES-SEED root       (default: /home/lenovo/data/bones-seed)
-#     OUTPUT_ROOT        output base directory         (default: same as BONES_SEED_DIR)
+#     BONES_SEED_DIR     path to BONES-SEED root       (default: auto-detected)
+#     OUTPUT_ROOT        output base directory         (default: local data/ when present)
 #     NUM_WORKERS        parallel workers for stages 1-2 (default: 16)
 #     PACK_WORKERS       parallel workers for stage 3  (default: 8)
 #     FPS_TARGET         output frame rate             (default: 50)
@@ -17,6 +17,8 @@
 #     MOB_RASTER_BACKEND vectorized or scalar exact MOB (default: vectorized)
 #     METADATA_CSV       BONES-SEED metadata CSV        (default: ${BONES_SEED_DIR}/metadata/seed_metadata_v004.csv)
 #     TEMPORAL_JSONL     temporal event labels          (default: ${BONES_SEED_DIR}/metadata/seed_metadata_v002_temporal_labels.jsonl)
+#     FORCE_REPACK       rebuild Stage 3 even with a .done marker (default: 0)
+#     PYTHON_BIN         Python interpreter for all stages (default: auto-detected)
 #
 # Stages:
 #     1. convert_soma_csv_to_motion_lib.py    CSV -> motion_lib PKL (+ contact_mask + scene occu)
@@ -35,9 +37,27 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 MJCF_DIR="${MJCF_DIR:-${PROJECT_ROOT}/TextOpRobotMDAR/description/robots/g1}"
 
 # ---- config ----
-BONES_SEED_DIR="${BONES_SEED_DIR:-/ALG/yukang/dataset/bones-seed}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${BONES_SEED_DIR}}"
-# OUTPUT_ROOT="${OUTPUT_ROOT:-data}"
+if [ -d "${PROJECT_ROOT}/data/motion_lib_filtered" ]; then
+    DEFAULT_BONES_SEED_DIR="${HOME}/data/bones-seed"
+    DEFAULT_OUTPUT_ROOT="${PROJECT_ROOT}/data"
+else
+    DEFAULT_BONES_SEED_DIR="/ALG/yukang/dataset/bones-seed"
+    DEFAULT_OUTPUT_ROOT="${DEFAULT_BONES_SEED_DIR}"
+fi
+BONES_SEED_DIR="${BONES_SEED_DIR:-${DEFAULT_BONES_SEED_DIR}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${DEFAULT_OUTPUT_ROOT}}"
+FORCE_REPACK="${FORCE_REPACK:-0}"
+if [ -z "${PYTHON_BIN:-}" ]; then
+    if [ -n "${CONDA_PREFIX:-}" ] \
+        && [ -x "${CONDA_PREFIX}/bin/python" ] \
+        && "${CONDA_PREFIX}/bin/python" -c 'import joblib' >/dev/null 2>&1; then
+        PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+    elif [ -x "${HOME}/miniforge3/envs/textop/bin/python" ]; then
+        PYTHON_BIN="${HOME}/miniforge3/envs/textop/bin/python"
+    else
+        PYTHON_BIN="python3"
+    fi
+fi
 FPS_TARGET="${FPS_TARGET:-50}"
 FPS_SOURCE="${FPS_SOURCE:-120}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
@@ -70,7 +90,7 @@ echo "  Output: ${S1_OUT}"
 if [ -f "${S1_DONE}" ]; then
     echo "  [SKIP] already done"
 else
-    python3 "${SCRIPT_DIR}/convert_soma_csv_to_motion_lib.py" \
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/convert_soma_csv_to_motion_lib.py" \
         --input "${BONES_SEED_DIR}/g1/csv" \
         --output "${S1_OUT}" \
         --fps "${FPS_TARGET}" \
@@ -97,7 +117,7 @@ echo "  Output: ${S2_OUT}"
 if [ -f "${S2_DONE}" ]; then
     echo "  [SKIP] already done"
 else
-    python3 "${SCRIPT_DIR}/filter_and_copy_bones_data.py" \
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/filter_and_copy_bones_data.py" \
         --source "${S1_OUT}" \
         --dest "${S2_OUT}" \
         --workers "${NUM_WORKERS}"
@@ -115,10 +135,26 @@ echo "  Output: ${S3_OUT}"
 echo "  Metadata: ${METADATA_CSV}"
 echo "  Temporal: ${TEMPORAL_JSONL}"
 
-if [ -f "${S3_DONE}" ]; then
-    echo "  [SKIP] already done"
+STAGE3_REBUILT=0
+NEW_INPUT_PKL=""
+if [ -f "${S3_DONE}" ] && [ -d "${S2_OUT}" ]; then
+    NEW_INPUT_PKL="$(find "${S2_OUT}" -type f -name '*.pkl' -newer "${S3_DONE}" -print -quit)"
+fi
+
+if [ "${FORCE_REPACK}" = "1" ]; then
+    echo "  [REBUILD] FORCE_REPACK=1"
+    REBUILD_STAGE3=1
+elif [ ! -f "${S3_DONE}" ]; then
+    REBUILD_STAGE3=1
+elif [ -n "${NEW_INPUT_PKL}" ]; then
+    echo "  [REBUILD] input PKL is newer than ${S3_DONE}: ${NEW_INPUT_PKL}"
+    REBUILD_STAGE3=1
 else
-    python3 "${SCRIPT_DIR}/pack_motion_lib_to_textop.py" \
+    REBUILD_STAGE3=0
+fi
+
+if [ "${REBUILD_STAGE3}" -eq 1 ]; then
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/pack_motion_lib_to_textop.py" \
         --input "${S2_OUT}" \
         --output "${S3_OUT}" \
         --metadata-csv "${METADATA_CSV}" \
@@ -127,7 +163,20 @@ else
         --seed "${SEED}" \
         --workers "${PACK_WORKERS}"
     touch "${S3_DONE}"
+    STAGE3_REBUILT=1
+    for cache in \
+        "${S3_OUT}"/meanstd*.pkl \
+        "${S3_OUT}"/weighted_meanstd*.pkl \
+        "${S3_OUT}/goal_stats.pkl"; do
+        if [ -f "${cache}" ]; then
+            stale_cache="${cache}.stale.$(date +%Y%m%d_%H%M%S)"
+            mv "${cache}" "${stale_cache}"
+            echo "  [INVALIDATE] ${cache} -> ${stale_cache}"
+        fi
+    done
     echo "  [DONE]"
+else
+    echo "  [SKIP] already done"
 fi
 
 # ============================================================================
@@ -140,15 +189,27 @@ echo "Stage 4/4: cal_weighted_statistics.py (neutral)"
 echo "  Input : ${S3_OUT}/train.pkl"
 echo "  Output: ${S4_OUT}/action_statistics.json"
 
-if [ -f "${S4_DONE}" ]; then
-    echo "  [SKIP] already done"
+if [ ! -f "${S4_DONE}" ]; then
+    REBUILD_STAGE4=1
+elif [ "${STAGE3_REBUILT}" -eq 1 ]; then
+    echo "  [REBUILD] Stage 3 produced a new manifest"
+    REBUILD_STAGE4=1
+elif [ -f "${S3_OUT}/train.pkl" ] && [ "${S3_OUT}/train.pkl" -nt "${S4_DONE}" ]; then
+    echo "  [REBUILD] train.pkl is newer than ${S4_DONE}"
+    REBUILD_STAGE4=1
 else
-    python3 "${SCRIPT_DIR}/cal_weighted_statistics.py" \
+    REBUILD_STAGE4=0
+fi
+
+if [ "${REBUILD_STAGE4}" -eq 1 ]; then
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/cal_weighted_statistics.py" \
         --data_folder "${S3_OUT}" \
         --trg_filename "${S4_OUT}/action_statistics.json" \
         --neutral
     touch "${S4_DONE}"
     echo "  [DONE]"
+else
+    echo "  [SKIP] already done"
 fi
 
 # ============================================================================
