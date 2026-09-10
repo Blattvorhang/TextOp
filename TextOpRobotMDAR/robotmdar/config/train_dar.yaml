@@ -4,7 +4,7 @@ defaults:
   - train/dar
   - _self_
 
-expname: BONES-SEED-FUTURE-64-ROT-MAT
+expname: BONES-SEED-FUTURE-64-TEXT
 task: train-dar
 
 data:

@@ -35,7 +35,7 @@ load_text_embeddings: false
 clip_version: ViT-B/32
 # Optional local checkpoint for offline machines. If null, CLIP's normal cache
 # and download behavior is used; TEXTOP_CLIP_PATH is also supported.
-clip_model_path: null
+clip_model_path: /ALG/hanyi/textop/ViT-B-32.pt
 clip_dim: 512
 # Bounded startup audit for recovery/text metadata. Set to 0 to skip primitive
 # window sampling; sequence-level manifest counts are still cheap.
