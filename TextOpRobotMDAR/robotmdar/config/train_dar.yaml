@@ -18,7 +18,7 @@ data:
   weighted_sample: true
   preload_ram: true
   load_scene: false
-  load_text_embeddings: true
+  load_text_embeddings: false
   clip_version: ViT-B/32
   clip_dim: 512
   goal_type: joint_state
@@ -42,44 +42,41 @@ denoiser:
   goal_encoding: ${data.goal_encoding}
   goal_dim: 66
   text_condition_enabled: false
-  cond_mask_prob:
-    # The two profiles are selected per sample from batch[pidx]["is_recovery"]
-    locomotion:
-      text: 1.0
-      goal:
-        position:
-          hor: 0.05
-          vert: 0.4
-        velocity: 0.1
-        orientation:
-          rot6d: 0.4
-          gravity: 0.4
-        joint: 0.8
-        end_effector:
-          left_hand: 0.3
-          right_hand: 0.3
-          left_foot: 0.3
-          right_foot: 0.3
-        time: 0.1
-      scene: 1.0
-    getup:
-      text: 1.0
-      goal:
-        position:
-          hor: 0.95
-          vert: 0.05
-        velocity: 0.95
-        orientation:
-          rot6d: 0.95
-          gravity: 0.05
-        joint: 0.95
-        end_effector:
-          left_hand: 0.95
-          right_hand: 0.95
-          left_foot: 0.95
-          right_foot: 0.95
-        time: 0.1
-      scene: 1.0
+  # Training-time condition coverage. Probabilities describe the chance that
+  # a condition is visible; the implementation masks the complementary set.
+  condition_sampling:
+    cardinality:
+      none: 0.10
+      single: 0.60
+      composition: 0.29
+      full_condition: 0.01
+    single_preference:
+      text: 0.0
+      position_hor: 1.0
+      position_vert: 0.3
+      velocity: 0.7
+      orientation_rot6d: 0.5
+      gravity: 0.8
+      joint: 0.3
+      end_effector:
+        left_hand: 0.7
+        right_hand: 0.7
+        left_foot: 0.7
+        right_foot: 0.7
+    composition_probability:  # [0, 1] probability of sampling a composition condition
+      text: 0.0
+      position_hor: 0.75
+      position_vert: 0.30
+      velocity: 0.60
+      orientation_rot6d: 0.40
+      gravity: 0.50
+      joint: 0.25
+      end_effector:
+        left_hand: 0.30
+        right_hand: 0.30
+        left_foot: 0.30
+        right_foot: 0.30
+    time_probability: 0.50
 
 train:
   manager:

@@ -82,6 +82,112 @@ def _condition_recovery_mask(y, batch_size: int, device):
     return _condition_valid_mask(value, batch_size, device)
 
 
+def _sample_condition_keep_plan(model, y, batch_size: int, device):
+    """Sample none/single/composition/full condition sets for training.
+
+    Returns leaf-condition keep masks, or ``None`` when legacy masking should
+    be used. End-effector tokens remain separate leaves under the EE group.
+    """
+    cfg = getattr(model, 'condition_sampling', None)
+    if not model.training or not _is_mapping_like(cfg):
+        return None
+    existing = y.get('_condition_sampling_plan')
+    if _is_mapping_like(existing):
+        first = next(iter(existing.values()), None)
+        if (torch.is_tensor(first) and first.shape == (batch_size,)):
+            return existing
+    cardinality = _mapping_get(cfg, 'cardinality', cfg)
+    none_p = float(_mapping_get(cardinality, 'none', 0.0))
+    single_p = float(_mapping_get(cardinality, 'single', 0.0))
+    composition_p = float(_mapping_get(cardinality, 'composition', 0.0))
+    full_p = float(_mapping_get(cardinality, 'full_condition', 0.0))
+    if min(none_p, single_p, composition_p) < 0 or \
+            full_p < 0 or max(none_p, single_p, composition_p, full_p) > 1 or \
+            abs(none_p + single_p + composition_p + full_p - 1.0) > 1e-5:
+        raise ValueError(
+            'condition_sampling none/single/composition/full_condition '
+            'must sum to 1')
+    single_cfg = _mapping_get(cfg, 'single_preference', {})
+    composition_cfg = _mapping_get(cfg, 'composition_probability', {})
+    names = (
+        ('text',) if bool(getattr(model, 'text_condition_enabled', False))
+        else ()
+    ) + (
+        'position_hor', 'position_vert', 'orientation_rot6d',
+        'gravity', 'joint', 'velocity',
+    )
+    ee_cfg_single = _mapping_get(single_cfg, 'end_effector', {})
+    ee_cfg_combo = _mapping_get(composition_cfg, 'end_effector', {})
+    names += ('end_effector',)
+    weights = []
+    probs = []
+    for name in names:
+        if name == 'end_effector':
+            weights.append(float(_mapping_get(
+                ee_cfg_single, 'preference', ee_cfg_single
+                if not _is_mapping_like(ee_cfg_single) else 0.0)))
+            probs.append(float(_mapping_get(
+                ee_cfg_combo, 'probability', ee_cfg_combo
+                if not _is_mapping_like(ee_cfg_combo) else 0.0)))
+        else:
+            weights.append(float(_mapping_get(single_cfg, name, 0.0)))
+            probs.append(float(_mapping_get(composition_cfg, name, 0.0)))
+    if any(w < 0 for w in weights) or sum(weights) <= 0:
+        raise ValueError('single_preference must contain positive weights')
+    if any(p < 0 or p > 1 for p in probs):
+        raise ValueError('composition_probability values must be in [0, 1]')
+    if composition_p > 0.0 and sum(probs) < 2.0:
+        raise ValueError(
+            'composition_probability must support at least two conditions')
+    category = torch.multinomial(
+        torch.tensor([none_p, single_p, composition_p, full_p], device=device),
+        batch_size, replacement=True)
+    keep = torch.zeros(batch_size, len(names), dtype=torch.bool, device=device)
+    single_rows = torch.nonzero(category == 1, as_tuple=False).flatten()
+    if single_rows.numel():
+        choices = torch.multinomial(
+            torch.tensor(weights, device=device, dtype=torch.float32),
+            single_rows.numel(), replacement=True)
+        keep[single_rows, choices] = True
+    combo_rows = torch.nonzero(category == 2, as_tuple=False).flatten()
+    if combo_rows.numel():
+        p = torch.tensor(probs, device=device, dtype=torch.float32)
+        sampled = torch.bernoulli(p.expand(combo_rows.numel(), -1)).bool()
+        # A composition is guaranteed to contain at least two leaves.
+        for row in range(sampled.shape[0]):
+            if int(sampled[row].sum()) < 2:
+                choices = torch.multinomial(p, 2, replacement=False)
+                sampled[row, choices] = True
+        keep[combo_rows] = sampled
+    full_rows = torch.nonzero(category == 3, as_tuple=False).flatten()
+    if full_rows.numel():
+        keep[full_rows] = True
+    time_p = float(_mapping_get(cfg, 'time_probability', 0.0))
+    if time_p < 0.0 or time_p > 1.0:
+        raise ValueError('condition_sampling time_probability must be in [0, 1]')
+    time_keep = torch.bernoulli(torch.full(
+        (batch_size,), time_p, device=device)) > 0
+    time_keep = time_keep & (category != 0)
+    keep_plan = {name: keep[:, i] for i, name in enumerate(names)}
+    keep_plan['time'] = time_keep
+    return keep_plan
+
+
+def _sampling_probability(model, y, name, batch_size, device, plan, index=None):
+    if plan is None or name not in plan:
+        return _condition_mask_probability(model, y, {
+            'position_hor': 'goal_position_hor',
+            'position_vert': 'goal_position_vert',
+            'orientation_rot6d': 'goal_orientation_rot6d',
+            'gravity': 'goal_gravity', 'joint': 'goal_joint',
+            'velocity': 'goal_velocity',
+            'time': 'goal_time',
+            'text': 'text',
+        }.get(name, 'goal_end_effector'), batch_size, device,
+        index=index)
+    return (~plan[name]).to(dtype=torch.float32)
+
+
 def _condition_mask_probability(model, y, name: str, batch_size: int,
                                 device, index=None):
     """Select locomotion/getup dropout probabilities per batch sample."""
@@ -571,6 +677,10 @@ def _mask_split_goal(model, goal, y):
     layout = _split_goal_layout(goal.shape[-1])
     batch_size = goal.shape[0]
     device = goal.device
+    condition_plan = _sample_condition_keep_plan(
+        model, y, batch_size, device)
+    if condition_plan is not None:
+        y['_condition_sampling_plan'] = condition_plan
     root_valid = _model_goal_valid_mask(
         model, y, 'root', batch_size, device)
     orientation_valid = _combine_valid_masks(
@@ -606,48 +716,48 @@ def _mask_split_goal(model, goal, y):
     )
     horizontal, horizontal_keep = model.mask_condition(
         goal[:, horizontal_content],
-        _condition_mask_probability(
-            model, y, 'goal_position_hor', batch_size, device),
+        _sampling_probability(model, y, 'position_hor', batch_size, device,
+                              condition_plan),
         force_mask=force_position_hor,
         valid_mask=root_valid,
         return_keep_mask=True,
     )
     vertical_height, vertical_keep = model.mask_condition(
         goal[:, layout["vertical_height"]],
-        _condition_mask_probability(
-            model, y, 'goal_position_vert', batch_size, device),
+        _sampling_probability(model, y, 'position_vert', batch_size, device,
+                              condition_plan),
         force_mask=force_position_vert,
         valid_mask=root_valid,
         return_keep_mask=True,
     )
     gravity, gravity_keep = model.mask_condition(
         goal[:, layout["vertical_gravity"]],
-        _condition_mask_probability(
-            model, y, 'goal_gravity', batch_size, device),
+        _sampling_probability(model, y, 'gravity', batch_size, device,
+                              condition_plan),
         force_mask=force_gravity,
         valid_mask=orientation_valid,
         return_keep_mask=True,
     )
     rot, orientation_keep = model.mask_condition(
         goal[:, layout["orientation"]],
-        _condition_mask_probability(
-            model, y, 'goal_orientation_rot6d', batch_size, device),
+        _sampling_probability(model, y, 'orientation_rot6d', batch_size,
+                              device, condition_plan),
         force_mask=force_orientation,
         valid_mask=orientation_valid,
         return_keep_mask=True,
     )
     joints, joint_keep = model.mask_condition(
         goal[:, layout["joint"]],
-        _condition_mask_probability(
-            model, y, 'goal_joint', batch_size, device),
+        _sampling_probability(model, y, 'joint', batch_size, device,
+                              condition_plan),
         force_mask=y.get('force_drop_goal_joint', False),
         valid_mask=joint_valid,
         return_keep_mask=True,
     )
     velocity, velocity_keep = model.mask_condition(
         goal[:, layout["velocity"]],
-        _condition_mask_probability(
-            model, y, 'goal_velocity', batch_size, device),
+        _sampling_probability(model, y, 'velocity', batch_size, device,
+                              condition_plan),
         force_mask=y.get('force_drop_goal_velocity', False),
         valid_mask=velocity_valid,
         return_keep_mask=True,
@@ -679,9 +789,9 @@ def _mask_split_goal(model, goal, y):
         for idx, name in enumerate(SPLIT_END_EFFECTOR_TOKEN_ORDER):
             end_effector, keep = model.mask_condition(
                 goal[:, layout["end_effector_subslices"][name]],
-                _condition_mask_probability(
-                    model, y, 'goal_end_effector', batch_size, device,
-                    index=idx),
+                _sampling_probability(
+                    model, y, 'end_effector', batch_size, device,
+                    condition_plan, index=idx),
                 force_mask=_force_drop_end_effector(y, name),
                 valid_mask=_goal_end_effector_valid_mask(
                     model, y, name, batch_size, device),
@@ -693,7 +803,9 @@ def _mask_split_goal(model, goal, y):
             end_effector_keeps, dim=1)
     time_valid = _model_goal_valid_mask(
         model, y, 'time', batch_size, device)
-    if 'arrival_time_condition_keep_mask' in y:
+    if condition_plan is not None and 'time' in condition_plan:
+        time_keep = condition_plan['time']
+    elif 'arrival_time_condition_keep_mask' in y:
         time_keep = y['arrival_time_condition_keep_mask']
     elif y.get('force_drop_goal_time', False) or y.get(
             'force_drop_arrival_time', False):
@@ -1093,6 +1205,7 @@ class DenoiserMLP(nn.Module):
         _validate_model_goal_encoding(self.goal_dim, self.goal_encoding)
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
+        self.condition_sampling = kargs.pop('condition_sampling', None)
         mask_profiles = _resolve_condition_mask_profiles(
             kargs,
             cond_mask_prob=cond_mask_prob,
@@ -1228,8 +1341,9 @@ class DenoiserMLP(nn.Module):
                     "y['time_to_arrival_frame']")
             arrival_time_frame, arrival_keep_mask = self.mask_condition(
                 arrival_time_frame.reshape(-1, 1).to(goal.device).float(),
-                _condition_mask_probability(
-                    self, y, 'goal_time', goal.shape[0], goal.device),
+                _sampling_probability(
+                    self, y, 'time', goal.shape[0], goal.device,
+                    y.get('_condition_sampling_plan')),
                 force_mask=(
                     y.get('force_drop_arrival_time', False)
                     or y.get('force_drop_goal_time', False)),
@@ -1375,6 +1489,7 @@ class DenoiserTransformer(nn.Module):
         _validate_model_goal_encoding(self.goal_dim, self.goal_encoding)
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
+        self.condition_sampling = kargs.pop('condition_sampling', None)
         mask_profiles = _resolve_condition_mask_profiles(
             kargs,
             cond_mask_prob=cond_mask_prob,
@@ -1580,8 +1695,9 @@ class DenoiserTransformer(nn.Module):
                 text_embedding = text_embedding.to(device=device, dtype=x_t.dtype)
                 text_embedding, text_keep_mask = self.mask_condition(
                     text_embedding,
-                    _condition_mask_probability(
-                        self, y, 'text', batch_size, text_embedding.device),
+                    _sampling_probability(
+                        self, y, 'text', batch_size, text_embedding.device,
+                        y.get('_condition_sampling_plan')),
                     force_mask=(
                         y.get('force_drop_text', False)
                         or y.get('uncond', False)),
@@ -1616,8 +1732,9 @@ class DenoiserTransformer(nn.Module):
             else:
                 arrival_time_frame, arrival_keep_mask = self.mask_condition(
                     arrival_time_frame.reshape(-1, 1).to(device=device).float(),
-                    _condition_mask_probability(
-                        self, y, 'goal_time', goal.shape[0], goal.device),
+                    _sampling_probability(
+                        self, y, 'time', goal.shape[0], goal.device,
+                        y.get('_condition_sampling_plan')),
                     force_mask=(
                         y.get('force_drop_arrival_time', False)
                         or y.get('force_drop_goal_time', False)),
