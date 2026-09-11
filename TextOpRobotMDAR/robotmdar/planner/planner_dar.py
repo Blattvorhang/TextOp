@@ -43,7 +43,9 @@ from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
     apply_generated_history_alignment_correction,
     generated_history_at_frame,
+    g1_joint_limits_from_mjcf,
     motion_dict_to_g1data,
+    residual_reanchor_generated_history,
     state_goal_from_reference,
     state_to_ego_goal,
     state_to_model_input,
@@ -74,6 +76,25 @@ def _load_models(
     manager: DARManager = instantiate(cfg.train.manager)
     manager.hold_model(vae, denoiser, None, val_data)
     return vae, denoiser, diffusion, val_data
+
+
+def _parse_generated_history_alignment_mode(value) -> str:
+    """Normalize legacy bool config and the generated-history enum."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "spatial" if value else "null"
+    mode = str(value).strip().lower()
+    if mode in ("", "null", "none", "false"):
+        return "null"
+    if mode == "true":
+        return "spatial"
+    if mode not in ("spatial", "residual_reanchor"):
+        raise ValueError(
+            "generated_history.align_to_g1 must be one of "
+            "null, spatial, residual_reanchor, got "
+            f"{value!r}")
+    return mode
 
 
 def _encode_text_embedding(clip_model, text, device: str):
@@ -974,8 +995,10 @@ def main(cfg: DictConfig) -> None:
     generated_history_cfg = cfg.get("generated_history", {})
     use_generated_history = bool(generated_history_cfg.get(
         "enabled", cfg.get("use_generated_history", False)))
-    align_generated_history = bool(generated_history_cfg.get(
-        "align_to_g1", cfg.get("align_generated_history_to_g1", False)))
+    generated_history_align_mode = _parse_generated_history_alignment_mode(
+        generated_history_cfg.get(
+            "align_to_g1", cfg.get("align_generated_history_to_g1", False)))
+    align_generated_history = generated_history_align_mode != "null"
     phase_lag_offset = int(generated_history_cfg.get(
         "phase_lag_offset", cfg.get("phase_lag_offset", 0)))
     if phase_lag_offset < 0:
@@ -1023,6 +1046,8 @@ def main(cfg: DictConfig) -> None:
     last_alignment_epoch = None
     last_alignment_source_epoch = None
     last_alignment_correction = None
+    last_residual_reanchor_correction = None
+    residual_joint_limits = None
     next_ack_log_time = 0.0
     infer_times: list[float] = []  # rolling window for running average
     fixed_sampling_noise = None
@@ -1049,11 +1074,14 @@ def main(cfg: DictConfig) -> None:
     logger.info(
         "TextOp planner ready: replan={:.1f} Hz, motion={:.1f} Hz, "
         "history={} features/{} states, future={} frames, history_source={}, "
-        "phase_lag={} frames, align_every={} replans",
+        "phase_lag={} frames, align_mode={}, align_every={} replans",
         1.0 / period, motion_fps, history_len, history_len, future_len,
-        ("generated+translated" if align_generated_history else "generated")
+        (f"generated+{generated_history_align_mode}"
+         if align_generated_history else "generated")
         if use_generated_history else "controller",
-        phase_lag_offset if align_generated_history else 0,
+        (phase_lag_offset
+         if generated_history_align_mode == "spatial" else 0),
+        generated_history_align_mode,
         align_generated_history_every if align_generated_history else 0)
 
     try:
@@ -1136,6 +1164,7 @@ def main(cfg: DictConfig) -> None:
                     use_generated_history and tracked_plan is not None)
                 current_alignment_epoch = None
                 alignment_mode = "none"
+                phase_offset_frames = None
                 if using_generated_history:
                     tracked_frame = tracked_frame_from_timestamps(
                         latest_state, motion_fps, future_len)
@@ -1152,10 +1181,98 @@ def main(cfg: DictConfig) -> None:
                             tracked_plan, tracked_frame, history_len,
                             phase_lag_offset=(
                                 phase_lag_offset
-                                if align_generated_history else 0)))
+                                if generated_history_align_mode == "spatial"
+                                else 0)))
                     if align_generated_history:
                         generated_history_replan_count += 1
-                        if align_this_replan:
+                        if generated_history_align_mode == "residual_reanchor":
+                            if align_this_replan:
+                                if residual_joint_limits is None:
+                                    residual_joint_limits = (
+                                        g1_joint_limits_from_mjcf(
+                                            val_data, cfg.device))
+                                (
+                                    abs_pose, history_motion,
+                                    residual_correction, residual_phase,
+                                    residual_phase_error,
+                                ) = residual_reanchor_generated_history(
+                                    generated_abs_pose,
+                                    history_motion,
+                                    latest_state,
+                                    val_data,
+                                    cfg.device,
+                                    joint_limits=residual_joint_limits)
+                                alignment_epoch += 1
+                                last_alignment_epoch = alignment_epoch
+                                current_alignment_epoch = alignment_epoch
+                                alignment_mode = (
+                                    "residual_reanchor:refreshed")
+                                last_alignment_source_epoch = (
+                                    source_alignment_epoch)
+                                last_residual_reanchor_correction = (
+                                    residual_correction)
+                                phase_offset_frames = int(
+                                    residual_correction[
+                                        "phase_offset_frames"][0])
+                                logger.info(
+                                    "Residual re-anchor phase={} "
+                                    "offset={:+d} frames error={:.5f}",
+                                    int(residual_phase[0]),
+                                    phase_offset_frames,
+                                    float(residual_phase_error[0]))
+                            elif (
+                                    last_residual_reanchor_correction
+                                    is not None
+                                    and source_alignment_epoch
+                                    == last_alignment_source_epoch
+                                    and source_alignment_epoch
+                                    != last_alignment_epoch):
+                                (
+                                    abs_pose, history_motion,
+                                    _, inherited_phase,
+                                    inherited_phase_error,
+                                ) = residual_reanchor_generated_history(
+                                    generated_abs_pose,
+                                    history_motion,
+                                    latest_state,
+                                    val_data,
+                                    cfg.device,
+                                    joint_limits=residual_joint_limits,
+                                    correction=(
+                                        last_residual_reanchor_correction))
+                                current_alignment_epoch = last_alignment_epoch
+                                alignment_mode = (
+                                    "residual_reanchor:inherited")
+                                phase_offset_frames = int(
+                                    last_residual_reanchor_correction[
+                                        "phase_offset_frames"][0])
+                                logger.info(
+                                    "Inherited residual re-anchor phase={} "
+                                    "offset={:+d} frames error={:.5f}",
+                                    int(inherited_phase[0]),
+                                    phase_offset_frames,
+                                    float(inherited_phase_error[0]))
+                            else:
+                                abs_pose = {
+                                    k: v.to(cfg.device)
+                                    for k, v in generated_abs_pose.items()
+                                }
+                                current_alignment_epoch = (
+                                    source_alignment_epoch)
+                                alignment_mode = (
+                                    "residual_reanchor:inherited"
+                                    if (current_alignment_epoch is not None
+                                        and current_alignment_epoch
+                                        == last_alignment_epoch)
+                                    else "residual_reanchor:none")
+                                if (alignment_mode.endswith(":inherited")
+                                        and last_residual_reanchor_correction
+                                        is not None):
+                                    phase_offset_frames = int(
+                                        last_residual_reanchor_correction[
+                                            "phase_offset_frames"][0])
+                            history_translation = None
+                        elif align_this_replan:
                             (abs_pose, _goal_reference_pos,
                              _goal_reference_rot, history_translation,
                              history_motion, alignment_correction) = (
@@ -1540,7 +1657,7 @@ def main(cfg: DictConfig) -> None:
                         "plan={} state={} motion={} frames infer={:.1f} ms "
                         "(avg20={:.1f} ms) "
                         "history={} tracked_plan={} frame={} shift={:.3f} m "
-                        "align={} "
+                        "align={} phase_offset={} frames "
                         "seam=({:.4f} m, {:.2f} deg, {:.4f} rad) "
                         "goal_r=({:.3f}->{:.3f}) m",
                         published_seq, state_seq, motion.num_frames, infer_ms, avg_ms,
@@ -1551,6 +1668,8 @@ def main(cfg: DictConfig) -> None:
                         (float(torch.linalg.vector_norm(history_translation))
                          if history_translation is not None else 0.0),
                         alignment_mode,
+                        (f"{phase_offset_frames:+d}"
+                         if phase_offset_frames is not None else "n/a"),
                         seam_root_error, seam_root_angle_deg, seam_joint_error,
                         _goal_r_world, _goal_r_ego)
             except Exception:

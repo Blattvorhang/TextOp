@@ -51,14 +51,14 @@ generated_history:
   # Bootstrap from controller history once, then autoregress on generated
   # history.
   enabled: true
-  # Keep false while debugging pure autoregressive history. When enabled, the
-  # selected generated-history endpoint is translated onto the measured G1
-  # root; skipped cycles inherit the latest correction.
-  align_to_g1: true
+  # null = pure autoregressive history; spatial = legacy root alignment;
+  # residual_reanchor = joint/position residuals plus SO(3) re-anchoring;
+  # V6 gravity is regenerated from the re-anchored orientation.
+  align_to_g1: spatial
   # Number of generated-motion frames by which the tracker lags the reference.
-  # Alignment compares the current measured state with the earlier predicted
-  # frame (tracked_frame - phase_lag_offset). Values beyond plan start clamp
-  # to 0.
+  # Used only by spatial alignment, which compares against
+  # tracked_frame - phase_lag_offset. Residual re-anchoring ignores this value
+  # and searches backward through the history ending at tracked_frame.
   phase_lag_offset: 0
   # Recompute alignment once every N generated-history replans. The first
   # generated-history replan always aligns; skipped replans inherit the last

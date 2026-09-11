@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+import xml.etree.ElementTree as ETree
 
 from robotmdar.utils.goal import (
     GoalClamp,
@@ -28,10 +29,18 @@ from robotmdar.dtype.motion import (
     G1_MUJOCO_DOF_JOINT_NAMES,
     G1_WRIST_DOF_INDICES,
     motion_dict_to_feature_v3,
+    motion_dict_to_feature_v6,
     motion_feature_dim_for_dof,
     quaternion_to_euler_angles,
 )
-from robotmdar.dtype.rotation import euler_angles_to_quaternion, quat_apply
+from robotmdar.dtype.rotation import (
+    euler_angles_to_quaternion,
+    matrix_to_quaternion,
+    quat_apply,
+    quaternion_to_matrix,
+    wxyz_to_xyzw,
+    xyzw_to_wxyz,
+)
 
 
 G1_ISAACLAB_DOF_JOINT_NAMES = (
@@ -851,6 +860,300 @@ def _rotation_matrix_between_vectors(source: torch.Tensor,
     antiparallel = parallel & (c.squeeze(-1) < 0.0)
     result = torch.where(parallel.view(batch_size, 1, 1), eye, rodrigues)
     return torch.where(antiparallel.view(batch_size, 1, 1), fallback, result)
+
+
+@lru_cache(maxsize=8)
+def _g1_joint_limits_from_mjcf_path(
+        mjcf_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Read the active G1 hinge ranges from the MJCF, in MuJoCo DOF order."""
+    ranges = {}
+    tree = ETree.parse(mjcf_path)
+    for joint in tree.getroot().iter("joint"):
+        name = joint.attrib.get("name")
+        range_text = joint.attrib.get("range")
+        if name is None or range_text is None:
+            continue
+        values = np.fromstring(range_text, dtype=np.float32, sep=" ")
+        if values.shape == (2,):
+            ranges[name] = values
+
+    missing = [
+        name for name in G1_MUJOCO_DOF_JOINT_NAMES
+        if name not in ranges
+    ]
+    if missing:
+        raise ValueError(
+            f"Active MJCF {mjcf_path} is missing joint ranges for {missing}")
+    limits = np.stack(
+        [ranges[name] for name in G1_MUJOCO_DOF_JOINT_NAMES], axis=0)
+    if not np.isfinite(limits).all() or np.any(limits[:, 0] > limits[:, 1]):
+        raise ValueError(f"Invalid G1 joint ranges in active MJCF {mjcf_path}")
+    return limits[:, 0].copy(), limits[:, 1].copy()
+
+
+def g1_joint_limits_from_mjcf(
+        val_data: Any,
+        device: str | torch.device,
+        dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return lower/upper G1 joint limits from the dataset's active MJCF."""
+    try:
+        mjcf_path = str(val_data.skeleton.fk.mjcf_file)
+    except AttributeError as exc:
+        raise ValueError(
+            "Residual re-anchoring requires val_data.skeleton.fk.mjcf_file "
+            "to load G1 joint limits") from exc
+    lower, upper = _g1_joint_limits_from_mjcf_path(mjcf_path)
+    return (
+        torch.as_tensor(lower, device=device, dtype=dtype),
+        torch.as_tensor(upper, device=device, dtype=dtype),
+    )
+
+
+def _residual_reanchor_real_state(
+        state_msg: Any,
+        device: str | torch.device,
+        dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    real_pos = torch.as_tensor(
+        np.asarray(state_msg.states.g1_pos[-1], dtype=np.float32),
+        device=device,
+        dtype=dtype,
+    ).reshape(1, 3)
+    real_rot_np = _normalized_wire_quaternions_wxyz_as_xyzw(
+        np.asarray(state_msg.states.g1_root_rot[-1:], dtype=np.float32))
+    real_rot = torch.as_tensor(
+        real_rot_np, device=device, dtype=dtype).reshape(1, 4)
+    real_joint_np = isaaclab_to_mujoco_dof(
+        np.asarray(state_msg.states.g1_joint_pos[-1:], dtype=np.float32))
+    real_joint = torch.as_tensor(
+        real_joint_np, device=device, dtype=dtype).reshape(1, -1)
+    return real_pos, real_rot, real_joint
+
+
+def residual_reanchor_generated_history(
+        abs_pose: dict,
+        history_motion: torch.Tensor,
+        state_msg: Any,
+        val_data: Any,
+        device: str | torch.device,
+        joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
+        correction: dict[str, torch.Tensor] | None = None,
+):
+    """Re-integrate predicted local increments from a measured state anchor."""
+    if history_motion is None or val_data is None:
+        raise ValueError("Residual re-anchoring requires generated history data")
+
+    device = torch.device(device)
+    normalized_history = history_motion.to(device)
+    if hasattr(val_data, "reconstruct_motion"):
+        predicted = val_data.reconstruct_motion(
+            normalized_history,
+            abs_pose={
+                key: value.to(device)
+                for key, value in abs_pose.items()
+            },
+            ret_fk=False,
+        )
+    else:
+        predicted = motion_dtype.motion_feature_to_dict(
+            val_data.denormalize(normalized_history),
+            {
+                key: value.to(device)
+                for key, value in abs_pose.items()
+            },
+        )
+
+    pred_pos = predicted["root_trans_offset"].to(device)
+    pred_rot = predicted["root_rot"].to(device)
+    pred_joint = predicted["dof"].to(device)
+    batch_size, num_frames = pred_pos.shape[:2]
+    if batch_size != 1:
+        raise ValueError(
+            "Residual re-anchoring currently expects one measured G1 state, "
+            f"but generated history has batch size {batch_size}")
+    if num_frames <= 0:
+        raise ValueError("Generated history must contain at least one feature")
+
+    real_pos, real_rot, real_joint = _residual_reanchor_real_state(
+        state_msg, device, pred_pos.dtype)
+    if joint_limits is None:
+        joint_limits = g1_joint_limits_from_mjcf(
+            val_data, device=device, dtype=pred_joint.dtype)
+    lower, upper = (
+        limit.to(device=device, dtype=pred_joint.dtype).reshape(1, -1)
+        for limit in joint_limits
+    )
+    if lower.shape[-1] != pred_joint.shape[-1]:
+        raise ValueError(
+            "G1 MJCF joint limit count does not match generated history: "
+            f"{lower.shape[-1]} != {pred_joint.shape[-1]}")
+
+    pred_anchor_pos = abs_pose["root_trans_offset"].to(
+        device=device, dtype=pred_pos.dtype).reshape(batch_size, 3)
+    pred_anchor_rot = abs_pose["root_rot"].to(
+        device=device, dtype=pred_pos.dtype).reshape(batch_size, 4)
+    pred_full_pos = torch.cat([pred_anchor_pos[:, None], pred_pos], dim=1)
+    pred_full_rot = torch.cat([pred_anchor_rot[:, None], pred_rot], dim=1)
+    pred_full_rot_matrix = quaternion_to_matrix(
+        xyzw_to_wxyz(pred_full_rot))
+
+    # V3 carries a joint delta for the first feature edge. V6 carries only
+    # the current joint state, so its synthetic pre-history joint is unused.
+    pred_full_joint = torch.cat([pred_joint[:, :1], pred_joint], dim=1)
+    if motion_dtype.FeatureVersion == 3:
+        denormalized_history = val_data.denormalize(normalized_history)
+        dof_dim = pred_joint.shape[-1]
+        first_joint_delta = denormalized_history[:, 0,
+                                                 11 + dof_dim:11 + 2 * dof_dim]
+        pred_full_joint[:, 0] = pred_joint[:, 0] - first_joint_delta
+
+    pred_delta_local = torch.matmul(
+        pred_full_rot_matrix[:, :-1].transpose(-1, -2),
+        (pred_full_pos[:, 1:] - pred_full_pos[:, :-1]).unsqueeze(-1),
+    ).squeeze(-1)
+    pred_relative_rot = torch.matmul(
+        pred_full_rot_matrix[:, :-1].transpose(-1, -2),
+        pred_full_rot_matrix[:, 1:],
+    )
+    pred_delta_joint = pred_full_joint[:, 1:] - pred_full_joint[:, :-1]
+
+    real_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(real_rot))
+    if correction is None:
+        joint_difference = pred_joint - real_joint[:, None]
+        phase_error = joint_difference.square().sum(dim=-1)
+        reverse_phase_index = torch.flip(phase_error, dims=(1,)).argmin(dim=-1)
+        phase_index = num_frames - 1 - reverse_phase_index
+        correction = {
+            "real_pos": real_pos.detach().clone(),
+            "real_joint": real_joint.detach().clone(),
+            "real_rot_matrix": real_rot_matrix.detach().clone(),
+            "phase_index": phase_index.detach().clone(),
+            # The generated-history window ends at the current tracked frame.
+            # Earlier phase matches therefore have a negative signed offset.
+            "phase_offset_frames": (
+                phase_index - (num_frames - 1)).detach().clone(),
+            "phase_error": phase_error.gather(
+                1, phase_index[:, None]).squeeze(1).detach().clone(),
+        }
+    else:
+        correction = {
+            key: value.to(device)
+            for key, value in correction.items()
+        }
+
+    real_pos = correction["real_pos"].to(dtype=pred_pos.dtype)
+    real_joint = correction["real_joint"].to(dtype=pred_joint.dtype)
+
+    # The phase index addresses the generated states, while the integrated
+    # sequence also contains the pre-history pose at index 0.
+    phase_offset = correction["phase_offset_frames"].to(device)
+    # Never extrapolate beyond the cached generated window.  An out-of-range
+    # inherited phase is held at the nearest boundary; missing motion is thus
+    # a zero translation increment and an identity rotation increment.
+    phase_index = num_frames - 1 + phase_offset
+    phase_index = phase_index.clamp(0, num_frames - 1).long()
+    anchor_state_index = phase_index + 1
+    hybrid_pos = torch.zeros_like(pred_full_pos)
+    hybrid_rot_matrix = torch.zeros_like(pred_full_rot_matrix)
+    hybrid_joint = torch.zeros_like(pred_full_joint)
+    hybrid_pos[:, anchor_state_index] = real_pos
+    hybrid_rot_matrix[:, anchor_state_index] = real_rot_matrix
+    hybrid_joint[:, anchor_state_index] = real_joint
+
+    # Re-integrate exactly the predicted edge increments in both directions.
+    for edge_index in range(num_frames):
+        forward_mask = edge_index >= anchor_state_index
+        if bool(forward_mask.any()):
+            next_index = edge_index + 1
+            current_rot = hybrid_rot_matrix[:, edge_index]
+            hybrid_rot_matrix[:, next_index] = torch.where(
+                forward_mask[:, None, None],
+                torch.matmul(current_rot, pred_relative_rot[:, edge_index]),
+                hybrid_rot_matrix[:, next_index],
+            )
+            hybrid_pos[:, next_index] = torch.where(
+                forward_mask[:, None],
+                hybrid_pos[:, edge_index]
+                + torch.matmul(
+                    current_rot,
+                    pred_delta_local[:, edge_index].unsqueeze(-1),
+                ).squeeze(-1),
+                hybrid_pos[:, next_index],
+            )
+            hybrid_joint[:, next_index] = torch.where(
+                forward_mask[:, None],
+                torch.clamp(
+                    hybrid_joint[:, edge_index]
+                    + pred_delta_joint[:, edge_index],
+                    min=lower,
+                    max=upper,
+                ),
+                hybrid_joint[:, next_index],
+            )
+
+        backward_index = num_frames - 1 - edge_index
+        backward_mask = backward_index < anchor_state_index
+        if bool(backward_mask.any()):
+            current_rot = hybrid_rot_matrix[:, backward_index + 1]
+            hybrid_rot_matrix[:, backward_index] = torch.where(
+                backward_mask[:, None, None],
+                torch.matmul(
+                    current_rot,
+                    pred_relative_rot[:, backward_index].transpose(-1, -2),
+                ),
+                hybrid_rot_matrix[:, backward_index],
+            )
+            hybrid_pos[:, backward_index] = torch.where(
+                backward_mask[:, None],
+                hybrid_pos[:, backward_index + 1]
+                - torch.matmul(
+                    hybrid_rot_matrix[:, backward_index],
+                    pred_delta_local[:, backward_index].unsqueeze(-1),
+                ).squeeze(-1),
+                hybrid_pos[:, backward_index],
+            )
+            hybrid_joint[:, backward_index] = torch.where(
+                backward_mask[:, None],
+                torch.clamp(
+                    hybrid_joint[:, backward_index + 1]
+                    - pred_delta_joint[:, backward_index],
+                    min=lower,
+                    max=upper,
+                ),
+                hybrid_joint[:, backward_index],
+            )
+
+    hybrid_rot = wxyz_to_xyzw(matrix_to_quaternion(hybrid_rot_matrix))
+    # Re-encode through the active feature definition. For V6 this projects
+    # the integrated 3-D trajectory back to delta_hor + height, whose decoder
+    # relation is p = p_hor - g*h.
+    anchor_contact = predicted["contact_mask"][:, :1].to(device)
+    reencode_motion = {
+        "root_trans_offset": hybrid_pos,
+        "root_rot": hybrid_rot,
+        "dof": hybrid_joint,
+        "contact_mask": torch.cat(
+            [anchor_contact, predicted["contact_mask"].to(device)], dim=1),
+    }
+    if motion_dtype.FeatureVersion == 3:
+        raw_history, aligned_abs_pose = motion_dict_to_feature_v3(
+            reencode_motion)
+    elif motion_dtype.FeatureVersion == 6:
+        raw_history, aligned_abs_pose = motion_dict_to_feature_v6(
+            reencode_motion)
+    else:
+        raise ValueError(
+            "Residual re-anchoring supports FeatureVersion 3 and 6, got "
+            f"{motion_dtype.FeatureVersion}")
+
+    return (
+        aligned_abs_pose,
+        val_data.normalize(raw_history),
+        correction,
+        correction["phase_index"],
+        correction["phase_error"],
+    )
 
 
 def apply_generated_history_alignment_correction(
