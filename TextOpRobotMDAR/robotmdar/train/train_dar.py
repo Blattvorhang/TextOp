@@ -58,7 +58,7 @@ from robotmdar.utils.occupancy import (
     compute_scene_surface_batch,
     query_local_occupancy,
 )
-from robotmdar.dtype import seed, logger
+from robotmdar.dtype import seed, logger as logger_module
 from robotmdar.dtype.abc import VAE, Dataset, Denoiser, Diffusion, Optimizer, SSampler
 from robotmdar.utils.dof_contract import (
     configure_dof_contract,
@@ -2009,7 +2009,7 @@ def main(cfg: DictConfig):
 
     configure_dof_contract(cfg)
     seed.set(cfg.seed + rank)
-    logger.set(cfg)
+    logger = logger_module.set(cfg)
 
     # Override device in config for downstream components.
     cfg.device = str(device)
