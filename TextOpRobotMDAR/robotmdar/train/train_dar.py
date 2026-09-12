@@ -642,6 +642,15 @@ def _add_condition_keep_diagnostics(extras, y, is_recovery) -> None:
         device = ee_mask.device
     if batch_size is None:
         return
+    category = y.get('_condition_sampling_plan', {}).get(
+        '_cardinality_category') if isinstance(
+            y.get('_condition_sampling_plan'), dict) else None
+    if isinstance(category, torch.Tensor) and category.shape == (batch_size,):
+        category = category.to(device=device, dtype=torch.long)
+        category_names = ('none', 'single', 'composition', 'full_condition')
+        for idx, name in enumerate(category_names):
+            extras[f'condition/cardinality_{name}_ratio'] = (
+                (category == idx).float().mean())
     recovery = _as_recovery_mask(is_recovery, batch_size, device)
     locomotion = ~recovery
     extras['data/batch_recovery_fraction'] = recovery.float().mean()
@@ -669,6 +678,20 @@ def _add_condition_keep_diagnostics(extras, y, is_recovery) -> None:
         extras['condition/locomotion_end_effector_keep_ratio'] = (
             per_sample[locomotion].mean()
             if locomotion.any() else per_sample.new_zeros(()))
+    if isinstance(category, torch.Tensor):
+        atomic_masks = dict(mask_keys)
+        atomic_masks['end_effector'] = 'goal_end_effector_condition_keep_mask'
+        for name, key in atomic_masks.items():
+            value = y.get(key)
+            if not isinstance(value, torch.Tensor):
+                continue
+            keep = value.to(device=device, dtype=torch.bool)
+            if name == 'end_effector':
+                keep = keep.all(dim=1)
+            else:
+                keep = keep.reshape(batch_size)
+            extras[f'condition/single_{name}_ratio'] = (
+                ((category == 1) & keep).float().mean())
 
 
 def _add_batch_data_diagnostics(extras, primitive, y) -> None:
@@ -2039,6 +2062,15 @@ def main(cfg: DictConfig):
 
     vae: VAE = instantiate(cfg.vae)
     denoiser: Denoiser = instantiate(cfg.denoiser)
+    if is_main_process():
+        logger.info(
+            'Condition sampling config: enabled_text={}, cardinality={}, '
+            'time_probability={}',
+            bool(cfg.denoiser.get('text_condition_enabled', False)),
+            cfg.denoiser.get('condition_sampling', {}).get('cardinality', {}),
+            cfg.denoiser.get('condition_sampling', {}).get(
+                'time_probability', 0.0),
+        )
     vae = vae.to(device)
     denoiser = denoiser.to(device)
 

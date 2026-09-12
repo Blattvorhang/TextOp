@@ -170,6 +170,7 @@ def _sample_condition_keep_plan(model, y, batch_size: int, device):
     time_keep = time_keep & (category != 0)
     keep_plan = {name: keep[:, i] for i, name in enumerate(names)}
     keep_plan['time'] = time_keep
+    keep_plan['_cardinality_category'] = category
     return keep_plan
 
 
