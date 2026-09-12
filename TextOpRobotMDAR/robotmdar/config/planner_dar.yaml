@@ -95,8 +95,6 @@ data:
 denoiser:
   goal_encoding: ${data.goal_encoding}
   goal_dim: 67
-  # Do not inherit the training-time condition-dropout schedule.
-  cond_mask_prob: null
 
 # Condition dropout probabilities belong to training. At inference the
 # controller's `*_valid` fields are passed to the denoiser as real masks.

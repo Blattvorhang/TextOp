@@ -16,7 +16,3 @@ train:
   manager:
     platform:
       _target_: robotmdar.train.train_platforms.NoPlatform
-
-denoiser:
-  cond_mask_prob:
-    text: 0.1

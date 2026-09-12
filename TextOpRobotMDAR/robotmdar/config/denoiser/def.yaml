@@ -13,14 +13,3 @@ clip_dim: 512
 goal_encoding: split
 goal_dim: 5
 grid_size: 25
-cond_mask_prob:
-  text: 0.1
-  goal:
-    position: 0.1
-    yaw: 0.0
-    time: 0.0
-    body: 0.0
-    orientation: 0.0
-    joint: 0.0
-    velocity: 0.0
-  scene: 1.0

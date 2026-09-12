@@ -11,9 +11,3 @@ data:
 denoiser:
   goal_encoding: ${data.goal_encoding}
   goal_dim: 21
-  cond_mask_prob:
-    goal:
-      position: 0.1
-      yaw: 0.3
-      time: 0.3
-      body: 0.3
