@@ -1016,6 +1016,7 @@ class GeometryLoss:
         future_motion_pred,
         future_motion_gt,
         history_motion=None,
+        future_motion_transition_gt=None,
         smooth=False,
         sliding_mask=None,
         action_label=None,
@@ -1252,9 +1253,13 @@ class GeometryLoss:
         pred = self._feature_v6_components(future_motion_pred)
         with torch.no_grad():
             gt = self._feature_v6_components(future_motion_gt)
+            transition_gt = self._feature_v6_components(
+                future_motion_transition_gt
+                if future_motion_transition_gt is not None
+                else future_motion_gt)
 
         rot_chord_per_sample = (
-            pred['rel_rot'] - gt['rel_rot']
+            pred['rel_rot'] - transition_gt['rel_rot']
         ).square().sum(dim=(-1, -2)).mean(dim=1)
         terms['rot_chord'] = rot_chord_per_sample.mean()
         per_sample_loss_terms['rot_chord'] = rot_chord_per_sample
@@ -2412,6 +2417,8 @@ def calc_dar_loss(
     latent_pred=None,
     weights=None,
     history_motion=None,
+    future_motion_transition_gt=None,
+    future_motion_rec_target=None,
     sliding_mask=None,
     ego_goal=None,
     goal_condition_keep_mask=None,
@@ -2441,8 +2448,11 @@ def calc_dar_loss(
         return bool(goal_condition_enabled.get(name, default))
 
     # 重构损失
+    rec_target = (future_motion_rec_target
+                  if future_motion_rec_target is not None
+                  else future_motion_gt)
     rec_per_sample = _rec_loss_per_sample(
-        self.rec_criterion, future_motion_pred, future_motion_gt)
+        self.rec_criterion, future_motion_pred, rec_target)
     rec_loss = rec_per_sample.mean()
     terms['rec'] = rec_loss
     per_sample_terms['rec'] = (rec_per_sample, None)
@@ -2493,6 +2503,7 @@ def calc_dar_loss(
                 future_motion_pred,
                 future_motion_gt,
                 history_motion,
+                future_motion_transition_gt=future_motion_transition_gt,
                 smooth=_loss_weight_any(self.loss_weight, 'smooth') > 0.0,
                 sliding_mask=sliding_mask,
                 action_label=action_label,

@@ -12,7 +12,9 @@ from omegaconf import DictConfig
 from hydra.utils import instantiate
 from robotmdar.dtype.rotation import (
     matrix_to_quaternion,
+    matrix_to_rot6d,
     quaternion_to_matrix,
+    rot6d_to_matrix,
     wxyz_to_xyzw,
     xyzw_to_wxyz,
 )
@@ -1060,6 +1062,31 @@ def _rebase_goal_to_reference(primitive, reference_pos, reference_rot,
             .squeeze(-1)
         )
     return result
+
+
+def _reexpress_seam_transition_v6(dataset, future_motion_gt,
+                                  gt_history, used_history):
+    """Express only the first GT transition in the supplied history frame."""
+    if (motion_dtype.FeatureVersion != 6 or gt_history is None
+            or used_history is None):
+        return future_motion_gt
+    if future_motion_gt.shape[1] == 0:
+        return future_motion_gt
+
+    gt_future = dataset.denormalize(future_motion_gt).clone()
+    gt_prev_gravity = motion_dtype._project_feature_v6_components(
+        dataset.denormalize(gt_history[:, -1:]))[0][:, 0]
+    pred_prev_gravity = motion_dtype._project_feature_v6_components(
+        dataset.denormalize(used_history[:, -1:]))[0][:, 0]
+    tilt_alignment_rot = motion_dtype._shortest_arc_right_correction(
+        pred_prev_gravity, gt_prev_gravity)
+    gt_future[:, 0, 4:7] = torch.matmul(
+        tilt_alignment_rot, gt_future[:, 0, 4:7].unsqueeze(-1)
+    ).squeeze(-1)
+    seam_rel_rot = rot6d_to_matrix(gt_future[:, 0, 7:13])
+    gt_future[:, 0, 7:13] = matrix_to_rot6d(torch.matmul(
+        tilt_alignment_rot, seam_rel_rot))
+    return dataset.normalize(gt_future)
 
 
 def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
@@ -2255,6 +2282,9 @@ def main(cfg: DictConfig):
             # 使用统一的history选择函数
             history_motion, used_rollout = manager.choose_history(
                 gt_history, prev_motion, history_len, return_rollout=True)
+            future_motion_target = _reexpress_seam_transition_v6(
+                train_data, future_motion_gt, gt_history,
+                history_motion if used_rollout else gt_history)
             manager.extra['self_rollout_used'] = float(used_rollout)
 
             if used_rollout:
@@ -2306,7 +2336,7 @@ def main(cfg: DictConfig):
 
             # Encode using VAE
             latent_gt, _ = vae.encode(
-                future_motion=future_motion_gt,
+                future_motion=future_motion_target,
                 history_motion=history_motion
             )  # [T=1, B, D]   latent_gt: (1, 512, 128)
 
@@ -2341,6 +2371,8 @@ def main(cfg: DictConfig):
                 latent_pred,
                 weights,
                 history_motion=history_motion,  # dist=None for DAR
+                future_motion_transition_gt=future_motion_target,
+                future_motion_rec_target=future_motion_target,
                 sliding_mask=sliding_mask,
                 ego_goal=y['ego_goal_raw'],
                 goal_type=cfg.data.goal_type,
