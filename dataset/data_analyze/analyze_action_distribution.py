@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""
-BONES-SEED Action Name Distribution Analysis
-=============================================
-Read action labels from the BONES-SEED metadata CSV and classify them at two levels:
-
-  Fine-grained: metadata/content_short_description               → ~4000 classes
-  Core: short action phrase extracted from content_short_description → ~100 classes
-
-Outputs:
-  - action_distribution_bar.png       : fine-grained Top-50 bar chart
-  - action_core_bar.png               : core distribution bar chart
-  - action_core_wordcloud.png         : core word cloud
-  - action_short_description_wordcloud.png      : all short-description labels
-  - action_statistics.txt             : full two-level report with task annotation
-
-Usage:  python analyze_action_distribution.py
-"""
+"""Visualize BONES-SEED's four metadata-defined content action fields."""
 
 import csv
 import argparse
@@ -33,10 +17,6 @@ from dataset.data_process.filter_and_copy_bones_data import (  # noqa: E402
     DEFAULT_FILTER_KEYWORDS,
     should_filter_out,
 )
-from dataset.data_analyze.analyze_text_description_similarity import (  # noqa: E402
-    build_core_description,
-)
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -53,6 +33,13 @@ SHORT_DESCRIPTION_COLUMNS = (
     "content_short_description_2",
 )
 PRIMARY_SHORT_DESCRIPTION_COLUMN = "content_short_description"
+MOVEMENT_TYPE_COLUMN = "content_type_of_movement"
+CONTENT_ACTION_COLUMNS = (
+    "content_all_rigplay_styles",
+    "content_uniform_style",
+    "content_type_of_movement",
+    "content_body_position",
+)
 STRIP_SHORT_DESCRIPTION_DIGITS = True
 SPATIAL_SHORT_DESCRIPTION_WORDS = ("left", "right")
 STRIP_SHORT_DESCRIPTION_SPATIAL_WORDS = True
@@ -1296,5 +1283,234 @@ def main():
     print("  action_statistics.txt         — full report + usage guide")
 
 
+def collect_movement_type_distribution(
+    metadata_csv: str,
+    *,
+    skip_mirrored: bool = SKIP_MIRRORED,
+    filename_filter_mode: str = "none",
+    filtered_motion_dir: str | Path = DEFAULT_FILTERED_MOTION_DIR,
+    filter_keywords: list[str] | None = None,
+    include_keywords: list[str] | None = None,
+):
+    """Collect exact values and word frequencies for the four content fields."""
+    if filter_keywords is None:
+        filter_keywords = list(DEFAULT_FILTER_KEYWORDS)
+    if filename_filter_mode not in {"none", "keywords", "filtered-dir"}:
+        raise ValueError(f"unknown filename filter mode: {filename_filter_mode}")
+
+    allowed = None
+    if filename_filter_mode == "filtered-dir":
+        allowed = load_filtered_motion_filename_counts(filtered_motion_dir)
+
+    field_counters = {column: Counter() for column in CONTENT_ACTION_COLUMNS}
+    field_word_counters = {column: Counter() for column in CONTENT_ACTION_COLUMNS}
+    metadata_filenames = set()
+    audit = Counter()
+    audit["metadata_rows"] = 0
+    audit["analyzed_rows"] = 0
+    audit["analyzed_metadata_rows"] = 0
+    audit["skipped_mirrored_rows"] = 0
+    audit["rows_skipped_by_filename_filter"] = 0
+    audit["empty_movement_type_rows"] = 0
+
+    with open(metadata_csv, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {
+            "filename", "is_mirror", "move_g1_path", MOVEMENT_TYPE_COLUMN,
+            *CONTENT_ACTION_COLUMNS,
+        }
+        missing = sorted(required - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(f"metadata CSV missing required columns: {missing}")
+
+        for row in reader:
+            audit["metadata_rows"] += 1
+            filename = row.get("filename", "")
+            metadata_filenames.add(filename)
+
+            if allowed is not None and filename not in allowed:
+                audit["rows_skipped_by_filename_filter"] += 1
+                continue
+            if filename_filter_mode == "keywords" and should_filter_out(
+                metadata_row_to_filter_name(row), filter_keywords, include_keywords
+            ):
+                audit["rows_skipped_by_filename_filter"] += 1
+                continue
+            if skip_mirrored and is_truthy_metadata_value(row.get("is_mirror", "")):
+                audit["skipped_mirrored_rows"] += 1
+                continue
+
+            weight = allowed[filename] if allowed is not None else 1
+            audit["analyzed_rows"] += weight
+            audit["analyzed_metadata_rows"] += 1
+            for column in CONTENT_ACTION_COLUMNS:
+                value = normalize_label(row.get(column, "")) or "<empty>"
+                field_counters[column][value] += weight
+                for word in re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", value):
+                    field_word_counters[column][word] += weight
+
+    audit["filtered_motion_file_count"] = sum((allowed or Counter()).values())
+    audit["allowed_filename_count"] = len(allowed or ())
+    audit["allowed_filenames_missing_metadata"] = len(
+        set(allowed or ()) - metadata_filenames
+    )
+    audit["augmented_motion_file_count"] = sum(
+        max(count - 1, 0) for count in (allowed or Counter()).values()
+    )
+    return field_counters, field_word_counters, dict(audit)
+
+
+def _safe_plot_name(value: str) -> str:
+    name = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return name or "empty"
+
+
+def plot_movement_type_bar(counter: Counter, total: int, top_n: int = 50):
+    items = counter.most_common(top_n)
+    names = [name for name, _ in items]
+    counts = [count for _, count in items]
+    fig, ax = plt.subplots(figsize=(15, max(8, len(items) * 0.28)))
+    ax.barh(range(len(items)), counts, color=plt.cm.viridis(
+        np.linspace(0.15, 0.85, len(items))))
+    ax.set_yticks(range(len(items)))
+    ax.set_yticklabels(names, fontsize=7, fontfamily="monospace")
+    ax.invert_yaxis()
+    ax.set_xlabel("Number of motions")
+    ax.set_title(
+        f"BONES-SEED content_type_of_movement Distribution — Top {len(items)}"
+    )
+    for i, count in enumerate(counts):
+        ax.text(count + max(counts) * 0.005, i,
+                f"{count:,} ({count / total * 100:.1f}%)", va="center", fontsize=6)
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    path = OUTPUT_DIR / "content_type_of_movement_distribution_bar.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_counter_bar(counter: Counter, title: str, path: Path, top_n: int = 30):
+    items = counter.most_common(top_n)
+    if not items:
+        return None
+    names = [name for name, _ in items]
+    counts = [count for _, count in items]
+    fig, ax = plt.subplots(figsize=(15, max(7, len(items) * 0.3)))
+    ax.barh(range(len(items)), counts, color="#2a9d8f")
+    ax.set_yticks(range(len(items)))
+    ax.set_yticklabels(names, fontsize=7, fontfamily="monospace")
+    ax.invert_yaxis()
+    ax.set_xlabel("Number of motions")
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_wordcloud(counter: Counter, title: str, path: Path):
+    if not counter:
+        return None
+    kwargs = dict(
+        width=1600, height=900, background_color="white", colormap="tab20",
+        max_words=100, relative_scaling=0.5, min_font_size=12,
+        random_state=42, stopwords=set(), collocations=False,
+    )
+    if FONT_PATH:
+        kwargs["font_path"] = FONT_PATH
+    cloud = WordCloud(**kwargs).generate_from_frequencies(dict(counter))
+    fig, ax = plt.subplots(figsize=(16, 9))
+    ax.imshow(cloud, interpolation="bilinear")
+    ax.axis("off")
+    ax.set_title(title, fontsize=14, pad=15)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def save_content_action_statistics(field_counters, audit: dict):
+    total = audit["analyzed_rows"]
+    lines = [
+        "BONES-SEED CONTENT MOVEMENT TYPE DISTRIBUTION",
+        "=" * 60,
+        f"Analyzed motion entries: {total:,}",
+        f"Analyzed metadata rows: {audit['analyzed_metadata_rows']:,}",
+        f"Skipped mirrored rows: {audit['skipped_mirrored_rows']:,}",
+        f"Rows skipped by filename filter: {audit['rows_skipped_by_filename_filter']:,}",
+        "",
+        "Fields: " + ", ".join(CONTENT_ACTION_COLUMNS),
+        "Text handling: lowercase and whitespace normalization only",
+        "",
+        "CONTENT FIELD VALUE DISTRIBUTIONS",
+        "-" * 60,
+    ]
+    for column in CONTENT_ACTION_COLUMNS:
+        lines.extend(["", f"[{column}]"])
+        for value, count in field_counters[column].most_common():
+            lines.append(f"{value}\t{count:,}\t{count / total * 100:.2f}%")
+    path = OUTPUT_DIR / "content_action_field_statistics.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def parse_new_args():
+    parser = argparse.ArgumentParser(description="Analyze BONES-SEED content action fields")
+    parser.add_argument("--metadata-csv", default=METADATA_CSV)
+    parser.add_argument("--filename-filter-mode", choices=("none", "keywords", "filtered-dir"), default="none")
+    parser.add_argument("--filtered-motion-dir", default=str(DEFAULT_FILTERED_MOTION_DIR))
+    parser.add_argument("--filter-keywords", nargs="+", default=None)
+    parser.add_argument("--add-filter-keywords", nargs="+", default=None)
+    parser.add_argument("--filter-file", default=None)
+    parser.add_argument("--include-mirrored", action="store_true")
+    parser.add_argument("--top-n", type=int, default=50)
+    return parser.parse_args()
+
+
+def new_main():
+    args = parse_new_args()
+    if not os.path.isfile(args.metadata_csv):
+        raise SystemExit(f"ERROR: metadata CSV not found: {args.metadata_csv}")
+    filter_keywords = list(args.filter_keywords or DEFAULT_FILTER_KEYWORDS)
+    if args.add_filter_keywords:
+        filter_keywords.extend(args.add_filter_keywords)
+    include_keywords = read_include_keywords(args.filter_file)
+
+    field_counters, field_word_counters, audit = collect_movement_type_distribution(
+        args.metadata_csv,
+        skip_mirrored=not args.include_mirrored,
+        filename_filter_mode=args.filename_filter_mode,
+        filtered_motion_dir=args.filtered_motion_dir,
+        filter_keywords=filter_keywords,
+        include_keywords=include_keywords,
+    )
+    total = audit["analyzed_rows"]
+    if not total:
+        raise SystemExit("ERROR: no motions left after filtering")
+    print(f"Analyzed {total:,} motion entries")
+    print(f"Skipped mirrored rows: {audit['skipped_mirrored_rows']:,}")
+
+    for column in CONTENT_ACTION_COLUMNS:
+        slug = _safe_plot_name(column)
+        counter = field_counters[column]
+        plot_counter_bar(
+            counter,
+            f"BONES-SEED {column} Distribution",
+            OUTPUT_DIR / f"{slug}_distribution_bar.png",
+            args.top_n,
+        )
+        plot_wordcloud(
+            field_word_counters[column],
+            f"BONES-SEED {column}",
+            OUTPUT_DIR / f"{slug}_wordcloud.png",
+        )
+        print(f"  {column}: {len(counter):,} unique values")
+
+    save_content_action_statistics(field_counters, audit)
+    print(f"Outputs saved to: {OUTPUT_DIR}")
+
+
 if __name__ == "__main__":
-    main()
+    new_main()
