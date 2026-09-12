@@ -23,7 +23,9 @@ from TextOpRobotMDAR.robotmdar.model.mld_denoiser import (
     DenoiserTransformer,
 )
 from TextOpRobotMDAR.robotmdar.dtype.rotation import (
+    matrix_to_quaternion,
     quaternion_to_matrix,
+    wxyz_to_xyzw,
     xyzw_to_wxyz,
 )
 from TextOpRobotMDAR.robotmdar.train.manager import (
@@ -36,6 +38,7 @@ from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _add_batch_data_diagnostics,
     _build_train_condition_plan,
     _conditions,
+    _rebase_goal_to_reference,
 )
 from TextOpRobotMDAR.robotmdar.utils.goal import (
     SPLIT_NO_LOG_ORIENTATION_SLICE,
@@ -64,6 +67,56 @@ class DummyManager(BaseManager):
 
     def load_model(self, *args, **kwargs):
         pass
+
+
+def test_rollout_goal_gravity_alignment_has_correct_direction():
+    """Tilt alignment fixes gravity and leaves yaw-only drift unchanged."""
+    gt_pos = torch.zeros(1, 3)
+    gt_rot = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+    goal_rot = gt_rot.clone()
+    goal_pos = torch.tensor([[1.0, 0.0, 1.0]])
+    primitive = {
+        'gt_ref_pos': gt_pos,
+        'gt_ref_rot': gt_rot,
+        'world_goal_pos': goal_pos,
+        'world_goal_rot': goal_rot,
+        'world_goal_vel': torch.zeros(1, 3),
+        'world_goal_end_effectors': torch.zeros(1, 4, 3),
+    }
+    angle = torch.tensor(0.4)
+    tilt_R = torch.stack((
+        torch.stack((torch.cos(angle), torch.tensor(0.), torch.sin(angle))),
+        torch.tensor([0., 1., 0.]),
+        torch.stack((-torch.sin(angle), torch.tensor(0.), torch.cos(angle))),
+    ))[None]
+    pred_rot = wxyz_to_xyzw(matrix_to_quaternion(tilt_R))
+    rebased = _rebase_goal_to_reference(
+        primitive, torch.zeros(1, 3), pred_rot, torch.device('cpu'))
+    gt_g = torch.tensor([[0., 0., -1.]])
+    pred_g = torch.matmul(tilt_R.transpose(-1, -2), gt_g.unsqueeze(-1)).squeeze(-1)
+    pred_R = quaternion_to_matrix(xyzw_to_wxyz(pred_rot))
+    effective_rel = torch.matmul(
+        pred_R.transpose(-1, -2),
+        quaternion_to_matrix(xyzw_to_wxyz(rebased['world_goal_rot'])),
+    )
+    assert torch.allclose(
+        torch.matmul(effective_rel, gt_g.unsqueeze(-1)).squeeze(-1), pred_g,
+        atol=1e-5)
+
+    yaw = torch.tensor(0.7)
+    yaw_R = torch.stack((
+        torch.stack((torch.cos(yaw), -torch.sin(yaw), torch.tensor(0.))),
+        torch.stack((torch.sin(yaw), torch.cos(yaw), torch.tensor(0.))),
+        torch.tensor([0., 0., 1.]),
+    ))[None]
+    yaw_rot = wxyz_to_xyzw(matrix_to_quaternion(yaw_R))
+    yaw_rebased = _rebase_goal_to_reference(
+        primitive, torch.zeros(1, 3), yaw_rot, torch.device('cpu'))
+    yaw_effective = torch.matmul(
+        quaternion_to_matrix(xyzw_to_wxyz(yaw_rot)).transpose(-1, -2),
+        quaternion_to_matrix(xyzw_to_wxyz(yaw_rebased['world_goal_rot'])),
+    )
+    assert torch.allclose(yaw_effective, torch.eye(3).unsqueeze(0), atol=1e-5)
 
 
 def _manager(max_grad_norm=0.5, eval_steps=2):

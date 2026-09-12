@@ -10,6 +10,12 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 from hydra.utils import instantiate
+from robotmdar.dtype.rotation import (
+    matrix_to_quaternion,
+    quaternion_to_matrix,
+    wxyz_to_xyzw,
+    xyzw_to_wxyz,
+)
 
 from robotmdar.utils.goal import (
     GoalEncoding,
@@ -965,6 +971,97 @@ def _goal_time_frame_for_loss(conditions, cfg):
     )
 
 
+def _rebase_goal_to_reference(primitive, reference_pos, reference_rot,
+                              device):
+    """Build rollout goals with posture-only, not spatial, re-anchoring.
+
+    Self-rollout must correct model posture drift (height/tilt), while keeping
+    execution-induced XY/yaw drift out of the supervision.  GT-local vectors
+    are therefore rotated by the minimum tilt-alignment rotation only.
+    """
+    # Older validation fixtures may omit explicit GT anchors; in that case
+    # the supplied reference is the teacher-forced GT reference.
+    gt_pos = primitive.get('gt_ref_pos', reference_pos).to(device)
+    gt_rot = primitive.get('gt_ref_rot', reference_rot).to(device)
+    goal_pos = primitive['world_goal_pos'].to(device)
+    gt_R = quaternion_to_matrix(xyzw_to_wxyz(gt_rot))
+    ref_R = quaternion_to_matrix(xyzw_to_wxyz(reference_rot))
+    gravity_world = motion_dtype._world_gravity_like(gt_pos)
+    gt_g = torch.matmul(
+        gt_R.transpose(-1, -2), gravity_world.unsqueeze(-1)
+    ).squeeze(-1)
+    ref_g = torch.matmul(
+        ref_R.transpose(-1, -2), gravity_world.unsqueeze(-1)
+    ).squeeze(-1)
+    # _shortest_arc_right_correction(a, b) returns S with S.T @ a == b.
+    # Passing (predicted gravity, GT gravity) gives
+    # tilt_alignment_rot @ g_gt == g_pred.
+    tilt_alignment_rot = motion_dtype._shortest_arc_right_correction(
+        ref_g, gt_g)
+
+    gt_delta = torch.matmul(
+        gt_R.transpose(-1, -2), (goal_pos - gt_pos).unsqueeze(-1)
+    ).squeeze(-1)
+    delta_hor = gt_delta - (gt_delta * gt_g).sum(
+        dim=-1, keepdim=True) * gt_g
+    delta_hor = torch.matmul(
+        tilt_alignment_rot, delta_hor.unsqueeze(-1)).squeeze(-1)
+    # Add only the gravity-axis component needed to retain the absolute GT
+    # goal height; the builder projects it away when forming delta_hor.
+    delta_world_hor = torch.matmul(
+        ref_R, delta_hor.unsqueeze(-1)).squeeze(-1)
+    gravity_world_z = gravity_world[..., 2:3]
+    alpha = (
+        goal_pos[..., 2:3]
+        - reference_pos[..., 2:3]
+        - delta_world_hor[..., 2:3]
+    ) / gravity_world_z
+    rebased_pos = reference_pos + delta_world_hor + (
+        gravity_world * alpha
+    )
+
+    result = {'world_goal_pos': rebased_pos}
+    if 'world_goal_rot' in primitive:
+        goal_R = quaternion_to_matrix(
+            xyzw_to_wxyz(primitive['world_goal_rot'].to(device)))
+        gt_relative_R = torch.matmul(gt_R.transpose(-1, -2), goal_R)
+        # Keep GT yaw gauge; only convert the relative goal orientation into
+        # the predicted tilt frame.
+        effective_relative_R = torch.matmul(
+            tilt_alignment_rot, gt_relative_R)
+        rebased_R = torch.matmul(ref_R, effective_relative_R)
+        result['world_goal_rot'] = wxyz_to_xyzw(
+            matrix_to_quaternion(rebased_R))
+    if 'world_goal_vel' in primitive:
+        goal_vel = primitive['world_goal_vel'].to(device)
+        gt_vel = torch.matmul(
+            gt_R.transpose(-1, -2), goal_vel.unsqueeze(-1)
+        ).squeeze(-1)
+        gt_vel_hor = gt_vel - (gt_vel * gt_g).sum(
+            dim=-1, keepdim=True) * gt_g
+        gt_vel_vert = (gt_vel * gt_g).sum(dim=-1, keepdim=True)
+        effective_vel = torch.matmul(
+            tilt_alignment_rot, gt_vel_hor.unsqueeze(-1)).squeeze(-1)
+        effective_vel = effective_vel + gt_vel_vert * ref_g
+        result['world_goal_vel'] = torch.matmul(
+            ref_R, effective_vel.unsqueeze(-1)).squeeze(-1)
+    if 'world_goal_end_effectors' in primitive:
+        goal_ee = primitive['world_goal_end_effectors'].to(device)
+        gt_ee = torch.matmul(
+            gt_R.transpose(-1, -2).unsqueeze(-3),
+            (goal_ee - gt_pos.unsqueeze(-2)).unsqueeze(-1),
+        ).squeeze(-1)
+        effective_ee = torch.matmul(
+            tilt_alignment_rot.unsqueeze(-3), gt_ee.unsqueeze(-1)
+        ).squeeze(-1)
+        result['world_goal_end_effectors'] = (
+            reference_pos.unsqueeze(-2)
+            + torch.matmul(ref_R.unsqueeze(-3), effective_ee.unsqueeze(-1))
+            .squeeze(-1)
+        )
+    return result
+
+
 def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
                 fps: float, goal_stats=None, use_scene: bool = True,
                 text_embedding=None, condition_plan=None):
@@ -994,8 +1091,12 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         goal_time = None
 
     build_goal = not planned or condition_plan['goal_any']
+    rebased_goal = None
+    if build_goal:
+        rebased_goal = _rebase_goal_to_reference(
+            primitive, reference_pos, reference_rot, device)
     if build_goal and planned and goal_type is GoalType.JOINT_STATE:
-        actual_world_goal_pos = primitive['world_goal_pos'].to(device)
+        actual_world_goal_pos = rebased_goal['world_goal_pos']
         if condition_plan['goal_position_hor']:
             world_goal_pos = actual_world_goal_pos
         else:
@@ -1003,7 +1104,7 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             if condition_plan['goal_position_vert']:
                 world_goal_pos[..., 2:3] = actual_world_goal_pos[..., 2:3]
         world_goal_rot = (
-            primitive['world_goal_rot'].to(device)
+            rebased_goal['world_goal_rot']
             if condition_plan['goal_orientation_source']
             else reference_rot
         )
@@ -1014,13 +1115,13 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
                 batch_size, 29, device=device, dtype=reference_pos.dtype)
         )
         world_root_velocity = (
-            primitive['world_goal_vel'].to(device)
+            rebased_goal['world_goal_vel']
             if condition_plan['goal_velocity']
             else torch.zeros(
                 batch_size, 3, device=device, dtype=reference_pos.dtype)
         )
         world_goal_end_effectors = (
-            primitive['world_goal_end_effectors'].to(device)
+            rebased_goal['world_goal_end_effectors']
             if any(condition_plan['goal_end_effector'])
             else torch.zeros(
                 batch_size, 4, 3, device=device, dtype=reference_pos.dtype)
@@ -1028,10 +1129,10 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
         world_goal_yaw = torch.zeros(
             batch_size, device=device, dtype=reference_pos.dtype)
     elif build_goal:
-        world_goal_pos = primitive['world_goal_pos'].to(device)
+        world_goal_pos = rebased_goal['world_goal_pos']
         world_goal_yaw = primitive['world_goal_yaw'].to(device)
         world_goal_rot = (
-            primitive['world_goal_rot'].to(device)
+            rebased_goal['world_goal_rot']
             if goal_type is GoalType.JOINT_STATE else None
         )
         world_goal_dof = (
@@ -1039,12 +1140,12 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
             if goal_type is GoalType.JOINT_STATE else None
         )
         world_goal_end_effectors = (
-            primitive['world_goal_end_effectors'].to(device)
+            rebased_goal['world_goal_end_effectors']
             if goal_type is GoalType.JOINT_STATE
             and goal_encoding.uses_end_effectors else None
         )
         world_root_velocity = (
-            primitive['world_goal_vel'].to(device)
+            rebased_goal['world_goal_vel']
             if goal_type.uses_arrival_time else None
         )
     else:
