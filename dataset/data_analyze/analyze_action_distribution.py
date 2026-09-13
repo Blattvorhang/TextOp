@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -21,6 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 from wordcloud import WordCloud
 
 # ---------------------------------------------------------------------------
@@ -28,6 +30,7 @@ from wordcloud import WordCloud
 # ---------------------------------------------------------------------------
 METADATA_CSV = "/home/lenovo/data/bones-seed/metadata/seed_metadata_v004.csv"
 DEFAULT_FILTERED_MOTION_DIR = REPO_ROOT / "data/motion_lib_filtered"
+DEFAULT_HIPHI_DIR = REPO_ROOT / "data/hiphi"
 SHORT_DESCRIPTION_COLUMNS = (
     "content_short_description",
     "content_short_description_2",
@@ -1431,6 +1434,127 @@ def plot_wordcloud(counter: Counter, title: str, path: Path):
     return path
 
 
+# ===================================================================
+# HiPhi duration distribution
+# ===================================================================
+def _npz_scalar(data, key: str, default=None):
+    """Read a scalar NPZ value regardless of whether it is 0-D or 1-D."""
+    if key not in data:
+        return default
+    value = np.asarray(data[key]).reshape(-1)
+    return float(value[0]) if value.size else default
+
+
+def _hiphi_duration(data) -> float | None:
+    """Return duration in seconds, using explicit metadata or frame count."""
+    duration = _npz_scalar(data, "duration")
+    if duration is not None and duration >= 0:
+        return duration
+    fps = _npz_scalar(data, "fps", 50.0)
+    if fps is None or fps <= 0:
+        return None
+    for key in ("root_trans_offset", "root_pos", "dof", "dof_pos", "body_pos_w"):
+        if key in data:
+            return max(np.asarray(data[key]).shape[0], 0) / fps
+    return None
+
+
+def collect_hiphi_distribution(
+    hiphi_dir: str | Path = DEFAULT_HIPHI_DIR,
+    workers: int = min(16, os.cpu_count() or 4),
+):
+    """Count HiPhi actions from filenames.txt without opening motion files."""
+    root = Path(hiphi_dir)
+    motions_dir = root / "motions"
+    if not motions_dir.is_dir():
+        raise FileNotFoundError(f"HiPhi motions directory not found: {motions_dir}")
+    index_path = root / "filenames.txt"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"HiPhi filename index not found: {index_path}")
+
+    stats = defaultdict(lambda: {"count": 0})
+    skipped = Counter()
+    with index_path.open("r", encoding="utf-8") as handle:
+        relative_paths = [
+            line.strip() for line in handle
+            if line.strip() and line.strip().endswith(".npz")
+        ]
+    for relative_path in tqdm(relative_paths, desc="Counting HiPhi actions", unit="file"):
+        relative = Path(relative_path)
+        if len(relative.parts) < 3:
+            skipped["missing_action_directory"] += 1
+            continue
+        stats[relative.parts[1]]["count"] += 1
+
+    return stats, {"hiphi_dir": str(root), "motions_dir": str(motions_dir),
+                   "index_path": str(index_path),
+                   "files_found": len(relative_paths),
+                   "files_analyzed": sum(v["count"] for v in stats.values()),
+                   "workers": workers,
+                   "skipped": dict(skipped)}
+
+
+def save_hiphi_statistics(stats, audit: dict):
+    lines = ["HIPHI ACTION FREQUENCY DISTRIBUTION", "=" * 72,
+             f"HiPhi root: {audit['hiphi_dir']}",
+             f"NPZ files found: {audit['files_found']:,}",
+             f"NPZ files analyzed: {audit['files_analyzed']:,}",
+             "Duration is approximated by action frequency; no NPZ files were read.", "",
+             "action\tcount"]
+    for action, value in sorted(stats.items(), key=lambda item: (-item[1]["count"], item[0])):
+        lines.append(f"{action}\t{value['count']:,}")
+    if audit["skipped"]:
+        lines.extend(["", "Skipped files:"])
+        lines.extend(f"  {reason}: {count:,}" for reason, count in sorted(audit["skipped"].items()))
+    path = OUTPUT_DIR / "hiphi_action_duration_statistics.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def plot_hiphi_duration_distribution(stats, path: Path):
+    """Plot HiPhi action frequency from filenames.txt."""
+    items = sorted(stats.items(), key=lambda item: -item[1]["count"])
+    if not items:
+        return None
+    names = [name for name, _ in items]
+    totals = [value["count"] for _, value in items]
+    fig, ax = plt.subplots(figsize=(15, max(7, len(items) * 0.3)))
+    ax.barh(range(len(items)), totals, color="#2a9d8f")
+    ax.set_yticks(range(len(items)))
+    ax.set_yticklabels(names, fontsize=7, fontfamily="monospace")
+    ax.invert_yaxis()
+    ax.set_xlabel("Number of motion files")
+    ax.set_title("HiPhi Action Frequency Distribution")
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_hiphi_action_wordcloud(stats, path: Path):
+    """Plot a word cloud weighted by the number of HiPhi motion files."""
+    frequencies = {action: value["count"] for action, value in stats.items()}
+    if not frequencies:
+        return None
+    kwargs = dict(
+        width=1800, height=1000, background_color="white", colormap="tab20",
+        max_words=200, relative_scaling=0.45, min_font_size=10,
+        random_state=42, collocations=False,
+    )
+    if FONT_PATH:
+        kwargs["font_path"] = FONT_PATH
+    cloud = WordCloud(**kwargs).generate_from_frequencies(frequencies)
+    fig, ax = plt.subplots(figsize=(18, 10))
+    ax.imshow(cloud, interpolation="bilinear")
+    ax.axis("off")
+    ax.set_title("HiPhi Action Distribution (second-level directory)", fontsize=14, pad=15)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def save_content_action_statistics(field_counters, audit: dict):
     total = audit["analyzed_rows"]
     lines = [
@@ -1457,7 +1581,13 @@ def save_content_action_statistics(field_counters, audit: dict):
 
 
 def parse_new_args():
-    parser = argparse.ArgumentParser(description="Analyze BONES-SEED content action fields")
+    parser = argparse.ArgumentParser(description="Analyze BONES-SEED or HiPhi action distributions")
+    parser.add_argument("--dataset", choices=("hiphi", "bones-seed"), default="hiphi",
+                        help="Dataset to analyze (default: hiphi)")
+    parser.add_argument("--hiphi-dir", default=str(DEFAULT_HIPHI_DIR),
+                        help="HiPhi dataset root containing motions/ (default: data/hiphi)")
+    parser.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 4),
+                        help="Number of parallel HiPhi file readers (default: CPU-based)")
     parser.add_argument("--metadata-csv", default=METADATA_CSV)
     parser.add_argument("--filename-filter-mode", choices=("none", "keywords", "filtered-dir"), default="none")
     parser.add_argument("--filtered-motion-dir", default=str(DEFAULT_FILTERED_MOTION_DIR))
@@ -1471,6 +1601,30 @@ def parse_new_args():
 
 def new_main():
     args = parse_new_args()
+    if args.dataset == "hiphi":
+        if args.workers < 1:
+            raise SystemExit("ERROR: --workers must be >= 1")
+        try:
+            stats, audit = collect_hiphi_distribution(args.hiphi_dir, workers=args.workers)
+        except FileNotFoundError as exc:
+            raise SystemExit(f"ERROR: {exc}")
+        if not audit["files_analyzed"]:
+            raise SystemExit("ERROR: no HiPhi motions with a valid duration were found")
+        output = OUTPUT_DIR / "hiphi_action_duration_distribution.png"
+        plot_hiphi_duration_distribution(stats, output)
+        wordcloud_output = OUTPUT_DIR / "hiphi_action_wordcloud.png"
+        plot_hiphi_action_wordcloud(stats, wordcloud_output)
+        report = save_hiphi_statistics(stats, audit)
+        print(f"HiPhi root: {args.hiphi_dir}")
+        print(f"Filename index: {audit['index_path']}")
+        print(f"Workers: {audit['workers']}")
+        print(f"Analyzed {audit['files_analyzed']:,} motions by filename frequency")
+        print(f"Actions: {len(stats):,}; duration plot: {output}")
+        print(f"Action wordcloud: {wordcloud_output}")
+        print(f"Statistics: {report}")
+        if audit["skipped"]:
+            print(f"Skipped: {audit['skipped']}")
+        return
     if not os.path.isfile(args.metadata_csv):
         raise SystemExit(f"ERROR: metadata CSV not found: {args.metadata_csv}")
     filter_keywords = list(args.filter_keywords or DEFAULT_FILTER_KEYWORDS)
