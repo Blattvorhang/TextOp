@@ -396,6 +396,39 @@ def _weighted_total_from_terms(
     return total
 
 
+def _add_weighted_loss_diagnostics(
+    terms: Dict[str, torch.Tensor],
+    extras: Dict[str, torch.Tensor],
+    loss_weight,
+    *,
+    batch_size: int,
+    device,
+    dtype,
+    is_recovery=None,
+    per_sample_terms=None,
+    diffusion_weight=None,
+) -> None:
+    """Expose raw terms and their actual weighted contribution separately."""
+    per_sample_terms = per_sample_terms or {}
+    for key, value in terms.items():
+        if key == 'total':
+            continue
+        extras[f'loss_raw/{key}'] = value.detach()
+        entry = per_sample_terms.get(key)
+        weighted = _weighted_total_from_terms(
+            {key: value},
+            loss_weight,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+            is_recovery=is_recovery,
+            per_sample_terms={key: entry} if entry is not None else None,
+        )
+        if diffusion_weight is not None:
+            weighted = weighted * diffusion_weight.mean()
+        extras[f'loss_weighted/{key}'] = weighted.detach()
+
+
 def _motion_class_labels(action_label, is_recovery=None) -> List[str]:
     """Map per-sample BABEL verbs to coarse motion classes (doc §4.3.6).
 
@@ -2773,5 +2806,16 @@ def calc_dar_loss(
     if weights is not None:
         total_loss = total_loss * weights.mean()
 
+    _add_weighted_loss_diagnostics(
+        terms,
+        extras,
+        self.loss_weight,
+        batch_size=future_motion_gt.shape[0],
+        device=future_motion_gt.device,
+        dtype=future_motion_gt.dtype,
+        is_recovery=is_recovery,
+        per_sample_terms=per_sample_terms,
+        diffusion_weight=weights,
+    )
     terms['total'] = total_loss
     return terms, extras

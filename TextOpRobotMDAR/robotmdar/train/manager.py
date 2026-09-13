@@ -24,6 +24,7 @@ from robotmdar.train.loss import (
     _add_per_class_extras,
     _motion_class_labels,
     _standard_normal_kl_mean,
+    _loss_weight_any,
     calc_dar_loss,
     calc_mvae_loss,
 )
@@ -38,6 +39,7 @@ _META_KEYS = frozenset(
     {'stage', 'scene_active', 'augmentation_active', 'feature_version',
      'lr', 'grad_norm', 'eval_time', 'self_rollout_prob',
      'self_rollout_used'})
+_RUN_LOG_ONLY_KEYS = frozenset({'feature_version'})
 
 
 def _classify_extra(name: str, phase: str) -> Tuple[str, str]:
@@ -231,6 +233,7 @@ class BaseManager(ABC):
         self.save_dir = Path(self.save_dir)
         self._tqdm = None
         self.extra = {}
+        self._run_log_constants = set()
 
         # EMA相关
         self.use_ema = getattr(self, 'use_ema', False)
@@ -279,6 +282,22 @@ class BaseManager(ABC):
             self.extra['lr'] = lrnow
             self.optimizer.param_groups[0]["lr"] = lrnow
 
+    def _is_run_log_only(self, key: str) -> bool:
+        """Return whether a scalar is provably constant for this run."""
+        if key in _RUN_LOG_ONLY_KEYS:
+            return True
+        prefix = 'loss_weighted/'
+        if key.startswith(prefix):
+            term = key[len(prefix):]
+            return _loss_weight_any(self.loss_weight, term) == 0.0
+        return False
+
+    def _report_run_log_constant(self, key: str, value) -> None:
+        if key in self._run_log_constants:
+            return
+        self._run_log_constants.add(key)
+        logger.info('constant_metric {} = {}', key, _report_value(value))
+
     def begin_eval_cycle(self) -> None:
         """Mark the start of a validation cycle for wall-clock timing."""
         self._eval_t0 = time.perf_counter()
@@ -314,6 +333,9 @@ class BaseManager(ABC):
                             self.step, group_name="loss"
                         )
                     for k, v in reduced_extras.items():
+                        if self._is_run_log_only(k):
+                            self._report_run_log_constant(k, v)
+                            continue
                         group, tag = _classify_extra(k, 'eval')
                         divisor = 1.0 if k == 'eval_time' else self.eval_steps
                         self.platform.report_scalar(
@@ -353,11 +375,17 @@ class BaseManager(ABC):
                     "train/" + k, _report_value(v),
                     self.step, group_name="loss")
             for k, v in extras.items():
+                if self._is_run_log_only(k):
+                    self._report_run_log_constant(k, v)
+                    continue
                 group, tag = _classify_extra(k, 'train')
                 self.platform.report_scalar(
                     tag, _report_value(v), self.step, group_name=group
                 )
             for k, v in self.extra.items():
+                if self._is_run_log_only(k):
+                    self._report_run_log_constant(k, v)
+                    continue
                 group, tag = _classify_extra(k, 'train')
                 self.platform.report_scalar(tag, v, self.step, group_name=group)
 
