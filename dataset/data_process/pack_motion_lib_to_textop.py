@@ -77,12 +77,6 @@ _AUG_FALL_RECOVERY_PREFIX_RE = re.compile(
     r"^(?:.*__)?aug_fall_recovery__",
     flags=re.IGNORECASE,
 )
-SUBJECT_PREFIX_RE = re.compile(
-    r"^(?:a|an|the)\s+"
-    r"(?:(?:standing|seated|upright|injured|wounded|crouched|kneeling|sitting|lying|bent)\s+)*"
-    r"(?:person(?:'s)?|character(?:'s)?|individual(?:'s)?|figure(?:'s)?|man|woman|dancer|player|actor|someone|somebody)\b[\s,]*"
-)
-COPULA_PREFIX_RE = re.compile(r"^(?:is|are|was|were|be|been|being)\s+")
 
 
 # ---------------------------------------------------------------------------
@@ -94,13 +88,6 @@ def compact_text(text: object) -> str:
 
 def normalize_text(text: object) -> str:
     return compact_text(text).lower()
-
-
-def normalize_motion_text(text: object) -> str:
-    text = normalize_text(text)
-    text = SUBJECT_PREFIX_RE.sub("", text)
-    text = COPULA_PREFIX_RE.sub("", text)
-    return text.strip(" ,;:.!?\"'")
 
 
 def _canonical_motion_name(name: str) -> str:
@@ -127,10 +114,10 @@ def load_metadata_lookup(metadata_csv: str) -> dict[str, dict[str, str]]:
     lookup: dict[str, dict[str, str]] = {}
     with open(metadata_csv, "r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
-            short_text = compact_text(row.get("content_short_description", ""))
-            if not short_text:
+            movement_type = normalize_text(row.get("content_type_of_movement", ""))
+            if not movement_type:
                 continue
-            row["content_short_description"] = short_text
+            row["content_type_of_movement"] = movement_type
             key = compact_text(row.get("filename") or row.get("move_name") or "")
             if not key:
                 continue
@@ -152,18 +139,6 @@ def load_temporal_lookup(jsonl_path: str) -> dict[str, dict]:
             lookup[key] = obj
             lookup[_canonical_motion_name(key)] = obj
     return lookup
-
-
-def build_text_candidates(*texts: object) -> list[str]:
-    candidates: list[str] = []
-    seen: set[str] = set()
-    for text in texts:
-        candidate = compact_text(text)
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        candidates.append(candidate)
-    return candidates
 
 
 def _fallback_classify_coarse(label: str) -> str:
@@ -214,17 +189,7 @@ def classify_coarse_text(label: object) -> str:
 
 
 def _metadata_act_cat(row: dict[str, str]) -> list[str]:
-    candidates = [
-        row.get("content_type_of_movement", ""),
-        row.get("content_short_description", ""),
-        row.get("content_short_description_2", ""),
-    ]
-    for candidate in candidates:
-        coarse = classify_coarse_text(candidate)
-        if coarse != "other":
-            return [coarse]
-
-    return ["other"]
+    return [classify_coarse_text(row.get("content_type_of_movement", ""))]
 
 
 def _snap_event_times_to_fps(
@@ -690,22 +655,19 @@ def motion_lib_entry_to_textop(
 
     frame_ann: list[tuple[float, float, list[str], list[str]]] = []
     if metadata_row is not None:
-        short_text = compact_text(metadata_row.get("content_short_description", ""))
-        if short_text:
-            sequence_texts = build_text_candidates(
-                short_text,
-                normalize_motion_text(short_text),
-            )
-            frame_ann.append(
-                (0.0, duration, sequence_texts, _metadata_act_cat(metadata_row))
-            )
+        movement_type = normalize_text(
+            metadata_row.get("content_type_of_movement", "")
+        )
+        if movement_type:
+            # Keep one sequence-level annotation as the guaranteed fallback.
+            # Temporal events use the same sole label, but retain their 50 Hz
+            # aligned intervals for temporal overlap sampling.
+            act_cat = _metadata_act_cat(metadata_row)
+            frame_ann.append((0.0, duration, [movement_type], act_cat))
 
             if temporal_obj is not None:
                 events = temporal_obj.get("events") or []
                 for event in events:
-                    temporal_raw = compact_text(event.get("description", ""))
-                    if not temporal_raw:
-                        continue
                     snapped = _snap_event_times_to_fps(
                         event.get("start_time"),
                         event.get("end_time"),
@@ -714,14 +676,8 @@ def motion_lib_entry_to_textop(
                     )
                     if snapped is None:
                         continue
-                    event_core = normalize_motion_text(temporal_raw) or normalize_text(temporal_raw)
-                    event_texts = build_text_candidates(
-                        temporal_raw,
-                        event_core,
-                        short_text,
-                    )
                     frame_ann.append(
-                        (snapped[0], snapped[1], event_texts, _metadata_act_cat(metadata_row))
+                        (snapped[0], snapped[1], [movement_type], act_cat)
                     )
 
     return {
@@ -763,7 +719,7 @@ def main():
     parser.add_argument(
         "--metadata-csv",
         default="/home/lenovo/data/bones-seed/metadata/seed_metadata_v004.csv",
-        help="BONES-SEED metadata CSV with content_short_description",
+        help="BONES-SEED metadata CSV with content_type_of_movement",
     )
     parser.add_argument(
         "--temporal-jsonl",

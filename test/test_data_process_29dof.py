@@ -191,8 +191,8 @@ def test_directory_packer_uses_folder_prefix_without_repeating_motion_name(tmp_p
     assert fps_values == {50}
     assert manifest[0]["_source"] == "221010__walk_ff_loop_180_R_003__A045_M"
     assert manifest[0]["frame_ann"] == [
-        (0.0, frames / 50, ["walk forward"], ["walk"]),
-        (0.0, 0.1, ["A person walks forward.", "walks forward", "walk forward"], ["walk"]),
+        (0.0, frames / 50, ["walking"], ["walk"]),
+        (0.0, 0.1, ["walking"], ["walk"]),
     ]
     stored = joblib.load(out / manifest[0]["_data_path"])
     assert stored["_source"] == manifest[0]["_source"]
@@ -255,7 +255,7 @@ def test_augmented_motion_uses_base_metadata_lookup(tmp_path):
     assert skipped == 0
     assert fps_values == {50}
     assert manifest[0]["_source"] == f"walk_ff_loop_180_R_003__A045_M_aug_003"
-    assert manifest[0]["frame_ann"][0][2] == ["walk forward"]
+    assert manifest[0]["frame_ann"][0][2] == ["walking"]
 
 
 def test_augmented_recovery_subdir_uses_base_metadata_lookup(tmp_path):
@@ -312,7 +312,7 @@ def test_augmented_recovery_subdir_uses_base_metadata_lookup(tmp_path):
         "aug_fall_recovery__stand_up_lying_R_002__A472_aug_003"
     )
     assert manifest[0]["_recovery_boost"] is True
-    assert manifest[0]["frame_ann"][0][2] == ["stand up from lying"]
+    assert manifest[0]["frame_ann"][0][2] == ["fall"]
 
 
 def test_motion_split_key_groups_original_and_mirror_sources():
