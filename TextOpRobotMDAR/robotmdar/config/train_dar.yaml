@@ -3,6 +3,9 @@ defaults:
   - base
   - train/dar
   - _self_
+  # Select the condition/loss profile through Hydra. Rollout timing is
+  # intentionally separate and remains controlled by train.manager.stages.
+  - condition_stage: text_prior
 
 expname: BONES-SEED-FUTURE-64-TEXT
 task: train-dar
@@ -18,7 +21,6 @@ data:
   weighted_sample: true
   preload_ram: true
   load_scene: false
-  load_text_embeddings: false
   clip_version: ViT-B/32
   clip_dim: 512
   goal_type: joint_state
@@ -29,11 +31,6 @@ data:
   # future frame inside each primitive window.
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
-  # Keep clean histories for the warm-up, then enable V7.1 history DR in the
-  # dataloader. The server training launch may override this threshold.
-  augmentation_enabled: false
-  augmentation_start_step: 50000
-  augmentation_prob: 0.5
   val:
     # Mirror training so validation measures the same randomized goal window.
     goal_offset_range: ${..goal_offset_range}
@@ -41,70 +38,6 @@ data:
 denoiser:
   goal_encoding: ${data.goal_encoding}
   goal_dim: 66
-  text_condition_enabled: false
-  # Training-time condition coverage. Probabilities describe the chance that
-  # a condition is visible; the implementation masks the complementary set.
-  condition_sampling:
-    cardinality:
-      none: 0.10
-      single: 0.60
-      composition: 0.29
-      full_condition: 0.01
-    single_preference:
-      text: 0.0
-      position_hor: 1.0
-      position_vert: 0.3
-      velocity: 0.7
-      orientation_rot6d: 0.5
-      gravity: 0.8
-      joint: 0.3
-      end_effector:
-        left_hand: 0.7
-        right_hand: 0.7
-        left_foot: 0.7
-        right_foot: 0.7
-    composition_probability:  # [0, 1] probability of sampling a composition condition
-      text: 0.0
-      position_hor: 0.75
-      position_vert: 0.30
-      velocity: 0.60
-      orientation_rot6d: 0.40
-      gravity: 0.50
-      joint: 0.25
-      end_effector:
-        left_hand: 0.30
-        right_hand: 0.30
-        left_foot: 0.30
-        right_foot: 0.30
-    time_probability: 0.50
-
-train:
-  manager:
-    loss_weight:
-      locomotion:
-        rec: 1.0
-        foot_contact: 0.01
-        support_consistency: 1.0
-        goal:
-          g: 0.0
-          root_position_hor: 0.25
-          root_position_vert: 0.01
-          root_velocity: 0.02
-          root_orientation: 0.0
-          joint_angle: 0.0
-          end_effector: 0.05
-      getup:
-        rec: 1.2
-        foot_contact: 0.01
-        support_consistency: 1.0
-        goal:
-          g: 0.0
-          root_position_hor: 0.0
-          root_position_vert: 0.0
-          root_velocity: 0.0
-          root_orientation: 0.0
-          joint_angle: 0.0
-          end_effector: 0.0
 
 ckpt:
   # For dof_dim=23 this resolves to the original long-horizon VAE. The 29-DoF

@@ -686,16 +686,36 @@ def _add_condition_keep_diagnostics(extras, y, is_recovery) -> None:
         extras['condition/locomotion_end_effector_keep_ratio'] = (
             per_sample[locomotion].mean()
             if locomotion.any() else per_sample.new_zeros(()))
+        ee_names = ('left_hand', 'right_hand', 'left_foot', 'right_foot')
+        for idx, ee_name in enumerate(ee_names):
+            ee_keep = keep[:, idx]
+            extras[f'condition/end_effector_{ee_name}_keep_ratio'] = (
+                ee_keep.float().mean())
+            extras[f'condition/recovery_end_effector_{ee_name}_keep_ratio'] = (
+                _masked_mean(ee_keep, recovery))
+            extras[f'condition/locomotion_end_effector_{ee_name}_keep_ratio'] = (
+                _masked_mean(ee_keep, locomotion))
     if isinstance(category, torch.Tensor):
         atomic_masks = dict(mask_keys)
         atomic_masks['end_effector'] = 'goal_end_effector_condition_keep_mask'
+        if isinstance(ee_mask, torch.Tensor):
+            for idx, ee_name in enumerate(
+                    ('left_hand', 'right_hand', 'left_foot', 'right_foot')):
+                atomic_masks[f'end_effector_{ee_name}'] = (
+                    'goal_end_effector_condition_keep_mask', idx)
         for name, key in atomic_masks.items():
             value = y.get(key)
+            index = None
+            if isinstance(key, tuple):
+                key, index = key
+                value = y.get(key)
             if not isinstance(value, torch.Tensor):
                 continue
             keep = value.to(device=device, dtype=torch.bool)
             if name == 'end_effector':
                 keep = keep.all(dim=1)
+            elif index is not None:
+                keep = keep[:, index]
             else:
                 keep = keep.reshape(batch_size)
             extras[f'condition/single_{name}_ratio'] = (

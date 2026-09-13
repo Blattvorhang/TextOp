@@ -1,0 +1,69 @@
+# @package _global_
+# Text + goal fine-tuning condition/loss profile. Selected by Hydra. Rollout
+# remains controlled independently by train.manager.use_rollout and stages.
+
+expname: text_goal_finetune
+
+data:
+  load_text_embeddings: true
+  augmentation_enabled: true
+  augmentation_start_step: 15000
+  augmentation_prob: 0.5
+
+denoiser:
+  text_condition_enabled: true
+  condition_sampling:
+    cardinality:
+      none: 0.10
+      single: 0.35
+      composition: 0.45
+      full_condition: 0.10
+    single_preference:
+      text: 1.5
+      position_hor: 1.0
+      position_vert: 0.25
+      orientation_rot6d: 0.45
+      gravity: 0.75
+      joint: 0.25
+      velocity: 0.65
+      end_effector:
+        left_hand: 0.55
+        right_hand: 0.55
+        left_foot: 0.55
+        right_foot: 0.55
+    composition_probability:
+      text: 0.65
+      position_hor: 0.85
+      position_vert: 0.30
+      orientation_rot6d: 0.45
+      gravity: 0.55
+      joint: 0.30
+      velocity: 0.65
+      end_effector:
+        left_hand: 0.35
+        right_hand: 0.35
+        left_foot: 0.35
+        right_foot: 0.35
+    time_probability: 0.75
+
+train:
+  manager:
+    loss_weight:
+      locomotion:
+        goal:
+          g: 0.0
+          root_position_hor: 0.05
+          root_position_vert: 0.005
+          root_velocity: 0.005
+          root_orientation: 0.0
+          joint_angle: 0.0
+          end_effector: 0.01
+      getup:
+        goal:
+          g: 0.0
+          root_position_hor: 0.01
+          root_position_vert: 0.001
+          root_velocity: 0.001
+          root_orientation: 0.0
+          joint_angle: 0.0
+          end_effector: 0.005

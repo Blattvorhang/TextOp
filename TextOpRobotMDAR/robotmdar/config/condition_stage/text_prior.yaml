@@ -1,0 +1,70 @@
+# @package _global_
+# Text motion-prior condition/loss profile. Selected by train_dar.yaml.
+
+expname: text_prior
+
+data:
+  load_text_embeddings: true
+  augmentation_enabled: true
+  augmentation_start_step: 15000
+  augmentation_prob: 0.5
+
+denoiser:
+  text_condition_enabled: true
+  # Text visibility is controlled here; cond_mask_prob.text is intentionally
+  # absent.  20% unconditional samples preserve a usable motion prior.
+  condition_sampling:
+    cardinality:
+      none: 0.20
+      single: 0.80
+      composition: 0.00
+      full_condition: 0.00
+    single_preference:
+      text: 1.0
+      position_hor: 0.0
+      position_vert: 0.0
+      orientation_rot6d: 0.0
+      gravity: 0.0
+      joint: 0.0
+      velocity: 0.0
+      end_effector:
+        left_hand: 0.0
+        right_hand: 0.0
+        left_foot: 0.0
+        right_foot: 0.0
+    composition_probability:
+      text: 0.0
+      position_hor: 0.0
+      position_vert: 0.0
+      orientation_rot6d: 0.0
+      gravity: 0.0
+      joint: 0.0
+      velocity: 0.0
+      end_effector:
+        left_hand: 0.0
+        right_hand: 0.0
+        left_foot: 0.0
+        right_foot: 0.0
+    time_probability: 0.0
+
+train:
+  manager:
+    loss_weight:
+      locomotion:
+        goal:
+          g: 0.0
+          root_position_hor: 0.0
+          root_position_vert: 0.0
+          root_velocity: 0.0
+          root_orientation: 0.0
+          joint_angle: 0.0
+          end_effector: 0.0
+      getup:
+        goal:
+          g: 0.0
+          root_position_hor: 0.0
+          root_position_vert: 0.0
+          root_velocity: 0.0
+          root_orientation: 0.0
+          joint_angle: 0.0
+          end_effector: 0.0

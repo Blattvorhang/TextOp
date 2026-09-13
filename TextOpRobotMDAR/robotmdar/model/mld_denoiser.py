@@ -118,17 +118,31 @@ def _sample_condition_keep_plan(model, y, batch_size: int, device):
     )
     ee_cfg_single = _mapping_get(single_cfg, 'end_effector', {})
     ee_cfg_combo = _mapping_get(composition_cfg, 'end_effector', {})
-    names += ('end_effector',)
+    # End effectors are independent condition leaves.  Keep the group-level
+    # scalar form as a shorthand for applying the same value to all leaves.
+    ee_names = tuple(
+        f'end_effector_{name}' for name in SPLIT_END_EFFECTOR_TOKEN_ORDER)
+    names += ee_names
     weights = []
     probs = []
     for name in names:
-        if name == 'end_effector':
-            weights.append(float(_mapping_get(
-                ee_cfg_single, 'preference', ee_cfg_single
-                if not _is_mapping_like(ee_cfg_single) else 0.0)))
-            probs.append(float(_mapping_get(
-                ee_cfg_combo, 'probability', ee_cfg_combo
-                if not _is_mapping_like(ee_cfg_combo) else 0.0)))
+        if name.startswith('end_effector_'):
+            ee_name = name[len('end_effector_'):]
+            if _is_mapping_like(ee_cfg_single):
+                weight = _mapping_get(ee_cfg_single, ee_name, None)
+                if weight is None:
+                    weight = _mapping_get(ee_cfg_single, 'preference', 0.0)
+            else:
+                weight = ee_cfg_single
+            if _is_mapping_like(ee_cfg_combo):
+                probability = _mapping_get(ee_cfg_combo, ee_name, None)
+                if probability is None:
+                    probability = _mapping_get(
+                        ee_cfg_combo, 'probability', 0.0)
+            else:
+                probability = ee_cfg_combo
+            weights.append(float(weight))
+            probs.append(float(probability))
         else:
             weights.append(float(_mapping_get(single_cfg, name, 0.0)))
             probs.append(float(_mapping_get(composition_cfg, name, 0.0)))
@@ -175,6 +189,10 @@ def _sample_condition_keep_plan(model, y, batch_size: int, device):
 
 
 def _sampling_probability(model, y, name, batch_size, device, plan, index=None):
+    if plan is not None and name == 'end_effector' and index is not None:
+        leaf_name = f'end_effector_{SPLIT_END_EFFECTOR_TOKEN_ORDER[index]}'
+        if leaf_name in plan:
+            return (~plan[leaf_name]).to(dtype=torch.float32)
     if plan is None or name not in plan:
         return _condition_mask_probability(model, y, {
             'position_hor': 'goal_position_hor',
