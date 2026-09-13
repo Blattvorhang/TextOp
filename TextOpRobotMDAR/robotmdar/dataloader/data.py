@@ -1312,17 +1312,23 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     self.text_embeddings_dict[''] = torch.zeros(
                         self.clip_dim, dtype=torch.float32)
                 return
-            logger.info(" Computing text embeddings...")
-            from robotmdar.model.clip import load_and_freeze_clip
-            clip_model = load_and_freeze_clip(
-                clip_version=self.clip_version,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                clip_model_path=self.clip_model_path,
-            )
-            self.text_embeddings_dict = self._compute_text_embeddings(
-                self.raw_data, clip_model, clip_dim=self.clip_dim)
-            _save_text_embedding_cache(
-                self.text_embeddings_dict, text_embedding_path)
+            logger.info(
+                " Computing text embeddings for new cache {}",
+                text_embedding_path)
+        # Both a missing cache and a stale cache reach this writer path.  The
+        # previous implementation only computed inside the missing-file
+        # branch, leaving stale caches untouched while all other ranks waited.
+        logger.info(" Loading frozen CLIP model for text cache generation")
+        from robotmdar.model.clip import load_and_freeze_clip
+        clip_model = load_and_freeze_clip(
+            clip_version=self.clip_version,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            clip_model_path=self.clip_model_path,
+        )
+        self.text_embeddings_dict = self._compute_text_embeddings(
+            self.raw_data, clip_model, clip_dim=self.clip_dim)
+        _save_text_embedding_cache(
+            self.text_embeddings_dict, text_embedding_path)
         if '' not in self.text_embeddings_dict:
             self.text_embeddings_dict[''] = torch.zeros(
                 self.clip_dim, dtype=torch.float32)
