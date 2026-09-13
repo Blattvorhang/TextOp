@@ -219,12 +219,22 @@ def _wait_for_complete_text_embedding_cache(text_embedding_path: Path,
                                             timeout_s: float = 900.0
                                             ) -> Dict[str, torch.Tensor]:
     deadline = time.monotonic() + timeout_s
+    last_log = 0.0
     while True:
         if text_embedding_path.exists():
             cache = torch.load(text_embedding_path, map_location="cpu")
             if _text_embedding_cache_complete(cache, needed_texts, clip_dim):
                 return cache
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if now - last_log >= 30.0:
+            logger.info(
+                "Waiting for text embedding cache {} ({} labels, {:.0f}s elapsed)",
+                text_embedding_path,
+                len(needed_texts),
+                timeout_s - max(0.0, deadline - now),
+            )
+            last_log = now
+        if now > deadline:
             raise TimeoutError(
                 f"Timed out after {timeout_s:.0f}s waiting for a complete "
                 f"text embedding cache at {text_embedding_path}."
@@ -931,7 +941,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # Flat-lying recovery sequences (stand_up_lying*, faint_stand_up_lying*)
         # are rare (~0.4% of data). Multiply their sampling weight so the model
         # sees them more often without changing the global category distribution.
-        RECOVERY_WEIGHT_MULTIPLIER = 5.0
+        RECOVERY_WEIGHT_MULTIPLIER = 3.0
 
         # frame_weights are only read when frame_weight=True. The old code
         # calculated them unconditionally, which made every weighted run scan
@@ -1289,6 +1299,9 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                     _wait_for_complete_text_embedding_cache(
                         text_embedding_path, needed_texts, self.clip_dim))
                 return
+            logger.info(
+                " Text embedding cache writer rank={} will rebuild {}",
+                os.environ.get('RANK', '0'), text_embedding_path)
         else:
             if not _is_goal_stats_writer() and _is_torchrun():
                 logger.info(" Waiting for cached text embeddings...")
@@ -1347,10 +1360,23 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
         embeddings_list = []
         from robotmdar.model.clip import encode_text
+        total_batches = (len(uni_texts) + batch_size - 1) // batch_size
+        logger.info(
+            "Computing CLIP text embeddings: {} unique labels in {} batches",
+            len(uni_texts), total_batches)
+        started = time.monotonic()
         for i in range(0, len(uni_texts), batch_size):
             batch_texts = uni_texts[i:i + batch_size]
-            batch_embeddings = encode_text(clip_model, batch_texts)
+            # CLIP is frozen; inference_mode preserves the embedding values
+            # while avoiding autograd graphs during cache construction.
+            with torch.inference_mode():
+                batch_embeddings = encode_text(clip_model, batch_texts)
             embeddings_list.append(batch_embeddings.detach().cpu().float())
+            batch_idx = i // batch_size + 1
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % 10 == 0:
+                logger.info(
+                    "CLIP text embeddings: {}/{} batches ({:.1f}s)",
+                    batch_idx, total_batches, time.monotonic() - started)
 
         text_embeddings = torch.cat(embeddings_list, dim=0)
         text_embeddings_dict = dict(zip(uni_texts, text_embeddings))
