@@ -41,11 +41,11 @@ from robotmdar.utils.goal import (
 )
 from robotmdar.utils.planner_convert import (
     align_generated_history_pose,
-    apply_generated_history_alignment_correction,
     generated_history_at_frame,
     g1_joint_limits_from_mjcf,
+    match_generated_joint_phase,
     motion_dict_to_g1data,
-    residual_reanchor_generated_history,
+    residual_reanchor_generated_plan_at_frame,
     state_goal_from_reference,
     state_to_ego_goal,
     state_to_model_input,
@@ -130,6 +130,7 @@ def _time_to_arrival_from_state(
     state_msg,
     motion_fps: float,
     device: str | torch.device,
+    reference_time_offset_s: float = 0.0,
 ) -> tuple[float, torch.Tensor]:
     goal_timestamp_ns = state_msg.condition.goal.timestamp_ns
     timestamps_ns = state_msg.history_meta.timestamps_ns
@@ -139,7 +140,8 @@ def _time_to_arrival_from_state(
         raise ValueError("Goal requires controller timestamps_ns for arrival PE")
     time_to_arrival_s = max(
         0.0,
-        (int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9,
+        (int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9
+        - float(reference_time_offset_s),
     )
     time_to_arrival_frame = torch.round(torch.tensor(
         [time_to_arrival_s * float(motion_fps)],
@@ -999,17 +1001,21 @@ def main(cfg: DictConfig) -> None:
         generated_history_cfg.get(
             "align_to_g1", cfg.get("align_generated_history_to_g1", False)))
     align_generated_history = generated_history_align_mode != "null"
-    phase_lag_offset = int(generated_history_cfg.get(
-        "phase_lag_offset", cfg.get("phase_lag_offset", 0)))
-    if phase_lag_offset < 0:
+    latency_align = bool(generated_history_cfg.get("latency_align", False))
+    latency_align_ema_alpha = float(generated_history_cfg.get(
+        "latency_align_ema_alpha", 0.5))
+    if (not math.isfinite(latency_align_ema_alpha)
+            or not 0.0 < latency_align_ema_alpha <= 1.0):
         raise ValueError(
-            f"phase_lag_offset must be non-negative, got {phase_lag_offset}")
-    align_generated_history_every = int(generated_history_cfg.get(
-        "align_every", cfg.get("align_generated_history_every", 1)))
-    if align_generated_history_every <= 0:
+            "generated_history.latency_align_ema_alpha must be in (0, 1], "
+            f"got {latency_align_ema_alpha}")
+    phase_matching_cfg = generated_history_cfg.get("phase_matching", {})
+    phase_matching_enabled = bool(phase_matching_cfg.get("enabled", False))
+    phase_match_block_size = int(phase_matching_cfg.get("block_size", 1))
+    if phase_match_block_size <= 0:
         raise ValueError(
-            "align_generated_history_every must be positive, got "
-            f"{align_generated_history_every}")
+            "generated_history.phase_match_block_size must be positive, got "
+            f"{phase_match_block_size}")
     joint_smoothing_cfg = cfg.get("history_joint_smoothing")
     joint_smoothing_enabled = (
         joint_smoothing_cfg is not None
@@ -1041,15 +1047,9 @@ def main(cfg: DictConfig) -> None:
             "max_velocity={} rad/s, ema_alpha={:.3f}",
             max_velocity_log, joint_smoothing_ema_alpha)
     generated_plans = {}
-    generated_history_replan_count = 0
-    alignment_epoch = 0
-    last_alignment_epoch = None
-    last_alignment_source_epoch = None
-    last_alignment_correction = None
-    last_residual_reanchor_correction = None
     residual_joint_limits = None
     next_ack_log_time = 0.0
-    infer_times: list[float] = []  # rolling window for running average
+    planning_latency_ema_ms = None
     fixed_sampling_noise = None
     if not bool(cfg.get("resample_noise_each_plan", False)):
         fixed_sampling_noise = torch.randn(
@@ -1074,15 +1074,14 @@ def main(cfg: DictConfig) -> None:
     logger.info(
         "TextOp planner ready: replan={:.1f} Hz, motion={:.1f} Hz, "
         "history={} features/{} states, future={} frames, history_source={}, "
-        "phase_lag={} frames, align_mode={}, align_every={} replans",
+        "align_mode={}, "
+        "latency_align={} (ema_alpha={:.2f})",
         1.0 / period, motion_fps, history_len, history_len, future_len,
         (f"generated+{generated_history_align_mode}"
          if align_generated_history else "generated")
         if use_generated_history else "controller",
-        (phase_lag_offset
-         if generated_history_align_mode == "spatial" else 0),
         generated_history_align_mode,
-        align_generated_history_every if align_generated_history else 0)
+        latency_align, latency_align_ema_alpha)
 
     try:
         while True:
@@ -1121,6 +1120,7 @@ def main(cfg: DictConfig) -> None:
             scheduled_next = next_infer_time + period
 
             try:
+                planning_start = time.perf_counter()
                 state_goal_type = GoalType.parse(
                     latest_state.condition.goal.goal_type)
                 if state_goal_type is not goal_type:
@@ -1162,237 +1162,149 @@ def main(cfg: DictConfig) -> None:
                                 text)
                 using_generated_history = (
                     use_generated_history and tracked_plan is not None)
-                current_alignment_epoch = None
                 alignment_mode = "none"
                 phase_offset_frames = None
+                latency_align_ms = 0.0
+                latency_align_frames = 0
+                selected_history_frame = None
+                observed_tracked_frame = None
                 if using_generated_history:
-                    tracked_frame = tracked_frame_from_timestamps(
+                    observed_tracked_frame = tracked_frame_from_timestamps(
                         latest_state, motion_fps, future_len)
-                    source_alignment_epoch = tracked_plan.get(
-                        "alignment_epoch")
-                    align_this_replan = (
-                        align_generated_history
-                        and generated_history_replan_count
-                        % align_generated_history_every == 0
-                    )
+                    if latency_align and planning_latency_ema_ms is not None:
+                        # Advance the controller timestamp by the planner's
+                        # locally measured processing duration. Absolute
+                        # clocks are intentionally never compared.
+                        latency_align_ms = planning_latency_ema_ms
+                        latency_align_frames = round(
+                            latency_align_ms * motion_fps / 1000.0)
+                    tracked_frame = tracked_frame_from_timestamps(
+                        latest_state, motion_fps, future_len,
+                        latency_ms=latency_align_ms)
+                    selected_history_frame = tracked_frame
                     (history_motion, generated_abs_pose,
                      generated_reference_pos, generated_reference_rot) = (
                         generated_history_at_frame(
                             tracked_plan, tracked_frame, history_len,
-                            phase_lag_offset=(
-                                phase_lag_offset
-                                if generated_history_align_mode == "spatial"
-                                else 0)))
-                    if align_generated_history:
-                        generated_history_replan_count += 1
-                        if generated_history_align_mode == "residual_reanchor":
-                            if align_this_replan:
-                                if residual_joint_limits is None:
-                                    residual_joint_limits = (
-                                        g1_joint_limits_from_mjcf(
-                                            val_data, cfg.device))
-                                (
-                                    abs_pose, history_motion,
-                                    residual_correction, residual_phase,
-                                    residual_phase_error,
-                                ) = residual_reanchor_generated_history(
-                                    generated_abs_pose,
-                                    history_motion,
-                                    latest_state,
-                                    val_data,
-                                    cfg.device,
-                                    joint_limits=residual_joint_limits)
-                                alignment_epoch += 1
-                                last_alignment_epoch = alignment_epoch
-                                current_alignment_epoch = alignment_epoch
-                                alignment_mode = (
-                                    "residual_reanchor:refreshed")
-                                last_alignment_source_epoch = (
-                                    source_alignment_epoch)
-                                last_residual_reanchor_correction = (
-                                    residual_correction)
-                                phase_offset_frames = int(
-                                    residual_correction[
-                                        "phase_offset_frames"][0])
-                                logger.info(
-                                    "Residual re-anchor phase={} "
-                                    "offset={:+d} frames error={:.5f}",
-                                    int(residual_phase[0]),
-                                    phase_offset_frames,
-                                    float(residual_phase_error[0]))
-                            elif (
-                                    last_residual_reanchor_correction
-                                    is not None
-                                    and source_alignment_epoch
-                                    == last_alignment_source_epoch
-                                    and source_alignment_epoch
-                                    != last_alignment_epoch):
-                                (
-                                    abs_pose, history_motion,
-                                    _, inherited_phase,
-                                    inherited_phase_error,
-                                ) = residual_reanchor_generated_history(
-                                    generated_abs_pose,
-                                    history_motion,
-                                    latest_state,
-                                    val_data,
-                                    cfg.device,
-                                    joint_limits=residual_joint_limits,
-                                    correction=(
-                                        last_residual_reanchor_correction))
-                                current_alignment_epoch = last_alignment_epoch
-                                alignment_mode = (
-                                    "residual_reanchor:inherited")
-                                phase_offset_frames = int(
-                                    last_residual_reanchor_correction[
-                                        "phase_offset_frames"][0])
-                                logger.info(
-                                    "Inherited residual re-anchor phase={} "
-                                    "offset={:+d} frames error={:.5f}",
-                                    int(inherited_phase[0]),
-                                    phase_offset_frames,
-                                    float(inherited_phase_error[0]))
-                            else:
-                                abs_pose = {
-                                    k: v.to(cfg.device)
-                                    for k, v in generated_abs_pose.items()
-                                }
-                                current_alignment_epoch = (
-                                    source_alignment_epoch)
-                                alignment_mode = (
-                                    "residual_reanchor:inherited"
-                                    if (current_alignment_epoch is not None
-                                        and current_alignment_epoch
-                                        == last_alignment_epoch)
-                                    else "residual_reanchor:none")
-                                if (alignment_mode.endswith(":inherited")
-                                        and last_residual_reanchor_correction
-                                        is not None):
-                                    phase_offset_frames = int(
-                                        last_residual_reanchor_correction[
-                                            "phase_offset_frames"][0])
-                            history_translation = None
-                        elif align_this_replan:
-                            (abs_pose, _goal_reference_pos,
-                             _goal_reference_rot, history_translation,
-                             history_motion, alignment_correction) = (
-                                align_generated_history_pose(
-                                    generated_abs_pose,
-                                    generated_reference_pos,
-                                    generated_reference_rot,
-                                    latest_state,
-                                    cfg.device,
-                                    history_motion=history_motion,
-                                    val_data=val_data,
-                                    return_correction=True))
-                            alignment_epoch += 1
-                            last_alignment_epoch = alignment_epoch
-                            current_alignment_epoch = alignment_epoch
-                            alignment_mode = "refreshed"
-                            last_alignment_source_epoch = (
-                                source_alignment_epoch)
-                            last_alignment_correction = alignment_correction
-                        elif (
-                                last_alignment_correction is not None
-                                and source_alignment_epoch
-                                == last_alignment_source_epoch
-                                and source_alignment_epoch
-                                != last_alignment_epoch):
-                            # The controller may still be tracking the source
-                            # plan from which the last refresh was computed.
-                            # Carry that fixed correction into this new window
-                            # without re-anchoring it to the current state.
-                            (abs_pose, history_motion) = (
-                                apply_generated_history_alignment_correction(
-                                    generated_abs_pose,
-                                    last_alignment_correction,
-                                    history_motion=history_motion,
-                                    val_data=val_data))
-                            history_translation = last_alignment_correction[
-                                "pose_translation"].to(cfg.device)
-                            current_alignment_epoch = last_alignment_epoch
-                            alignment_mode = "inherited"
-                        else:
-                            # The source plan already carries the current
-                            # correction. Keep its coordinate frame and do
-                            # not apply the same correction a second time.
-                            abs_pose = {
-                                k: v.to(cfg.device)
-                                for k, v in generated_abs_pose.items()
-                            }
-                            history_translation = None
-                            current_alignment_epoch = source_alignment_epoch
-                            alignment_mode = (
-                                "inherited"
-                                if (current_alignment_epoch is not None
-                                    and current_alignment_epoch
-                                    == last_alignment_epoch)
-                                else "none"
-                            )
-
-                        # The goal must follow the measured robot even on
-                        # replans where history alignment is intentionally
-                        # skipped.
-                        ego_goal_raw = state_to_ego_goal(
-                            latest_state, cfg.device,
-                            goal_type=goal_type,
-                            goal_reference_path=goal_reference_path,
-                            goal_encoding=GoalEncoding.LEGACY40,
-                            goal_clamp=goal_clamp, fps=motion_fps,
+                            ))
+                    matched_phase_index = torch.tensor(
+                        [history_len - 1 + observed_tracked_frame],
+                        device=cfg.device, dtype=torch.long)
+                    matched_public_frame = observed_tracked_frame
+                    if (phase_matching_enabled
+                            and generated_history_align_mode != "null"):
+                        matched_phase_index, _ = match_generated_joint_phase(
+                            tracked_plan["dof"][:, :tracked_frame + history_len],
+                            latest_state,
+                            cfg.device,
+                            min_phase_index=history_len - 1,
+                            max_phase_index=(
+                                history_len - 1 + observed_tracked_frame),
+                            phase_match_block_size=phase_match_block_size)
+                        matched_public_frame = (
+                            int(matched_phase_index[0]) - history_len + 1)
+                        phase_offset_frames = (
+                            matched_public_frame - observed_tracked_frame)
+                    if generated_history_align_mode == "spatial":
+                        generated_reference_pos = tracked_plan["root_pos"][
+                            :, matched_phase_index[0]]
+                        generated_reference_rot = tracked_plan["root_rot"][
+                            :, matched_phase_index[0]]
+                    if generated_history_align_mode == "residual_reanchor":
+                        if residual_joint_limits is None:
+                            residual_joint_limits = g1_joint_limits_from_mjcf(
+                                val_data, cfg.device)
+                        (
+                            history_motion, abs_pose,
+                            generated_reference_pos, generated_reference_rot,
+                            _, residual_phase, residual_phase_error,
+                        ) = residual_reanchor_generated_plan_at_frame(
+                            tracked_plan,
+                            observed_tracked_frame,
+                            tracked_frame,
+                            history_len,
+                            latest_state,
+                            val_data,
+                            cfg.device,
+                            joint_limits=residual_joint_limits,
+                            phase_match_block_size=phase_match_block_size,
+                            phase_index=matched_phase_index,
+                            min_phase_index=history_len - 1)
+                        history_translation = None
+                        alignment_mode = "residual_reanchor"
+                        logger.info(
+                            "Residual re-anchor phase={} offset={} "
+                            "frames error={:.5f}",
+                            matched_public_frame,
+                            (f"{phase_offset_frames:+d}"
+                             if phase_offset_frames is not None else "n/a"),
+                            float(residual_phase_error[0]))
+                        goal_builder = state_goal_from_reference
+                        goal_builder_prefix = (
+                            latest_state, generated_reference_pos,
+                            generated_reference_rot, cfg.device)
+                        goal_builder_extra = {
+                            "reference_time_offset_s": (
+                                latency_align_ms / 1000.0
+                                if latency_align else 0.0)
+                        }
+                    elif generated_history_align_mode == "spatial":
+                        (
+                            abs_pose, _, _, history_translation,
+                            history_motion,
+                        ) = align_generated_history_pose(
+                            generated_abs_pose,
+                            generated_reference_pos,
+                            generated_reference_rot,
+                            latest_state,
+                            cfg.device,
+                            history_motion=history_motion,
                             val_data=val_data)
-                        ego_goal = (
-                            ego_goal_raw
-                            if goal_encoding is GoalEncoding.LEGACY40
-                            else state_to_ego_goal(
-                                latest_state, cfg.device,
-                                goal_type=goal_type,
-                                goal_reference_path=goal_reference_path,
-                                goal_encoding=goal_encoding,
-                                goal_stats=goal_stats,
-                                goal_clamp=goal_clamp, fps=motion_fps,
-                                val_data=val_data,
-                                goal_include_log_d_hor=(
-                                    goal_include_log_d_hor))
-                        )
+                        alignment_mode = "spatial"
+                        goal_builder = state_to_ego_goal
+                        goal_builder_prefix = (latest_state, cfg.device)
+                        goal_builder_extra = {}
                     else:
-                        align_this_replan = False
                         abs_pose = {
-                            k: v.to(cfg.device)
-                            for k, v in generated_abs_pose.items()
+                            key: value.to(cfg.device)
+                            for key, value in generated_abs_pose.items()
                         }
                         history_translation = None
-                        current_alignment_epoch = source_alignment_epoch
-                        alignment_mode = (
-                            "inherited"
-                            if current_alignment_epoch is not None
-                            else "none"
-                        )
-                        ego_goal_raw = state_goal_from_reference(
+                        goal_builder = state_goal_from_reference
+                        goal_builder_prefix = (
                             latest_state, generated_reference_pos,
-                            generated_reference_rot, cfg.device,
+                            generated_reference_rot, cfg.device)
+                        goal_builder_extra = {
+                            "reference_time_offset_s": (
+                                latency_align_ms / 1000.0
+                                if latency_align else 0.0)
+                        }
+
+                    ego_goal_raw = goal_builder(
+                        *goal_builder_prefix,
+                        goal_type=goal_type,
+                        goal_reference_path=goal_reference_path,
+                        goal_encoding=GoalEncoding.LEGACY40,
+                        goal_clamp=goal_clamp, fps=motion_fps,
+                        val_data=val_data,
+                        **goal_builder_extra)
+                    ego_goal = (
+                        ego_goal_raw
+                        if goal_encoding is GoalEncoding.LEGACY40
+                        else goal_builder(
+                            *goal_builder_prefix,
                             goal_type=goal_type,
                             goal_reference_path=goal_reference_path,
-                            goal_encoding=GoalEncoding.LEGACY40,
+                            goal_encoding=goal_encoding,
+                            goal_stats=goal_stats,
                             goal_clamp=goal_clamp, fps=motion_fps,
-                            val_data=val_data)
-                        ego_goal = (
-                            ego_goal_raw
-                            if goal_encoding is GoalEncoding.LEGACY40
-                            else state_goal_from_reference(
-                                latest_state, generated_reference_pos,
-                                generated_reference_rot, cfg.device,
-                                goal_type=goal_type,
-                                goal_reference_path=goal_reference_path,
-                                goal_encoding=goal_encoding,
-                                goal_stats=goal_stats,
-                                goal_clamp=goal_clamp, fps=motion_fps,
-                                val_data=val_data,
-                                goal_include_log_d_hor=(
-                                    goal_include_log_d_hor))
-                        )
+                            val_data=val_data,
+                            goal_include_log_d_hor=(
+                                goal_include_log_d_hor),
+                            **goal_builder_extra)
+                    )
                 else:
                     tracked_frame = None
-                    align_this_replan = False
                     if latest_state.history_meta.n_states < history_len:
                         raise ValueError(
                             f"State {state_seq} has "
@@ -1423,6 +1335,52 @@ def main(cfg: DictConfig) -> None:
                     )
                     history_translation = None
                     alignment_mode = "none"
+
+                if (using_generated_history and latency_align
+                        and generated_history_align_mode == "spatial"):
+                    # Latency alignment changes the semantic "current" state
+                    # to the anticipated plan-switch endpoint. Always derive
+                    # the goal from the final history actually sent to the
+                    # model, independent of the optional spatial/reanchor mode.
+                    final_history_motion = val_data.reconstruct_motion(
+                        history_motion,
+                        abs_pose={
+                            key: value.to(cfg.device)
+                            for key, value in abs_pose.items()
+                        },
+                        ret_fk=False,
+                    )
+                    generated_reference_pos = final_history_motion[
+                        "root_trans_offset"][:, -1]
+                    generated_reference_rot = final_history_motion[
+                        "root_rot"][:, -1]
+                    ego_goal_raw = state_goal_from_reference(
+                        latest_state, generated_reference_pos,
+                        generated_reference_rot, cfg.device,
+                        goal_type=goal_type,
+                        goal_reference_path=goal_reference_path,
+                        goal_encoding=GoalEncoding.LEGACY40,
+                        goal_clamp=goal_clamp, fps=motion_fps,
+                        val_data=val_data,
+                        reference_time_offset_s=(
+                            latency_align_ms / 1000.0))
+                    ego_goal = (
+                        ego_goal_raw
+                        if goal_encoding is GoalEncoding.LEGACY40
+                        else state_goal_from_reference(
+                            latest_state, generated_reference_pos,
+                            generated_reference_rot, cfg.device,
+                            goal_type=goal_type,
+                            goal_reference_path=goal_reference_path,
+                            goal_encoding=goal_encoding,
+                            goal_stats=goal_stats,
+                            goal_clamp=goal_clamp, fps=motion_fps,
+                            val_data=val_data,
+                            reference_time_offset_s=(
+                                latency_align_ms / 1000.0),
+                            goal_include_log_d_hor=(
+                                goal_include_log_d_hor))
+                    )
 
                 # DEBUG: overwrite the ego_goal
                 # ego_goal[0, 0] = 0.1
@@ -1490,7 +1448,11 @@ def main(cfg: DictConfig) -> None:
                     if _goal_time_valid:
                         time_to_arrival_s, time_to_arrival_frame = (
                             _time_to_arrival_from_state(
-                                latest_state, motion_fps, cfg.device))
+                                latest_state, motion_fps, cfg.device,
+                                reference_time_offset_s=(
+                                    latency_align_ms / 1000.0
+                                    if using_generated_history
+                                    and latency_align else 0.0)))
                     else:
                         time_to_arrival_s = 0.0
                         time_to_arrival_frame = torch.zeros(
@@ -1503,6 +1465,10 @@ def main(cfg: DictConfig) -> None:
 
                 _cuda_synchronize(str(cfg.device))
                 infer_start = time.perf_counter()
+                input_abs_pose = {
+                    key: value.detach().clone()
+                    for key, value in abs_pose.items()
+                }
                 state_ego_occ = latest_state.condition.ego_occ
                 if not scene_condition_supported:
                     ego_occ = np.zeros(n_voxels, dtype=np.float32)
@@ -1538,13 +1504,14 @@ def main(cfg: DictConfig) -> None:
                     scene_valid=scene_valid,
                     is_recovery=bool(cfg.get('is_recovery', False)),
                     initial_noise=fixed_sampling_noise,
-                    ret_fk=True,
+                    ret_fk=False,
                     time_to_arrival_frame=time_to_arrival_frame,
                 )
                 _cuda_synchronize(str(cfg.device))
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
-                infer_times.append(infer_ms)
-                avg_ms = sum(infer_times[-20:]) / len(infer_times[-20:])
+                latency_ema_log_ms = (
+                    planning_latency_ema_ms
+                    if planning_latency_ema_ms is not None else 0.0)
                 occ_count = int(voxel.sum().item())
                 if goal_type is GoalType.ROOT:
                     logger.info(
@@ -1552,24 +1519,24 @@ def main(cfg: DictConfig) -> None:
                         "yaw={:.1f} deg) "
                         "ego(pos=({:.3f},{:.3f},{:.3f}) "
                         "yaw={:.1f} deg) | "
-                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        "occ={} | infer={:.1f} ms (latency_ema={:.1f} ms)",
                         _goal_world_x, _goal_world_y, _goal_world_z,
                         _goal_yaw_world_deg,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
-                        occ_count, infer_ms, avg_ms)
+                        occ_count, infer_ms, latency_ema_log_ms)
                 elif goal_type is GoalType.BODY:
                     logger.info(
                         "goal[body]: world(pos=({:.3f},{:.3f},{:.3f}) "
                         "yaw={:.1f} deg) "
                         "ego(pos=({:.3f},{:.3f},{:.3f}) "
                         "yaw={:.1f} deg) | "
-                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        "occ={} | infer={:.1f} ms (latency_ema={:.1f} ms)",
                         _goal_world_x, _goal_world_y, _goal_world_z,
                         _goal_yaw_world_deg,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
-                        occ_count, infer_ms, avg_ms)
+                        occ_count, infer_ms, latency_ema_log_ms)
                 elif goal_type is GoalType.BODY_EXT:
                     logger.info(
                         "goal[body_ext]: world(pos=({:.3f},{:.3f},{:.3f}) "
@@ -1577,7 +1544,7 @@ def main(cfg: DictConfig) -> None:
                         "ego(pos=({:.3f},{:.3f},{:.3f}) "
                         "yaw={:.1f} deg "
                         "vel=({:.3f},{:.3f},{:.3f}) dt={:.3f}s) | "
-                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        "occ={} | infer={:.1f} ms (latency_ema={:.1f} ms)",
                         _goal_world_x, _goal_world_y, _goal_world_z,
                         _goal_yaw_world_deg,
                         _vel_world_x, _vel_world_y, _vel_world_z,
@@ -1585,7 +1552,7 @@ def main(cfg: DictConfig) -> None:
                         _goal_ego_yaw_deg,
                         _ego_vel_x, _ego_vel_y, _ego_vel_z,
                         0.0 if not _goal_time_valid else time_to_arrival_s,
-                        occ_count, infer_ms, avg_ms)
+                        occ_count, infer_ms, latency_ema_log_ms)
                 else:
                     logger.info(
                         "goal[joint_state]: world(pos=({:.3f},{:.3f},{:.3f}) "
@@ -1593,14 +1560,14 @@ def main(cfg: DictConfig) -> None:
                         "ego(pos=({:.3f},{:.3f},{:.3f}) "
                         "yaw={:.1f} deg "
                         "vel=({:.3f},{:.3f},{:.3f}) dt={:.3f}s) | "
-                        "occ={} | infer={:.1f} ms (avg20={:.1f} ms)",
+                        "occ={} | infer={:.1f} ms (latency_ema={:.1f} ms)",
                         _goal_world_x, _goal_world_y, _goal_world_z,
                         _vel_world_x, _vel_world_y, _vel_world_z,
                         _goal_ego_x, _goal_ego_y, _goal_delta_z,
                         _goal_ego_yaw_deg,
                         _ego_vel_x, _ego_vel_y, _ego_vel_z,
                         0.0 if not _goal_time_valid else time_to_arrival_s,
-                        occ_count, infer_ms, avg_ms)
+                        occ_count, infer_ms, latency_ema_log_ms)
 
                 # SonicRunner resets each newly received G1 plan to frame 0.
                 # Keep the current measured history frame as that exact seam;
@@ -1633,7 +1600,46 @@ def main(cfg: DictConfig) -> None:
                     motion.joint_pos[0]
                     - np.asarray(latest_state.states.g1_joint_pos[-1],
                                  dtype=np.float32))))
+                chain_seam_root_error = float("nan")
+                chain_seam_angle_deg = float("nan")
+                chain_seam_joint_error = float("nan")
+                if using_generated_history:
+                    cached_pose_index = (
+                        history_len - 1 + selected_history_frame)
+                    cached_root_pos = tracked_plan["root_pos"][
+                        0, cached_pose_index]
+                    cached_root_rot = tracked_plan["root_rot"][
+                        0, cached_pose_index]
+                    cached_dof = tracked_plan["dof"][0, cached_pose_index]
+                    new_root_pos = motion_dict["root_trans_offset"][
+                        0, skip_history]
+                    new_root_rot = motion_dict["root_rot"][0, skip_history]
+                    new_dof = motion_dict["dof"][0, skip_history]
+                    chain_seam_root_error = float(torch.linalg.vector_norm(
+                        new_root_pos - cached_root_pos).item())
+                    chain_quat_dot = float(torch.clamp(torch.abs(torch.dot(
+                        new_root_rot, cached_root_rot)), 0.0, 1.0).item())
+                    chain_seam_angle_deg = math.degrees(
+                        2.0 * math.acos(chain_quat_dot))
+                    chain_seam_joint_error = float(torch.max(torch.abs(
+                        new_dof - cached_dof)).item())
                 published_seq = node.publish_motion(motion)
+                planning_latency_ms = (
+                    time.perf_counter() - planning_start) * 1000.0
+                preprocess_ms = max(
+                    0.0, (infer_start - planning_start) * 1000.0)
+                postprocess_ms = max(
+                    0.0, planning_latency_ms - preprocess_ms - infer_ms)
+                planner_processing_latency_ms = planning_latency_ms
+                if latency_align:
+                    if planning_latency_ema_ms is None:
+                        planning_latency_ema_ms = planner_processing_latency_ms
+                    else:
+                        planning_latency_ema_ms = (
+                            latency_align_ema_alpha * planner_processing_latency_ms
+                            + (1.0 - latency_align_ema_alpha)
+                            * planning_latency_ema_ms
+                        )
 
                 if use_generated_history:
                     generated_plans[published_seq] = {
@@ -1643,10 +1649,10 @@ def main(cfg: DictConfig) -> None:
                         "root_pos": motion_dict[
                             "root_trans_offset"].detach().clone(),
                         "root_rot": motion_dict["root_rot"].detach().clone(),
-                        # The generated motion is now expressed in this
-                        # alignment frame. Future replans inherit it by
-                        # selecting this plan's history and pose.
-                        "alignment_epoch": current_alignment_epoch,
+                        "dof": motion_dict["dof"].detach().clone(),
+                        "input_abs_pose": input_abs_pose,
+                        # Future replans select history and pose directly from
+                        # this generated plan.
                     }
                     while len(generated_plans) > 16:
                         del generated_plans[next(iter(generated_plans))]
@@ -1655,12 +1661,16 @@ def main(cfg: DictConfig) -> None:
                 if inference_count == 1 or inference_count % log_every == 0:
                     logger.info(
                         "plan={} state={} motion={} frames infer={:.1f} ms "
-                        "(avg20={:.1f} ms) "
+                        "(latency_ema={:.1f} ms) "
                         "history={} tracked_plan={} frame={} shift={:.3f} m "
                         "align={} phase_offset={} frames "
+                        "latency_align={:.1f} ms/{:+d} frames "
+                        "(planner={:.1f} ms, pre={:.1f} ms, post={:.1f} ms) "
+                        "chain_seam=({:.6f} m, {:.4f} deg, {:.6f} rad) "
                         "seam=({:.4f} m, {:.2f} deg, {:.4f} rad) "
                         "goal_r=({:.3f}->{:.3f}) m",
-                        published_seq, state_seq, motion.num_frames, infer_ms, avg_ms,
+                        published_seq, state_seq, motion.num_frames, infer_ms,
+                        latency_ema_log_ms,
                         "generated" if using_generated_history else "controller",
                         (latest_state.tracking.seq
                          if using_generated_history else -1),
@@ -1670,6 +1680,11 @@ def main(cfg: DictConfig) -> None:
                         alignment_mode,
                         (f"{phase_offset_frames:+d}"
                          if phase_offset_frames is not None else "n/a"),
+                        latency_align_ms, latency_align_frames,
+                        planner_processing_latency_ms,
+                        preprocess_ms, postprocess_ms,
+                        chain_seam_root_error, chain_seam_angle_deg,
+                        chain_seam_joint_error,
                         seam_root_error, seam_root_angle_deg, seam_joint_error,
                         _goal_r_world, _goal_r_ego)
             except Exception:

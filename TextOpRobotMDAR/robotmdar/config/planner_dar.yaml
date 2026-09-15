@@ -5,88 +5,58 @@ defaults:
 
 task: planner-dar
 
-# Let SONIC consume the complete generated segment before replacing it.
-# Resetting its frame-index cursor faster than the 8-frame / 50 Hz horizon
-# repeatedly discards most of every reference and destabilizes tracking.
+# Replan period and motion sampling.
 infer_period_ms: 500
 motion_fps: 50.0
 state_timeout_ms: 1
-log_every: 20
+log_every: 1
 pub_all_frames: false
 
-# Smooth measured controller joint history before it is encoded as model
-# history. The newest state is kept exact; older states are pulled backward
-# into a max-velocity tube so physical oscillation does not create OOD joint
-# deltas at the planner input. Tune max_velocity_rad_s from training-set
-# per-joint velocity percentiles when those stats are available.
+# Optional smoothing for measured joint history.
 history_joint_smoothing:
   enabled: true
   max_velocity_rad_s: 10.0
-  # 1.0 disables the optional backward EMA. Use <1.0 for extra low-pass
-  # smoothing after checking that the added history lag is acceptable.
+  # 1.0 disables EMA smoothing.
   ema_alpha: 1.0
 
-# Keep the diffusion latent fixed across MPC updates. Nearby controller states
-# should produce nearby plans instead of independent samples at every seam.
+# Reuse diffusion noise across replans.
 resample_noise_each_plan: false
 
-# Experimental: seed the diffusion initial noise from a motion_lib clip.
-# Set to a data/motion_lib/*.pkl path to enable; null (default) disables.
+# Optional motion-lib noise seed.
 motion_path: null
-# Starting frame index within the selected clip (raw frame, 0-based).
 motion_start_frame: 0
-# Clip name inside the pkl (required when pkl has >1 clip; auto-detected otherwise).
 motion_clip: null
 
-# Text conditioning is supplied by the controller in each TextOp state.
-# `text_valid: false` masks this condition; there is no static prompt fallback.
-
-# Optional fixed profile selector for offline recovery tests.  Leave false for
-# normal SONIC locomotion.  A dynamic controller-owned recovery signal can be
-# forwarded through the same `is_recovery` field in generate_next_motion().
+# Optional fixed recovery profile.
 is_recovery: false
 
-# Generated-history autoregressive chain and state-alignment policy.
+# Generated-history autoregressive chain.
 generated_history:
-  # Bootstrap from controller history once, then autoregress on generated
-  # history.
   enabled: true
-  # null = pure autoregressive history; spatial = legacy root alignment;
-  # residual_reanchor = joint/position residuals plus SO(3) re-anchoring;
-  # V6 gravity is regenerated from the re-anchored orientation.
-  align_to_g1: spatial
-  # Number of generated-motion frames by which the tracker lags the reference.
-  # Used only by spatial alignment, which compares against
-  # tracked_frame - phase_lag_offset. Residual re-anchoring ignores this value
-  # and searches backward through the history ending at tracked_frame.
-  phase_lag_offset: 0
-  # Recompute alignment once every N generated-history replans. The first
-  # generated-history replan always aligns; skipped replans inherit the last
-  # correction while the controller is still on the source plan.
-  align_every: 1
-
-# Single-step denoising is the real-time path. Full diffusion can be enabled
-# explicitly for offline experiments, but is not expected to meet the online
-# segment cadence.
+  # Project the switch frame using recent planner latency.
+  latency_align: true
+  latency_align_ema_alpha: 0.5
+  # null | spatial | residual_reanchor.
+  align_to_g1: residual_reanchor
+  # Replace the current state at a matched generated frame.
+  phase_matching:
+    enabled: false
+    block_size: 8
+# Single-step denoising.
 use_full_sample: false
 
 comm_config: ${hydra:runtime.cwd}/robotmdar/config/communication/pubsub.yaml
 
-# null means the current all-zero local occupancy condition.
 occ_grid: null
 
 data:
   dof_dim: 29
   goal_type: joint_state
-  # Current 67-D joint_state contract:
-  # root position/yaw/urgency + orientation + joints + velocity + four EEs.
   goal_encoding: split_end_effector
   goal_per_primitive: true
   goal_offset_range: [-63, 0]
   goal_timestep_mode: relative
   goal_include_log_d_hor: false
-  # Text is encoded online from controller-provided descriptions; the
-  # planner does not need dataset annotation embeddings at startup.
   load_text_embeddings: false
   history_len: 16
   future_len: 64
@@ -96,28 +66,12 @@ denoiser:
   goal_encoding: ${data.goal_encoding}
   goal_dim: 67
 
-# Condition dropout probabilities belong to training. At inference the
-# controller's `*_valid` fields are passed to the denoiser as real masks.
-# Text architecture support is inferred from the loaded checkpoint; the
-# per-state `text_valid` flag controls whether its text condition is present.
+# Controller validity fields are passed to the denoiser as masks.
 
-# Clamp the controller goal back into the training distribution before it is
-# encoded: r_max(T) = clip(speed_max * clip(T, 1/fps, time_max), r_min, r_max).
-# x, y are scaled proportionally when r exceeds the bound (direction preserved,
-# z untouched); the same time cap feeds the urgency channels and the arrival
-# PE. The envelope is DERIVED from the frozen goal_stats.pkl shipped with the
-# checkpoint (quantile tables of the per-window ego goal distance and implied
-# speed r/T): `quantile` is the training-distribution percentile to admit —
-# lower is stricter. Derived: speed_max = speed quantile, r_max = distance
-# quantile, r_min = speed_max/fps, time_max = future_len/fps. The stats must
-# be written by the current dataset statistics pipeline; older goal_stats.pkl
-# files without the quantile tables raise an error when enabled (refresh them
-# with the refresh-goal-stats task). Disable at runtime with
-# `goal_clamp_enabled=false` (or `goal_clamp=null`).
+# Optional training-distribution goal clamp.
 goal_clamp_enabled: false
 goal_clamp:
   quantile: 99
 
-# joint_state requires protocol-v5+ root pose, 29-DOF joint position, root
-# velocity, and timestamp. No FK keypoint reference is needed.
+# joint_state uses root pose, 29-DOF joints, velocity, and timestamp.
 goal_reference_path: null
