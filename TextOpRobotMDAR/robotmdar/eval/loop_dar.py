@@ -1,58 +1,55 @@
 """
-Loop DAR Script - Continuous Motion Generation
+Loop DAR Script - Continuous Text-Conditioned Motion Generation
 
 Continuously generates motion using DAR model in an autoregressive manner.
-Starts from zero pose and generates infinite trajectory based on goal+scene conditioning.
+Starts from a zero pose and generates an infinite trajectory from the
+text condition alone: the goal and scene conditions are force-dropped, and
+the history is fed back from the generated blocks (the same regime as
+planner_dar's generated_history with align_to_g1=null).
 
 Usage:
 - python eval/loop_dar.py --config-name=loop_dar
 - Interactive commands:
-  - Enter 'x y z yaw(deg)' in terminal: Set world-space goal (yaw degrees, 0°=+X)
+  - Type any text line in the terminal: update the text condition for the
+    next generated block (e.g. 'walking, turning')
+  - Empty line: clear the text condition (unconditional motion prior)
   - Space or 'p': Pause/resume generation
   - Esc or 'q': Quit
-- Goal visualization: green arrow for heading
 """
 
 import atexit
-import math
 import os
 import threading
 import time
 from pathlib import Path
-import sys
 
 import mujoco
 import numpy as np
 import torch
-from hydra.utils import instantiate, to_absolute_path
+from hydra.utils import instantiate
 from loguru import logger
 from omegaconf import DictConfig
 
-from robotmdar.utils.goal import (
-    GoalEncoding,
-    GoalType,
-    build_ego_goal,
-    validate_goal_config,
-)
 from robotmdar.utils.planner_convert import (
-    load_goal_keypoints_from_reference,
     mujoco_to_isaaclab_dof,
 )
 from robotmdar.dtype import seed, logger as dtype_logger
 from robotmdar.dtype.abc import Dataset, VAE, Denoiser, Diffusion, SSampler
 import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import (
-    G1_ROOT_HEIGHT,
     get_zero_abs_pose,
     motion_dict_to_abs_pose,
     motion_dict_to_qpos,
 )
 from robotmdar.dtype.vis_mjc import mjc_load_everything
-from robotmdar.eval.generate_dar import generate_next_motion
+from robotmdar.eval.generate_dar import (
+    denoiser_supports_text_guidance,
+    generate_next_motion,
+)
+from robotmdar.model.clip import encode_text, load_and_freeze_clip
 from robotmdar.train.manager import DARManager
 from robotmdar.utils.dof_contract import configure_dof_contract
 
-from robotmdar.wrapper.vae_decode import DecoderWrapper
 from robotmdar.dtype.debug import pdb_decorator
 
 # ---------------------------------------------------------------------------
@@ -71,7 +68,6 @@ from robotmdar.dtype.debug import pdb_decorator
 # the 14 bodies that the Tracker specifically needs.
 # ---------------------------------------------------------------------------
 _NPZ_BUFFER: list = []          # each entry: (dof_pos, dof_vel, body_trans, body_rot)
-_NPZ_FIRST_BLOCK = True
 _NPZ_OUTPUT = os.environ.get("NPZ_OUTPUT", "loop_motion.npz")
 _NPZ_FPS = None
 _NPZ_HISTORY_LEN = None
@@ -167,104 +163,30 @@ class LoopState:
 
     def __init__(self):
         self.paused = False
-        # World-space goal: (x, y, z, yaw_deg), yaw=0° → +X direction
-        # Default Z = G1_ROOT_HEIGHT (0.77m), the canonical standing root height
-        self.world_goal = [0.0, 0.0, G1_ROOT_HEIGHT, 0.0]
-        self.goal_received = False  # True after first valid user input
+        # Current text condition ("" = unconditional motion prior)
+        self.text = ""
         self.quit_requested = False
 
 
 def interactive_input_thread(loop_state: LoopState):
-    """Interactive input thread for goal input.
+    """Interactive input thread for the text condition.
 
-    Accepts world-space goal as: x y z yaw(deg)
-    - x, y, z: target position in world frame (meters)
-    - yaw: target heading in DEGREES, 0° = +X direction, 90° = +Y
-    Example: "1.0 0.5 0.0 90" (target 1m forward, 0.5m left, facing +Y)
+    Every non-empty line becomes the text condition for the next generated
+    block. An empty line clears the condition (unconditional prior).
     """
-    print("Enter world goal: x y z yaw(deg)")
-    print("  yaw(deg): 0°=+X, 90°=+Y, 180°=-X, -90°=-Y")
+    print("Enter text prompt for the motion prior (empty line = clear)")
     while not loop_state.quit_requested:
         try:
             user_input = input()
-            parts = user_input.strip().split()
-            if len(parts) == 4:
-                x, y, z, yaw_deg = map(float, parts)
-                yaw_rad = math.radians(yaw_deg)
-                loop_state.world_goal = [x, y, z, yaw_rad]
-                loop_state.goal_received = True
-                print(f"Goal updated: x={x:.3f} y={y:.3f} z={z:.3f} "
-                      f"yaw={yaw_deg:.1f}° ({yaw_rad:.3f} rad)")
-            else:
-                print(f"Invalid: expected 4 values (x y z yaw_deg), got {len(parts)}")
         except (EOFError, KeyboardInterrupt):
             break
-        except ValueError as e:
-            print(f"Parse error: {e}. Format: x y z yaw_deg "
-                  f"(e.g. '1.0 0.0 0.0 90')")
-
-
-def _update_goal_vis(viewer, world_goal: list, goal_received: bool):
-    """Draw goal heading as an arrow + base sphere via ``mjv_initGeom``.
-
-    Uses ``mjGEOM_ARROW`` (cone+cylinder along local +Z) for the heading
-    arrow and ``mjGEOM_SPHERE`` for the base position marker.  Avoids
-    ``mjv_connector`` which segfaults in some MuJoCo builds.
-    """
-    viewer.user_scn.ngeom = 0
-    if not goal_received:
-        return
-
-    x, y, z, yaw = world_goal
-    cos_h = math.cos(yaw)
-    sin_h = math.sin(yaw)
-
-    pos = np.array([x, y, z], dtype=np.float64)
-
-    arrow_radius = 0.025
-    arrow_length = 0.5
-    sphere_radius = 0.05
-
-    rgba = np.array([0.2, 1.0, 0.2, 0.9], dtype=np.float32)
-
-    # arrow
-    if viewer.user_scn.ngeom < viewer.user_scn.maxgeom:
-        g = viewer.user_scn.geoms[viewer.user_scn.ngeom]
-
-        mat = np.array([
-            -sin_h, 0.0, cos_h,
-            cos_h, 0.0, sin_h,
-            0.0,   1.0, 0.0,
-        ], dtype=np.float64)
-
-        mujoco.mjv_initGeom(
-            g,
-            mujoco.mjtGeom.mjGEOM_ARROW,
-            np.array(
-                [arrow_radius, arrow_radius, arrow_length],
-                dtype=np.float32,
-            ),
-            pos,
-            mat,
-            rgba,
-        )
-
-        g.category = mujoco.mjtCatBit.mjCAT_DECOR
-        viewer.user_scn.ngeom += 1
-
-    # base sphere
-    if viewer.user_scn.ngeom < viewer.user_scn.maxgeom:
-        g = viewer.user_scn.geoms[viewer.user_scn.ngeom]
-        mujoco.mjv_initGeom(
-            g,
-            mujoco.mjtGeom.mjGEOM_SPHERE,
-            np.array([sphere_radius, sphere_radius, sphere_radius], dtype=np.float32),
-            pos,
-            np.eye(3).reshape(-1),
-            rgba,
-        )
-        g.category = mujoco.mjtCatBit.mjCAT_DECOR
-        viewer.user_scn.ngeom += 1
+        text = user_input.strip()
+        if text:
+            loop_state.text = text
+            print(f"Text updated: {text!r} (applies at the next block)")
+        else:
+            loop_state.text = ""
+            print("Text cleared (unconditional prior)")
 
 
 @pdb_decorator
@@ -272,37 +194,6 @@ def main(cfg: DictConfig):
     configure_dof_contract(cfg)
     dtype_logger.set(cfg)
     seed.set(cfg.seed)
-    goal_encoding = GoalEncoding.parse(
-        cfg.data.get('goal_encoding', GoalEncoding.LEGACY40)
-    )
-    denoiser_goal_encoding = GoalEncoding.parse(
-        cfg.denoiser.get('goal_encoding', goal_encoding)
-    )
-    if denoiser_goal_encoding is not goal_encoding:
-        raise ValueError(
-            f"data.goal_encoding={goal_encoding.value!r} must match "
-            f"denoiser.goal_encoding={denoiser_goal_encoding.value!r}"
-        )
-    goal_type = validate_goal_config(
-        cfg.data.goal_type,
-        cfg.denoiser.goal_dim,
-        goal_encoding,
-        dof_dim=cfg.data.dof_dim,
-        goal_offset_range=cfg.data.get('goal_offset_range'),
-        goal_timestep_mode=cfg.data.get('goal_timestep_mode'),
-    )
-    goal_reference_path = cfg.get("goal_reference_path")
-    if goal_reference_path is not None:
-        goal_reference_path = to_absolute_path(str(goal_reference_path))
-    if goal_type is GoalType.BODY and goal_reference_path is None:
-        raise ValueError("Body-goal loop requires goal_reference_path")
-    if goal_type is GoalType.JOINT_STATE:
-        raise ValueError(
-            "Interactive loop_dar cannot synthesize a joint_state goal from "
-            "the root-only keyboard target; use dataset vis_dar or "
-            "planner_dar with controller-provided goal_root_rot_world and "
-            "goal_dof_pos")
-    # torch.set_default_device(cfg.device)
 
     # Load models
     val_data: Dataset = instantiate(cfg.data.val)
@@ -325,8 +216,36 @@ def main(cfg: DictConfig):
     denoiser_trt = denoiser
     cfg_denoiser = denoiser_trt
 
+    # Text condition support comes from the checkpoint architecture.
+    text_condition_supported = denoiser_supports_text_guidance(denoiser)
+    clip_model = None
+    text_embedding_cache: dict = {}
+    if text_condition_supported:
+        clip_model = load_and_freeze_clip(
+            str(cfg.data.get("clip_version", "ViT-B/32")),
+            device=str(cfg.device),
+            clip_model_path=cfg.data.get("clip_model_path"),
+        )
+        with torch.no_grad():
+            _warmup = encode_text(clip_model, ["text condition warmup"])
+        del _warmup
+        if torch.cuda.is_available() and str(cfg.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        logger.info("Text conditioning enabled; type text lines to change it")
+    else:
+        logger.warning(
+            "Denoiser has no text-condition weights; text input will be "
+            "ignored (unconditional generation)")
+
     future_len = cfg.data.future_len
     history_len = cfg.data.history_len
+    replanning_period_frames = int(cfg.replanning_period_frames)
+    if not history_len <= replanning_period_frames <= future_len:
+        raise ValueError(
+            "replanning_period_frames must satisfy "
+            f"history_len ({history_len}) <= replanning_period_frames "
+            f"({replanning_period_frames}) <= future_len ({future_len})"
+        )
 
     # Store for NPZ saving
     global _NPZ_FPS, _NPZ_HISTORY_LEN, _NPZ_SKELETON_BODY_NAMES
@@ -348,6 +267,24 @@ def main(cfg: DictConfig):
                                                                 -1).to(cfg.device))
     abs_pose = get_zero_abs_pose((1, ), device=cfg.device)
 
+    # Goal/scene conditions are force-dropped: this loop is pure text prior.
+    # The tensors keep the checkpoint's dimensions (66-D no-log
+    # split_end_effector goal, 25^3 scene voxels) but are fully masked at
+    # inference, matching the text-only regime of text_prior training.
+    goal = torch.zeros(1, int(cfg.denoiser.goal_dim), device=cfg.device)
+    voxel = torch.zeros(1, cfg.denoiser.grid_size**3, device=cfg.device)
+    # A present goal tensor requires an arrival-time frame for the split
+    # denoiser; it is force-dropped together with the goal itself.
+    time_to_arrival_frame = torch.zeros(
+        1, 1, dtype=torch.long, device=cfg.device)
+
+    # Reuse one diffusion noise realization across all blocks, mirroring the
+    # planner's resample_noise_each_plan: false. Independent noise at every
+    # block boundary makes nearby histories decode to visibly different
+    # motions and would pollute the seam-smoothness analysis.
+    fixed_sampling_noise = torch.randn(
+        (1, *denoiser.noise_shape), device=cfg.device)
+
     # Setup visualization with keyboard callback
     dt = 1.0 / val_data.fps
 
@@ -363,7 +300,15 @@ def main(cfg: DictConfig):
             logger.info("Quit requested")
             loop_state.quit_requested = True
 
-    show_fn, viewer = mjc_load_everything(dt, keycb_fn)
+    # Keep visualization on the exact MJCF selected by the active skeleton
+    # config.  The helper's historical default is a cwd-relative path and can
+    # otherwise silently diverge from the model/FK asset when launched from a
+    # different directory.
+    show_fn, viewer = mjc_load_everything(
+        dt,
+        keycb_fn,
+        humanoid_xml=str(val_data.skeleton.fk.mjcf_file),
+    )
 
     # Start interactive input thread
     input_thread = threading.Thread(target=interactive_input_thread,
@@ -373,97 +318,118 @@ def main(cfg: DictConfig):
 
     logger.info("Starting continuous motion generation...")
     logger.info(
-        "Commands: Enter 'x y z yaw(deg)' in terminal, Space/p(pause), Esc/q(quit)"
+        "Replanning after {} executed frames ({:.3f} s); model horizon={} "
+        "frames; history={} frames",
+        replanning_period_frames,
+        replanning_period_frames * dt,
+        future_len,
+        history_len,
     )
-    logger.info("  yaw(deg): 0°=+X, 90°=+Y, 180°=-X")
-    logger.info("  (goal defaults to zero until first input)")
-
-    # Pre-compute grid_size for zero voxel
-    grid_size = cfg.denoiser.grid_size
+    logger.info(
+        "Commands: type a text line to change the motion prompt, "
+        "empty line to clear it, Space/p(pause), Esc/q(quit)")
 
     # Main generation loop
+    current_text = ""
+    text_embedding = None
     frame_idx = 0
     while not loop_state.quit_requested and viewer.is_running():
-        # Build ego_goal from world goal + current robot pose.
-        # Before first user input, use all-zero ego_goal (stand still).
-        if loop_state.goal_received:
-            world_goal_pos = torch.tensor(
-                loop_state.world_goal[:3], device=cfg.device
-            ).float().unsqueeze(0)  # [1, 3]
-            world_goal_yaw = torch.tensor(
-                [loop_state.world_goal[3]], device=cfg.device
-            ).float()  # [1]
-
-            reference_pos = abs_pose['root_trans_offset']  # [1, 3]
-            reference_rot = abs_pose['root_rot']  # [1, 4] xyzw
-            goal_keypoints = None
-            if goal_type is GoalType.BODY:
-                goal_keypoints_np = load_goal_keypoints_from_reference(
-                    goal_reference_path,
-                    loop_state.world_goal[:3],
-                    float(loop_state.world_goal[3]),
-                )
-                goal_keypoints = torch.as_tensor(
-                    goal_keypoints_np, dtype=torch.float32,
-                    device=cfg.device).unsqueeze(0)
-
-            ego_goal = build_ego_goal(
-                world_goal_pos, world_goal_yaw,
-                reference_pos, reference_rot,
-                goal_type=goal_type,
-                world_goal_keypoints=goal_keypoints,
-            )
-        else:
-            ego_goal = torch.zeros(
-                1, goal_type.dimension, device=cfg.device)
-
-        # Scene condition: all zeros
-        voxel = torch.zeros(1, grid_size**3, device=cfg.device)
+        # Update the text condition when the prompt changed.
+        if text_condition_supported:
+            text_prompt = loop_state.text.strip()
+            if text_prompt != current_text:
+                current_text = text_prompt
+                if current_text:
+                    text_embedding = text_embedding_cache.get(current_text)
+                    if text_embedding is None:
+                        with torch.no_grad():
+                            text_embedding = encode_text(
+                                clip_model, [current_text]).to(cfg.device)
+                        text_embedding_cache[current_text] = text_embedding
+                        logger.info("Text condition: {!r}", current_text)
+                else:
+                    text_embedding = None
+                    logger.info("Text condition cleared (unconditional prior)")
 
         # Generate next motion if not paused
         if not loop_state.paused:
+            # ``abs_pose`` is the pose at the start of the new future window.
+            # Keep it separate: the generic generator also reconstructs a
+            # history+future tensor, which is useful for legacy consumers but
+            # is incorrect for V6 transition features when history is already
+            # anchored at this pose (it would integrate the 16 history frames
+            # a second time).
+            future_start_abs_pose = abs_pose
             # breakpoint()
             future_motion, motion_dict, abs_pose = generate_next_motion(
                 vae=vae_trt,
                 denoiser=cfg_denoiser,
                 diffusion=diffusion,
                 val_data=val_data,
-                goal=ego_goal,
+                goal=goal,
                 voxel=voxel,
                 history_motion=history_motion,
                 abs_pose=abs_pose,
                 future_len=future_len,
                 use_full_sample=cfg.use_full_sample,
                 guidance_scale=cfg.guidance_scale,
+                initial_noise=fixed_sampling_noise,
+                text_embedding=text_embedding,
+                text_valid=True if text_embedding is not None else None,
+                force_drop_goal_root=True,
+                force_drop_goal_yaw=True,
+                force_drop_goal_time=True,
+                force_drop_goal_orientation=True,
+                force_drop_goal_joint=True,
+                force_drop_goal_velocity=True,
+                force_drop_goal_end_effector=True,
+                force_drop_scene=True,
+                time_to_arrival_frame=time_to_arrival_frame,
                 ret_fk=True)
 
-            # ── NPZ: accumulate FK results (new frames only, skip first-block history padding) ──
-            global _NPZ_BUFFER, _NPZ_FIRST_BLOCK
-            skip = history_len if _NPZ_FIRST_BLOCK else 0
-            _NPZ_FIRST_BLOCK = False
-            dof_pos = motion_dict['dof_pos'][0, skip:].detach().cpu().numpy()             # [T', 23]
-            dof_vel = motion_dict['dof_vel'][0, skip:].detach().cpu().numpy()             # [T', 23]
-            body_t  = motion_dict['global_translation'][0, skip:].detach().cpu().numpy()  # [T', N, 3]
-            body_r  = motion_dict['global_rotation'][0, skip:].detach().cpu().numpy()     # [T', N, 4] xyzw
+            # Reconstruct only the newly generated future from the current
+            # absolute pose.  This is the sequence that is played, saved, and
+            # used to anchor the next autoregressive block.
+            motion_dict = val_data.reconstruct_motion(
+                future_motion,
+                abs_pose=future_start_abs_pose,
+                ret_fk=True,
+            )
+            # Advance only through the execution horizon. Predicted states
+            # after this frame are deliberately discarded.
+            abs_pose = motion_dict_to_abs_pose(
+                motion_dict, idx=replanning_period_frames - 1)
+
+            # ── NPZ: accumulate the newly reconstructed future ──
+            # Each entry contains only executed frames, so saved seams land at
+            # replanning_period_frames boundaries rather than future_len.
+            global _NPZ_BUFFER
+            executed = slice(0, replanning_period_frames)
+            dof_pos = motion_dict['dof_pos'][0, executed].detach().cpu().numpy()             # [P, 29]
+            dof_vel = motion_dict['dof_vel'][0, executed].detach().cpu().numpy()             # [P, 29]
+            body_t  = motion_dict['global_translation'][0, executed].detach().cpu().numpy()  # [P, N, 3]
+            body_r  = motion_dict['global_rotation'][0, executed].detach().cpu().numpy()     # [P, N, 4] xyzw
             _NPZ_BUFFER.append((dof_pos, dof_vel, body_t, body_r))
             # ────────────────────────────────────────────────────────────────────
 
             # Update history for next generation (autoregressive)
-            history_motion = future_motion[:, -history_len:, :]
+            history_motion = future_motion[
+                :,
+                replanning_period_frames - history_len:
+                replanning_period_frames,
+                :,
+            ]
 
             # Visualize the motion
             qpos_data, contact_data = motion_dict_to_qpos(motion_dict)
 
             # Convert to numpy - qpos_data and contact_data are torch tensors
-            qpos_np = qpos_data.detach().cpu().numpy()  # [B, T, 30]
+            qpos_np = qpos_data.detach().cpu().numpy()  # [B, T, dof]
             contact_np = contact_data.detach().cpu().numpy()  # [B, T, 2]
 
-            # Update goal vis once per generated block (not every frame)
-            _update_goal_vis(viewer, loop_state.world_goal,
-                             loop_state.goal_received)
-
-            # Show each frame of the generated motion
-            for t in range(qpos_np.shape[1]):
+            # Display only the execution horizon. The unused suffix of the
+            # 64-frame prediction is discarded before the next inference.
+            for t in range(replanning_period_frames):
                 if loop_state.quit_requested or not viewer.is_running():
                     break
                 show_fn(qpos_np[0, t], contact_np[0, t])

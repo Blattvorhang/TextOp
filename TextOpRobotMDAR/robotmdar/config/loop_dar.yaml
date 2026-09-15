@@ -8,15 +8,26 @@ task: loop-dar
 # Generation settings
 use_full_sample: true  # Use full DDPM sampling for better quality
 
-# Required in body-goal mode when the controller does not provide keypoints.
-goal_reference_path: null
+# Number of generated future frames to consume before replanning. The model
+# still predicts data.future_len frames (64); frames after this execution
+# horizon are discarded. Must satisfy data.history_len <= value <=
+# data.future_len so the next history contains only executed frames.
+replanning_period_frames: 25
 
-# Override data settings for loop generation
+# Pure-kinematics text-conditioned loop (planner v12 text motion prior).
+# Goal and scene conditions are force-dropped at inference, so the model
+# generates from text + generated history alone — the same text-only regime
+# as 80% of the text_prior training steps. The goal/scene dims must still
+# match the checkpoint for the denoiser architecture to load.
 data:
-  goal_encoding: legacy40
+  goal_encoding: split_end_effector  # matches 0914_text_motion_prior ckpt
+  load_goal_stats: false             # no goal conditions in this loop
+  load_text_embeddings: false        # text is encoded online via CLIP
   val:
     batch_size: 1  # Fixed batch size for loop generation
     split: none # No need to load data
 
 denoiser:
   goal_encoding: ${data.goal_encoding}
+  goal_dim: 66  # no-log split_end_effector layout (66-D)
+  text_condition_enabled: true  # required by the text-prior ckpt
