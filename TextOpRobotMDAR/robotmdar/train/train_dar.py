@@ -1461,6 +1461,86 @@ def _conditions(primitive, reference_pos, reference_rot, history_motion, cfg,
     return conditions
 
 
+def _goal_intervention_eval(
+    denoiser,
+    vae,
+    x_t: torch.Tensor,
+    timesteps: torch.Tensor,
+    y: dict,
+    history_motion: torch.Tensor,
+    future_len: int,
+    manager,
+    max_batch: int,
+):
+    """Measure goal controllability with one batched counterfactual pass.
+
+    The same noisy latent is evaluated with the original goal, a fully
+    dropped goal, and a goal taken from another sample.  Keeping this on the
+    single-step validation path makes the diagnostic substantially cheaper
+    than three full diffusion sampling loops.
+    """
+    batch_size = int(x_t.shape[0])
+    n = min(batch_size, max(2, int(max_batch)))
+    if n < 2:
+        return {}
+    base = {k: (v[:n] if isinstance(v, torch.Tensor)
+                and v.ndim > 0 and v.shape[0] == batch_size else v)
+            for k, v in y.items()}
+    goal = base.get('goal')
+    raw_goal = base.get('ego_goal_raw')
+    if not isinstance(goal, torch.Tensor) or not isinstance(raw_goal, torch.Tensor):
+        return {}
+
+    # Drop every goal family so this remains valid for all goal encodings.
+    drop_keys = (
+        'force_drop_goal', 'force_drop_goal_root',
+        'force_drop_goal_position_hor', 'force_drop_goal_position_vert',
+        'force_drop_goal_yaw', 'force_drop_goal_time',
+        'force_drop_goal_body', 'force_drop_goal_gravity',
+        'force_drop_goal_orientation', 'force_drop_goal_orientation_rot6d',
+        'force_drop_goal_joint', 'force_drop_goal_velocity',
+        'force_drop_goal_end_effector',
+        'force_drop_goal_end_effector_left_hand',
+        'force_drop_goal_end_effector_right_hand',
+        'force_drop_goal_end_effector_left_foot',
+        'force_drop_goal_end_effector_right_foot',
+    )
+    on = dict(base)
+    null = dict(base)
+    null.update({k: True for k in drop_keys})
+    wrong = dict(base)
+    wrong['goal'] = torch.roll(goal, shifts=1, dims=0)
+
+    variants = (on, null, wrong)
+    predictions = []
+    with torch.no_grad():
+        for variant in variants:
+            latent = denoiser(
+                x_t=x_t[:n], timesteps=timesteps[:n], y=variant
+            ).permute(1, 0, 2)
+            predictions.append(vae.decode(
+                latent, history_motion[:n], nfuture=future_len))
+        predicted = torch.cat(predictions, dim=0)
+    trajectory = manager.root_trajectory_ego(
+        predicted, history_motion[:n].repeat(3, 1, 1))[:, -1]
+    on_disp, null_disp, wrong_disp = trajectory.chunk(3, dim=0)
+    target = _raw_goal_root_target(raw_goal)
+    wrong_target = torch.roll(target, shifts=1, dims=0)
+    on_error = torch.linalg.vector_norm(on_disp - target, dim=-1)
+    null_error = torch.linalg.vector_norm(null_disp - target, dim=-1)
+    wrong_error = torch.linalg.vector_norm(wrong_disp - wrong_target, dim=-1)
+    return {
+        'goal_intervention_response_m': torch.linalg.vector_norm(
+            on_disp - null_disp, dim=-1).mean(),
+        'goal_intervention_wrong_response_m': torch.linalg.vector_norm(
+            wrong_disp - on_disp, dim=-1).mean(),
+        'goal_intervention_null_gain_m': (null_error - on_error).mean(),
+        'goal_intervention_on_error_m': on_error.mean(),
+        'goal_intervention_null_error_m': null_error.mean(),
+        'goal_intervention_wrong_error_m': wrong_error.mean(),
+    }
+
+
 def _prepare_batch_text_embeddings(
         batch, cfg, device, optimize_always_dropped: bool = False):
     """Move all primitive text embeddings to the training device once."""
@@ -2557,6 +2637,19 @@ def main(cfg: DictConfig):
                         action_label=batch[pidx].get('action_label'),
                         is_recovery=batch[pidx].get('is_recovery'))
                     _add_batch_data_diagnostics(extras, primitive, y)
+                    if (getattr(manager, 'eval_goal_intervention', False)
+                            and manager._to_eval_steps == manager.eval_steps):
+                        extras.update(_goal_intervention_eval(
+                            denoiser_raw,
+                            vae,
+                            x_t,
+                            diffusion._scale_timesteps(t),
+                            y,
+                            history_motion,
+                            future_len,
+                            manager,
+                            getattr(manager, 'eval_goal_intervention_batch_size', 4),
+                        ))
 
                     if getattr(manager, 'eval_full_sample', False):
                         sample_latent = diffusion.p_sample_loop(

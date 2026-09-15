@@ -5,6 +5,7 @@ import joblib
 import numpy as np
 import pytest
 import torch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -17,6 +18,7 @@ from dataset.data_process.pack_motion_lib_to_textop import (
 from TextOpRobotMDAR.robotmdar.dataloader.data import SkeletonPrimitiveDataset
 from TextOpRobotMDAR.robotmdar.utils.goal import GoalEncoding, GoalType
 from TextOpRobotMDAR.robotmdar.train.manager import GeometryLoss
+from TextOpRobotMDAR.robotmdar.skeleton.end_effector import EndEffectorAnchor
 
 
 def _motion_item(length: int, marker: str = "motion"):
@@ -25,6 +27,57 @@ def _motion_item(length: int, marker: str = "motion"):
         "motion": {"motion_len": length},
         "marker": marker,
     }
+
+
+def test_end_effector_goal_frames_use_one_batched_fk_call():
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.fps = 50
+    dataset._select_model_dof = lambda value: value
+    anchors = tuple(
+        EndEffectorAnchor(
+            name=name,
+            source_type="body",
+            source_name=name,
+            parent_body=name,
+            parent_body_index=index,
+            local_pos=torch.zeros(3),
+        )
+        for index, name in enumerate(
+            ("left_hand", "right_hand", "left_foot", "right_foot"))
+    )
+    dataset._end_effector_anchors = lambda: anchors
+    calls = []
+
+    def forward_kinematics(motion, fps):
+        calls.append(motion["dof"].shape)
+        batch_size = motion["dof"].shape[0]
+        translation = torch.zeros((batch_size, 1, 4, 3))
+        translation[:, 0, :, 0] = torch.arange(4, dtype=torch.float32)
+        rotation = torch.eye(3).reshape(1, 1, 1, 3, 3).expand(
+            batch_size, 1, 4, 3, 3)
+        return {
+            "global_translation": translation,
+            "global_rotation_mat": rotation,
+        }
+
+    dataset.skeleton = SimpleNamespace(
+        forward_kinematics=forward_kinematics)
+    raw_motion = {
+        "dof": np.zeros((12, 29), dtype=np.float32),
+        "root_trans_offset": np.zeros((12, 3), dtype=np.float32),
+        "root_rot": np.tile(
+            np.asarray([0, 0, 0, 1], dtype=np.float32), (12, 1)),
+    }
+
+    actual = dataset._world_goal_end_effectors_batch(
+        raw_motion, [3, 6, 9])
+
+    assert calls == [(3, 1, 29)]
+    assert actual.shape == (3, 4, 3)
+    torch.testing.assert_close(
+        actual[:, :, 0],
+        torch.arange(4, dtype=torch.float32).expand(3, 4),
+    )
 
 
 def _length_only_dataset(datadir: Path, *, weighted_sample: bool = False):
@@ -70,6 +123,51 @@ def test_dataset_filters_lengths_at_training_time_and_accepts_exact_window(tmp_p
     assert sampled == [[("exact", 0)]]
 
 
+def _weighted_dataset(tmp_path: Path, *, frame_weight: bool):
+    stats_path = tmp_path / "action_statistics.json"
+    stats_path.write_text(
+        '{"walk": {"weight": 2.0}, "stand": {"weight": 1.0}}',
+        encoding="utf-8",
+    )
+    dataset = SkeletonPrimitiveDataset.__new__(SkeletonPrimitiveDataset)
+    dataset.action_statistics_path = str(stats_path)
+    dataset.raw_data = [
+        {
+            "length": 4,
+            "frame_ann": [(0.0, 4.0, "walk", ["walk"])],
+        },
+        {
+            "length": 3,
+            "frame_ann": [(0.0, 3.0, "stand", ["stand"])],
+        },
+    ]
+    dataset.valid_indices = [0, 1]
+    dataset.frame_weight = frame_weight
+    dataset.segment_len = 3
+    dataset.fps = 1.0
+    dataset.split = "train"
+    return dataset
+
+
+def test_weighted_sampling_skips_frame_weights_when_disabled(tmp_path):
+    dataset = _weighted_dataset(tmp_path, frame_weight=False)
+
+    dataset._cal_sample_weight()
+
+    np.testing.assert_allclose(dataset.seq_weights, [8.0 / 11.0, 3.0 / 11.0])
+    assert "frame_weights" not in dataset.raw_data[0]
+    assert "frame_weights" not in dataset.raw_data[1]
+
+
+def test_weighted_sampling_preserves_frame_weights_when_enabled(tmp_path):
+    dataset = _weighted_dataset(tmp_path, frame_weight=True)
+
+    dataset._cal_sample_weight()
+
+    np.testing.assert_allclose(dataset.raw_data[0]["frame_weights"], [4.0, 4.0])
+    np.testing.assert_allclose(dataset.raw_data[1]["frame_weights"], [2.0])
+
+
 def test_dataset_lazily_loads_manifest_sample(tmp_path):
     sample_dir = tmp_path / "samples"
     sample_dir.mkdir()
@@ -94,6 +192,41 @@ def test_dataset_lazily_loads_manifest_sample(tmp_path):
 
     assert sampled == [[("lazy", 0)]]
     assert "motion" not in dataset.raw_data[0]
+
+
+def test_dataset_audit_reports_recovery_text_and_source_stats(tmp_path):
+    joblib.dump(
+        [
+            {
+                "length": 12,
+                "frame_ann": [(0.0, 1.0, ["stand up from lying"], ["fall"])],
+                "_data_path": "samples/stand_up_lying_demo.pkl",
+                "_recovery_boost": True,
+            },
+            {
+                "length": 12,
+                "frame_ann": [(0.0, 1.0, ["walk forward"], ["walk"])],
+                "_data_path": "samples/walk_demo.pkl",
+                "_recovery_boost": False,
+            },
+        ],
+        tmp_path / "train.pkl",
+    )
+    dataset = _length_only_dataset(tmp_path)
+    dataset.fps = 10.0
+    dataset.audit_primitive_windows = 16
+    dataset._load_data()
+
+    stats = dataset.audit_stats
+
+    assert stats["total_sequences"] == 2.0
+    assert stats["recovery_sequences"] == 1.0
+    assert stats["recovery_sequence_fraction"] == 0.5
+    assert stats["recovery_source_match_rate"] == 1.0
+    assert stats["recovery_action_label_empty_rate"] == 0.0
+    assert stats["recovery_text_embedding_empty_rate"] == 1.0
+    assert stats["non_recovery_text_like_rate"] == 0.0
+    assert stats["recovery_top_action_labels"][0][0] == "stand up from lying"
 
 
 def test_dataset_reports_active_window_when_every_clip_is_too_short(tmp_path):

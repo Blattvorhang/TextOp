@@ -23,6 +23,11 @@ manager:
   eval_every: 2000
   eval_steps: 10
   eval_full_sample: True
+  # Cheap counterfactual controllability diagnostic.  It runs only on the
+  # first primitive of each eval cycle and batches goal-on/null/wrong-goal in
+  # one single-step denoiser call.
+  eval_goal_intervention: True
+  eval_goal_intervention_batch_size: 4
 
   device: ${...device}
   save_dir: ${...experiment_dir}

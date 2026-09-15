@@ -24,6 +24,7 @@ from TextOpRobotMDAR.robotmdar.model.mld_denoiser import (
 )
 from TextOpRobotMDAR.robotmdar.dtype.rotation import (
     matrix_to_quaternion,
+    matrix_to_rot6d,
     quaternion_to_matrix,
     wxyz_to_xyzw,
     xyzw_to_wxyz,
@@ -38,6 +39,7 @@ from TextOpRobotMDAR.robotmdar.train.train_dar import (
     _add_batch_data_diagnostics,
     _build_train_condition_plan,
     _conditions,
+    _reexpress_seam_transition_v6,
     _rebase_goal_to_reference,
 )
 from TextOpRobotMDAR.robotmdar.utils.goal import (
@@ -117,6 +119,36 @@ def test_rollout_goal_gravity_alignment_has_correct_direction():
         quaternion_to_matrix(xyzw_to_wxyz(yaw_rebased['world_goal_rot'])),
     )
     assert torch.allclose(yaw_effective, torch.eye(3).unsqueeze(0), atol=1e-5)
+
+
+def test_seam_target_matches_original_gt_history():
+    """Teacher forcing must preserve the original future feature target."""
+    old_runtime = runtime_motion_dtype.FeatureVersion
+    old_package = package_motion_dtype.FeatureVersion
+    runtime_motion_dtype.set_feature_version(6)
+    package_motion_dtype.set_feature_version(6)
+    try:
+        class IdentityDataset:
+            @staticmethod
+            def denormalize(value):
+                return value
+
+            @staticmethod
+            def normalize(value):
+                return value
+
+        gt_history = torch.zeros(1, 2, 44)
+        gt_history[..., 1:4] = torch.tensor([0., 0., -1.])
+        future = torch.randn(1, 3, 44)
+        future[..., 1:4] = torch.tensor([0., 0., -1.])
+        future[..., 7:13] = matrix_to_rot6d(
+            torch.eye(3).unsqueeze(0)).unsqueeze(1)
+        corrected = _reexpress_seam_transition_v6(
+            IdentityDataset(), future, gt_history, gt_history)
+        assert torch.equal(corrected, future)
+    finally:
+        runtime_motion_dtype.set_feature_version(old_runtime)
+        package_motion_dtype.set_feature_version(old_package)
 
 
 def _manager(max_grad_norm=0.5, eval_steps=2):
