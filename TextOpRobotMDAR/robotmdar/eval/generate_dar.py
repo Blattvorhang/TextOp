@@ -447,8 +447,15 @@ def generate_next_motion(
                                                   ret_fk=ret_fk,
                                                   ret_fk_full=ret_fk_full)
 
-        # Update absolute pose for next primitive
-        pose_idx = -1 if motion_dtype.FeatureVersion == 6 else -2
+        # Update absolute pose for next primitive.  The next block's history
+        # is the tail of this block's generated future, and V6 reconstructs
+        # root pose by integrating per-frame deltas from abs_pose.  Anchor at
+        # the frame immediately BEFORE the history window: anchoring at the
+        # last frame re-integrates the history deltas a second time and makes
+        # every autoregressive seam jump by the history window's net
+        # displacement.
+        pose_idx = -(history_motion.shape[1] + 1) if (
+            motion_dtype.FeatureVersion == 6) else -2
         new_abs_pose = motion_dict_to_abs_pose(motion_dict, idx=pose_idx)
 
         return future_motion_pred, motion_dict, new_abs_pose

@@ -155,8 +155,12 @@ def add_batch_fn(motion_buff, val_dataiter, vae, denoiser, diffusion, val_data,
                 abs_pose=gt_abs_pose,
                 ret_fk=False)
 
-            # Update ground truth absolute pose for next primitive
-            pose_idx = -1 if motion_dtype.FeatureVersion == 6 else -2
+            # Update ground truth absolute pose for next primitive.  Same
+            # V6 anchoring rule as generate_next_motion: the anchor is the
+            # frame immediately before the next history window, otherwise the
+            # window's deltas are integrated a second time.
+            pose_idx = -(history_motion_gt.shape[1] + 1) if (
+                motion_dtype.FeatureVersion == 6) else -2
             gt_abs_pose = motion_dict_to_abs_pose(future_motion_gt_dict,
                                                   idx=pose_idx)
 

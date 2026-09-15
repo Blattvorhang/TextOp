@@ -113,9 +113,12 @@ def single_inference_step(prev_motion, abs_pose, text_embedding, vae, denoiser,
                                                           ret_fk=False)
     timings['motion_reconstruction'] = time.time() - recon_start
 
-    # 5. Update state for next iteration
+    # 5. Update state for next iteration.  Same V6 anchoring rule as
+    # generate_next_motion: anchor at the frame before the next history
+    # window so the window's deltas are not integrated twice.
     new_prev_motion = full_motion
-    pose_idx = -1 if motion_dtype.FeatureVersion == 6 else -2
+    pose_idx = -(history_motion.shape[1] + 1) if (
+        motion_dtype.FeatureVersion == 6) else -2
     new_abs_pose = motion_dict_to_abs_pose(future_motion_pred_dict, idx=pose_idx)
 
     timings['total_step'] = time.time() - step_start

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import math
 from pathlib import Path
 from typing import Any
 
@@ -556,6 +557,7 @@ def state_goal_from_reference(state_msg: Any,
                               fps: float | None = None,
                               val_data: Any = None,
                               goal_include_log_d_hor: bool = True,
+                              reference_time_offset_s: float = 0.0,
                               ) -> torch.Tensor:
     """Convert the state goal relative to an explicit generated-history pose."""
     goal_type = GoalType.parse(goal_type)
@@ -567,6 +569,12 @@ def state_goal_from_reference(state_msg: Any,
         device=device, dtype=torch.float32).reshape(1, 3)
     reference_rot = reference_rot.to(
         device=device, dtype=torch.float32).reshape(1, 4)
+    reference_time_offset_s = float(reference_time_offset_s)
+    if (not math.isfinite(reference_time_offset_s)
+            or reference_time_offset_s < 0.0):
+        raise ValueError(
+            "reference_time_offset_s must be finite and non-negative, got "
+            f"{reference_time_offset_s}")
     goal_keypoints_world = None
 
     goal_root_valid = _state_bool_field(
@@ -686,7 +694,8 @@ def state_goal_from_reference(state_msg: Any,
                     f"{goal_type.value} goal requires controller timestamps_ns")
             remaining_seconds = max(
                 0.0,
-                (int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9,
+                (int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9
+                - reference_time_offset_s,
             )
         else:
             remaining_seconds = 0.0
@@ -931,6 +940,94 @@ def _residual_reanchor_real_state(
     return real_pos, real_rot, real_joint
 
 
+def _match_phase_from_predicted_joints(
+        pred_joint: torch.Tensor,
+        state_msg: Any,
+        device: str | torch.device,
+        min_phase_index: int = 0,
+        max_phase_index: int | None = None,
+        phase_match_block_size: int = 1,
+):
+    """Return the generated frame whose joint trajectory matches measured history."""
+    device = torch.device(device)
+    batch_size, num_frames = pred_joint.shape[:2]
+    block_size = int(phase_match_block_size)
+    if block_size <= 0:
+        raise ValueError(f"phase_match_block_size must be positive, got {block_size}")
+    measured = np.asarray(state_msg.states.g1_joint_pos, dtype=np.float32)
+    if measured.ndim < 2 or measured.shape[0] == 0:
+        raise ValueError("Phase matching requires at least one measured joint state")
+    block_size = min(block_size, num_frames, measured.shape[0])
+    measured_joint = torch.as_tensor(
+        isaaclab_to_mujoco_dof(measured[-block_size:]),
+        device=device, dtype=pred_joint.dtype).reshape(1, block_size, -1)
+    phase_error = torch.full(
+        (batch_size, num_frames), float("inf"), device=device,
+        dtype=pred_joint.dtype)
+    candidate_blocks = pred_joint.unfold(1, block_size, 1).permute(0, 1, 3, 2)
+    block_errors = (
+        candidate_blocks - measured_joint[:, None]
+    ).square().sum(dim=3).mean(dim=2)
+    phase_error[:, block_size - 1:] = block_errors
+    min_phase_index = int(min_phase_index)
+    if not 0 <= min_phase_index < num_frames:
+        raise ValueError(f"min_phase_index must address generated history, got {min_phase_index}")
+    phase_error[:, :min_phase_index] = float("inf")
+    if max_phase_index is not None:
+        max_phase_index = int(max_phase_index)
+        if not 0 <= max_phase_index < num_frames:
+            raise ValueError(
+                f"max_phase_index must address generated history, got {max_phase_index}")
+        phase_error[:, max_phase_index + 1:] = float("inf")
+    reverse_index = torch.flip(phase_error, dims=(1,)).argmin(dim=-1)
+    phase_index = num_frames - 1 - reverse_index
+    return phase_index, phase_error.gather(1, phase_index[:, None]).squeeze(1)
+
+
+def match_generated_history_phase(
+        history_motion: torch.Tensor,
+        abs_pose: dict,
+        state_msg: Any,
+        val_data: Any,
+        device: str | torch.device,
+        min_phase_index: int = 0,
+        max_phase_index: int | None = None,
+        phase_match_block_size: int = 1,
+):
+    """Find the generated state best suited for replacement by measured state."""
+    if hasattr(val_data, "reconstruct_motion"):
+        predicted = val_data.reconstruct_motion(
+            history_motion.to(device),
+            abs_pose={key: value.to(device) for key, value in abs_pose.items()},
+            ret_fk=False,
+        )
+    else:
+        predicted = motion_dtype.motion_feature_to_dict(
+            val_data.denormalize(history_motion.to(device)),
+            {key: value.to(device) for key, value in abs_pose.items()},
+        )
+    return _match_phase_from_predicted_joints(
+        predicted["dof"].to(device), state_msg, device,
+        min_phase_index=min_phase_index,
+        max_phase_index=max_phase_index,
+        phase_match_block_size=phase_match_block_size)
+
+
+def match_generated_joint_phase(
+        predicted_joints: torch.Tensor,
+        state_msg: Any,
+        device: str | torch.device,
+        min_phase_index: int = 0,
+        max_phase_index: int | None = None,
+        phase_match_block_size: int = 1):
+    """Match phase from already reconstructed cached joint positions."""
+    return _match_phase_from_predicted_joints(
+        predicted_joints.to(device), state_msg, device,
+        min_phase_index=min_phase_index,
+        max_phase_index=max_phase_index,
+        phase_match_block_size=phase_match_block_size)
+
+
 def residual_reanchor_generated_history(
         abs_pose: dict,
         history_motion: torch.Tensor,
@@ -939,6 +1036,10 @@ def residual_reanchor_generated_history(
         device: str | torch.device,
         joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
         correction: dict[str, torch.Tensor] | None = None,
+        max_phase_index: int | None = None,
+        min_phase_index: int = 0,
+        phase_match_block_size: int = 1,
+        phase_index_override: torch.Tensor | None = None,
 ):
     """Re-integrate predicted local increments from a measured state anchor."""
     if history_motion is None or val_data is None:
@@ -974,6 +1075,11 @@ def residual_reanchor_generated_history(
             f"but generated history has batch size {batch_size}")
     if num_frames <= 0:
         raise ValueError("Generated history must contain at least one feature")
+    phase_match_block_size = int(phase_match_block_size)
+    if phase_match_block_size <= 0:
+        raise ValueError(
+            "phase_match_block_size must be positive, got "
+            f"{phase_match_block_size}")
 
     real_pos, real_rot, real_joint = _residual_reanchor_real_state(
         state_msg, device, pred_pos.dtype)
@@ -1020,10 +1126,15 @@ def residual_reanchor_generated_history(
 
     real_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(real_rot))
     if correction is None:
-        joint_difference = pred_joint - real_joint[:, None]
-        phase_error = joint_difference.square().sum(dim=-1)
-        reverse_phase_index = torch.flip(phase_error, dims=(1,)).argmin(dim=-1)
-        phase_index = num_frames - 1 - reverse_phase_index
+        if phase_index_override is None:
+            phase_index, phase_error_value = _match_phase_from_predicted_joints(
+                pred_joint, state_msg, device, max_phase_index=max_phase_index,
+                min_phase_index=min_phase_index,
+                phase_match_block_size=phase_match_block_size)
+        else:
+            phase_index = phase_index_override.to(device=device).long()
+            phase_error_value = torch.zeros(
+                phase_index.shape, device=device, dtype=pred_joint.dtype)
         correction = {
             "real_pos": real_pos.detach().clone(),
             "real_joint": real_joint.detach().clone(),
@@ -1033,8 +1144,7 @@ def residual_reanchor_generated_history(
             # Earlier phase matches therefore have a negative signed offset.
             "phase_offset_frames": (
                 phase_index - (num_frames - 1)).detach().clone(),
-            "phase_error": phase_error.gather(
-                1, phase_index[:, None]).squeeze(1).detach().clone(),
+            "phase_error": phase_error_value.detach().clone(),
         }
     else:
         correction = {
@@ -1156,176 +1266,161 @@ def residual_reanchor_generated_history(
     )
 
 
-def apply_generated_history_alignment_correction(
-        abs_pose: dict,
-        correction: dict[str, torch.Tensor | None],
-        history_motion: torch.Tensor | None = None,
-        val_data: Any = None):
-    """Apply a previously computed alignment correction without re-anchoring.
+def residual_reanchor_generated_plan_at_frame(
+        plan: dict,
+        observed_frame: int,
+        target_frame: int,
+        history_len: int,
+        state_msg: Any,
+        val_data: Any,
+        device: str | torch.device,
+        joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
+        phase_match_block_size: int = 1,
+        phase_index: torch.Tensor | None = None,
+        min_phase_index: int = 0,
+):
+    """Re-anchor at an observed phase, then crop at the future switch frame.
 
-    This is used while the controller is still tracking an older plan.  The
-    correction is a fixed frame transform, so it can be applied to a newly
-    selected history window without comparing that window to the current
-    measured state again.
+    Phase candidates are restricted to public plan frames at or before
+    ``observed_frame``. The re-anchored predicted trend is integrated through
+    ``target_frame`` before the terminal history window is selected.
     """
-    from robotmdar.dtype.rotation import (
-        euler_angles_to_quaternion,
-        get_euler_xyz,
-        quat_apply,
-        quat_inverse,
-        quat_mul,
-    )
+    observed_frame = int(observed_frame)
+    target_frame = int(target_frame)
+    history_len = int(history_len)
+    if observed_frame < 0 or target_frame < observed_frame:
+        raise ValueError(
+            "Expected 0 <= observed_frame <= target_frame, got "
+            f"{observed_frame} and {target_frame}")
+    if history_len <= 0:
+        raise ValueError(f"history_len must be positive, got {history_len}")
 
-    device = (
-        history_motion.device
-        if history_motion is not None
-        else abs_pose["root_trans_offset"].device
-    )
-    source_abs_pos = abs_pose["root_trans_offset"].to(device)
-    source_abs_rot = abs_pose["root_rot"].to(device)
-    if source_abs_pos.ndim == 1:
-        source_abs_pos = source_abs_pos.unsqueeze(0)
-    if source_abs_rot.ndim == 1:
-        source_abs_rot = source_abs_rot.unsqueeze(0)
-    pose_rotation = correction["pose_rotation"].to(device)
-    pose_translation = correction["pose_translation"].to(device)
-    aligned_abs_pose = {
-        "root_trans_offset": (
-            quat_apply(
-                pose_rotation,
-                source_abs_pos,
-                w_last=True,
+    features = plan["features"]
+    segment_end = target_frame + history_len
+    if segment_end > features.shape[1]:
+        raise ValueError(
+            f"Target frame {target_frame} with history_len={history_len} "
+            f"exceeds cached feature length {features.shape[1]}")
+    if "input_abs_pose" not in plan:
+        raise ValueError("Residual re-anchoring requires cached input_abs_pose")
+
+    # Fast path: the selected H features plus their preceding absolute state
+    # contain the replacement phase. Re-anchoring this local H+1-state window
+    # is mathematically identical to re-anchoring the prefix and cropping it.
+    if phase_index is not None:
+        local_phase_index = phase_index.to(device=device).long() - target_frame
+        if bool(((local_phase_index >= 0)
+                 & (local_phase_index < history_len)).all()):
+            segment = features[:, target_frame:segment_end]
+            if motion_dtype.FeatureVersion == 6 and target_frame == 0:
+                segment_abs_pose = {
+                    key: value.detach().clone()
+                    for key, value in plan["input_abs_pose"].items()
+                }
+            else:
+                anchor_index = (
+                    target_frame - 1
+                    if motion_dtype.FeatureVersion == 6 else target_frame)
+                segment_abs_pose = {
+                    "root_trans_offset": plan["root_pos"][:, anchor_index],
+                    "root_rot": plan["root_rot"][:, anchor_index],
+                }
+            (
+                aligned_abs_pose,
+                aligned_segment,
+                correction,
+                _,
+                phase_error,
+            ) = residual_reanchor_generated_history(
+                segment_abs_pose,
+                segment,
+                state_msg,
+                val_data,
+                device,
+                joint_limits=joint_limits,
+                phase_match_block_size=phase_match_block_size,
+                phase_index_override=local_phase_index,
             )
-            + pose_translation
-        ),
-        "root_rot": quat_mul(
-            pose_rotation,
-            source_abs_rot,
-            w_last=True,
-        ),
+            if hasattr(val_data, "reconstruct_motion"):
+                aligned_motion = val_data.reconstruct_motion(
+                    aligned_segment, abs_pose=aligned_abs_pose, ret_fk=False)
+            else:
+                aligned_motion = motion_dtype.motion_feature_to_dict(
+                    val_data.denormalize(aligned_segment), aligned_abs_pose)
+            correction["phase_index"] = phase_index.detach().clone()
+            return (
+                aligned_segment,
+                aligned_abs_pose,
+                aligned_motion["root_trans_offset"][:, -1],
+                aligned_motion["root_rot"][:, -1],
+                correction,
+                phase_index,
+                phase_error,
+            )
+
+    segment = features[:, :segment_end]
+    segment_abs_pose = {
+        key: value.detach().clone()
+        for key, value in plan["input_abs_pose"].items()
     }
-
-    if history_motion is None or val_data is None:
-        return aligned_abs_pose, history_motion
-
-    raw = val_data.denormalize(history_motion.to(device)).clone()
-    batch_size, num_frames = raw.shape[:2]
-    if num_frames <= 0:
-        raise ValueError("Generated history must contain at least one feature")
-
-    if motion_dtype.FeatureVersion == 6:
-        height_delta = correction["feature_height_delta"]
-        gravity_rotation = correction["feature_gravity_rotation"]
-        if height_delta is None or gravity_rotation is None:
-            raise ValueError(
-                "FeatureVersion 6 alignment correction is missing its "
-                "height/gravity transform")
-        raw[..., 0] = raw[..., 0] + height_delta.to(
-            device=device, dtype=raw.dtype).reshape(-1, 1)
-        raw[..., 1:4] = torch.matmul(
-            gravity_rotation.to(device=device, dtype=raw.dtype)
-            .unsqueeze(1),
-            raw[..., 1:4].unsqueeze(-1),
-        ).squeeze(-1)
-        raw[..., 1:4] = F.normalize(
-            raw[..., 1:4], dim=-1, eps=1e-8)
-        return aligned_abs_pose, val_data.normalize(raw)
-
-    if motion_dtype.FeatureVersion != 3:
-        return aligned_abs_pose, history_motion
-
-    feature_rotation = correction["feature_rotation"].to(device)
-    feature_translation = correction["feature_translation"].to(device)
-
-    sin_roll = raw[..., 0]
-    cos_roll = raw[..., 1] + 1
-    sin_pitch = raw[..., 2]
-    cos_pitch = raw[..., 3] + 1
-    delta_yaw = raw[..., 4]
-
-    init_euler = get_euler_xyz(
-        source_abs_rot, w_last=True)
-    ref_yaw = init_euler[2]
-    yaw_old = torch.zeros(
-        batch_size, num_frames, device=device, dtype=raw.dtype)
-    yaw_old[:, 0] = ref_yaw
-    if num_frames > 1:
-        yaw_old[:, 1:] = (
-            torch.cumsum(delta_yaw[:, :num_frames - 1], dim=1)
-            + ref_yaw.reshape(-1, 1)
-        )
-
-    euler = torch.stack([sin_roll.atan2(cos_roll),
-                         sin_pitch.atan2(cos_pitch),
-                         yaw_old], dim=-1)
-    rot_orig = euler_angles_to_quaternion(euler)
-    rot_corrected = quat_mul(
-        feature_rotation.expand(batch_size * num_frames, 4),
-        rot_orig.reshape(-1, 4),
-        w_last=True,
-    ).reshape(batch_size, num_frames, 4)
-
-    roll_new, pitch_new, yaw_new = get_euler_xyz(
-        rot_corrected.reshape(-1, 4), w_last=True)
-    roll_new = roll_new.reshape(batch_size, num_frames)
-    pitch_new = pitch_new.reshape(batch_size, num_frames)
-    yaw_new = yaw_new.reshape(batch_size, num_frames)
-    raw[..., 0] = torch.sin(roll_new)
-    raw[..., 1] = torch.cos(roll_new) - 1
-    raw[..., 2] = torch.sin(pitch_new)
-    raw[..., 3] = torch.cos(pitch_new) - 1
-    if num_frames > 1:
-        raw[..., :num_frames - 1, 4] = (
-            yaw_new[:, 1:] - yaw_new[:, :-1])
-
-    delta_trans_local = raw[..., 7:10].clone()
-    yaw_quat_old = euler_angles_to_quaternion(
-        torch.stack([
-            torch.zeros_like(yaw_old),
-            torch.zeros_like(yaw_old),
-            yaw_old,
-        ], dim=-1),
+    # Cached pose H-1+k is public frame k. Restrict matching to k<=t while
+    # retaining the predicted suffix needed to roll forward through t+d.
+    max_phase_index = history_len - 1 + observed_frame
+    (
+        aligned_segment_abs_pose,
+        aligned_segment,
+        correction,
+        phase_index,
+        phase_error,
+    ) = residual_reanchor_generated_history(
+        segment_abs_pose,
+        segment,
+        state_msg,
+        val_data,
+        device,
+        joint_limits=joint_limits,
+        max_phase_index=max_phase_index,
+        phase_match_block_size=phase_match_block_size,
+        phase_index_override=phase_index,
+        min_phase_index=min_phase_index,
     )
-    world_disp = quat_apply(
-        yaw_quat_old[:, :-1].reshape(-1, 4),
-        delta_trans_local[:, :-1].reshape(-1, 3),
-        w_last=True,
-    ).reshape(batch_size, num_frames - 1, 3)
-    world_disp_corr = quat_apply(
-        feature_rotation.expand(batch_size * (num_frames - 1), 4),
-        world_disp.reshape(-1, 3),
-        w_last=True,
-    ).reshape(batch_size, num_frames - 1, 3)
-    yaw_quat_new = euler_angles_to_quaternion(
-        torch.stack([
-            torch.zeros_like(yaw_new),
-            torch.zeros_like(yaw_new),
-            yaw_new,
-        ], dim=-1),
-    )
-    delta_trans_new = quat_apply(
-        quat_inverse(yaw_quat_new[:, :-1], w_last=True).reshape(-1, 4),
-        world_disp_corr.reshape(-1, 3),
-        w_last=True,
-    ).reshape(batch_size, num_frames - 1, 3)
-    if num_frames > 1:
-        raw[..., :num_frames - 1, 7:10] = delta_trans_new
 
-    root_pos_old = torch.zeros(
-        batch_size, num_frames, 3, device=device, dtype=raw.dtype)
-    root_pos_old[:, 0] = source_abs_pos.to(dtype=raw.dtype)
-    if num_frames > 1:
-        root_pos_old[:, 1:] = (
-            torch.cumsum(world_disp, dim=1) + root_pos_old[:, :1]
+    if hasattr(val_data, "reconstruct_motion"):
+        aligned_motion = val_data.reconstruct_motion(
+            aligned_segment,
+            abs_pose=aligned_segment_abs_pose,
+            ret_fk=False,
         )
-    root_pos_old[..., 2] = raw[..., 10]
-    root_pos_corrected = quat_apply(
-        feature_rotation.unsqueeze(1).expand(batch_size, num_frames, 4),
-        root_pos_old,
-        w_last=True,
-    ) + feature_translation.unsqueeze(1)
-    raw[..., 10] = root_pos_corrected[..., 2]
-    return aligned_abs_pose, val_data.normalize(raw)
+    else:
+        aligned_motion = motion_dtype.motion_feature_to_dict(
+            val_data.denormalize(aligned_segment), aligned_segment_abs_pose)
+
+    history = aligned_segment[:, target_frame:segment_end]
+    if motion_dtype.FeatureVersion == 6 and target_frame == 0:
+        abs_pose = {
+            key: value.detach().clone()
+            for key, value in aligned_segment_abs_pose.items()
+        }
+    else:
+        anchor_index = (
+            target_frame - 1
+            if motion_dtype.FeatureVersion == 6 else target_frame
+        )
+        abs_pose = {
+            "root_trans_offset": aligned_motion["root_trans_offset"][
+                :, anchor_index],
+            "root_rot": aligned_motion["root_rot"][:, anchor_index],
+        }
+    endpoint_index = segment_end - 1
+    return (
+        history,
+        abs_pose,
+        aligned_motion["root_trans_offset"][:, endpoint_index],
+        aligned_motion["root_rot"][:, endpoint_index],
+        correction,
+        phase_index,
+        phase_error,
+    )
 
 
 def align_generated_history_pose(abs_pose: dict,
@@ -1334,16 +1429,13 @@ def align_generated_history_pose(abs_pose: dict,
                                  state_msg: Any,
                                  device: str | torch.device,
                                  history_motion: torch.Tensor | None = None,
-                                 val_data: Any = None,
-                                 return_correction: bool = False):
+                                 val_data: Any = None):
     """Translate and rotate generated history so its reference pose matches the real G1 root.
 
     When *history_motion* and *val_data* are provided, version-specific
     absolute pose channels are also corrected so every reconstructed frame
     carries the current G1 seam state.
 
-    If *return_correction* is true, append the fixed correction transform to
-    the return tuple so later replans can inherit it without re-anchoring.
     """
     from robotmdar.dtype.rotation import (
         euler_angles_to_quaternion,
@@ -1612,34 +1704,6 @@ def align_generated_history_pose(abs_pose: dict,
 
         aligned_history_motion = val_data.normalize(raw)
 
-    pose_rotation = quat_mul(
-        aligned_abs_pose["root_rot"].to(device),
-        quat_inverse(abs_pose["root_rot"].to(device), w_last=True),
-        w_last=True,
-    )
-    pose_translation = (
-        aligned_abs_pose["root_trans_offset"].to(device)
-        - quat_apply(
-            pose_rotation,
-            abs_pose["root_trans_offset"].to(device),
-            w_last=True,
-        )
-    )
-    correction = {
-        "pose_rotation": pose_rotation.detach().clone(),
-        "pose_translation": pose_translation.detach().clone(),
-        "feature_rotation": q_delta.detach().clone(),
-        "feature_translation": feature_translation.detach().clone(),
-        "feature_height_delta": (
-            feature_height_delta.detach().clone()
-            if feature_height_delta is not None else None
-        ),
-        "feature_gravity_rotation": (
-            feature_gravity_rotation.detach().clone()
-            if feature_gravity_rotation is not None else None
-        ),
-    }
-
     # Goal reference pose is the *real* G1 pose so ego-goal is computed
     # relative to where the robot actually is.
     result = (
@@ -1649,18 +1713,21 @@ def align_generated_history_pose(abs_pose: dict,
         real_current_pos - generated_reference_pos,  # translation
         aligned_history_motion,
     )
-    if return_correction:
-        return result + (correction,)
     return result
 
 
 def tracked_frame_from_timestamps(state_msg: Any, fps: float,
-                                  future_len: int) -> int:
-    """Resolve the active plan frame from controller-owned timestamps."""
+                                  future_len: int, *,
+                                  latency_ms: float = 0.0) -> int:
+    """Resolve the active plan frame, optionally projected past inference."""
     if fps <= 0:
         raise ValueError(f"Motion fps must be positive, got {fps}")
     if future_len <= 0:
         raise ValueError(f"future_len must be positive, got {future_len}")
+    latency_ms = float(latency_ms)
+    if not math.isfinite(latency_ms) or latency_ms < 0.0:
+        raise ValueError(
+            f"latency_ms must be finite and non-negative, got {latency_ms}")
     start_t_ns = int(state_msg.tracking.start_t_ns)
     state_t_ns = int(state_msg.history_meta.publish_t_ns)
     if start_t_ns <= 0:
@@ -1668,19 +1735,14 @@ def tracked_frame_from_timestamps(state_msg: Any, fps: float,
     if state_t_ns < start_t_ns:
         raise ValueError(
             f"State timestamp {state_t_ns} precedes plan start {start_t_ns}")
-    elapsed_frames = round((state_t_ns - start_t_ns) * fps / 1e9)
+    projected_state_t_ns = state_t_ns + round(latency_ms * 1e6)
+    elapsed_frames = round((projected_state_t_ns - start_t_ns) * fps / 1e9)
     return min(int(elapsed_frames), future_len - 1)
 
 
 def generated_history_at_frame(plan: dict, tracked_frame: int,
-                               history_len: int, *,
-                               phase_lag_offset: int = 0):
-    """Select history at a tracked frame, compensating for tracker phase lag.
-
-    ``phase_lag_offset`` shifts the selected generated frame earlier in the
-    plan, so a measured state at ``tracked_frame`` is compared with the
-    predicted state at ``tracked_frame - phase_lag_offset``.
-    """
+                               history_len: int):
+    """Select the generated history ending at a public controller frame."""
     features = plan["features"]
     root_pos = plan["root_pos"]
     root_rot = plan["root_rot"]
@@ -1688,34 +1750,41 @@ def generated_history_at_frame(plan: dict, tracked_frame: int,
         raise ValueError(f"history_len must be positive, got {history_len}")
     if tracked_frame < 0:
         raise ValueError(f"tracked_frame must be non-negative, got {tracked_frame}")
-    phase_lag_offset = int(phase_lag_offset)
-    if phase_lag_offset < 0:
-        raise ValueError(
-            f"phase_lag_offset must be non-negative, got {phase_lag_offset}")
-    selected_frame = max(0, tracked_frame - phase_lag_offset)
-    feature_end = history_len + selected_frame
-    feature_start = feature_end - history_len + 1
+    # The controller holds the final reference frame after the cached plan
+    # ends, so latency projection saturates rather than failing at the edge.
+    max_public_frame = features.shape[1] - history_len - 1
+    selected_frame = min(max(0, tracked_frame), max_public_frame)
+    # Published frame 0 is cached pose history_len - 1 because the planner
+    # retains the terminal history pose as the exact seam. Therefore published
+    # frame f ends at cached feature/pose history_len - 1 + f.
+    feature_start = selected_frame
+    feature_end = feature_start + history_len - 1
     if feature_end >= features.shape[1]:
-        raise ValueError(
-            f"Selected frame {selected_frame} exceeds cached plan with "
-            f"{features.shape[1] - history_len} future frames")
+        raise ValueError("Cached plan does not cover the selected history")
     if root_pos.shape[1] <= feature_end or root_rot.shape[1] <= feature_end:
         raise ValueError("Cached plan poses do not cover the selected history")
     history = features[:, feature_start:feature_end + 1]
     if history.shape[1] != history_len:
         raise ValueError(
             f"Selected {history.shape[1]} history frames, expected {history_len}")
-    anchor_index = (
-        feature_start - 1 if motion_dtype.FeatureVersion == 6 else feature_start
-    )
-    if anchor_index < 0:
-        raise ValueError(
-            "FeatureVersion 6 generated history requires cached pose before "
-            f"feature_start={feature_start}")
-    abs_pose = {
-        "root_trans_offset": root_pos[:, anchor_index],
-        "root_rot": root_rot[:, anchor_index],
-    }
+    if motion_dtype.FeatureVersion == 6 and feature_start == 0:
+        if "input_abs_pose" not in plan:
+            raise ValueError(
+                "FeatureVersion 6 generated history at frame 0 requires the "
+                "cached input_abs_pose before feature 0")
+        abs_pose = {
+            key: value.detach().clone()
+            for key, value in plan["input_abs_pose"].items()
+        }
+    else:
+        anchor_index = (
+            feature_start - 1
+            if motion_dtype.FeatureVersion == 6 else feature_start
+        )
+        abs_pose = {
+            "root_trans_offset": root_pos[:, anchor_index],
+            "root_rot": root_rot[:, anchor_index],
+        }
     return history, abs_pose, root_pos[:, feature_end], root_rot[:, feature_end]
 
 
@@ -1756,13 +1825,26 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
             raise ValueError(f"Planner supports batch size 1, got {key} {value.shape}")
         return value[0].detach().cpu().numpy()
 
-    dof_pos = np.asarray(batch_numpy("dof_pos"), dtype=np.float32)
-    body_pos = np.asarray(
-        batch_numpy("global_translation_extend"), dtype=np.float32)
-    body_ori_xyzw = np.asarray(
-        batch_numpy("global_rotation_extend"), dtype=np.float32)
-    if not (len(dof_pos) == len(body_pos) == len(body_ori_xyzw)):
-        raise ValueError("Reconstructed motion arrays have different frame counts")
+    g1_fields = getattr(G1MotionData, "model_fields", {})
+    supports_root_payload = (
+        "root_pos" in g1_fields and "root_ori" in g1_fields)
+    has_direct_root = (
+        supports_root_payload
+        and "root_trans_offset" in motion_dict
+        and "root_rot" in motion_dict
+    )
+    dof_key = "dof_pos" if "dof_pos" in motion_dict else "dof"
+    dof_pos = np.asarray(batch_numpy(dof_key), dtype=np.float32)
+    body_pos = None
+    body_ori_xyzw = None
+    if include_body or not has_direct_root:
+        body_pos = np.asarray(
+            batch_numpy("global_translation_extend"), dtype=np.float32)
+        body_ori_xyzw = np.asarray(
+            batch_numpy("global_rotation_extend"), dtype=np.float32)
+        if not (len(dof_pos) == len(body_pos) == len(body_ori_xyzw)):
+            raise ValueError(
+                "Reconstructed motion arrays have different frame counts")
     if skip_history < 0 or skip_history >= len(dof_pos):
         raise ValueError(
             f"skip_history must be in [0, {len(dof_pos) - 1}], got {skip_history}")
@@ -1788,12 +1870,15 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
         joint_pos[:, _WRIST_ISAACLAB_INDICES] = locked_joint_pos[
             _WRIST_ISAACLAB_INDICES]
         joint_vel[:, _WRIST_ISAACLAB_INDICES] = 0.0
-    root_pos = np.ascontiguousarray(body_pos[skip_history:, 0, :])
-    root_ori = np.ascontiguousarray(
-        body_ori_xyzw[skip_history:, 0, :][..., [3, 0, 1, 2]])
-    g1_fields = getattr(G1MotionData, "model_fields", {})
-    supports_root_payload = (
-        "root_pos" in g1_fields and "root_ori" in g1_fields)
+    if has_direct_root:
+        root_pos = np.ascontiguousarray(
+            batch_numpy("root_trans_offset")[skip_history:])
+        root_ori = np.ascontiguousarray(
+            batch_numpy("root_rot")[skip_history:][..., [3, 0, 1, 2]])
+    else:
+        root_pos = np.ascontiguousarray(body_pos[skip_history:, 0, :])
+        root_ori = np.ascontiguousarray(
+            body_ori_xyzw[skip_history:, 0, :][..., [3, 0, 1, 2]])
     body_pos_packet = None
     body_ori_packet = None
     if include_body or not supports_root_payload:
