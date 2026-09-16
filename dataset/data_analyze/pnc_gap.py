@@ -1,800 +1,697 @@
 import numpy as np
 import matplotlib.pyplot as plt
-
 from matplotlib.patches import FancyArrowPatch
-from matplotlib.lines import Line2D
-
 
 # ============================================================
-# Global style
+# Style
 # ============================================================
+try:
+    import scienceplots
+    plt.style.use(["science", "no-latex"])
+except ImportError:
+    pass
+
 plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 11,
-    "axes.labelsize": 12,
-    "axes.titlesize": 13,
-    "legend.fontsize": 10,
-    "mathtext.fontset": "stix",
-    "axes.linewidth": 1.0,
+    "font.size": 13,
+    "axes.labelsize": 14,
+    "legend.fontsize": 9.5,
+    "axes.linewidth": 1.1,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
 })
-
-# Explicitly keep the same semantic colors as your original figure
-C_REF = "#2ca02c"       # planner/reference
-C_EXEC = "#2878B5"      # SONIC execution
-C_PHASE = "#8a8a8a"     # phase-aligned reference
-C_NEW = "#D62728"       # newly replanned chunk
-C_OLD = "#202020"       # currently executing old chunk
-C_AUX = "#777777"
-
 
 # ============================================================
 # Helpers
 # ============================================================
-def smoothstep(x):
-    """0 -> 1 smooth transition."""
-    x = np.clip(x, 0.0, 1.0)
-    return x * x * (3.0 - 2.0 * x)
-
-
-def ref_motion(t):
+def hermite_segment(t, t0, t1, y0, y1, m0, m1):
     """
-    Abstract planner/reference state.
-    It is intentionally smooth but nontrivial so phase lag is visible.
+    Cubic Hermite interpolation.
+    Guarantees value and tangent continuity at both endpoints.
     """
+    s = (t - t0) / (t1 - t0)
+
+    h00 = 2 * s**3 - 3 * s**2 + 1
+    h10 = s**3 - 2 * s**2 + s
+    h01 = -2 * s**3 + 3 * s**2
+    h11 = s**3 - s**2
+
     return (
-        0.15 * t
-        + 0.48 * np.sin(0.92 * t)
-        + 0.10 * np.sin(1.90 * t + 0.35)
+        h00 * y0
+        + h10 * (t1 - t0) * m0
+        + h01 * y1
+        + h11 * (t1 - t0) * m1
     )
 
 
-def interp(tq, t, y):
-    return np.interp(tq, t, y)
+def smooth_step(x, x0, sharpness=6.0):
+    return 1.0 / (1.0 + np.exp(-(x - x0) * sharpness))
 
 
-def double_arrow(ax, xy1, xy2, color, lw=1.4, ms=11, zorder=8):
-    patch = FancyArrowPatch(
-        xy1, xy2,
-        arrowstyle="<->",
-        mutation_scale=ms,
-        linewidth=lw,
-        color=color,
-        zorder=zorder
+# ============================================================
+# Timeline
+# ============================================================
+t = np.linspace(0.0, 6.25, 1600)
+
+t_start = 3.20
+delay = 1.02
+t_finish = t_start + delay
+
+# ============================================================
+# Old reference
+# ============================================================
+def old_reference_base(t):
+    return (
+        0.14
+        + 0.93 * np.exp(-0.5 * ((t - 2.05) / 0.90) ** 2)
+        - 0.95 / (1.0 + np.exp(-(t - 3.28) * 5.0))
+        - 0.085 * np.maximum(t - 4.0, 0.0)
     )
-    ax.add_patch(patch)
-    return patch
 
+
+# Lift the right side slightly for a compact conceptual figure.
+tail_lift = 0.34 * smooth_step(t, 3.35, sharpness=4.0)
+y_old = old_reference_base(t) + tail_lift
 
 # ============================================================
-# Construct synthetic planner / execution signals
+# Realized execution before handoff
 # ============================================================
-t = np.linspace(0.0, 12.0, 1201)
-dt = t[1] - t[0]
 
-ref = ref_motion(t)
-
-# ------------------------------------------------------------
-# 1) Execution phase lag
-#
-# Initially ~0.
-# Then gradually grows to ~0.65 s.
-# This is NOT inference latency: it represents physical
-# controller / robot motion phase lag.
-# ------------------------------------------------------------
-tau_max = 0.65
-tau = tau_max * smoothstep((t - 2.7) / 2.0)
-
-t_phase = np.clip(t - tau, 0.0, t[-1])
-phase_aligned_ref = ref_motion(t_phase)
-
-
-# ------------------------------------------------------------
-# 2) Bounded tracking deviation
-#
-# IMPORTANT:
-# This oscillates around the phase-aligned reference, so execution
-# can be either above or below reference.
-# ------------------------------------------------------------
+# Tracking mismatch deliberately exaggerated for visualization.
 tracking_error = (
-    0.055 * np.sin(5.0 * t + 0.4)
-    + 0.020 * np.sin(8.2 * t - 0.7)
+    -0.19 * np.exp(-0.5 * ((t - 1.70) / 0.42) ** 2)
+    + 0.07 * np.exp(-0.5 * ((t - 2.42) / 0.30) ** 2)
 )
 
+# Accumulated spatial drift.
+spatial_drift = -0.045 * np.maximum(t - 1.05, 0.0)
 
-# ------------------------------------------------------------
-# 3) Spatial drift
-#
-# Small initially, then accumulates.
-# Think of this as global XY / heading drift that SONIC's local
-# joint tracking cannot fully eliminate.
-# ------------------------------------------------------------
-drift_start = 5.8
-drift_progress = np.maximum(t - drift_start, 0.0)
-
-spatial_drift = -0.038 * drift_progress**1.45
-
-
-# ------------------------------------------------------------
-# Optional disturbance:
-# makes the realized history visibly more "physical" / off-manifold.
-# ------------------------------------------------------------
-disturbance = -0.20 * np.exp(
-    -0.5 * ((t - 7.35) / 0.16) ** 2
+# Localized external perturbation.
+t_pert = 2.68
+perturbation = (
+    0.115
+    * np.sin(27.0 * (t - t_pert))
+    * np.exp(-0.5 * ((t - t_pert) / 0.16) ** 2)
 )
 
+# Additional deviation close to replanning.
+disturbance_offset = (
+    -0.10
+    * np.exp(-0.5 * ((t - 3.10) / 0.14) ** 2)
+)
 
-# Full realized execution
-execution = (
-    phase_aligned_ref
+y_exec_base = (
+    y_old
     + tracking_error
     + spatial_drift
-    + disturbance
+    + perturbation
+    + disturbance_offset
 )
 
-
 # ============================================================
-# Inference / replanning timing
-# ============================================================
-t_infer_start = 7.55
-t_infer_finish = 9.05
-
-i_start = np.argmin(np.abs(t - t_infer_start))
-i_finish = np.argmin(np.abs(t - t_infer_finish))
-
-y_exec_start = execution[i_start]
-y_exec_finish = execution[i_finish]
-
-y_ref_finish = ref[i_finish]
-
-
-# ============================================================
-# Construct a newly generated chunk
+# New reference
 #
-# It is conditioned on the state sampled at inference start.
-# Conceptually it exists from t_infer_start onward, but becomes
-# available only at t_infer_finish.
+# Starts from the realized state and matches its tangent.
+# ============================================================
+y_exec_start = np.interp(t_start, t, y_exec_base)
+
+dy_exec_base = np.gradient(y_exec_base, t)
+m_exec_start = np.interp(t_start, t, dy_exec_base)
+
+y_new = np.full_like(t, np.nan)
+
+# First segment
+t_mid = t_start + 0.92
+
+mask_new_1 = (
+    (t >= t_start)
+    & (t <= t_mid)
+)
+
+y_mid = y_exec_start - 0.08
+m_mid = -0.055
+
+y_new[mask_new_1] = hermite_segment(
+    t[mask_new_1],
+    t_start,
+    t_mid,
+    y_exec_start,
+    y_mid,
+    m_exec_start,
+    m_mid,
+)
+
+# Second segment
+t_end = 6.05
+
+mask_new_2 = (
+    (t > t_mid)
+    & (t <= t_end)
+)
+
+y_end = -0.38
+m_end = -0.025
+
+y_new[mask_new_2] = hermite_segment(
+    t[mask_new_2],
+    t_mid,
+    t_end,
+    y_mid,
+    y_end,
+    m_mid,
+    m_end,
+)
+
+valid_new = np.isfinite(y_new)
+
+# ============================================================
+# Boundary values
+# ============================================================
+y_old_finish = np.interp(
+    t_finish,
+    t,
+    y_old,
+)
+
+y_new_finish = np.interp(
+    t_finish,
+    t[valid_new],
+    y_new[valid_new],
+)
+
+# ============================================================
+# Physical response after inference finishes
 #
-# We deliberately make it a different but individually smooth
-# continuation so that switching to it at inference finish produces
-# a replanning seam.
+# IMPORTANT:
+# no discontinuity in execution itself.
+#
+# u = 0 exactly at t_finish.
+# Both the pulse and jitter start from zero smoothly.
 # ============================================================
-mask_new = t >= t_infer_start
-t_new = t[mask_new]
-u = t_new - t_infer_start
-
-# estimate local velocity at inference start
-exec_vel = np.gradient(execution, t)
-v0 = exec_vel[i_start]
-
-new_plan = (
-    y_exec_start
-    + 0.55 * v0 * u
-    - 0.075 * u
-    - 0.34 * (
-        np.sin(0.86 * u + 0.20) - np.sin(0.20)
-    )
-)
-
-mask_unavailable = (
-    (t_new >= t_infer_start)
-    & (t_new < t_infer_finish)
-)
-mask_available = t_new >= t_infer_finish
-
-y_new_finish = interp(
-    t_infer_finish,
-    t_new,
-    new_plan
-)
-
-
-# ============================================================
-# Plot
-# ============================================================
-fig, ax = plt.subplots(figsize=(15.5, 7.2))
-
+u = np.maximum(t - t_finish, 0.0)
 
 # ------------------------------------------------------------
-# Main reference and execution
+# Smooth upward response
+#
+# u^2 exp(-u/tau) starts with:
+#   value      = 0
+#   derivative = 0
+#
+# Therefore execution remains smooth at the handoff.
 # ------------------------------------------------------------
+tau_impact = 0.13
+
+raw_impact = (
+    (u / tau_impact) ** 2
+    * np.exp(-u / tau_impact)
+)
+
+# Normalize peak to 1.
+raw_peak = np.max(raw_impact)
+if raw_peak > 0:
+    raw_impact = raw_impact / raw_peak
+
+smooth_impact = 0.16 * raw_impact
+
+# ------------------------------------------------------------
+# Damped jitter
+#
+# The rise envelope ensures jitter also starts smoothly.
+# ------------------------------------------------------------
+jitter_rise = (
+    1.0
+    - np.exp(-u / 0.10)
+)
+
+jitter_decay = np.exp(-u / 0.85)
+
+smooth_jitter = (
+    0.045
+    * np.sin(19.0 * u)
+    * jitter_rise
+    * jitter_decay
+)
+
+# Final physical execution.
+y_exec = (
+    y_exec_base
+    + smooth_impact
+    + smooth_jitter
+)
+
+# ============================================================
+# Tracking Gap annotation
+# ============================================================
+t_track = 1.72
+
+y_old_track = np.interp(
+    t_track,
+    t,
+    y_old,
+)
+
+y_exec_track = np.interp(
+    t_track,
+    t,
+    y_exec,
+)
+
+track_mid = 0.5 * (
+    y_old_track
+    + y_exec_track
+)
+
+actual_half_gap = (
+    0.5
+    * abs(y_old_track - y_exec_track)
+)
+
+# Exaggerated for schematic readability.
+visual_half_gap = max(
+    actual_half_gap * 1.35,
+    0.075,
+)
+
+track_top = (
+    track_mid
+    + visual_half_gap
+)
+
+track_bottom = (
+    track_mid
+    - visual_half_gap
+)
+
+# ============================================================
+# Colors
+# ============================================================
+c_old = "#4472C4"
+c_exec = "#222222"
+c_new = "#C55A11"
+
+c_tracking = "#7A5195"
+c_distribution = "#4E8B8B"
+c_delay = "#B23A48"
+c_boundary = "#D62728"
+c_gray = "#555555"
+
+# ============================================================
+# Figure
+# ============================================================
+fig, ax = plt.subplots(
+    figsize=(7.15, 4.9)
+)
+
+# ============================================================
+# Old reference
+#
+# Becomes faded once the new reference becomes available.
+# ============================================================
+mask_old_active = t <= t_finish
+mask_old_inactive = t >= t_finish
+
 ax.plot(
-    t, ref,
-    linestyle="--",
-    linewidth=2.7,
-    color=C_REF,
-    label="Planner prediction / reference",
-    zorder=3
-)
-
-ax.plot(
-    t, execution,
-    linewidth=2.8,
-    color=C_EXEC,
-    label="Realized execution / SONIC",
-    zorder=4
-)
-
-
-# ------------------------------------------------------------
-# Phase-aligned reference:
-#
-# This answers:
-#   "Which older planner state does the current execution correspond to?"
-# ------------------------------------------------------------
-phase_show = (t >= 2.6) & (t <= 8.5)
-
-ax.plot(
-    t[phase_show],
-    phase_aligned_ref[phase_show],
-    linestyle=(0, (2, 2)),
-    linewidth=1.8,
-    color=C_PHASE,
-    alpha=0.85,
-    zorder=2
-)
-
-
-# ============================================================
-# (1) TRACKING DEVIATION
-# execution alternates around reference
-# ============================================================
-tracking_times = [0.85, 1.25, 1.65, 2.05, 2.38]
-
-for tt in tracking_times:
-    yr = interp(tt, t, ref)
-    ye = interp(tt, t, execution)
-
-    double_arrow(
-        ax,
-        (tt, yr),
-        (tt, ye),
-        color=C_AUX,
-        lw=1.05,
-        ms=8
-    )
-
-ax.text(
-    0.55, 1.42,
-    "(1) Tracking deviation",
-    fontweight="bold",
-    fontsize=12.5
-)
-
-ax.text(
-    0.55, 1.22,
-    "bounded local error\noscillates around reference",
-    fontsize=10.5,
-    color=C_AUX
-)
-
-
-# ============================================================
-# (2) EXECUTION PHASE LAG
-#
-# Detect one characteristic peak in reference and the corresponding
-# later peak in execution.
-# ============================================================
-
-# Find reference peak in a controlled interval
-mask_peak_ref = (t >= 3.1) & (t <= 4.8)
-idx_r_local = np.argmax(ref[mask_peak_ref])
-idx_r = np.where(mask_peak_ref)[0][idx_r_local]
-
-t_peak_ref = t[idx_r]
-y_peak_ref = ref[idx_r]
-
-# Find execution peak later
-mask_peak_exec = (
-    (t >= t_peak_ref + 0.20)
-    & (t <= t_peak_ref + 1.15)
-)
-idx_e_local = np.argmax(execution[mask_peak_exec])
-idx_e = np.where(mask_peak_exec)[0][idx_e_local]
-
-t_peak_exec = t[idx_e]
-y_peak_exec = execution[idx_e]
-
-y_lag_arrow = max(y_peak_ref, y_peak_exec) + 0.30
-
-ax.vlines(
-    [t_peak_ref, t_peak_exec],
-    ymin=[y_peak_ref, y_peak_exec],
-    ymax=y_lag_arrow,
-    linestyles=":",
-    linewidth=1.2,
-    color=C_AUX
-)
-
-double_arrow(
-    ax,
-    (t_peak_ref, y_lag_arrow),
-    (t_peak_exec, y_lag_arrow),
-    color=C_AUX,
-    lw=1.3,
-    ms=10
-)
-
-ax.text(
-    0.5 * (t_peak_ref + t_peak_exec),
-    y_lag_arrow + 0.08,
-    r"(2) execution phase lag $\tau$",
-    ha="center",
-    fontsize=11.5,
-    fontweight="bold"
-)
-
-ax.scatter(
-    [t_peak_ref],
-    [y_peak_ref],
-    s=48,
-    color=C_REF,
-    zorder=8
-)
-
-ax.scatter(
-    [t_peak_exec],
-    [y_peak_exec],
-    s=48,
-    color=C_EXEC,
-    zorder=8
-)
-
-
-# ============================================================
-# Spatial drift annotation
-#
-# Compare execution to phase-aligned reference.
-# This removes the pure phase-lag component first.
-# ============================================================
-drift_times = [6.15, 6.75, 7.30]
-
-for tt in drift_times:
-    yp = interp(tt, t, phase_aligned_ref)
-    ye = interp(tt, t, execution)
-
-    double_arrow(
-        ax,
-        (tt, yp),
-        (tt, ye),
-        color=C_AUX,
-        lw=1.0,
-        ms=8
-    )
-
-ax.text(
-    6.02, -0.13,
-    "phase-aligned physical residual",
-    color=C_AUX,
-    fontsize=9.8,
-    rotation=-8
-)
-
-ax.annotate(
-    "global spatial drift accumulates",
-    xy=(7.05, interp(7.05, t, execution)),
-    xytext=(5.65, -0.82),
-    fontsize=10.5,
-    color=C_EXEC,
-    arrowprops=dict(
-        arrowstyle="->",
-        lw=1.1,
-        color=C_EXEC
-    )
-)
-
-
-# ============================================================
-# (3) EXECUTION-FEEDBACK DISTRIBUTION SHIFT
-#
-# Highlight a recent raw realized-history segment that would be
-# directly fed to an autoregressive planner by a naive method.
-# ============================================================
-feedback_window_start = t_infer_start - 0.75
-
-feedback_mask = (
-    (t >= feedback_window_start)
-    & (t <= t_infer_start)
-)
-
-# Emphasize the raw realized history with dots
-idx_fb = np.where(feedback_mask)[0][::12]
-
-ax.scatter(
-    t[idx_fb],
-    execution[idx_fb],
-    s=28,
-    facecolor="white",
-    edgecolor=C_EXEC,
-    linewidth=1.3,
-    zorder=8
-)
-
-# horizontal bracket beneath the raw history
-y_feedback_bracket = min(execution[feedback_mask]) - 0.32
-
-ax.annotate(
-    "",
-    xy=(feedback_window_start, y_feedback_bracket),
-    xytext=(t_infer_start, y_feedback_bracket),
-    arrowprops=dict(
-        arrowstyle="|-|",
-        lw=1.3,
-        color=C_AUX
-    )
-)
-
-ax.text(
-    0.5 * (feedback_window_start + t_infer_start),
-    y_feedback_bracket - 0.10,
-    "(3) raw realized history",
-    ha="center",
-    va="top",
-    fontsize=10.8,
-    fontweight="bold"
-)
-
-ax.text(
-    0.5 * (feedback_window_start + t_infer_start),
-    y_feedback_bracket - 0.29,
-    "dynamics / disturbance $\\rightarrow$ distribution shift",
-    ha="center",
-    va="top",
-    fontsize=9.8,
-    color=C_AUX
-)
-
-
-# ============================================================
-# (4) INFERENCE STALENESS
-#
-# Closely follows the conceptual structure of real-time action
-# chunking:
-#
-# t_start: observation sampled
-# [start, finish]: old chunk keeps running
-# t_finish: new chunk becomes available
-# ============================================================
-
-# Current old chunk during inference
-old_mask = (
-    (t >= t_infer_start)
-    & (t <= t_infer_finish)
+    t[mask_old_active],
+    y_old[mask_old_active],
+    linestyle=(0, (6, 4)),
+    linewidth=2.25,
+    color=c_old,
+    label=r"old reference $r^{\mathrm{old}}$",
+    zorder=3,
 )
 
 ax.plot(
-    t[old_mask],
-    ref[old_mask],
-    color=C_OLD,
-    linewidth=3.2,
-    zorder=6
+    t[mask_old_inactive],
+    y_old[mask_old_inactive],
+    linestyle=(0, (6, 4)),
+    linewidth=2.15,
+    color=c_old,
+    alpha=0.23,
+    zorder=1,
 )
 
+# ============================================================
+# Realized execution
+#
+# Clear before inference starts, faded afterwards.
+# ============================================================
+mask_exec_before = t <= t_start
+mask_exec_after = t >= t_start
 
+ax.plot(
+    t[mask_exec_before],
+    y_exec[mask_exec_before],
+    linewidth=2.55,
+    color=c_exec,
+    label=r"realized execution $x^{\mathrm{exec}}$",
+    zorder=5,
+)
+
+ax.plot(
+    t[mask_exec_after],
+    y_exec[mask_exec_after],
+    linewidth=2.35,
+    color=c_exec,
+    alpha=0.23,
+    zorder=2,
+)
+
+# ============================================================
+# New reference
+#
+# Transparent while being generated,
+# opaque after inference finishes.
+# ============================================================
+mask_new_generating = (
+    (t >= t_start)
+    & (t < t_finish)
+    & valid_new
+)
+
+mask_new_active = (
+    (t >= t_finish)
+    & valid_new
+)
+
+ax.plot(
+    t[mask_new_generating],
+    y_new[mask_new_generating],
+    linestyle=(0, (5, 3)),
+    linewidth=2.1,
+    color=c_new,
+    alpha=0.32,
+    zorder=4,
+)
+
+ax.plot(
+    t[mask_new_active],
+    y_new[mask_new_active],
+    linestyle=(0, (5, 3)),
+    linewidth=2.4,
+    color=c_new,
+    label=r"new reference $r^{\mathrm{new}}$",
+    zorder=6,
+)
+
+# ============================================================
 # Inference start / finish markers
-y_top = 2.25
-y_bottom = -1.42
-
-ax.vlines(
-    t_infer_start,
-    ymin=y_bottom + 0.25,
-    ymax=y_top - 0.12,
-    linestyles=(0, (4, 3)),
-    linewidth=1.25,
-    color=C_AUX
+# ============================================================
+ax.axvline(
+    t_start,
+    ymin=0.08,
+    ymax=0.94,
+    color="0.30",
+    linestyle=(0, (2, 4)),
+    linewidth=1.15,
 )
 
-ax.vlines(
-    t_infer_finish,
-    ymin=y_bottom + 0.25,
-    ymax=y_top - 0.12,
-    linestyles=(0, (4, 3)),
-    linewidth=1.25,
-    color=C_AUX
+ax.axvline(
+    t_finish,
+    ymin=0.08,
+    ymax=0.84,
+    color="0.30",              # black/gray like inference starts
+    linestyle=(0, (2, 4)),
+    linewidth=1.15,
 )
 
 ax.text(
-    t_infer_start,
-    y_top,
+    t_start,
+    1.245,
     "inference starts",
     ha="center",
     va="bottom",
-    fontweight="bold"
+    fontsize=13.0,
+    color="black",
 )
 
 ax.text(
-    t_infer_finish,
-    y_top,
+    t_finish,
+    1.00,
     "inference finishes",
     ha="center",
     va="bottom",
-    fontweight="bold"
+    fontsize=11.8,
+    color="black",
 )
-
-# inference-delay arrow
-y_delay = y_top - 0.29
-
-double_arrow(
-    ax,
-    (t_infer_start, y_delay),
-    (t_infer_finish, y_delay),
-    color=C_AUX,
-    lw=1.3,
-    ms=10
-)
-
-ax.text(
-    0.5 * (t_infer_start + t_infer_finish),
-    y_delay + 0.08,
-    r"(4) inference delay $d$",
-    ha="center",
-    va="bottom",
-    fontsize=11.3,
-    fontweight="bold"
-)
-
-
-# ------------------------------------------------------------
-# Stale state:
-# snapshot from inference start propagated only in wall-clock time
-# ------------------------------------------------------------
-ax.plot(
-    [t_infer_start, t_infer_finish],
-    [y_exec_start, y_exec_start],
-    linestyle=":",
-    linewidth=1.5,
-    color=C_AUX,
-    zorder=2
-)
-
-double_arrow(
-    ax,
-    (t_infer_finish, y_exec_start),
-    (t_infer_finish, y_exec_finish),
-    color=C_AUX,
-    lw=1.15,
-    ms=9
-)
-
-ax.text(
-    t_infer_finish + 0.10,
-    0.5 * (y_exec_start + y_exec_finish),
-    "state\nstaleness",
-    fontsize=9.5,
-    color=C_AUX,
-    va="center"
-)
-
 
 # ============================================================
-# New replanned chunk
+# Tracking Gap
 # ============================================================
-
-# unavailable part during inference
-ax.plot(
-    t_new[mask_unavailable],
-    new_plan[mask_unavailable],
-    linestyle=(0, (2, 2)),
+tracking_arrow = FancyArrowPatch(
+    (t_track, track_bottom),
+    (t_track, track_top),
+    arrowstyle="<->",
+    mutation_scale=19,
     linewidth=2.0,
-    color=C_NEW,
-    alpha=0.38,
-    zorder=2
+    color=c_tracking,
+    zorder=12,
 )
 
-# available new chunk after inference
-ax.plot(
-    t_new[mask_available],
-    new_plan[mask_available],
-    linewidth=3.0,
-    color=C_NEW,
-    zorder=6
-)
-
-
-# small markers on the new chunk
-idx_new = np.where(mask_available)[0][::45]
-
-ax.scatter(
-    t_new[idx_new],
-    new_plan[idx_new],
-    s=25,
-    color=C_NEW,
-    zorder=7
-)
-
-
-ax.text(
-    t_infer_start + 0.12,
-    y_exec_start - 0.33,
-    "new chunk being inferred\n(not yet available)",
-    fontsize=9.3,
-    color=C_NEW,
-    alpha=0.62
-)
-
-
-# ============================================================
-# (5) REPLANNING DISCONTINUITY
-#
-# At inference finish, execution/old-plan state has evolved, while
-# the new chunk was generated from stale/raw feedback.
-# ============================================================
-
-y_old_at_finish = interp(
-    t_infer_finish,
-    t,
-    ref
-)
-
-double_arrow(
-    ax,
-    (t_infer_finish, y_old_at_finish),
-    (t_infer_finish, y_new_finish),
-    color=C_NEW,
-    lw=2.0,
-    ms=12
-)
-
-ax.scatter(
-    [t_infer_finish],
-    [y_old_at_finish],
-    s=45,
-    color=C_OLD,
-    zorder=9
-)
-
-ax.scatter(
-    [t_infer_finish],
-    [y_new_finish],
-    s=45,
-    color=C_NEW,
-    zorder=9
+ax.add_patch(
+    tracking_arrow
 )
 
 ax.annotate(
-    "(5) replanning discontinuity",
+    "Tracking Gap",
     xy=(
-        t_infer_finish,
-        0.5 * (y_old_at_finish + y_new_finish)
+        t_track,
+        track_top,
     ),
-    xytext=(9.45, 0.55),
-    fontsize=12,
-    fontweight="bold",
-    color=C_NEW,
+    xytext=(
+        0.88,
+        1.075,
+    ),
     arrowprops=dict(
         arrowstyle="->",
-        linewidth=1.4,
-        color=C_NEW
-    )
+        linewidth=1.25,
+        color=c_tracking,
+    ),
+    fontsize=13,
+    color=c_tracking,
+    fontstyle="italic",
+    ha="center",
+)
+
+# ============================================================
+# External perturbation
+# ============================================================
+y_pert = np.interp(
+    t_pert,
+    t,
+    y_exec,
+)
+
+ax.annotate(
+    "external perturbation",
+    xy=(
+        t_pert,
+        y_pert,
+    ),
+    xytext=(
+        1.63,
+        0.02,
+    ),
+    arrowprops=dict(
+        arrowstyle="->",
+        linewidth=1.25,
+        color=c_gray,
+    ),
+    fontsize=11.7,
+    color=c_gray,
+    ha="left",
+)
+
+# ============================================================
+# Feedback anchor
+# ============================================================
+ax.scatter(
+    [t_start],
+    [y_exec_start],
+    s=36,
+    color=c_new,
+    edgecolor="white",
+    linewidth=0.8,
+    zorder=13,
+)
+
+# ============================================================
+# Execution Distribution Gap
+# ============================================================
+history_start = 2.61
+history_end = t_start
+history_y = -0.73
+
+ax.annotate(
+    "",
+    xy=(
+        history_end,
+        history_y,
+    ),
+    xytext=(
+        history_start,
+        history_y,
+    ),
+    arrowprops=dict(
+        arrowstyle="|-|",
+        linewidth=1.6,
+        color=c_distribution,
+    ),
 )
 
 ax.text(
-    9.47, 0.30,
-    "tracking + phase + feedback + staleness\n"
-    "manifest at the chunk boundary",
-    fontsize=10.2,
-    color=C_AUX
+    history_start - 0.05,
+    history_y + 0.075,
+    "feedback history",
+    ha="left",
+    va="bottom",
+    fontsize=10.0,
+    color="0.42",
 )
 
+ax.text(
+    2.34,
+    -0.96,
+    "Execution Distribution Gap",
+    ha="center",
+    va="top",
+    fontsize=12.2,
+    color=c_distribution,
+    fontstyle="italic",
+)
 
 # ============================================================
-# Time-direction arrows
+# Inference Delay
+#
+# No brace/end ticks are drawn here.
+# Leave clean space for manual annotation.
 # ============================================================
+delay_y = -0.39
+
+ax.text(
+    0.5 * (t_start + t_finish),
+    delay_y,
+    r"Inference Delay $d$",
+    ha="center",
+    va="center",
+    fontsize=12.5,
+    color=c_delay,
+    fontstyle="italic",
+)
+
+# ============================================================
+# Boundary Discontinuity
+# ============================================================
+x_boundary = t_finish + 0.055
+
+boundary_arrow = FancyArrowPatch(
+    (
+        x_boundary,
+        y_new_finish,
+    ),
+    (
+        x_boundary,
+        y_old_finish,
+    ),
+    arrowstyle="<->",
+    mutation_scale=15,
+    linewidth=1.55,
+    color=c_boundary,
+    zorder=12,
+)
+
+ax.add_patch(
+    boundary_arrow
+)
+
 ax.annotate(
-    "",
-    xy=(12.05, ref[-1]),
-    xytext=(11.72, ref[-1]),
+    "Boundary\nDiscontinuity",
+    xy=(
+        x_boundary,
+        0.5 * (
+            y_new_finish
+            + y_old_finish
+        ),
+    ),
+    xytext=(
+        4.87,
+        0.36,
+    ),
     arrowprops=dict(
         arrowstyle="->",
-        lw=2.5,
-        color=C_REF
+        linewidth=1.15,
+        color=c_boundary,
     ),
-    annotation_clip=False
+    color=c_boundary,
+    fontsize=11.7,
+    ha="left",
 )
-
-ax.annotate(
-    "",
-    xy=(12.05, execution[-1]),
-    xytext=(11.72, execution[-1]),
-    arrowprops=dict(
-        arrowstyle="->",
-        lw=2.5,
-        color=C_EXEC
-    ),
-    annotation_clip=False
-)
-
 
 # ============================================================
-# Axis / legend / title
+# Physical consequence
 # ============================================================
-ax.set_xlabel("Wall-clock time")
-ax.set_ylabel("Motion / spatial state")
-
-ax.set_title(
-    "Planning–Control Gaps in Autoregressive Humanoid Replanning",
-    pad=16,
-    fontweight="bold",
-    fontsize=15
+ax.text(
+    4.72,
+    -0.82,
+    r"$\rightarrow$ physical jitter",
+    fontsize=10.7,
+    color="0.45",
+    ha="left",
 )
 
-ax.set_xlim(0.0, 12.25)
-ax.set_ylim(-1.72, 2.55)
+# ============================================================
+# Axes / layout
+# ============================================================
+ax.set_xlim(
+    0.25,
+    6.12,
+)
 
-# schematic: numeric y ticks are not important
+ax.set_ylim(
+    -1.05,
+    1.31,
+)
+
+ax.set_xlabel(
+    "time",
+    fontsize=15,
+)
+
+ax.set_ylabel(
+    "motion state / spatial trajectory",
+    fontsize=13.5,
+)
+
+ax.set_xticks([])
 ax.set_yticks([])
-
-# keep x-axis sparse
-ax.set_xticks([0, 2, 4, 6, 8, 10, 12])
 
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
+ax.spines["left"].set_visible(False)
+ax.spines["bottom"].set_linewidth(1.0)
 
-
-legend_handles = [
-    Line2D(
-        [0], [0],
-        color=C_REF,
-        lw=2.7,
-        linestyle="--",
-        label="Planner prediction / reference"
-    ),
-    Line2D(
-        [0], [0],
-        color=C_EXEC,
-        lw=2.8,
-        label="Realized execution / SONIC"
-    ),
-    Line2D(
-        [0], [0],
-        color=C_PHASE,
-        lw=1.8,
-        linestyle=(0, (2, 2)),
-        label=r"Phase-aligned reference $r(t-\tau)$"
-    ),
-    Line2D(
-        [0], [0],
-        color=C_OLD,
-        lw=3.0,
-        label="Old chunk executing during inference"
-    ),
-    Line2D(
-        [0], [0],
-        color=C_NEW,
-        lw=3.0,
-        label="New replanned chunk"
-    ),
-]
-
+# ============================================================
+# Legend
+# ============================================================
 ax.legend(
-    handles=legend_handles,
-    loc="lower left",
-    bbox_to_anchor=(0.01, 0.015),
-    ncol=2,
+    loc="upper right",
+    bbox_to_anchor=(1.01, 1.025),
     frameon=False,
-    columnspacing=1.7,
-    handlelength=3.1
+    fontsize=9.3,
+    handlelength=2.1,
+    borderpad=0.05,
+    labelspacing=0.18,
 )
 
 plt.tight_layout()
 
-
-# ============================================================
-# Export
-# ============================================================
-plt.savefig(
-    "planning_control_gaps.png",
-    dpi=300,
-    bbox_inches="tight"
-)
-
-plt.savefig(
-    "planning_control_gaps.pdf",
-    bbox_inches="tight"
-)
-
-plt.savefig(
-    "planning_control_gaps.svg",
-    bbox_inches="tight"
-)
+# plt.savefig(
+#     "planner_controller_gaps.pdf",
+#     bbox_inches="tight",
+# )
+#
+# plt.savefig(
+#     "planner_controller_gaps.png",
+#     dpi=400,
+#     bbox_inches="tight",
+# )
 
 plt.show()
