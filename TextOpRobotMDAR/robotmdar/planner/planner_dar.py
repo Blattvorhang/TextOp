@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
+import traceback
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -109,6 +112,56 @@ def _encode_text_embedding(clip_model, text, device: str):
 def _cuda_synchronize(device: str) -> None:
     if torch.cuda.is_available() and str(device).startswith("cuda"):
         torch.cuda.synchronize(device)
+
+
+def _save_latency_diagnostics(samples: deque[dict[str, float]],
+                              output_path: str | Path) -> None:
+    """Save per-plan latency prediction and bias curves."""
+    if not samples:
+        logger.info("No planner latency samples to save")
+        return
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_index = np.arange(1, len(samples) + 1)
+    actual = np.asarray([sample["actual_ms"] for sample in samples])
+    predicted = np.asarray([sample["predicted_ms"] for sample in samples])
+    preprocess = np.asarray([sample["preprocess_ms"] for sample in samples])
+    infer = np.asarray([sample["infer_ms"] for sample in samples])
+    postprocess = np.asarray([sample["postprocess_ms"] for sample in samples])
+    bias = np.asarray([sample["bias_ms"] for sample in samples])
+    bias_ema = np.asarray([sample["bias_ema_ms"] for sample in samples])
+
+    figure = Figure(figsize=(11, 9), layout="constrained")
+    FigureCanvasAgg(figure)
+    latency_axis, component_axis, bias_axis = figure.subplots(
+        3, 1, sharex=True)
+    latency_axis.plot(plan_index, actual, label="actual planner latency", lw=1.5)
+    latency_axis.plot(
+        plan_index, predicted, label="predicted latency (pre-plan EMA)", lw=1.5)
+    latency_axis.set_ylabel("Latency (ms)")
+    latency_axis.grid(True, alpha=0.25)
+    latency_axis.legend()
+
+    component_axis.plot(plan_index, preprocess, label="preprocess", lw=1.2)
+    component_axis.plot(plan_index, infer, label="model inference", lw=1.2)
+    component_axis.plot(plan_index, postprocess, label="postprocess", lw=1.2)
+    component_axis.set_ylabel("Component time (ms)")
+    component_axis.grid(True, alpha=0.25)
+    component_axis.legend()
+
+    bias_axis.axhline(0.0, color="black", lw=0.8, alpha=0.6)
+    bias_axis.plot(plan_index, bias, label="bias: actual - predicted", alpha=0.45)
+    bias_axis.plot(plan_index, bias_ema, label="bias EMA", lw=1.8)
+    bias_axis.set_xlabel("Inference index")
+    bias_axis.set_ylabel("Prediction bias (ms)")
+    bias_axis.grid(True, alpha=0.25)
+    bias_axis.legend()
+    figure.savefig(output_path, dpi=160)
+    logger.info("Saved {} planner latency samples to {}", len(samples), output_path)
 
 
 def _load_text_clip_model(
@@ -943,6 +996,7 @@ def main(cfg: DictConfig) -> None:
         cfg, [("planner", val_data)], vae, denoiser)
     history_len = int(cfg.data.history_len)
     future_len = int(cfg.data.future_len)
+    controller_history_states = history_len + 1
     motion_fps = float(cfg.motion_fps)
     if abs(float(val_data.fps) - motion_fps) > 1e-6:
         raise ValueError(
@@ -984,6 +1038,7 @@ def main(cfg: DictConfig) -> None:
     log_every = max(1, int(cfg.log_every))
     comm_config = to_absolute_path(str(cfg.comm_config))
     node = PlannerNode(comm_config)
+    synchronous_comm = bool(getattr(node, "is_synchronous", False))
 
     scene_condition_supported = bool(
         checkpoint_compatibility["scene_input"])
@@ -1001,14 +1056,27 @@ def main(cfg: DictConfig) -> None:
         generated_history_cfg.get(
             "align_to_g1", cfg.get("align_generated_history_to_g1", False)))
     align_generated_history = generated_history_align_mode != "null"
-    latency_align = bool(generated_history_cfg.get("latency_align", False))
-    latency_align_ema_alpha = float(generated_history_cfg.get(
-        "latency_align_ema_alpha", 0.5))
-    if (not math.isfinite(latency_align_ema_alpha)
-            or not 0.0 < latency_align_ema_alpha <= 1.0):
+    latency_compensation = (
+        bool(generated_history_cfg.get("latency_compensation", False))
+        and not synchronous_comm
+    )
+    latency_compensation_ema_alpha = float(generated_history_cfg.get(
+        "latency_compensation_ema_alpha", 0.5))
+    if (not math.isfinite(latency_compensation_ema_alpha)
+            or not 0.0 < latency_compensation_ema_alpha <= 1.0):
         raise ValueError(
-            "generated_history.latency_align_ema_alpha must be in (0, 1], "
-            f"got {latency_align_ema_alpha}")
+            "generated_history.latency_compensation_ema_alpha must be in "
+            f"(0, 1], got {latency_compensation_ema_alpha}")
+    latency_bias_ema_alpha = float(generated_history_cfg.get(
+        "latency_bias_ema_alpha", 0.2))
+    if (not math.isfinite(latency_bias_ema_alpha)
+            or not 0.0 < latency_bias_ema_alpha <= 1.0):
+        raise ValueError(
+            "generated_history.latency_bias_ema_alpha must be in (0, 1], "
+            f"got {latency_bias_ema_alpha}")
+    latency_plot_path = Path(to_absolute_path(str(generated_history_cfg.get(
+        "latency_plot_path",
+        Path(str(cfg.experiment_dir)) / "latency_compensation.png"))))
     phase_matching_cfg = generated_history_cfg.get("phase_matching", {})
     phase_matching_enabled = bool(phase_matching_cfg.get("enabled", False))
     phase_match_block_size = int(phase_matching_cfg.get("block_size", 1))
@@ -1050,6 +1118,8 @@ def main(cfg: DictConfig) -> None:
     residual_joint_limits = None
     next_ack_log_time = 0.0
     planning_latency_ema_ms = None
+    latency_bias_ema_ms = None
+    latency_samples: deque[dict[str, float]] = deque(maxlen=100)
     fixed_sampling_noise = None
     if not bool(cfg.get("resample_noise_each_plan", False)):
         fixed_sampling_noise = torch.randn(
@@ -1071,17 +1141,35 @@ def main(cfg: DictConfig) -> None:
         logger.info("Seeded diffusion latent from {} shape={}",
                     motion_path, tuple(fixed_sampling_noise.shape))
 
+    def _reset_episode_state() -> None:
+        """Restore the same planner-side state as a fresh first request."""
+        nonlocal latest_state, last_inferred_seq, next_infer_time
+        nonlocal inference_count, next_ack_log_time
+        nonlocal planning_latency_ema_ms, latency_bias_ema_ms
+        latest_state = None
+        last_inferred_seq = None
+        next_infer_time = time.perf_counter()
+        inference_count = 0
+        next_ack_log_time = 0.0
+        planning_latency_ema_ms = None
+        latency_bias_ema_ms = None
+        generated_plans.clear()
+        logger.info("Planner episode reset: generated history cleared")
+
+    node.set_reset_handler(_reset_episode_state)
+
     logger.info(
         "TextOp planner ready: replan={:.1f} Hz, motion={:.1f} Hz, "
         "history={} features/{} states, future={} frames, history_source={}, "
         "align_mode={}, "
-        "latency_align={} (ema_alpha={:.2f})",
-        1.0 / period, motion_fps, history_len, history_len, future_len,
+        "latency_compensation={} (ema_alpha={:.2f})",
+        1.0 / period, motion_fps, history_len, controller_history_states,
+        future_len,
         (f"generated+{generated_history_align_mode}"
          if align_generated_history else "generated")
         if use_generated_history else "controller",
         generated_history_align_mode,
-        latency_align, latency_align_ema_alpha)
+        latency_compensation, latency_compensation_ema_alpha)
 
     try:
         while True:
@@ -1092,7 +1180,8 @@ def main(cfg: DictConfig) -> None:
                 latest_state = message
 
             now = time.perf_counter()
-            if latest_state is None or now < next_infer_time:
+            if (latest_state is None
+                    or (not synchronous_comm and now < next_infer_time)):
                 time.sleep(0.001)
                 continue
 
@@ -1121,6 +1210,9 @@ def main(cfg: DictConfig) -> None:
 
             try:
                 planning_start = time.perf_counter()
+                # Freeze the prediction before doing any work for this plan.
+                # It must not include the current plan's observed latency.
+                predicted_latency_ms = planning_latency_ema_ms
                 state_goal_type = GoalType.parse(
                     latest_state.condition.goal.goal_type)
                 if state_goal_type is not goal_type:
@@ -1164,23 +1256,24 @@ def main(cfg: DictConfig) -> None:
                     use_generated_history and tracked_plan is not None)
                 alignment_mode = "none"
                 phase_offset_frames = None
-                latency_align_ms = 0.0
-                latency_align_frames = 0
+                latency_compensation_ms = 0.0
+                latency_compensation_frames = 0
                 selected_history_frame = None
                 observed_tracked_frame = None
                 if using_generated_history:
                     observed_tracked_frame = tracked_frame_from_timestamps(
                         latest_state, motion_fps, future_len)
-                    if latency_align and planning_latency_ema_ms is not None:
+                    if (latency_compensation
+                            and predicted_latency_ms is not None):
                         # Advance the controller timestamp by the planner's
                         # locally measured processing duration. Absolute
                         # clocks are intentionally never compared.
-                        latency_align_ms = planning_latency_ema_ms
-                        latency_align_frames = round(
-                            latency_align_ms * motion_fps / 1000.0)
+                        latency_compensation_ms = predicted_latency_ms
+                        latency_compensation_frames = round(
+                            latency_compensation_ms * motion_fps / 1000.0)
                     tracked_frame = tracked_frame_from_timestamps(
                         latest_state, motion_fps, future_len,
-                        latency_ms=latency_align_ms)
+                        latency_ms=latency_compensation_ms)
                     selected_history_frame = tracked_frame
                     (history_motion, generated_abs_pose,
                      generated_reference_pos, generated_reference_rot) = (
@@ -1233,9 +1326,10 @@ def main(cfg: DictConfig) -> None:
                         history_translation = None
                         alignment_mode = "residual_reanchor"
                         logger.info(
-                            "Residual re-anchor phase={} offset={} "
-                            "frames error={:.5f}",
+                            "Residual re-anchor frame={} phase_matching={} "
+                            "offset={} frames error={:.5f}",
                             matched_public_frame,
+                            "on" if phase_matching_enabled else "off",
                             (f"{phase_offset_frames:+d}"
                              if phase_offset_frames is not None else "n/a"),
                             float(residual_phase_error[0]))
@@ -1245,8 +1339,8 @@ def main(cfg: DictConfig) -> None:
                             generated_reference_rot, cfg.device)
                         goal_builder_extra = {
                             "reference_time_offset_s": (
-                                latency_align_ms / 1000.0
-                                if latency_align else 0.0)
+                                latency_compensation_ms / 1000.0
+                                if latency_compensation else 0.0)
                         }
                     elif generated_history_align_mode == "spatial":
                         (
@@ -1276,8 +1370,8 @@ def main(cfg: DictConfig) -> None:
                             generated_reference_rot, cfg.device)
                         goal_builder_extra = {
                             "reference_time_offset_s": (
-                                latency_align_ms / 1000.0
-                                if latency_align else 0.0)
+                                latency_compensation_ms / 1000.0
+                                if latency_compensation else 0.0)
                         }
 
                     ego_goal_raw = goal_builder(
@@ -1305,11 +1399,13 @@ def main(cfg: DictConfig) -> None:
                     )
                 else:
                     tracked_frame = None
-                    if latest_state.history_meta.n_states < history_len:
+                    if (latest_state.history_meta.n_states
+                            < controller_history_states):
                         raise ValueError(
                             f"State {state_seq} has "
                             f"{latest_state.history_meta.n_states} "
-                            f"entries; need at least {history_len}")
+                            "entries; need at least "
+                            f"{controller_history_states}")
                     history_motion, abs_pose = state_to_model_input(
                         latest_state, history_len, val_data, cfg.device,
                         fps=motion_fps,
@@ -1336,9 +1432,9 @@ def main(cfg: DictConfig) -> None:
                     history_translation = None
                     alignment_mode = "none"
 
-                if (using_generated_history and latency_align
+                if (using_generated_history and latency_compensation
                         and generated_history_align_mode == "spatial"):
-                    # Latency alignment changes the semantic "current" state
+                    # Latency compensation changes the semantic "current" state
                     # to the anticipated plan-switch endpoint. Always derive
                     # the goal from the final history actually sent to the
                     # model, independent of the optional spatial/reanchor mode.
@@ -1363,7 +1459,7 @@ def main(cfg: DictConfig) -> None:
                         goal_clamp=goal_clamp, fps=motion_fps,
                         val_data=val_data,
                         reference_time_offset_s=(
-                            latency_align_ms / 1000.0))
+                            latency_compensation_ms / 1000.0))
                     ego_goal = (
                         ego_goal_raw
                         if goal_encoding is GoalEncoding.LEGACY40
@@ -1377,7 +1473,7 @@ def main(cfg: DictConfig) -> None:
                             goal_clamp=goal_clamp, fps=motion_fps,
                             val_data=val_data,
                             reference_time_offset_s=(
-                                latency_align_ms / 1000.0),
+                                latency_compensation_ms / 1000.0),
                             goal_include_log_d_hor=(
                                 goal_include_log_d_hor))
                     )
@@ -1450,9 +1546,9 @@ def main(cfg: DictConfig) -> None:
                             _time_to_arrival_from_state(
                                 latest_state, motion_fps, cfg.device,
                                 reference_time_offset_s=(
-                                    latency_align_ms / 1000.0
+                                    latency_compensation_ms / 1000.0
                                     if using_generated_history
-                                    and latency_align else 0.0)))
+                                    and latency_compensation else 0.0)))
                     else:
                         time_to_arrival_s = 0.0
                         time_to_arrival_frame = torch.zeros(
@@ -1631,13 +1727,41 @@ def main(cfg: DictConfig) -> None:
                 postprocess_ms = max(
                     0.0, planning_latency_ms - preprocess_ms - infer_ms)
                 planner_processing_latency_ms = planning_latency_ms
-                if latency_align:
+                latency_bias_ms = None
+                if predicted_latency_ms is not None:
+                    latency_bias_ms = (
+                        planner_processing_latency_ms - predicted_latency_ms)
+                    if latency_bias_ema_ms is None:
+                        latency_bias_ema_ms = latency_bias_ms
+                    else:
+                        latency_bias_ema_ms = (
+                            latency_bias_ema_alpha * latency_bias_ms
+                            + (1.0 - latency_bias_ema_alpha)
+                            * latency_bias_ema_ms
+                        )
+                latency_samples.append({
+                    "actual_ms": planner_processing_latency_ms,
+                    "predicted_ms": (
+                        float(predicted_latency_ms)
+                        if predicted_latency_ms is not None else float("nan")),
+                    "preprocess_ms": preprocess_ms,
+                    "infer_ms": infer_ms,
+                    "postprocess_ms": postprocess_ms,
+                    "bias_ms": (
+                        float(latency_bias_ms)
+                        if latency_bias_ms is not None else float("nan")),
+                    "bias_ema_ms": (
+                        float(latency_bias_ema_ms)
+                        if latency_bias_ema_ms is not None else float("nan")),
+                })
+                if latency_compensation:
                     if planning_latency_ema_ms is None:
                         planning_latency_ema_ms = planner_processing_latency_ms
                     else:
                         planning_latency_ema_ms = (
-                            latency_align_ema_alpha * planner_processing_latency_ms
-                            + (1.0 - latency_align_ema_alpha)
+                            latency_compensation_ema_alpha
+                            * planner_processing_latency_ms
+                            + (1.0 - latency_compensation_ema_alpha)
                             * planning_latency_ema_ms
                         )
 
@@ -1664,7 +1788,8 @@ def main(cfg: DictConfig) -> None:
                         "(latency_ema={:.1f} ms) "
                         "history={} tracked_plan={} frame={} shift={:.3f} m "
                         "align={} phase_offset={} frames "
-                        "latency_align={:.1f} ms/{:+d} frames "
+                        "latency_compensation={:.1f} ms/{:+d} frames "
+                        "bias={} ms (ema={} ms) "
                         "(planner={:.1f} ms, pre={:.1f} ms, post={:.1f} ms) "
                         "chain_seam=({:.6f} m, {:.4f} deg, {:.6f} rad) "
                         "seam=({:.4f} m, {:.2f} deg, {:.4f} rad) "
@@ -1680,15 +1805,20 @@ def main(cfg: DictConfig) -> None:
                         alignment_mode,
                         (f"{phase_offset_frames:+d}"
                          if phase_offset_frames is not None else "n/a"),
-                        latency_align_ms, latency_align_frames,
+                        latency_compensation_ms, latency_compensation_frames,
+                        (f"{latency_bias_ms:+.1f}"
+                         if latency_bias_ms is not None else "n/a"),
+                        (f"{latency_bias_ema_ms:+.1f}"
+                         if latency_bias_ema_ms is not None else "n/a"),
                         planner_processing_latency_ms,
                         preprocess_ms, postprocess_ms,
                         chain_seam_root_error, chain_seam_angle_deg,
                         chain_seam_joint_error,
                         seam_root_error, seam_root_angle_deg, seam_joint_error,
                         _goal_r_world, _goal_r_ego)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to process controller state {}", state_seq)
+                node.publish_error(str(exc), traceback.format_exc())
 
             finished = time.perf_counter()
             next_infer_time = (
@@ -1697,4 +1827,10 @@ def main(cfg: DictConfig) -> None:
     except KeyboardInterrupt:
         logger.info("Planner interrupted")
     finally:
+        try:
+            _save_latency_diagnostics(latency_samples, latency_plot_path)
+        except Exception:
+            logger.exception(
+                "Failed to save planner latency diagnostics to {}",
+                latency_plot_path)
         node.close()

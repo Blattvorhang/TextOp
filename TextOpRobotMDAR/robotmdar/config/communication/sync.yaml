@@ -1,0 +1,18 @@
+# Blocking TextOp planner communication. The controller owns the 2 Hz cadence.
+comm_mode: sync
+
+# Planner binds REP; controller connects REQ.
+sync_port: 28710
+reset_port: 28711  # reserved for pubsub; sync reuses sync_port
+planner_host: "localhost"
+
+# Retained for schema compatibility; unused in sync mode.
+current_state_port: 28703
+motion_port: 28701
+controller_host: "localhost"
+
+replan_period: 0.5
+# FeatureVersion 6 prepends a zero-delta feature to 16 physical states.
+history_size: 16
+planner_request_timeout_ms: 300000
+planner_connect_timeout_s: 30.0

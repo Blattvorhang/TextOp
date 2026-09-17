@@ -14,7 +14,7 @@ pub_all_frames: false
 
 # Optional smoothing for measured joint history.
 history_joint_smoothing:
-  enabled: true
+  enabled: false
   max_velocity_rad_s: 10.0
   # 1.0 disables EMA smoothing.
   ema_alpha: 1.0
@@ -34,8 +34,10 @@ is_recovery: false
 generated_history:
   enabled: true
   # Project the switch frame using recent planner latency.
-  latency_align: true
-  latency_align_ema_alpha: 0.5
+  latency_compensation: true
+  latency_compensation_ema_alpha: 0.5
+  latency_bias_ema_alpha: 0.2  # only for visualization; does not affect planning
+  latency_plot_path: ${experiment_dir}/latency_compensation.png
   # null | spatial | residual_reanchor.
   align_to_g1: residual_reanchor
   # Replace the current state at a matched generated frame.
