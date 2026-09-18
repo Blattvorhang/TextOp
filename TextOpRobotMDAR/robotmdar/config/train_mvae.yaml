@@ -3,17 +3,17 @@ defaults:
   - base
   - _self_
 
-expname: BONES-SEED-FUTURE-64-ROT-MAT-VAE
+expname: HIPHI-FUTURE-64-ROT-MAT-VAE
 task: train-mvae
 
 data:
-  datadir: ./dataset/BONES-SEED-29dof-FULL-50fps
+  datadir: ./dataset/HIPHI-29dof-50fps
   dof_dim: 29
   load_goal_stats: false
   preload_ram: true
   load_scene: false
   num_primitive: 3
-  batch_size: 256
+  batch_size: 512
   weighted_sample: true
 
 train:

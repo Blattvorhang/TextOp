@@ -16,10 +16,10 @@ echo "Working directory: $(pwd)"
 #   export CUDA_VISIBLE_DEVICES=0,1,2,3    # use GPU 0-3, master is GPU 0
 #   export CUDA_VISIBLE_DEVICES=4,5,6,7    # use GPU 4-7, master is GPU 4
 #   export CUDA_VISIBLE_DEVICES=2,5        # use GPU 2 and 5, master is GPU 2
-CUDA_VISIBLE_DEVICES=0,1,3,7  # 0,1,2,3,4,5,6,7
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Number of GPUs to use (can be overridden via environment variable)
-NUM_GPUS=4
+NUM_GPUS=8
 
 # Count actually visible GPUs
 NUM_GPUS_AVAILABLE=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
@@ -47,14 +47,14 @@ echo "Master port: ${MASTER_PORT}"
 # so each step is equivalent to NUM_GPUS single-GPU steps.
 # Original: [100000, 50000, 50000] → scaled: ÷ NUM_GPUS
 SCALE_FACTOR=2
-STAGE0=$((100000 / NUM_GPUS * SCALE_FACTOR))
-STAGE1=$((50000 / NUM_GPUS * SCALE_FACTOR))
-STAGE2=$((50000 / NUM_GPUS * SCALE_FACTOR))
+STAGE0=50000
+STAGE1=25000
+STAGE2=25000
 TOTAL_STEPS=$((STAGE0 + STAGE1 + STAGE2))
 
 # Scale save/eval frequency proportionally
-SAVE_EVERY=$((20000 / NUM_GPUS * SCALE_FACTOR))
-EVAL_EVERY=$((2000 / NUM_GPUS * SCALE_FACTOR))
+SAVE_EVERY=10000
+EVAL_EVERY=1000
 
 echo "Scaled for ${NUM_GPUS} GPUs:"
 echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
