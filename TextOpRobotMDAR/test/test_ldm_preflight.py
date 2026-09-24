@@ -11,9 +11,9 @@ Each test maps to one preflight item that must hold before the first LDM run:
                                difference), not the leaving forward difference
   P4  orientation path       — g_g = R_g^T g_W and rho_6(R_t^T R_g) only; the
                                split path must never call legacy yaw builders
-  P5  augmentation order     — V7.1 perturbation touches raw history states
-                               before feature conversion; current frame w=0;
-                               last-history transition keeps ~1.1% residue
+  P5  augmentation order     — one deviation is applied to all H+1 raw
+                               history states before feature conversion, then
+                               decays over a sampled future recovery horizon
   P6  frozen config contract — FeatureVersion 6, 44-D features, 67-D goals,
                                pinned loss weights / mask probs / aug schedule,
                                frozen v6 mean/std cache on disk
@@ -362,45 +362,51 @@ def _quat_angle(qa, qb):
 
 
 def test_augmentation_applied_to_raw_states_before_feature_conversion(monkeypatch):
-    """P5: V7.1 perturbation touches raw history states only; the current
-    frame (first future raw state) is exactly untouched; features are then
-    recomputed from the perturbed states, with only the ~1.1% ramp residue
-    on the last history transition."""
+    """P5: history reanchoring is constant through t, then decays in future."""
     H = 16
-    frames = H + 2  # 18 raw states -> 17 features; current frame is idx H
+    recovery_horizon = 15
+    frames = H + recovery_horizon + 2
     clean = _motion(frames)
     motion = {k: v.clone() for k, v in clean.items()}
     dataset = _dataset(history_len=H)
     _patch_rand(monkeypatch, [0.0, 0.25, 0.25, 0.25, 0.25], 0.25)
+    monkeypatch.setattr(
+        data_module.torch,
+        "randint",
+        lambda low, high, size, generator=None: torch.tensor(recovery_horizon),
+    )
 
     assert dataset._augment_raw_motion(motion, generator=None) is True
 
-    # w=0 boundary: the current frame and everything after are untouched
-    for k in motion:
-        assert torch.equal(motion[k][H:], clean[k][H:])
-    # history frames are perturbed
-    assert not torch.equal(motion["dof"][:H], clean["dof"][:H])
-    assert not torch.equal(motion["root_rot"][:H], clean["root_rot"][:H])
-    assert not torch.equal(
-        motion["root_trans_offset"][:H, 2], clean["root_trans_offset"][:H, 2])
+    # The entire physical history, including current state t at index H,
+    # receives one coherent full-strength deviation.
+    dof_delta = motion["dof"] - clean["dof"]
+    height_delta = (
+        motion["root_trans_offset"][:, 2]
+        - clean["root_trans_offset"][:, 2]
+    )
+    assert_close(dof_delta[:H + 1], dof_delta[0].expand(H + 1, -1))
+    assert_close(height_delta[:H + 1], height_delta[0].expand(H + 1))
+    rot_delta = _quat_angle(motion["root_rot"], clean["root_rot"])
+    assert_close(rot_delta[:H + 1], rot_delta[0].expand(H + 1))
 
-    # V7.1 ramp contract (§6): w = 1 - (3u^2 - 2u^3) with u = (H-1)/H gives
-    # the last perturbed history frame ~1.1% of the frame-0 perturbation.
-    rot0 = _quat_angle(motion["root_rot"][0], clean["root_rot"][0])
-    rot_last = _quat_angle(motion["root_rot"][H - 1], clean["root_rot"][H - 1])
-    assert rot_last < 0.05 * rot0
-    dz0 = (motion["root_trans_offset"][0, 2] - clean["root_trans_offset"][0, 2]).abs()
-    dz_last = (motion["root_trans_offset"][H - 1, 2] - clean["root_trans_offset"][H - 1, 2]).abs()
-    assert dz_last < 0.05 * dz0
+    # Recovery starts at t+1, reaches exactly zero at t+R, and stays clean.
+    assert 0.0 < abs(float(height_delta[H + 1])) < abs(float(height_delta[H]))
+    for key in ("root_trans_offset", "root_rot", "dof"):
+        assert torch.equal(
+            motion[key][H + recovery_horizon:],
+            clean[key][H + recovery_horizon:],
+        )
+    assert torch.equal(motion["contact_mask"], clean["contact_mask"])
 
     feats_clean, _ = motion_dict_to_feature_v6(clean)
     feats_aug, _ = motion_dict_to_feature_v6(motion)
 
-    # first future feature (16 -> 17, both raw states untouched) identical
-    assert torch.equal(feats_aug[H], feats_clean[H])
-    # last history feature must reflect the perturbed raw states...
+    # Both the final history transition (t-1 -> t) and the first recovery
+    # transition (t -> t+1) are computed from the perturbed raw states.
+    assert not torch.equal(feats_aug[H], feats_clean[H])
     assert not torch.equal(feats_aug[H - 1], feats_clean[H - 1])
-    # ...and equal the explicit feature algebra on the perturbed states
+    # The final history feature equals the explicit v6 feature algebra.
     g_w = _world_gravity(motion["root_trans_offset"][0])
     R_prev = _mat_from_quat_xyzw(motion["root_rot"][H - 1])
     delta_local = R_prev.T @ (

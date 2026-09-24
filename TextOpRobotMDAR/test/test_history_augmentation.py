@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dataset.data_process.pack_motion_lib_to_textop import TARGET_DOF_NAMES
 from TextOpRobotMDAR.robotmdar.dataloader import data as data_module
 from TextOpRobotMDAR.robotmdar.dataloader.data import (
+    _AUG_RECOVERY_HORIZON_MAX,
+    _AUG_RECOVERY_HORIZON_MIN,
     _HISTORY_JOINT_AUG_AMPS,
     _HISTORY_ROOT_AUG_AMPS,
     SkeletonPrimitiveDataset,
@@ -76,6 +78,17 @@ def _patch_rand(monkeypatch, scalar_values, vector_value):
     monkeypatch.setattr(data_module.torch, "rand", fake_rand)
 
 
+def _patch_recovery_horizon(monkeypatch, value):
+    def fake_randint(low, high, size, generator=None, **_kwargs):
+        del generator
+        assert low == _AUG_RECOVERY_HORIZON_MIN
+        assert high == _AUG_RECOVERY_HORIZON_MAX + 1
+        assert size == ()
+        return torch.tensor(value)
+
+    monkeypatch.setattr(data_module.torch, "randint", fake_randint)
+
+
 def _quat_mul_xyzw_np(a, b):
     ax, ay, az, aw = np.moveaxis(np.asarray(a), -1, 0)
     bx, by, bz, bw = np.moveaxis(np.asarray(b), -1, 0)
@@ -90,25 +103,33 @@ def _quat_mul_xyzw_np(a, b):
     )
 
 
-def test_history_aug_ramp_matches_v71_boundary_contract():
-    weights = SkeletonPrimitiveDataset._history_aug_weight_schedule(
-        16, torch.device("cpu"), torch.float32
+def test_deviation_recovery_schedule_keeps_history_constant_then_decays():
+    history_len = 16
+    recovery_horizon = 20
+    weights = SkeletonPrimitiveDataset._deviation_recovery_weight_schedule(
+        history_len,
+        history_len + 32 + 1,
+        recovery_horizon,
+        torch.device("cpu"),
+        torch.float32,
     )
 
-    assert weights.shape == (17,)
-    torch.testing.assert_close(weights[0], torch.tensor(1.0))
-    torch.testing.assert_close(weights[8], torch.tensor(0.5))
-    torch.testing.assert_close(weights[-1], torch.tensor(0.0))
+    assert weights.shape == (49,)
     torch.testing.assert_close(
-        weights[15],
-        torch.tensor(1.0 - (3.0 * (15.0 / 16.0) ** 2 - 2.0 * (15.0 / 16.0) ** 3)),
-    )
+        weights[:history_len + 1], torch.ones(history_len + 1))
     torch.testing.assert_close(
-        weights[1] - weights[0],
-        weights[-1] - weights[-2],
-        atol=1e-6,
-        rtol=1e-6,
+        weights[history_len + 1],
+        torch.tensor(1.0 - (
+            6.0 * (1.0 / recovery_horizon) ** 5
+            - 15.0 * (1.0 / recovery_horizon) ** 4
+            + 10.0 * (1.0 / recovery_horizon) ** 3
+        )),
     )
+    torch.testing.assert_close(weights[history_len + recovery_horizon],
+                               torch.tensor(0.0))
+    torch.testing.assert_close(weights[history_len + recovery_horizon:],
+                               torch.zeros(13))
+    assert bool(torch.all(weights[:-1] >= weights[1:]))
 
 
 def test_history_aug_amplitude_tables_are_v71_normal_set():
@@ -143,12 +164,11 @@ def test_history_aug_root_rotation_matches_body_frame_xyz_numpy_port(monkeypatch
         scalar_values=[0.0, 0.75, 0.25, 0.90, 0.60],
         vector_value=0.5,
     )
+    _patch_recovery_horizon(monkeypatch, 20)
 
     assert dataset._augment_raw_motion(motion, generator=None)
 
-    weights = SkeletonPrimitiveDataset._history_aug_weight_schedule(
-        H, torch.device("cpu"), torch.float32
-    )[:H].numpy()
+    weights = np.ones(H + 1, dtype=np.float32)
     rx = (0.75 * 2.0 - 1.0) * _HISTORY_ROOT_AUG_AMPS["x"]
     ry = (0.25 * 2.0 - 1.0) * _HISTORY_ROOT_AUG_AMPS["y"]
     rz = (0.90 * 2.0 - 1.0) * _HISTORY_ROOT_AUG_AMPS["z"]
@@ -158,20 +178,18 @@ def test_history_aug_root_rotation_matches_body_frame_xyz_numpy_port(monkeypatch
     q_y = np.stack([zeros, np.sin(half * ry), zeros, np.cos(half * ry)], axis=-1)
     q_z = np.stack([zeros, zeros, np.sin(half * rz), np.cos(half * rz)], axis=-1)
     q_off = _quat_mul_xyzw_np(q_x, _quat_mul_xyzw_np(q_y, q_z))
-    expected = _quat_mul_xyzw_np(root_rot[:H].numpy(), q_off)
+    expected = _quat_mul_xyzw_np(root_rot.numpy(), q_off)
 
     torch.testing.assert_close(
-        motion["root_rot"][:H],
+        motion["root_rot"],
         torch.from_numpy(expected),
         atol=1e-6,
         rtol=1e-6,
     )
-    torch.testing.assert_close(motion["root_rot"][H], root_rot[H])
     torch.testing.assert_close(
-        motion["root_trans_offset"][:H, 2],
+        motion["root_trans_offset"][:, 2],
         torch.as_tensor(0.8 + weights * 0.002),
     )
-    torch.testing.assert_close(motion["root_trans_offset"][H, 2], torch.tensor(0.8))
 
 
 def test_history_aug_joint_sampling_intersects_limits_before_draw(monkeypatch):
@@ -193,18 +211,18 @@ def test_history_aug_joint_sampling_intersects_limits_before_draw(monkeypatch):
         scalar_values=[0.0, 0.5, 0.5, 0.5, 0.5],
         vector_value=1.0,
     )
+    _patch_recovery_horizon(monkeypatch, 20)
 
     assert dataset._augment_raw_motion(motion, generator=None)
 
     torch.testing.assert_close(
-        motion["dof"][:H, 0],
-        torch.tensor([1.0, 0.825]),
+        motion["dof"][:, 0],
+        torch.tensor([1.0, 0.85, 0.05]),
     )
     torch.testing.assert_close(
-        motion["dof"][:H, 1],
-        torch.tensor([1.20, 1.20]),
+        motion["dof"][:, 1],
+        torch.tensor([1.20, 1.20, 0.0]),
     )
-    torch.testing.assert_close(motion["dof"][H, :2], dof[H, :2])
 
 
 def test_history_aug_runs_when_feature_version_is_v6(monkeypatch):
@@ -218,10 +236,44 @@ def test_history_aug_runs_when_feature_version_is_v6(monkeypatch):
         scalar_values=[0.0, 0.5, 0.5, 0.5, 0.5],
         vector_value=1.0,
     )
+    _patch_recovery_horizon(monkeypatch, 20)
 
     assert dataset._augment_raw_motion(motion, generator=None)
-    assert bool((motion["dof"][:H].abs() > 0).any())
-    torch.testing.assert_close(motion["dof"][H], torch.zeros(29))
+    assert bool((motion["dof"].abs() > 0).any())
+    torch.testing.assert_close(motion["dof"][0], motion["dof"][H])
+
+
+def test_history_aug_decays_future_states_to_clean_gt(monkeypatch):
+    motion_dtype.set_feature_version(6)
+    H = 3
+    recovery_horizon = 15
+    motion = _motion(H + recovery_horizon + 3)
+    dataset = _dataset(history_len=H)
+
+    _patch_rand(
+        monkeypatch,
+        scalar_values=[0.0, 0.5, 0.5, 0.5, 1.0],
+        vector_value=0.5,
+    )
+    _patch_recovery_horizon(monkeypatch, recovery_horizon)
+
+    assert dataset._augment_raw_motion(motion, generator=None)
+
+    weights = SkeletonPrimitiveDataset._deviation_recovery_weight_schedule(
+        H,
+        motion["dof"].shape[0],
+        recovery_horizon,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    expected_height = weights * _HISTORY_ROOT_AUG_AMPS["h"]
+    torch.testing.assert_close(motion["root_trans_offset"][:, 2],
+                               expected_height)
+    torch.testing.assert_close(weights[:H + 1], torch.ones(H + 1))
+    assert 0.0 < float(weights[H + 1]) < 1.0
+    torch.testing.assert_close(weights[H + recovery_horizon], torch.tensor(0.0))
+    torch.testing.assert_close(motion["root_trans_offset"][
+        H + recovery_horizon:, 2], torch.zeros(3))
 
 
 def _batch_dataset(feature_width):
@@ -262,20 +314,17 @@ def _primitive():
         "gt_ref_rot": torch.zeros(4),
         "is_recovery": True,
         "action_label": "stand_up_lying",
-        "_clean_history_delta_q": torch.arange(29, dtype=torch.float32) + 10.0,
+        "text_embedding": torch.zeros(512),
     }
 
 
-def test_organize_restores_clean_history_delta_only_for_v3():
+def test_organize_does_not_patch_converted_features_for_v3():
     motion_dtype.set_feature_version(3)
     dataset = _batch_dataset(feature_width=69)
 
     batch = dataset._organize_primitives_by_index([[_primitive()]])[0]
 
-    torch.testing.assert_close(
-        batch["motion"][0, 1, 40:69],
-        torch.arange(29, dtype=torch.float32) + 10.0,
-    )
+    torch.testing.assert_close(batch["motion"], torch.zeros((1, 3, 69)))
 
 
 def test_organize_skips_clean_history_delta_restore_for_v6():

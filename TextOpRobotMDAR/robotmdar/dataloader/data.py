@@ -89,6 +89,8 @@ _HISTORY_JOINT_AUG_AMPS = (
     ("wrist", 0.05),
 )
 _HISTORY_ROOT_AUG_AMPS = {"x": 0.20, "y": 0.20, "z": 0.05, "h": 0.01}
+_AUG_RECOVERY_HORIZON_MIN = 15
+_AUG_RECOVERY_HORIZON_MAX = 40
 
 
 def _abs_p50_p99(values: torch.Tensor) -> tuple[float, float]:
@@ -1145,17 +1147,36 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     @staticmethod
     def _smoothstep(u: torch.Tensor) -> torch.Tensor:
-        return 3.0 * u * u - 2.0 * u * u * u
+        return 6.0 * u**5 - 15.0 * u**4 + 10.0 * u**3
 
     @staticmethod
-    def _history_aug_weight_schedule(
+    def _deviation_recovery_weight_schedule(
         history_len: int,
+        state_count: int,
+        recovery_horizon: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        u = torch.linspace(0.0, 1.0, history_len + 1,
-                           device=device, dtype=dtype)
-        return 1.0 - SkeletonPrimitiveDataset._smoothstep(u)
+        """Keep history reanchoring fixed, then decay it over the future."""
+        if history_len < 0 or state_count < history_len + 1:
+            raise ValueError(
+                f"Need at least history_len + 1 states, got "
+                f"history_len={history_len}, state_count={state_count}"
+            )
+        if recovery_horizon <= 0:
+            raise ValueError(
+                f"recovery_horizon must be positive, got {recovery_horizon}"
+            )
+
+        weights = torch.ones(state_count, device=device, dtype=dtype)
+        future_count = state_count - history_len - 1
+        if future_count > 0:
+            future_step = torch.arange(
+                1, future_count + 1, device=device, dtype=dtype)
+            u = (future_step / float(recovery_horizon)).clamp_(0.0, 1.0)
+            weights[history_len + 1:] = (
+                1.0 - SkeletonPrimitiveDataset._smoothstep(u))
+        return weights
 
     def _history_aug_dof_names(self) -> List[str]:
         names = list(self.skeleton.fk.dof_joint_names)
@@ -1209,7 +1230,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
 
     def _augment_raw_motion(self, motion: Dict[str, torch.Tensor],
                             generator: Optional[torch.Generator]) -> bool:
-        """Perturb raw history states before feature extraction."""
+        """Perturb raw history, then decay the deviation over the future."""
         augmentation_enabled = bool(getattr(self, 'augmentation_enabled', False))
         training_step = int(getattr(self, 'training_step', 0))
         augmentation_start_step = int(
@@ -1220,19 +1241,27 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         if torch.rand((), generator=generator).item() >= self.augmentation_prob:
             return False
 
-        history_count = min(self.history_len, motion['dof'].shape[0] - 1)
-        if history_count <= 0:
+        state_count = motion['dof'].shape[0]
+        history_len = min(self.history_len, state_count - 1)
+        if history_len <= 0:
             return False
         device, dtype = motion['dof'].device, motion['dof'].dtype
-        w = self._history_aug_weight_schedule(
-            history_count, device, dtype)[:history_count]
+        recovery_horizon = int(torch.randint(
+            _AUG_RECOVERY_HORIZON_MIN,
+            _AUG_RECOVERY_HORIZON_MAX + 1,
+            (),
+            generator=generator,
+        ).item())
+        w = self._deviation_recovery_weight_schedule(
+            history_len, state_count, recovery_horizon, device, dtype)
 
         amps = self._history_aug_amp_vector(device, dtype)
         limits = self._history_aug_joint_limits(device, dtype)
-        x = motion['dof'][:history_count]
         active = w > 0.0
-        lo = ((limits[:, 0] - x[active]) / w[active, None]).amax(dim=0)
-        hi = ((limits[:, 1] - x[active]) / w[active, None]).amin(dim=0)
+        x = motion['dof'][active]
+        active_w = w[active, None]
+        lo = ((limits[:, 0] - x) / active_w).amax(dim=0)
+        hi = ((limits[:, 1] - x) / active_w).amin(dim=0)
         lower, upper = torch.maximum(lo, -amps), torch.minimum(hi, amps)
         q = lower + (upper - lower) * torch.rand(
             self.dof_dim,
@@ -1241,7 +1270,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             dtype=dtype,
         )
         q = torch.where(lower <= upper, q, torch.zeros_like(q))
-        motion['dof'][:history_count] += w[:, None] * q
+        motion['dof'] += w[:, None] * q
 
         rx = (
             torch.rand((), generator=generator, device=device, dtype=dtype)
@@ -1267,8 +1296,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             zeros, zeros, torch.sin(half * rz), torch.cos(half * rz)
         ), dim=-1)
         q_off = self._quat_mul_xyzw(q_x, self._quat_mul_xyzw(q_y, q_z))
-        motion['root_rot'][:history_count] = self._quat_mul_xyzw(
-            motion['root_rot'][:history_count],
+        motion['root_rot'] = self._quat_mul_xyzw(
+            motion['root_rot'],
             q_off,
         )
 
@@ -1276,7 +1305,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             torch.rand((), generator=generator, device=device, dtype=dtype)
             * 2.0 - 1.0
         ) * _HISTORY_ROOT_AUG_AMPS["h"]
-        motion['root_trans_offset'][:history_count, 2] += w * dh
+        motion['root_trans_offset'][:, 2] += w * dh
         return True
 
     def _load_text_embeddings(self) -> None:
@@ -2283,10 +2312,6 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'action_label': action_label,
             'text_embedding': text_embedding.float(),
         }
-        primitive['_clean_history_delta_q'] = (
-            motion_data['dof'][self.history_len]
-            - motion_data['dof'][self.history_len - 1]
-        ).clone()
         if goal_type.uses_keypoints:
             if world_goal_keypoints is None:
                 world_goal_keypoints = self._world_goal_keypoints(
@@ -2509,14 +2534,6 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             ]
             for b, primitive in enumerate(primitives):
                 if primitive['_augmented']:
-                    if motion_dtype.FeatureVersion == 3:
-                        # Keep the final history delta clean: it references the
-                        # first future pose, which is outside the perturbed window.
-                        delta_start = 11 + self.dof_dim
-                        clean_delta = self._select_model_dof(
-                            primitive['_clean_history_delta_q'].unsqueeze(0))[0]
-                        motion_features[b, self.history_len - 1,
-                                        delta_start:delta_start + self.dof_dim] = clean_delta
                     # Goals stay clean, but ego-centric conditioning is reset to
                     # the perturbed latest history state (v1 contract).
                     ref = (
