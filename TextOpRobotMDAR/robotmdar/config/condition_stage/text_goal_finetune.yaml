@@ -2,7 +2,7 @@
 # Text + goal fine-tuning condition/loss profile. Selected by Hydra. Rollout
 # remains controlled independently by train.manager.use_rollout and stages.
 
-expname: text_goal_finetune
+expname: HIPHI-FUTURE-64-ROT-MAT
 
 data:
   load_text_embeddings: true
@@ -19,7 +19,7 @@ denoiser:
       composition: 0.45
       full_condition: 0.10
     single_preference:
-      text: 1.5
+      text: 2.0
       position_hor: 1.0
       position_vert: 0.25
       orientation_rot6d: 0.45
@@ -55,8 +55,8 @@ train:
           root_position_hor: 0.05
           root_position_vert: 0.005
           root_velocity: 0.005
-          root_orientation: 0.0
-          joint_angle: 0.0
+          root_orientation: 0.0005
+          joint_angle: 0.0005
           end_effector: 0.01
       getup:
         goal:

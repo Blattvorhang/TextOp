@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 echo "Working directory: $(pwd)"
 
 # ---- Required: pretrained VAE checkpoint ----
-VAE_CKPT="./logs/RobotMDAR/BONES-SEED-FUTURE-64-ROT-MAT-VAE/train-mvae-20260901_144822/ckpt_100000.pth"
+VAE_CKPT="./logs/RobotMDAR/HIPHI-FUTURE-64-ROT-MAT-VAE/train-mvae-20260913_202413/ckpt_100000.pth"
 if [ -z "${VAE_CKPT}" ]; then
     echo "ERROR: VAE_CKPT is required. Set it to the pretrained VAE checkpoint path."
     echo "Example:"
