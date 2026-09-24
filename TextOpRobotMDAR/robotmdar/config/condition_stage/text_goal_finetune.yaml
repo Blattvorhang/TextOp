@@ -8,7 +8,7 @@ data:
   load_text_embeddings: true
   augmentation_enabled: true
   augmentation_start_step: 15000
-  augmentation_prob: 0.5
+  augmentation_prob: 0.3
 
 denoiser:
   text_condition_enabled: true
