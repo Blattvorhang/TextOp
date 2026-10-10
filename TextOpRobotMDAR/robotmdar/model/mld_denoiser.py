@@ -10,6 +10,7 @@ from robotmdar.utils.goal import (
     EXTENDED_BODY_GOAL_DIM,
     GoalEncoding,
     JOINT_STATE_GOAL_DIM,
+    LEGACY45_SPLIT_GOAL_DIM,
     SPLIT_END_EFFECTOR_GOAL_DIM,
     SPLIT_END_EFFECTOR_SLICE,
     SPLIT_END_EFFECTOR_SUBSLICES,
@@ -700,13 +701,12 @@ def _mask_split_goal(model, goal, y):
         model, y, batch_size, device)
     if condition_plan is not None:
         y['_condition_sampling_plan'] = condition_plan
-    root_valid = _model_goal_valid_mask(
-        model, y, 'root', batch_size, device)
-    orientation_valid = _combine_valid_masks(
-        _model_goal_valid_mask(
-            model, y, 'orientation', batch_size, device),
-        _model_goal_valid_mask(model, y, 'yaw', batch_size, device),
-    )
+    horizontal_valid = _model_goal_valid_mask(
+        model, y, 'position_hor', batch_size, device)
+    vertical_valid = _model_goal_valid_mask(
+        model, y, 'position_vert', batch_size, device)
+    orientation_valid = _model_goal_valid_mask(
+        model, y, 'orientation', batch_size, device)
     joint_valid = _model_goal_valid_mask(
         model, y, 'joint', batch_size, device)
     velocity_valid = _model_goal_valid_mask(
@@ -738,7 +738,7 @@ def _mask_split_goal(model, goal, y):
         _sampling_probability(model, y, 'position_hor', batch_size, device,
                               condition_plan),
         force_mask=force_position_hor,
-        valid_mask=root_valid,
+        valid_mask=horizontal_valid,
         return_keep_mask=True,
     )
     vertical_height, vertical_keep = model.mask_condition(
@@ -746,7 +746,7 @@ def _mask_split_goal(model, goal, y):
         _sampling_probability(model, y, 'position_vert', batch_size, device,
                               condition_plan),
         force_mask=force_position_vert,
-        valid_mask=root_valid,
+        valid_mask=vertical_valid,
         return_keep_mask=True,
     )
     gravity, gravity_keep = model.mask_condition(
@@ -853,11 +853,8 @@ def _mask_legacy_split_goal(model, goal, y):
     device = goal.device
     root_valid = _model_goal_valid_mask(
         model, y, 'root', batch_size, device)
-    orientation_valid = _combine_valid_masks(
-        _model_goal_valid_mask(
-            model, y, 'orientation', batch_size, device),
-        _model_goal_valid_mask(model, y, 'yaw', batch_size, device),
-    )
+    orientation_valid = _model_goal_valid_mask(
+        model, y, 'orientation', batch_size, device)
     joint_valid = _model_goal_valid_mask(
         model, y, 'joint', batch_size, device)
     velocity_valid = _model_goal_valid_mask(
@@ -929,6 +926,59 @@ def _mask_legacy_split_goal(model, goal, y):
     return masked, root_keep
 
 
+def _mask_legacy45_split_goal(model, goal, y):
+    """Mask the 0827-era 45-D split goal (trans/rot/q/vel components)."""
+    batch_size = goal.shape[0]
+    device = goal.device
+    root_valid = _model_goal_valid_mask(
+        model, y, 'root', batch_size, device)
+    orientation_valid = _model_goal_valid_mask(
+        model, y, 'orientation', batch_size, device)
+    joint_valid = _model_goal_valid_mask(
+        model, y, 'joint', batch_size, device)
+    velocity_valid = _model_goal_valid_mask(
+        model, y, 'velocity', batch_size, device)
+    trans, root_keep = model.mask_condition(
+        goal[:, 0:8],
+        model.cond_goal_root_mask_prob,
+        force_mask=y.get('force_drop_goal_root', False),
+        valid_mask=root_valid,
+        return_keep_mask=True,
+    )
+    rot, orientation_keep = model.mask_condition(
+        goal[:, 8:13],
+        model.cond_goal_orientation_mask_prob,
+        force_mask=(
+            y.get('force_drop_goal_orientation', False)
+            or y.get('force_drop_goal_yaw', False)),
+        valid_mask=orientation_valid,
+        return_keep_mask=True,
+    )
+    joints, joint_keep = model.mask_condition(
+        goal[:, 13:42],
+        model.cond_goal_joint_mask_prob,
+        force_mask=y.get('force_drop_goal_joint', False),
+        valid_mask=joint_valid,
+        return_keep_mask=True,
+    )
+    velocity, velocity_keep = model.mask_condition(
+        goal[:, 42:45],
+        model.cond_goal_velocity_mask_prob,
+        force_mask=y.get('force_drop_goal_velocity', False),
+        valid_mask=velocity_valid,
+        return_keep_mask=True,
+    )
+    masked = goal.clone()
+    masked[:, 0:8] = trans
+    masked[:, 8:13] = rot
+    masked[:, 13:42] = joints
+    masked[:, 42:45] = velocity
+    y['goal_orientation_condition_keep_mask'] = orientation_keep
+    y['goal_joint_condition_keep_mask'] = joint_keep
+    y['goal_velocity_condition_keep_mask'] = velocity_keep
+    return masked, root_keep
+
+
 def _validate_model_goal_encoding(goal_dim: int,
                                   goal_encoding: GoalEncoding) -> None:
     if int(goal_dim) == JOINT_STATE_GOAL_DIM and goal_encoding is not GoalEncoding.LEGACY40:
@@ -945,11 +995,17 @@ def _validate_model_goal_encoding(goal_dim: int,
         raise ValueError(
             f"goal_dim={SPLIT_END_EFFECTOR_GOAL_DIM} requires "
             "goal_encoding='split_end_effector'")
+    if (int(goal_dim) == LEGACY45_SPLIT_GOAL_DIM
+            and goal_encoding is not GoalEncoding.SPLIT):
+        raise ValueError(
+            f"goal_dim={LEGACY45_SPLIT_GOAL_DIM} requires "
+            "goal_encoding='split'")
     if goal_encoding in (GoalEncoding.SINGLE, GoalEncoding.SPLIT) and int(goal_dim) not in (
-            SPLIT_GOAL_DIM, SPLIT_GOAL_NO_LOG_DIM):
+            SPLIT_GOAL_DIM, SPLIT_GOAL_NO_LOG_DIM, LEGACY45_SPLIT_GOAL_DIM):
         raise ValueError(
             "goal_encoding='single' or 'split' requires "
-            f"goal_dim={SPLIT_GOAL_DIM} or {SPLIT_GOAL_NO_LOG_DIM}")
+            f"goal_dim={SPLIT_GOAL_DIM}, {SPLIT_GOAL_NO_LOG_DIM}, or "
+            f"{LEGACY45_SPLIT_GOAL_DIM}")
     if (goal_encoding is GoalEncoding.SPLIT_END_EFFECTOR
             and int(goal_dim) not in (
                 SPLIT_END_EFFECTOR_GOAL_DIM,
@@ -963,6 +1019,8 @@ def _validate_model_goal_encoding(goal_dim: int,
 
 def _mask_goal(model, goal, y):
     """Mask V4 components independently while preserving legacy goal behavior."""
+    if int(model.goal_dim) == LEGACY45_SPLIT_GOAL_DIM:
+        return _mask_legacy45_split_goal(model, goal, y)
     if int(model.goal_dim) in (
             JOINT_STATE_GOAL_DIM,
             SPLIT_GOAL_DIM,
@@ -983,11 +1041,8 @@ def _mask_goal(model, goal, y):
         device = goal.device
         root_valid = _model_goal_valid_mask(
             model, y, 'root', batch_size, device)
-        orientation_valid = _combine_valid_masks(
-            _model_goal_valid_mask(
-                model, y, 'orientation', batch_size, device),
-            _model_goal_valid_mask(model, y, 'yaw', batch_size, device),
-        )
+        orientation_valid = _model_goal_valid_mask(
+            model, y, 'orientation', batch_size, device)
         joint_valid = _model_goal_valid_mask(
             model, y, 'joint', batch_size, device)
         velocity_valid = _model_goal_valid_mask(
@@ -1113,6 +1168,7 @@ def _goal_dim_uses_arrival_pe(goal_dim: int) -> bool:
         SPLIT_GOAL_NO_LOG_DIM,
         SPLIT_END_EFFECTOR_GOAL_DIM,
         SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM,
+        LEGACY45_SPLIT_GOAL_DIM,
     )
 
 
@@ -1121,6 +1177,8 @@ def _goal_dim_name(goal_dim: int) -> str:
         return "body_ext"
     if int(goal_dim) == JOINT_STATE_GOAL_DIM:
         return "joint_state"
+    if int(goal_dim) == LEGACY45_SPLIT_GOAL_DIM:
+        return "joint_state_split_legacy45"
     if int(goal_dim) == SPLIT_GOAL_DIM:
         return "joint_state_split"
     if int(goal_dim) == SPLIT_GOAL_NO_LOG_DIM:
@@ -1139,6 +1197,13 @@ def _apply_arrival_channel_mask(goal: torch.Tensor,
     if int(goal_dim) == EXTENDED_BODY_GOAL_DIM:
         goal = goal.clone()
         goal[:, 8:9] = 0.0
+        return goal
+    if int(goal_dim) == LEGACY45_SPLIT_GOAL_DIM:
+        # 0827-era layout: zero the urgency channels when arrival is masked.
+        goal = goal.clone()
+        keep = arrival_keep_mask.unsqueeze(-1).to(
+            device=goal.device, dtype=goal.dtype)
+        goal[:, 5:8] = goal[:, 5:8] * keep
         return goal
     if int(goal_dim) in (
             SPLIT_GOAL_DIM, SPLIT_GOAL_NO_LOG_DIM,
@@ -1489,6 +1554,7 @@ class DenoiserTransformer(nn.Module):
                  cond_goal_end_effector_mask_prob=None,
                  cond_scene_mask_prob=None,
                  legacy_split_goal_layout=False,
+                 legacy_split_goal45_layout=False,
                  use_vae=True,
                  **kargs):
         super().__init__()
@@ -1505,6 +1571,7 @@ class DenoiserTransformer(nn.Module):
         self.goal_dim = int(goal_dim)
         self.goal_encoding = GoalEncoding.parse(goal_encoding)
         self.legacy_split_goal_layout = bool(legacy_split_goal_layout)
+        self.legacy_split_goal45_layout = bool(legacy_split_goal45_layout)
         _validate_model_goal_encoding(self.goal_dim, self.goal_encoding)
         self.grid_size = grid_size
         self.scene_dim = grid_size**3
@@ -1563,6 +1630,19 @@ class DenoiserTransformer(nn.Module):
                                                self.sequence_pos_encoder)
 
         if (self.goal_encoding is GoalEncoding.SPLIT
+                and self.goal_dim == LEGACY45_SPLIT_GOAL_DIM):
+            # 0827-era token set: trans(8)/rot(5)/q(29)/vel(3), no time
+            # token, no text.  Module set matches the 8472297-era state
+            # dict so the old checkpoint loads with strict=True.
+            self.embed_goal_trans = MLP(
+                8, h_dims=(self.h_dim, self.h_dim), activation=activation)
+            self.embed_goal_rot = MLP(
+                5, h_dims=(self.h_dim, self.h_dim), activation=activation)
+            self.embed_goal_pose = MLP(
+                29, h_dims=(self.h_dim, self.h_dim), activation=activation)
+            self.embed_goal_vel = MLP(
+                3, h_dims=(self.h_dim, self.h_dim), activation=activation)
+        elif (self.goal_encoding is GoalEncoding.SPLIT
                 and self.legacy_split_goal_layout):
             self.embed_goal_trans = MLP(
                 12, h_dims=(self.h_dim, self.h_dim), activation=activation)
@@ -1777,6 +1857,47 @@ class DenoiserTransformer(nn.Module):
         emb_noise = self.embed_noise(x_t).permute(1, 0, 2)  # [1, bs, d]
 
         if (self.goal_encoding is GoalEncoding.SPLIT
+                and self.goal_dim == LEGACY45_SPLIT_GOAL_DIM):
+            # 0827-era forward: four goal tokens, arrival PE on every token,
+            # per-component keep masks, xseq = [time, trans, rot, pose, vel,
+            # scene, history, noise].
+            emb_goal_trans = self.embed_goal_trans(
+                goal[:, 0:8]).unsqueeze(0)
+            emb_goal_rot = self.embed_goal_rot(
+                goal[:, 8:13]).unsqueeze(0)
+            emb_goal_pose = self.embed_goal_pose(
+                goal[:, 13:42]).unsqueeze(0)
+            emb_goal_vel = self.embed_goal_vel(
+                goal[:, 42:45]).unsqueeze(0)
+            arrival_pe_ = arrival_pe.unsqueeze(0)
+            emb_goal_trans = emb_goal_trans + arrival_pe_
+            emb_goal_rot = emb_goal_rot + arrival_pe_
+            emb_goal_pose = emb_goal_pose + arrival_pe_
+            emb_goal_vel = emb_goal_vel + arrival_pe_
+            keep_masks = (
+                y['goal_condition_keep_mask'],
+                y['goal_orientation_condition_keep_mask'],
+                y['goal_joint_condition_keep_mask'],
+                y['goal_velocity_condition_keep_mask'],
+            )
+            embeddings = (
+                emb_goal_trans, emb_goal_rot, emb_goal_pose, emb_goal_vel,
+            )
+            embeddings = tuple(
+                embedding * keep_mask.unsqueeze(-1).to(embedding.dtype)
+                for embedding, keep_mask in zip(embeddings, keep_masks)
+            )
+            xseq_parts = [
+                emb_time,
+                *embeddings,
+                emb_scene,
+                emb_history,
+                emb_noise,
+            ]
+            if use_text_condition:
+                xseq_parts.insert(1, emb_text)
+            xseq = torch.cat(tuple(xseq_parts), dim=0)
+        elif (self.goal_encoding is GoalEncoding.SPLIT
                 and self.legacy_split_goal_layout):
             emb_goal_trans = self.embed_goal_trans(
                 goal[:, 0:12]).unsqueeze(0)
