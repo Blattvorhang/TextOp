@@ -2,11 +2,13 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 
 import robotmdar.dtype.motion as runtime_motion_dtype
 import TextOpRobotMDAR.robotmdar.dtype.motion as package_motion_dtype
+import TextOpRobotMDAR.robotmdar.utils.planner_convert as planner_convert
 from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
     G1_ISAACLAB_DOF_JOINT_NAMES,
     align_generated_history_pose,
@@ -62,6 +64,107 @@ def _set_both_feature_versions(version: int):
 
 def _xyzw_to_wxyz_np(values):
     return np.ascontiguousarray(np.asarray(values)[..., [3, 0, 1, 2]])
+
+
+def _joint_state_with_end_effectors(end_effectors, *, left_hand_valid=True):
+    end_effector_validity = SimpleNamespace(
+        valid=True,
+        left_hand=left_hand_valid,
+        right_hand=False,
+        left_foot=False,
+        right_foot=False,
+    )
+    goal_validity = SimpleNamespace(
+        position_hor=True,
+        position_vert=True,
+        yaw=False,
+        body=False,
+        orientation=True,
+        joint=True,
+        velocity=True,
+        time=True,
+        end_effector=end_effector_validity,
+    )
+    return SimpleNamespace(
+        states=SimpleNamespace(
+            g1_pos=np.zeros((1, 3), dtype=np.float32),
+            g1_root_rot=np.asarray(
+                [[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+            g1_joint_pos=np.zeros((1, 29), dtype=np.float32),
+        ),
+        history_meta=SimpleNamespace(
+            timestamps_ns=[1_000_000_000], publish_t_ns=1_000_000_000),
+        tracking=SimpleNamespace(seq=-1, start_t_ns=0),
+        condition=SimpleNamespace(
+            text=None,
+            ego_occ=None,
+            valid=SimpleNamespace(
+                scene=False, text=False, goal=goal_validity),
+            goal=SimpleNamespace(
+                goal_type="joint_state",
+                root_pos_world=np.asarray([0.0, 0.0, 0.8], dtype=np.float32),
+                yaw_world=None,
+                root_velocity_world=np.zeros(3, dtype=np.float32),
+                timestamp_ns=2_000_000_000,
+                keypoints_world=None,
+                root_rot_world=np.asarray(
+                    [1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                root_euler_world=None,
+                dof_pos=np.zeros(29, dtype=np.float32),
+                end_effectors_world=end_effectors,
+            ),
+        ),
+    )
+
+
+def test_joint_state_goal_allows_nonfinite_invalid_end_effectors(monkeypatch):
+    end_effectors = np.full((4, 3), np.nan, dtype=np.float32)
+    end_effectors[0] = [0.4, -0.2, 1.1]
+    state = _joint_state_with_end_effectors(end_effectors)
+    fallback = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+
+    monkeypatch.setattr(
+        planner_convert,
+        "_end_effectors_from_goal_state",
+        lambda *args, **kwargs: fallback.clone(),
+    )
+    monkeypatch.setattr(
+        planner_convert,
+        "build_ego_goal",
+        lambda *args, **kwargs: kwargs["world_goal_end_effectors"].clone(),
+    )
+
+    goal = state_goal_from_reference(
+        state,
+        reference_pos=torch.zeros((1, 3)),
+        reference_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+        device="cpu",
+        goal_type="joint_state",
+        goal_encoding=GoalEncoding.SPLIT_END_EFFECTOR,
+        fps=50.0,
+    )
+
+    torch.testing.assert_close(
+        goal[:, 0], torch.tensor([[0.4, -0.2, 1.1]]))
+    torch.testing.assert_close(goal[:, 1:], fallback[:, 1:])
+    assert torch.isfinite(goal).all()
+
+
+def test_joint_state_goal_rejects_nonfinite_valid_end_effector(monkeypatch):
+    end_effectors = np.zeros((4, 3), dtype=np.float32)
+    end_effectors[0, 1] = np.nan
+    state = _joint_state_with_end_effectors(end_effectors)
+
+    with pytest.raises(ValueError, match=r"valid end effectors: left_hand"):
+        state_goal_from_reference(
+            state,
+            reference_pos=torch.zeros((1, 3)),
+            reference_rot=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            device="cpu",
+            goal_type="joint_state",
+            goal_encoding=GoalEncoding.SPLIT_END_EFFECTOR,
+            fps=50.0,
+        )
 
 
 def test_fk_preserves_non_upright_root_quaternion():
@@ -264,11 +367,11 @@ def test_controller_v6_history_consumes_h_plus_one_physical_states():
             [1.0, 0.0, 0.0, 0.0],
         ], dtype=np.float32)
         joints = np.zeros((3, 29), dtype=np.float32)
-        state = SimpleNamespace(raw={
-            "g1_pos": positions,
-            "g1_root_rot": rotations,
-            "g1_joint_pos": joints,
-        })
+        state = SimpleNamespace(states=SimpleNamespace(
+            g1_pos=positions,
+            g1_root_rot=rotations,
+            g1_joint_pos=joints,
+        ))
 
         feature, abs_pose = state_to_model_input(
             state, history_len=2, val_data=IdentityNormalization(),
@@ -283,6 +386,21 @@ def test_controller_v6_history_consumes_h_plus_one_physical_states():
             atol=1e-6,
             rtol=0,
         )
+
+        short_state = SimpleNamespace(states=SimpleNamespace(
+            g1_pos=positions[-2:],
+            g1_root_rot=rotations[-2:],
+            g1_joint_pos=joints[-2:],
+        ))
+        with pytest.raises(
+                ValueError,
+                match=r"Need 3 physical states for 2 features, got 2"):
+            state_to_model_input(
+                short_state,
+                history_len=2,
+                val_data=IdentityNormalization(),
+                device="cpu",
+            )
     finally:
         runtime_motion_dtype.set_feature_version(old_runtime)
         package_motion_dtype.set_feature_version(old_package)
@@ -305,11 +423,11 @@ def test_controller_joint_history_smoothing_limits_v6_input_velocity():
         joints[0] = -20.0
         joints[1] = 20.0
         joints[2] = 10.0
-        state = SimpleNamespace(raw={
-            "g1_pos": positions,
-            "g1_root_rot": rotations,
-            "g1_joint_pos": joints,
-        })
+        state = SimpleNamespace(states=SimpleNamespace(
+            g1_pos=positions,
+            g1_root_rot=rotations,
+            g1_joint_pos=joints,
+        ))
 
         feature, _ = state_to_model_input(
             state,
@@ -360,7 +478,8 @@ def test_joint_state_goal_falls_back_when_condition_blocks_invalid():
             goal_dof_pos=None,
             goal_timestamp_ns=None,
             timestamps_ns=None,
-            goal_root_valid=False,
+            goal_position_hor_valid=False,
+            goal_position_vert_valid=False,
             goal_orientation_valid=False,
             goal_joint_valid=False,
             goal_velocity_valid=False,

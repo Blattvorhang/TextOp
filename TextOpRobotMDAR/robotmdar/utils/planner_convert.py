@@ -410,7 +410,7 @@ def _end_effectors_from_goal_state(
 
 
 def _state_field(state_msg: Any, name: str):
-    """Read a field from the latest protocol-11 nested StateMessage."""
+    """Read a field from the latest protocol-12 nested StateMessage."""
     state_fields = {
         "g1_pos": state_msg.states.g1_pos,
         "g1_root_rot": state_msg.states.g1_root_rot,
@@ -436,7 +436,8 @@ def _state_field(state_msg: Any, name: str):
     validity_fields = {
         "scene_valid": validity.scene,
         "text_valid": validity.text,
-        "goal_root_valid": goal_validity.root,
+        "goal_position_hor_valid": goal_validity.position_hor,
+        "goal_position_vert_valid": goal_validity.position_vert,
         "goal_yaw_valid": goal_validity.yaw,
         "goal_body_valid": goal_validity.body,
         "goal_orientation_valid": goal_validity.orientation,
@@ -474,7 +475,7 @@ def _state_field(state_msg: Any, name: str):
     if name in goal_fields:
         return goal_fields[name]
 
-    raise KeyError(f"Unknown protocol-11 state field: {name}")
+    raise KeyError(f"Unknown protocol-12 state field: {name}")
 
 
 def _state_bool_field(state_msg: Any, name: str, default: bool = True) -> bool:
@@ -486,6 +487,26 @@ def _state_bool_field(state_msg: Any, name: str, default: bool = True) -> bool:
             raise ValueError(f"{name} must be scalar-like, got {value.shape}")
         value = value.reshape(-1)[0]
     return bool(value)
+
+
+_END_EFFECTOR_VALIDITY_FIELDS = (
+    ("left_hand", "goal_end_effector_left_hand_valid"),
+    ("right_hand", "goal_end_effector_right_hand_valid"),
+    ("left_foot", "goal_end_effector_left_foot_valid"),
+    ("right_foot", "goal_end_effector_right_foot_valid"),
+)
+
+
+def _goal_end_effector_validity(state_msg: Any) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Return effective validity in end-effector wire order."""
+    overall_valid = _state_bool_field(
+        state_msg, "goal_end_effector_valid", True)
+    valid = np.asarray([
+        overall_valid and _state_bool_field(state_msg, field, True)
+        for _, field in _END_EFFECTOR_VALIDITY_FIELDS
+    ], dtype=np.bool_)
+    names = tuple(name for name, _ in _END_EFFECTOR_VALIDITY_FIELDS)
+    return valid, names
 
 
 def _reference_yaw(reference_rot: torch.Tensor) -> torch.Tensor:
@@ -577,8 +598,10 @@ def state_goal_from_reference(state_msg: Any,
             f"{reference_time_offset_s}")
     goal_keypoints_world = None
 
-    goal_root_valid = _state_bool_field(
-        state_msg, 'goal_root_valid', True)
+    goal_position_hor_valid = _state_bool_field(
+        state_msg, 'goal_position_hor_valid', True)
+    goal_position_vert_valid = _state_bool_field(
+        state_msg, 'goal_position_vert_valid', True)
     goal_yaw_valid = _state_bool_field(
         state_msg, 'goal_yaw_valid', True)
     goal_body_valid = _state_bool_field(
@@ -597,7 +620,8 @@ def state_goal_from_reference(state_msg: Any,
     requires_root_field = goal_type in (
         GoalType.ROOT, GoalType.BODY_EXT, GoalType.JOINT_STATE)
     if state_root_pos is None:
-        if requires_root_field and goal_root_valid:
+        if (requires_root_field
+                and (goal_position_hor_valid or goal_position_vert_valid)):
             raise ValueError("TextOp state is missing its root goal")
         goal_pos_world = reference_pos
     else:
@@ -769,14 +793,38 @@ def state_goal_from_reference(state_msg: Any,
                     raise ValueError(
                         "joint_state goal_end_effectors_world must have "
                         f"shape (4, 3), got {state_goal_end_effectors.shape}")
-                if not np.isfinite(state_goal_end_effectors).all():
+                end_effector_valid, end_effector_names = (
+                    _goal_end_effector_validity(state_msg))
+                finite_rows = np.isfinite(state_goal_end_effectors).all(axis=1)
+                invalid_valid_rows = end_effector_valid & ~finite_rows
+                if invalid_valid_rows.any():
+                    invalid_names = ", ".join(
+                        name for name, invalid
+                        in zip(end_effector_names, invalid_valid_rows)
+                        if invalid
+                    )
                     raise ValueError(
-                        "joint_state goal_end_effectors_world must be finite")
+                        "joint_state goal_end_effectors_world must be finite "
+                        f"for valid end effectors: {invalid_names}")
                 world_goal_end_effectors = torch.as_tensor(
                     state_goal_end_effectors,
                     dtype=torch.float32,
                     device=device,
                 ).reshape(1, 4, 3)
+                missing_rows = ~finite_rows
+                if missing_rows.any():
+                    fallback_end_effectors = _end_effectors_from_goal_state(
+                        goal_pos_world,
+                        world_goal_rot,
+                        world_goal_dof,
+                        val_data=val_data,
+                        device=device,
+                        fps=fps,
+                    )
+                    missing_rows_t = torch.as_tensor(
+                        missing_rows, dtype=torch.bool, device=device)
+                    world_goal_end_effectors[:, missing_rows_t] = (
+                        fallback_end_effectors[:, missing_rows_t])
             else:
                 # The payload may be omitted when the end-effector block is
                 # invalid; FK keeps the 67-D goal finite before masking.
@@ -1040,6 +1088,10 @@ def residual_reanchor_generated_history(
         min_phase_index: int = 0,
         phase_match_block_size: int = 1,
         phase_index_override: torch.Tensor | None = None,
+        anchor_state: str = "real",
+        anchor_gate_window: int = 4,
+        anchor_gate_low: float = 0.75,
+        anchor_gate_high: float = 1.5,
 ):
     """Re-integrate predicted local increments from a measured state anchor."""
     if history_motion is None or val_data is None:
@@ -1164,12 +1216,67 @@ def residual_reanchor_generated_history(
     phase_index = num_frames - 1 + phase_offset
     phase_index = phase_index.clamp(0, num_frames - 1).long()
     anchor_state_index = phase_index + 1
+
+    anchor_state = str(anchor_state).strip().lower()
+    if anchor_state not in ("real", "gate"):
+        raise ValueError(
+            "anchor_state must be one of 'real' or 'gate', got "
+            f"{anchor_state!r}")
+    if anchor_state == "gate":
+        anchor_gate_window = int(anchor_gate_window)
+        anchor_gate_low = float(anchor_gate_low)
+        anchor_gate_high = float(anchor_gate_high)
+        if anchor_gate_window < 0:
+            raise ValueError("anchor_gate_window must be non-negative")
+        if (not math.isfinite(anchor_gate_low)
+                or not math.isfinite(anchor_gate_high)
+                or anchor_gate_low < 0.0
+                or anchor_gate_high <= anchor_gate_low):
+            raise ValueError(
+                "anchor gate requires finite 0 <= low < high thresholds")
+        # The gate measures execution lag in the normalized joint space used
+        # by the dataset.  A small error at any nearby generated phase means
+        # the real state is still on the planned motion tube. Root pose is
+        # deliberately excluded: spatial feedback must remain closed-loop.
+        joint_std = getattr(val_data, "std", None)
+        if joint_std is None:
+            raise ValueError(
+                "anchor_state='gate' requires dataset normalization stats")
+        q_start = 13 if motion_dtype.FeatureVersion == 6 else 11
+        joint_std = torch.as_tensor(
+            joint_std[q_start:q_start + pred_joint.shape[-1]],
+            device=device, dtype=pred_joint.dtype).clamp_min(1e-6)
+        candidate = torch.arange(
+            -anchor_gate_window, 1, device=device, dtype=torch.long)[None, :]
+        candidate = (phase_index[:, None] + candidate).clamp(0, num_frames - 1)
+        candidate_joint = pred_joint.gather(
+            1, candidate[..., None].expand(-1, -1, pred_joint.shape[-1]))
+        joint_error = ((candidate_joint - real_joint[:, None]) / joint_std)
+        consistency_error = joint_error.square().mean(dim=-1).sqrt().min(dim=1).values
+        gate_lambda = (
+            (consistency_error - anchor_gate_low)
+            / (anchor_gate_high - anchor_gate_low)
+        ).clamp(0.0, 1.0)
+        correction["gate_lambda"] = gate_lambda.detach().clone()
+    else:
+        gate_lambda = torch.ones(
+            (batch_size,), device=device, dtype=pred_joint.dtype)
     hybrid_pos = torch.zeros_like(pred_full_pos)
     hybrid_rot_matrix = torch.zeros_like(pred_full_rot_matrix)
     hybrid_joint = torch.zeros_like(pred_full_joint)
-    hybrid_pos[:, anchor_state_index] = real_pos
-    hybrid_rot_matrix[:, anchor_state_index] = real_rot_matrix
-    hybrid_joint[:, anchor_state_index] = real_joint
+    if anchor_state == "gate":
+        # Spatial state is always corrected from the measured robot pose so
+        # downstream world/ego goal computation remains closed-loop. Only the
+        # joint state, which carries motion-progress ambiguity, is gated.
+        blended_joint = pred_full_joint[:, anchor_state_index] + gate_lambda[:, None] * (
+            real_joint - pred_full_joint[:, anchor_state_index])
+        hybrid_pos[:, anchor_state_index] = real_pos
+        hybrid_rot_matrix[:, anchor_state_index] = real_rot_matrix
+        hybrid_joint[:, anchor_state_index] = blended_joint
+    else:
+        hybrid_pos[:, anchor_state_index] = real_pos
+        hybrid_rot_matrix[:, anchor_state_index] = real_rot_matrix
+        hybrid_joint[:, anchor_state_index] = real_joint
 
     # Re-integrate exactly the predicted edge increments in both directions.
     for edge_index in range(num_frames):
@@ -1278,6 +1385,10 @@ def residual_reanchor_generated_plan_at_frame(
         phase_match_block_size: int = 1,
         phase_index: torch.Tensor | None = None,
         min_phase_index: int = 0,
+        anchor_state: str = "real",
+        anchor_gate_window: int = 4,
+        anchor_gate_low: float = 0.75,
+        anchor_gate_high: float = 1.5,
 ):
     """Re-anchor at an observed phase, then crop at the future switch frame.
 
@@ -1340,6 +1451,10 @@ def residual_reanchor_generated_plan_at_frame(
                 joint_limits=joint_limits,
                 phase_match_block_size=phase_match_block_size,
                 phase_index_override=local_phase_index,
+                anchor_state=anchor_state,
+                anchor_gate_window=anchor_gate_window,
+                anchor_gate_low=anchor_gate_low,
+                anchor_gate_high=anchor_gate_high,
             )
             if hasattr(val_data, "reconstruct_motion"):
                 aligned_motion = val_data.reconstruct_motion(
@@ -1383,6 +1498,10 @@ def residual_reanchor_generated_plan_at_frame(
         phase_match_block_size=phase_match_block_size,
         phase_index_override=phase_index,
         min_phase_index=min_phase_index,
+        anchor_state=anchor_state,
+        anchor_gate_window=anchor_gate_window,
+        anchor_gate_low=anchor_gate_low,
+        anchor_gate_high=anchor_gate_high,
     )
 
     if hasattr(val_data, "reconstruct_motion"):

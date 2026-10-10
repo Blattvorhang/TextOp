@@ -34,6 +34,8 @@ from robotmdar.utils.goal import (
     GoalClamp,
     GoalEncoding,
     GoalType,
+    LEGACY45_SPLIT_GOAL_DIM,
+    LEGACY45_SPLIT_GOAL_SCHEMA,
     SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA,
     SPLIT_GOAL_NO_LOG_DIM,
     SPLIT_GOAL_NO_LOG_SCHEMA,
@@ -210,7 +212,8 @@ def _state_bool_field(state_msg, name: str, default: bool = True) -> bool:
     validity_fields = {
         "scene_valid": validity.scene,
         "text_valid": validity.text,
-        "goal_root_valid": goal_validity.root,
+        "goal_position_hor_valid": goal_validity.position_hor,
+        "goal_position_vert_valid": goal_validity.position_vert,
         "goal_yaw_valid": goal_validity.yaw,
         "goal_body_valid": goal_validity.body,
         "goal_orientation_valid": goal_validity.orientation,
@@ -228,14 +231,17 @@ def _state_bool_field(state_msg, name: str, default: bool = True) -> bool:
             goal_validity.end_effector.right_foot),
     }
     if name not in validity_fields:
-        raise KeyError(f"Unknown protocol-11 validity field: {name}")
+        raise KeyError(f"Unknown protocol-12 validity field: {name}")
     return bool(validity_fields[name])
 
 
 def _controller_goal_validity(state_msg) -> dict[str, object]:
     """Collect controller validity as data for the denoiser."""
     return {
-        "root": _state_bool_field(state_msg, "goal_root_valid", True),
+        "position_hor": _state_bool_field(
+            state_msg, "goal_position_hor_valid", True),
+        "position_vert": _state_bool_field(
+            state_msg, "goal_position_vert_valid", True),
         "yaw": _state_bool_field(state_msg, "goal_yaw_valid", True),
         "body": _state_bool_field(state_msg, "goal_body_valid", True),
         "orientation": _state_bool_field(
@@ -270,6 +276,20 @@ def _goal_log_components(ego_goal_raw: torch.Tensor,
             float(ego_goal_raw[0, 42]),
             float(ego_goal_raw[0, 43]),
             float(ego_goal_raw[0, 45]),
+        )
+    if (goal_type is GoalType.JOINT_STATE
+            and motion_dtype.FeatureVersion == 3
+            and ego_goal_raw.shape[-1] == LEGACY45_SPLIT_GOAL_DIM):
+        # 0827-era 45-D split goal: trans(8) | rot(5) | pose(29) | vel(3);
+        # rot ends with raw yaw (radians) at index 12, vel at 42:45.
+        return (
+            float(ego_goal_raw[0, 0]),
+            float(ego_goal_raw[0, 1]),
+            float(ego_goal_raw[0, 2]),
+            math.degrees(float(ego_goal_raw[0, 12])),
+            float(ego_goal_raw[0, 42]),
+            float(ego_goal_raw[0, 43]),
+            float(ego_goal_raw[0, 44]),
         )
     if goal_type in (GoalType.ROOT, GoalType.BODY_EXT):
         yaw_deg = math.degrees(math.atan2(
@@ -443,11 +463,10 @@ def _checkpoint_contract(model_cfg: DictConfig) -> dict[str, object]:
     data_cfg = _config_get(model_cfg, "data", {})
     denoiser_cfg = _config_get(model_cfg, "denoiser", {})
 
-    feature_version = int(_first_config_value(
+    feature_version_raw = _first_config_value(
         _config_get(data_cfg, "feature_version", None),
         _config_get(model_cfg, "feature_version", None),
-        motion_dtype.FeatureVersion,
-    ))
+    )
     nfeats_value = _first_config_value(
         _config_get(data_cfg, "nfeats", None),
         _config_get(model_cfg, "nfeats", None),
@@ -460,12 +479,44 @@ def _checkpoint_contract(model_cfg: DictConfig) -> dict[str, object]:
         _config_get(data_cfg, "dof_dim", None),
         _config_get(model_cfg, "dof_dim", None),
     )
-    dof_dim = (
-        int(dof_value)
-        if dof_value is not None
-        else motion_dtype.infer_feature_dof_dim(
-            nfeats, feature_version=feature_version)
-    )
+    if feature_version_raw is not None:
+        feature_version = int(feature_version_raw)
+        dof_dim = (
+            int(dof_value)
+            if dof_value is not None
+            else motion_dtype.infer_feature_dof_dim(
+                nfeats, feature_version=feature_version)
+        )
+    else:
+        # 0827-era cfg.yaml predates data.feature_version.  Infer it from
+        # the recorded nfeats instead of the deployment module default, so
+        # old checkpoints resolve deterministically.
+        if dof_value is not None:
+            candidates = [
+                v for v in (3, 6)
+                if motion_dtype.motion_feature_dim_for_dof(
+                    int(dof_value), feature_version=v) == nfeats
+            ]
+        else:
+            candidates = [
+                v for v in (3, 6)
+                if nfeats == motion_dtype.motion_feature_dim_for_dof(
+                    motion_dtype.infer_feature_dof_dim(
+                        nfeats, feature_version=v),
+                    feature_version=v)
+            ]
+        if len(candidates) != 1:
+            raise ValueError(
+                "Cannot infer FeatureVersion from checkpoint nfeats="
+                f"{nfeats} (candidates: {candidates}); add data."
+                "feature_version to the checkpoint cfg.yaml")
+        feature_version = candidates[0]
+        dof_dim = (
+            int(dof_value)
+            if dof_value is not None
+            else motion_dtype.infer_feature_dof_dim(
+                nfeats, feature_version=feature_version)
+        )
 
     goal_type_value = _first_config_value(
         _config_get(data_cfg, "goal_type", None),
@@ -534,10 +585,15 @@ def _checkpoint_contract(model_cfg: DictConfig) -> dict[str, object]:
         and goal_dim == 55
         and not _config_has(data_cfg, "goal_include_log_d_hor")
     )
+    legacy_split_goal45_layout = (
+        goal_encoding is GoalEncoding.SPLIT
+        and goal_dim == LEGACY45_SPLIT_GOAL_DIM
+    )
     no_log_split_layout = goal_dim in (
         SPLIT_GOAL_NO_LOG_DIM, SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM)
     goal_schema = (
-        "rotmat_v7" if legacy_split_goal_layout
+        LEGACY45_SPLIT_GOAL_SCHEMA if legacy_split_goal45_layout
+        else "rotmat_v7" if legacy_split_goal_layout
         else (
             SPLIT_END_EFFECTOR_NO_LOG_GOAL_SCHEMA
             if goal_dim == SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM
@@ -576,6 +632,7 @@ def _checkpoint_contract(model_cfg: DictConfig) -> dict[str, object]:
         "goal_per_primitive": goal_per_primitive,
         "goal_include_log_d_hor": goal_include_log_d_hor,
         "legacy_split_goal_layout": legacy_split_goal_layout,
+        "legacy_split_goal45_layout": legacy_split_goal45_layout,
         "no_log_split_layout": no_log_split_layout,
         "goal_schema": goal_schema,
     }
@@ -694,6 +751,22 @@ def _apply_checkpoint_config(
                 cfg.data[key] = _plain_config_value(
                     _config_get(data_cfg, key))
 
+        # Dataset statistics are part of the model's input contract: the
+        # checkpoint's datadir ships the matching meanstd (e.g. the 0827-era
+        # FeatureVersion 3 statistics live in BONES-SEED, not the
+        # deployment's HIPHI datadir).  For checkpoints trained on the same
+        # dataset as the deployment this is a no-op.
+        if _config_has(data_cfg, "datadir"):
+            cfg.data["datadir"] = _plain_config_value(
+                _config_get(data_cfg, "datadir"))
+        model_val_cfg = _config_get(data_cfg, "val", None)
+        if model_val_cfg is not None:
+            with open_dict(cfg.data):
+                for key in ("datadir", "action_statistics_path"):
+                    if _config_has(model_val_cfg, key):
+                        cfg.data.val[key] = _plain_config_value(
+                            _config_get(model_val_cfg, key))
+
         # These values are required by the planner even when an older
         # cfg.yaml omitted one of the newer aliases.
         cfg.data.feature_version = int(contract["feature_version"])
@@ -719,6 +792,8 @@ def _apply_checkpoint_config(
             _checkpoint_text_condition_enabled(denoiser_cfg))
         denoiser_plain["legacy_split_goal_layout"] = bool(
             contract["legacy_split_goal_layout"])
+        denoiser_plain["legacy_split_goal45_layout"] = bool(
+            contract["legacy_split_goal45_layout"])
         cfg.denoiser = OmegaConf.create(denoiser_plain)
 
         vae_cfg = _config_get(model_cfg, "vae", None)
@@ -1017,12 +1092,30 @@ def main(cfg: DictConfig) -> None:
     _goal_clamp_cfg = cfg.get("goal_clamp")
     if _goal_clamp_cfg is not None and bool(
             cfg.get("goal_clamp_enabled", False)):
-        if goal_stats is None:
+        if bool(checkpoint_compatibility["legacy_split_goal45_layout"]):
+            # The 0827-era 45-D goal predates the data-driven clamp and its
+            # quantile tables are absent from the frozen goal_stats.pkl.
+            logger.info(
+                "Goal clamp disabled: the checkpoint uses the 0827-era "
+                "45-D split goal, which predates the data-driven clamp")
+        elif goal_stats is None:
             raise ValueError(
                 "goal_clamp_enabled requires frozen goal statistics; it is "
                 "only supported for the split goal encoding")
         _clamp_quantile = float(_goal_clamp_cfg.get("quantile", 99.0))
-        goal_clamp = GoalClamp.from_stats(goal_stats, _clamp_quantile)
+        goal_clamp = GoalClamp.from_stats(
+            goal_stats,
+            _clamp_quantile,
+            low_height_scale=float(
+                _goal_clamp_cfg.get("low_height_scale", 0.6)),
+            low_height=float(_goal_clamp_cfg.get("low_height", 0.20)),
+            speed_knee_height=float(
+                _goal_clamp_cfg.get("speed_knee_height", 0.70)),
+            standing_height=float(
+                _goal_clamp_cfg.get("standing_height", 0.78)),
+            low_height_distance_max=float(
+                _goal_clamp_cfg.get("low_height_distance_max", 0.5)),
+        )
         logger.info(
             "Goal clamp enabled from frozen stats at percentile {:.1f}: "
             "r_max(T)=clip({:.3f}*T, {:.3f}, {:.3f}) m with T<= {:.2f} s",
@@ -1084,6 +1177,22 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(
             "generated_history.phase_match_block_size must be positive, got "
             f"{phase_match_block_size}")
+    anchor_state = str(generated_history_cfg.get("anchor_state", "real")).strip().lower()
+    if anchor_state not in ("real", "gate"):
+        raise ValueError(
+            "generated_history.anchor_state must be one of real or gate, "
+            f"got {anchor_state!r}")
+    anchor_gate_cfg = generated_history_cfg.get("anchor_gate", {})
+    anchor_gate_window = int(anchor_gate_cfg.get("window", 4))
+    anchor_gate_low = float(anchor_gate_cfg.get("low_threshold", 0.75))
+    anchor_gate_high = float(anchor_gate_cfg.get("high_threshold", 1.5))
+    if anchor_gate_window < 0 or not math.isfinite(anchor_gate_low) \
+            or not math.isfinite(anchor_gate_high) \
+            or anchor_gate_low < 0.0 \
+            or anchor_gate_high <= anchor_gate_low:
+        raise ValueError(
+            "generated_history.anchor_gate requires window >= 0 and "
+            "finite 0 <= low_threshold < high_threshold")
     joint_smoothing_cfg = cfg.get("history_joint_smoothing")
     joint_smoothing_enabled = (
         joint_smoothing_cfg is not None
@@ -1227,6 +1336,15 @@ def main(cfg: DictConfig) -> None:
                 _goal_yaw_valid = bool(goal_valid["yaw"])
                 _goal_orientation_valid = bool(goal_valid["orientation"])
                 _goal_time_valid = bool(goal_valid["time"])
+                # A missing/invalid arrival time must not collapse the
+                # navigation goal to the one-frame clamp floor. The goal
+                # encoder may still use its numerical time floor for urgency,
+                # but distance clamping is meaningful only with a valid
+                # arrival-time budget.
+                # Invalid arrival time is represented by T=0 and masked in
+                # the goal encoding; the XY clamp still applies its fixed
+                # height-dependent distance cap in that case.
+                runtime_goal_clamp = goal_clamp
                 controller_text_valid = _state_bool_field(
                     latest_state, "text_valid", False)
                 text_valid = controller_text_valid and text_condition_supported
@@ -1310,7 +1428,8 @@ def main(cfg: DictConfig) -> None:
                         (
                             history_motion, abs_pose,
                             generated_reference_pos, generated_reference_rot,
-                            _, residual_phase, residual_phase_error,
+                            residual_correction, residual_phase,
+                            residual_phase_error,
                         ) = residual_reanchor_generated_plan_at_frame(
                             tracked_plan,
                             observed_tracked_frame,
@@ -1322,7 +1441,11 @@ def main(cfg: DictConfig) -> None:
                             joint_limits=residual_joint_limits,
                             phase_match_block_size=phase_match_block_size,
                             phase_index=matched_phase_index,
-                            min_phase_index=history_len - 1)
+                            min_phase_index=history_len - 1,
+                            anchor_state=anchor_state,
+                            anchor_gate_window=anchor_gate_window,
+                            anchor_gate_low=anchor_gate_low,
+                            anchor_gate_high=anchor_gate_high)
                         history_translation = None
                         alignment_mode = "residual_reanchor"
                         logger.info(
@@ -1333,6 +1456,11 @@ def main(cfg: DictConfig) -> None:
                             (f"{phase_offset_frames:+d}"
                              if phase_offset_frames is not None else "n/a"),
                             float(residual_phase_error[0]))
+                        if anchor_state == "gate":
+                            logger.info(
+                                "Residual anchor gate lambda={:.3f}",
+                                float(residual_correction.get(
+                                    "gate_lambda", torch.ones(1))[0]))
                         goal_builder = state_goal_from_reference
                         goal_builder_prefix = (
                             latest_state, generated_reference_pos,
@@ -1379,7 +1507,7 @@ def main(cfg: DictConfig) -> None:
                         goal_type=goal_type,
                         goal_reference_path=goal_reference_path,
                         goal_encoding=GoalEncoding.LEGACY40,
-                        goal_clamp=goal_clamp, fps=motion_fps,
+                        goal_clamp=runtime_goal_clamp, fps=motion_fps,
                         val_data=val_data,
                         **goal_builder_extra)
                     ego_goal = (
@@ -1391,7 +1519,7 @@ def main(cfg: DictConfig) -> None:
                             goal_reference_path=goal_reference_path,
                             goal_encoding=goal_encoding,
                             goal_stats=goal_stats,
-                            goal_clamp=goal_clamp, fps=motion_fps,
+                            goal_clamp=runtime_goal_clamp, fps=motion_fps,
                             val_data=val_data,
                             goal_include_log_d_hor=(
                                 goal_include_log_d_hor),
@@ -1416,7 +1544,7 @@ def main(cfg: DictConfig) -> None:
                         latest_state, cfg.device, goal_type=goal_type,
                         goal_reference_path=goal_reference_path,
                         goal_encoding=GoalEncoding.LEGACY40,
-                        goal_clamp=goal_clamp, fps=motion_fps,
+                        goal_clamp=runtime_goal_clamp, fps=motion_fps,
                         val_data=val_data)
                     ego_goal = (
                         ego_goal_raw if goal_encoding is GoalEncoding.LEGACY40
@@ -1425,7 +1553,7 @@ def main(cfg: DictConfig) -> None:
                             goal_reference_path=goal_reference_path,
                             goal_encoding=goal_encoding,
                             goal_stats=goal_stats,
-                            goal_clamp=goal_clamp, fps=motion_fps,
+                            goal_clamp=runtime_goal_clamp, fps=motion_fps,
                             val_data=val_data,
                             goal_include_log_d_hor=goal_include_log_d_hor)
                     )
@@ -1456,7 +1584,7 @@ def main(cfg: DictConfig) -> None:
                         goal_type=goal_type,
                         goal_reference_path=goal_reference_path,
                         goal_encoding=GoalEncoding.LEGACY40,
-                        goal_clamp=goal_clamp, fps=motion_fps,
+                        goal_clamp=runtime_goal_clamp, fps=motion_fps,
                         val_data=val_data,
                         reference_time_offset_s=(
                             latency_compensation_ms / 1000.0))
@@ -1470,7 +1598,7 @@ def main(cfg: DictConfig) -> None:
                             goal_reference_path=goal_reference_path,
                             goal_encoding=goal_encoding,
                             goal_stats=goal_stats,
-                            goal_clamp=goal_clamp, fps=motion_fps,
+                            goal_clamp=runtime_goal_clamp, fps=motion_fps,
                             val_data=val_data,
                             reference_time_offset_s=(
                                 latency_compensation_ms / 1000.0),
@@ -1531,7 +1659,7 @@ def main(cfg: DictConfig) -> None:
                     else:
                         _goal_ego_yaw_deg = _goal_ego_yaw_raw_deg
                 elif goal_type is GoalType.JOINT_STATE:
-                    if not (_goal_yaw_valid and _goal_orientation_valid):
+                    if not _goal_orientation_valid:
                         _goal_ego_yaw_deg = 0.0
                     else:
                         _goal_ego_yaw_deg = _goal_ego_yaw_raw_deg

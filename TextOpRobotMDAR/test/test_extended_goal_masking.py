@@ -367,8 +367,9 @@ def test_controller_validity_is_a_real_split_end_effector_mask():
     ).unsqueeze(0)
     y = {
         "goal_valid": {
-            "root": False,
-            "yaw": True,
+            "position_hor": False,
+            "position_vert": True,
+            "yaw": False,
             "orientation": True,
             "joint": True,
             "velocity": True,
@@ -387,7 +388,8 @@ def test_controller_validity_is_a_real_split_end_effector_mask():
     torch.testing.assert_close(
         masked[:, SPLIT_HORIZONTAL_SLICE], torch.zeros((1, 9)))
     torch.testing.assert_close(
-        masked[:, SPLIT_VERTICAL_HEIGHT_SLICE], torch.zeros((1, 2)))
+        masked[:, SPLIT_VERTICAL_HEIGHT_SLICE],
+        goal[:, SPLIT_VERTICAL_HEIGHT_SLICE])
     torch.testing.assert_close(
         masked[:, SPLIT_VERTICAL_GRAVITY_SLICE],
         goal[:, SPLIT_VERTICAL_GRAVITY_SLICE],
@@ -472,7 +474,8 @@ def test_controller_validity_is_ignored_during_training():
     ).unsqueeze(0)
     y = {
         "goal_valid": {
-            "root": False,
+            "position_hor": False,
+            "position_vert": False,
             "yaw": False,
             "orientation": False,
             "joint": False,

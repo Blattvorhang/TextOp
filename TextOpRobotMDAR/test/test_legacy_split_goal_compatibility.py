@@ -119,7 +119,8 @@ def test_no_log_split_end_effector_model_forward():
             "history_motion_normalized": torch.randn(1, 2, 44),
             "time_to_arrival_frame": torch.ones(1),
             "goal_valid": {
-                "root": True,
+                "position_hor": True,
+                "position_vert": True,
                 "orientation": True,
                 "joint": True,
                 "velocity": True,
