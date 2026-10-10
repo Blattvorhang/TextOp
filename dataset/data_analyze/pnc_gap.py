@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
+
 
 # ============================================================
 # Style
@@ -12,22 +12,14 @@ except ImportError:
     pass
 
 plt.rcParams.update({
-    "font.size": 13,
-    "axes.labelsize": 14,
-    "legend.fontsize": 9.5,
-    "axes.linewidth": 1.1,
-    "xtick.direction": "in",
-    "ytick.direction": "in",
+    "axes.linewidth": 1.0,
 })
+
 
 # ============================================================
 # Helpers
 # ============================================================
 def hermite_segment(t, t0, t1, y0, y1, m0, m1):
-    """
-    Cubic Hermite interpolation.
-    Guarantees value and tangent continuity at both endpoints.
-    """
     s = (t - t0) / (t1 - t0)
 
     h00 = 2 * s**3 - 3 * s**2 + 1
@@ -50,85 +42,145 @@ def smooth_step(x, x0, sharpness=6.0):
 # ============================================================
 # Timeline
 # ============================================================
-t = np.linspace(0.0, 6.25, 1600)
+t = np.linspace(
+    0.0,
+    6.25,
+    1600,
+)
 
 t_start = 3.20
 delay = 1.02
 t_finish = t_start + delay
 
+
+# ============================================================
+# Goal
+# ============================================================
+goal_y = 0.82
+
+
 # ============================================================
 # Old reference
 # ============================================================
-def old_reference_base(t):
-    return (
-        0.14
-        + 0.93 * np.exp(-0.5 * ((t - 2.05) / 0.90) ** 2)
-        - 0.95 / (1.0 + np.exp(-(t - 3.28) * 5.0))
-        - 0.085 * np.maximum(t - 4.0, 0.0)
+y0 = 0.06
+
+y_old = (
+    y0
+    + (goal_y - y0)
+    * (1.0 - np.exp(-0.82 * t))
+)
+
+y_old += (
+    0.050
+    * np.exp(
+        -0.5
+        * ((t - 2.15) / 0.78) ** 2
     )
-
-
-# Lift the right side slightly for a compact conceptual figure.
-tail_lift = 0.34 * smooth_step(t, 3.35, sharpness=4.0)
-y_old = old_reference_base(t) + tail_lift
-
-# ============================================================
-# Realized execution before handoff
-# ============================================================
-
-# Tracking mismatch deliberately exaggerated for visualization.
-tracking_error = (
-    -0.19 * np.exp(-0.5 * ((t - 1.70) / 0.42) ** 2)
-    + 0.07 * np.exp(-0.5 * ((t - 2.42) / 0.30) ** 2)
 )
 
-# Accumulated spatial drift.
-spatial_drift = -0.045 * np.maximum(t - 1.05, 0.0)
+y_old -= (
+    0.018
+    * smooth_step(
+        t,
+        3.75,
+        sharpness=4.0,
+    )
+)
 
-# Localized external perturbation.
+
+# ============================================================
+# Realized execution before replanning
+# ============================================================
+drift_progress = np.clip(
+    (t - 0.55)
+    / (t_start - 0.55),
+    0.0,
+    1.0,
+)
+
+spatial_drift = (
+    -0.025
+    * drift_progress
+    - 0.155
+    * drift_progress**1.75
+)
+
+tracking_fluctuation = (
+    (
+        0.008
+        + 0.018 * drift_progress
+    )
+    * np.sin(
+        4.2 * t + 0.35
+    )
+    * drift_progress
+)
+
+
+# ============================================================
+# External perturbation
+# ============================================================
 t_pert = 2.68
+
 perturbation = (
-    0.115
-    * np.sin(27.0 * (t - t_pert))
-    * np.exp(-0.5 * ((t - t_pert) / 0.16) ** 2)
+    0.110
+    * np.sin(
+        26.0 * (t - t_pert)
+    )
+    * np.exp(
+        -0.5
+        * ((t - t_pert) / 0.17) ** 2
+    )
 )
 
-# Additional deviation close to replanning.
-disturbance_offset = (
-    -0.10
-    * np.exp(-0.5 * ((t - 3.10) / 0.14) ** 2)
-)
 
+# ============================================================
+# Base realized execution
+# ============================================================
 y_exec_base = (
     y_old
-    + tracking_error
     + spatial_drift
+    + tracking_fluctuation
     + perturbation
-    + disturbance_offset
 )
+
 
 # ============================================================
 # New reference
-#
-# Starts from the realized state and matches its tangent.
 # ============================================================
-y_exec_start = np.interp(t_start, t, y_exec_base)
+y_exec_start = np.interp(
+    t_start,
+    t,
+    y_exec_base,
+)
 
-dy_exec_base = np.gradient(y_exec_base, t)
-m_exec_start = np.interp(t_start, t, dy_exec_base)
+dy_exec_base = np.gradient(
+    y_exec_base,
+    t,
+)
 
-y_new = np.full_like(t, np.nan)
+m_exec_start = np.interp(
+    t_start,
+    t,
+    dy_exec_base,
+)
+
+y_new = np.full_like(
+    t,
+    np.nan,
+)
+
 
 # First segment
-t_mid = t_start + 0.92
+t_mid = t_start + 1.42
 
 mask_new_1 = (
     (t >= t_start)
     & (t <= t_mid)
 )
 
-y_mid = y_exec_start - 0.08
-m_mid = -0.055
+y_mid = goal_y - 0.22
+m_mid = 0.085
 
 y_new[mask_new_1] = hermite_segment(
     t[mask_new_1],
@@ -140,6 +192,7 @@ y_new[mask_new_1] = hermite_segment(
     m_mid,
 )
 
+
 # Second segment
 t_end = 6.05
 
@@ -148,8 +201,8 @@ mask_new_2 = (
     & (t <= t_end)
 )
 
-y_end = -0.38
-m_end = -0.025
+y_end = goal_y - 0.008
+m_end = 0.0
 
 y_new[mask_new_2] = hermite_segment(
     t[mask_new_2],
@@ -161,125 +214,151 @@ y_new[mask_new_2] = hermite_segment(
     m_end,
 )
 
-valid_new = np.isfinite(y_new)
-
-# ============================================================
-# Boundary values
-# ============================================================
-y_old_finish = np.interp(
-    t_finish,
-    t,
-    y_old,
+valid_new = np.isfinite(
+    y_new
 )
 
-y_new_finish = np.interp(
+
+# ============================================================
+# Physical execution after handoff
+# ============================================================
+u = np.maximum(
+    t - t_finish,
+    0.0,
+)
+
+mask_after_handoff = (
+    t >= t_finish
+)
+
+
+# State and tangent at handoff
+y_handoff = np.interp(
     t_finish,
+    t,
+    y_exec_base,
+)
+
+m_handoff = np.interp(
+    t_finish,
+    t,
+    dy_exec_base,
+)
+
+
+# Interpolated new reference
+y_new_interp = np.interp(
+    t,
     t[valid_new],
     y_new[valid_new],
 )
 
-# ============================================================
-# Physical response after inference finishes
-#
-# IMPORTANT:
-# no discontinuity in execution itself.
-#
-# u = 0 exactly at t_finish.
-# Both the pulse and jitter start from zero smoothly.
-# ============================================================
-u = np.maximum(t - t_finish, 0.0)
 
-# ------------------------------------------------------------
-# Smooth upward response
-#
-# u^2 exp(-u/tau) starts with:
-#   value      = 0
-#   derivative = 0
-#
-# Therefore execution remains smooth at the handoff.
-# ------------------------------------------------------------
-tau_impact = 0.13
-
-raw_impact = (
-    (u / tau_impact) ** 2
-    * np.exp(-u / tau_impact)
+# Short continuation of old physical motion
+y_continuation = (
+    y_handoff
+    + m_handoff * u
 )
 
-# Normalize peak to 1.
-raw_peak = np.max(raw_impact)
-if raw_peak > 0:
-    raw_impact = raw_impact / raw_peak
 
-smooth_impact = 0.16 * raw_impact
+# Fast switch response
+tau_switch = 0.085
 
-# ------------------------------------------------------------
-# Damped jitter
-#
-# The rise envelope ensures jitter also starts smoothly.
-# ------------------------------------------------------------
+alpha_switch = (
+    1.0
+    - np.exp(
+        -(u / tau_switch) ** 2
+    )
+)
+
+
+# Growing post-handoff spatial lag
+tracking_lag_after = (
+    -0.016
+    - 0.050
+    * (
+        1.0
+        - np.exp(-u / 0.40)
+    )
+    - 0.030
+    * np.maximum(
+        u - 0.28,
+        0.0,
+    )
+)
+
+
+# Nominal post-switch execution
+y_exec_post = (
+    (1.0 - alpha_switch)
+    * y_continuation
+    + alpha_switch
+    * (
+        y_new_interp
+        + tracking_lag_after
+    )
+)
+
+
+# Downward transient / undershoot
+tau_drop = 0.12
+
+raw_drop = (
+    (u / tau_drop) ** 2
+    * np.exp(
+        -u / tau_drop
+    )
+)
+
+raw_drop_peak = np.max(
+    raw_drop
+)
+
+if raw_drop_peak > 0:
+    raw_drop = (
+        raw_drop
+        / raw_drop_peak
+    )
+
+drop_pulse = (
+    -0.070
+    * raw_drop
+)
+
+
+# Damped physical jitter
 jitter_rise = (
     1.0
-    - np.exp(-u / 0.10)
+    - np.exp(
+        -u / 0.07
+    )
 )
 
-jitter_decay = np.exp(-u / 0.85)
+jitter_decay = (
+    np.exp(
+        -u / 1.00
+    )
+)
 
-smooth_jitter = (
-    0.045
-    * np.sin(19.0 * u)
+physical_jitter = (
+    0.043
+    * np.sin(
+        19.0 * u
+    )
     * jitter_rise
     * jitter_decay
 )
 
-# Final physical execution.
-y_exec = (
-    y_exec_base
-    + smooth_impact
-    + smooth_jitter
+
+# Final realized execution
+y_exec = y_exec_base.copy()
+
+y_exec[mask_after_handoff] = (
+    y_exec_post[mask_after_handoff]
+    + drop_pulse[mask_after_handoff]
+    + physical_jitter[mask_after_handoff]
 )
 
-# ============================================================
-# Tracking Gap annotation
-# ============================================================
-t_track = 1.72
-
-y_old_track = np.interp(
-    t_track,
-    t,
-    y_old,
-)
-
-y_exec_track = np.interp(
-    t_track,
-    t,
-    y_exec,
-)
-
-track_mid = 0.5 * (
-    y_old_track
-    + y_exec_track
-)
-
-actual_half_gap = (
-    0.5
-    * abs(y_old_track - y_exec_track)
-)
-
-# Exaggerated for schematic readability.
-visual_half_gap = max(
-    actual_half_gap * 1.35,
-    0.075,
-)
-
-track_top = (
-    track_mid
-    + visual_half_gap
-)
-
-track_bottom = (
-    track_mid
-    - visual_half_gap
-)
 
 # ============================================================
 # Colors
@@ -287,27 +366,38 @@ track_bottom = (
 c_old = "#4472C4"
 c_exec = "#222222"
 c_new = "#C55A11"
+c_goal = "#888888"
 
-c_tracking = "#7A5195"
-c_distribution = "#4E8B8B"
-c_delay = "#B23A48"
-c_boundary = "#D62728"
-c_gray = "#555555"
 
 # ============================================================
 # Figure
 # ============================================================
 fig, ax = plt.subplots(
-    figsize=(7.15, 4.9)
+    figsize=(7.45, 5.05)
 )
+
+
+# Goal line
+ax.axhline(
+    goal_y,
+    color=c_goal,
+    linestyle=(0, (4, 4)),
+    linewidth=1.35,
+    alpha=0.90,
+    zorder=0,
+)
+
 
 # ============================================================
 # Old reference
-#
-# Becomes faded once the new reference becomes available.
 # ============================================================
-mask_old_active = t <= t_finish
-mask_old_inactive = t >= t_finish
+mask_old_active = (
+    t <= t_finish
+)
+
+mask_old_inactive = (
+    t >= t_finish
+)
 
 ax.plot(
     t[mask_old_active],
@@ -315,7 +405,6 @@ ax.plot(
     linestyle=(0, (6, 4)),
     linewidth=2.25,
     color=c_old,
-    label=r"old reference $r^{\mathrm{old}}$",
     zorder=3,
 )
 
@@ -325,25 +414,42 @@ ax.plot(
     linestyle=(0, (6, 4)),
     linewidth=2.15,
     color=c_old,
-    alpha=0.23,
+    alpha=0.20,
     zorder=1,
 )
 
+
 # ============================================================
 # Realized execution
-#
-# Clear before inference starts, faded afterwards.
 # ============================================================
-mask_exec_before = t <= t_start
-mask_exec_after = t >= t_start
+mask_exec_before = (
+    t <= t_start
+)
+
+mask_exec_during = (
+    (t >= t_start)
+    & (t < t_finish)
+)
+
+mask_exec_after = (
+    t >= t_finish
+)
 
 ax.plot(
     t[mask_exec_before],
     y_exec[mask_exec_before],
     linewidth=2.55,
     color=c_exec,
-    label=r"realized execution $x^{\mathrm{exec}}$",
     zorder=5,
+)
+
+ax.plot(
+    t[mask_exec_during],
+    y_exec[mask_exec_during],
+    linewidth=2.30,
+    color=c_exec,
+    alpha=0.20,
+    zorder=2,
 )
 
 ax.plot(
@@ -351,15 +457,13 @@ ax.plot(
     y_exec[mask_exec_after],
     linewidth=2.35,
     color=c_exec,
-    alpha=0.23,
-    zorder=2,
+    alpha=0.55,
+    zorder=5,
 )
+
 
 # ============================================================
 # New reference
-#
-# Transparent while being generated,
-# opaque after inference finishes.
 # ============================================================
 mask_new_generating = (
     (t >= t_start)
@@ -376,9 +480,9 @@ ax.plot(
     t[mask_new_generating],
     y_new[mask_new_generating],
     linestyle=(0, (5, 3)),
-    linewidth=2.1,
+    linewidth=2.10,
     color=c_new,
-    alpha=0.32,
+    alpha=0.25,
     zorder=4,
 )
 
@@ -386,256 +490,11 @@ ax.plot(
     t[mask_new_active],
     y_new[mask_new_active],
     linestyle=(0, (5, 3)),
-    linewidth=2.4,
+    linewidth=2.40,
     color=c_new,
-    label=r"new reference $r^{\mathrm{new}}$",
     zorder=6,
 )
 
-# ============================================================
-# Inference start / finish markers
-# ============================================================
-ax.axvline(
-    t_start,
-    ymin=0.08,
-    ymax=0.94,
-    color="0.30",
-    linestyle=(0, (2, 4)),
-    linewidth=1.15,
-)
-
-ax.axvline(
-    t_finish,
-    ymin=0.08,
-    ymax=0.84,
-    color="0.30",              # black/gray like inference starts
-    linestyle=(0, (2, 4)),
-    linewidth=1.15,
-)
-
-ax.text(
-    t_start,
-    1.245,
-    "inference starts",
-    ha="center",
-    va="bottom",
-    fontsize=13.0,
-    color="black",
-)
-
-ax.text(
-    t_finish,
-    1.00,
-    "inference finishes",
-    ha="center",
-    va="bottom",
-    fontsize=11.8,
-    color="black",
-)
-
-# ============================================================
-# Tracking Gap
-# ============================================================
-tracking_arrow = FancyArrowPatch(
-    (t_track, track_bottom),
-    (t_track, track_top),
-    arrowstyle="<->",
-    mutation_scale=19,
-    linewidth=2.0,
-    color=c_tracking,
-    zorder=12,
-)
-
-ax.add_patch(
-    tracking_arrow
-)
-
-ax.annotate(
-    "Tracking Gap",
-    xy=(
-        t_track,
-        track_top,
-    ),
-    xytext=(
-        0.88,
-        1.075,
-    ),
-    arrowprops=dict(
-        arrowstyle="->",
-        linewidth=1.25,
-        color=c_tracking,
-    ),
-    fontsize=13,
-    color=c_tracking,
-    fontstyle="italic",
-    ha="center",
-)
-
-# ============================================================
-# External perturbation
-# ============================================================
-y_pert = np.interp(
-    t_pert,
-    t,
-    y_exec,
-)
-
-ax.annotate(
-    "external perturbation",
-    xy=(
-        t_pert,
-        y_pert,
-    ),
-    xytext=(
-        1.63,
-        0.02,
-    ),
-    arrowprops=dict(
-        arrowstyle="->",
-        linewidth=1.25,
-        color=c_gray,
-    ),
-    fontsize=11.7,
-    color=c_gray,
-    ha="left",
-)
-
-# ============================================================
-# Feedback anchor
-# ============================================================
-ax.scatter(
-    [t_start],
-    [y_exec_start],
-    s=36,
-    color=c_new,
-    edgecolor="white",
-    linewidth=0.8,
-    zorder=13,
-)
-
-# ============================================================
-# Execution Distribution Gap
-# ============================================================
-history_start = 2.61
-history_end = t_start
-history_y = -0.73
-
-ax.annotate(
-    "",
-    xy=(
-        history_end,
-        history_y,
-    ),
-    xytext=(
-        history_start,
-        history_y,
-    ),
-    arrowprops=dict(
-        arrowstyle="|-|",
-        linewidth=1.6,
-        color=c_distribution,
-    ),
-)
-
-ax.text(
-    history_start - 0.05,
-    history_y + 0.075,
-    "feedback history",
-    ha="left",
-    va="bottom",
-    fontsize=10.0,
-    color="0.42",
-)
-
-ax.text(
-    2.34,
-    -0.96,
-    "Execution Distribution Gap",
-    ha="center",
-    va="top",
-    fontsize=12.2,
-    color=c_distribution,
-    fontstyle="italic",
-)
-
-# ============================================================
-# Inference Delay
-#
-# No brace/end ticks are drawn here.
-# Leave clean space for manual annotation.
-# ============================================================
-delay_y = -0.39
-
-ax.text(
-    0.5 * (t_start + t_finish),
-    delay_y,
-    r"Inference Delay $d$",
-    ha="center",
-    va="center",
-    fontsize=12.5,
-    color=c_delay,
-    fontstyle="italic",
-)
-
-# ============================================================
-# Boundary Discontinuity
-# ============================================================
-x_boundary = t_finish + 0.055
-
-boundary_arrow = FancyArrowPatch(
-    (
-        x_boundary,
-        y_new_finish,
-    ),
-    (
-        x_boundary,
-        y_old_finish,
-    ),
-    arrowstyle="<->",
-    mutation_scale=15,
-    linewidth=1.55,
-    color=c_boundary,
-    zorder=12,
-)
-
-ax.add_patch(
-    boundary_arrow
-)
-
-ax.annotate(
-    "Boundary\nDiscontinuity",
-    xy=(
-        x_boundary,
-        0.5 * (
-            y_new_finish
-            + y_old_finish
-        ),
-    ),
-    xytext=(
-        4.87,
-        0.36,
-    ),
-    arrowprops=dict(
-        arrowstyle="->",
-        linewidth=1.15,
-        color=c_boundary,
-    ),
-    color=c_boundary,
-    fontsize=11.7,
-    ha="left",
-)
-
-# ============================================================
-# Physical consequence
-# ============================================================
-ax.text(
-    4.72,
-    -0.82,
-    r"$\rightarrow$ physical jitter",
-    fontsize=10.7,
-    color="0.45",
-    ha="left",
-)
 
 # ============================================================
 # Axes / layout
@@ -646,52 +505,42 @@ ax.set_xlim(
 )
 
 ax.set_ylim(
-    -1.05,
-    1.31,
-)
-
-ax.set_xlabel(
-    "time",
-    fontsize=15,
-)
-
-ax.set_ylabel(
-    "motion state / spatial trajectory",
-    fontsize=13.5,
+    0.1,
+    0.9,
 )
 
 ax.set_xticks([])
 ax.set_yticks([])
 
-ax.spines["top"].set_visible(False)
-ax.spines["right"].set_visible(False)
-ax.spines["left"].set_visible(False)
-ax.spines["bottom"].set_linewidth(1.0)
+# Remove all axis labels and annotations.
+ax.set_xlabel("")
+ax.set_ylabel("")
 
-# ============================================================
-# Legend
-# ============================================================
-ax.legend(
-    loc="upper right",
-    bbox_to_anchor=(1.01, 1.025),
-    frameon=False,
-    fontsize=9.3,
-    handlelength=2.1,
-    borderpad=0.05,
-    labelspacing=0.18,
+# Remove all spines for a clean slide-ready figure.
+for spine in ax.spines.values():
+    spine.set_visible(False)
+
+# Remove any padding around the figure.
+plt.tight_layout(
+    pad=0.1
 )
 
-plt.tight_layout()
+
+# ============================================================
+# Save
+# ============================================================
+# Transparent background is useful for slides.
+# plt.savefig(
+#     "planner_controller_curves_only.pdf",
+#     bbox_inches="tight",
+#     transparent=True,
+# )
 
 # plt.savefig(
-#     "planner_controller_gaps.pdf",
-#     bbox_inches="tight",
-# )
-#
-# plt.savefig(
-#     "planner_controller_gaps.png",
+#     "planner_controller_curves_only.png",
 #     dpi=400,
 #     bbox_inches="tight",
+#     transparent=True,
 # )
 
 plt.show()
