@@ -245,6 +245,29 @@ def test_goal_clamp_from_stats_interpolates_quantile():
     assert clamp.r_max == pytest.approx(1.35 + 0.5 * (2.20 - 1.35))
 
 
+def test_goal_clamp_from_stats_interpolates_current_height():
+    stats = _goal_clamp_stats_fixture()
+    stats["goal_clamp"]["height_conditioned"] = {
+        "centers": [0.2, 1.0],
+        "quantile_levels": stats["goal_clamp"]["quantile_levels"],
+        "dist_quantiles": [
+            [0.08, 0.55, 0.98, 1.35, 1.50, 1.60],
+            [0.08, 0.55, 0.98, 1.35, 3.00, 3.20],
+        ],
+        "speed_quantiles": [
+            [0.06, 0.43, 0.76, 1.05, 0.80, 0.90],
+            [0.06, 0.43, 0.76, 1.05, 2.40, 2.60],
+        ],
+        "n_samples": [500, 500],
+    }
+    clamp = GoalClamp.from_stats(stats, 99.0)
+    speed, r_min, r_max = clamp.limits_for_height(
+        torch.tensor([0.6], dtype=torch.float32))
+    assert float(speed[0]) == pytest.approx(1.6)
+    assert float(r_min[0]) == pytest.approx(1.6 / 50.0)
+    assert float(r_max[0]) == pytest.approx(2.25)
+
+
 def test_goal_clamp_from_stats_missing_tables_raises():
     stats = dict(_goal_clamp_stats_fixture())
     del stats["goal_clamp"]

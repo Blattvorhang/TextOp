@@ -1652,6 +1652,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         # window start (the goal as issued) and the implied speed r/T.
         clamp_dist_terms = []
         clamp_speed_terms = []
+        clamp_height_terms = []
 
         for primitive in batch_data:
             if self.goal_encoding.uses_end_effectors:
@@ -1729,6 +1730,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             ).reshape(goal_radius.shape).clamp_min(1.0 / float(self.fps))
             clamp_dist_terms.append(goal_radius)
             clamp_speed_terms.append(goal_radius / time_budget)
+            clamp_height_terms.append(
+                torch.as_tensor(
+                    primitive['gt_ref_pos'], device=goal_radius.device,
+                    dtype=goal_radius.dtype,
+                )[..., 2].reshape(goal_radius.shape))
 
         if not pos_terms:
             raise ValueError("Unable to compute goal statistics from empty batch")
@@ -1864,6 +1870,46 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             [round(float(v), 3) for v in clamp_speed_quantiles],
             [round(float(v), 1) for v in clamp_levels_percent],
         )
+        # Height-conditioned envelope.  Quantile-based centers keep each
+        # bucket populated across mixed locomotion/posture datasets; runtime
+        # interpolates between neighboring centers.
+        clamp_height = torch.cat(clamp_height_terms, dim=0).reshape(-1)
+        # Rank-based buckets avoid empty/sparse tails when many clips share
+        # an identical quantized root height.  Runtime still interpolates
+        # over the resulting height centers.
+        bucket_count = min(5, int(clamp_height.numel()))
+        sorted_index = torch.argsort(clamp_height)
+        rank_bucket = torch.empty_like(sorted_index)
+        rank_bucket[sorted_index] = (
+            torch.arange(clamp_height.numel(), device=clamp_height.device)
+            * bucket_count // clamp_height.numel())
+        height_centers = torch.stack([
+            clamp_height[rank_bucket == index].mean()
+            for index in range(bucket_count)
+        ])
+        height_conditioned = None
+        if height_centers.numel() >= 2:
+            bucket = rank_bucket
+            h_dist_rows = []
+            h_speed_rows = []
+            h_counts = []
+            for index in range(height_centers.numel()):
+                mask = bucket == index
+                h_counts.append(int(mask.sum()))
+                if not bool(mask.any()):
+                    h_dist_rows.append(clamp_dist_quantiles)
+                    h_speed_rows.append(clamp_speed_quantiles)
+                else:
+                    h_dist_rows.append(torch.quantile(clamp_dist[mask], clamp_levels))
+                    h_speed_rows.append(torch.quantile(clamp_speed[mask], clamp_levels))
+            height_conditioned = {
+                'condition': 'reference_root_height',
+                'centers': [float(v) for v in height_centers.cpu()],
+                'quantile_levels': [float(v) for v in clamp_levels_percent],
+                'dist_quantiles': [[float(v) for v in row] for row in h_dist_rows],
+                'speed_quantiles': [[float(v) for v in row] for row in h_speed_rows],
+                'n_samples': h_counts,
+            }
         stats = {
             's_p': torch.as_tensor(float(s_p)),
             's_v': torch.as_tensor(float(s_v)),
@@ -1879,6 +1925,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             },
             'meta': self._goal_stats_meta(),
         }
+        if height_conditioned is not None:
+            stats['goal_clamp']['height_conditioned'] = height_conditioned
         if self.goal_include_log_d_hor:
             stats['s_l'] = torch.as_tensor(float(s_l))
             stats['meta']['goal_include_log_d_hor'] = True

@@ -503,6 +503,7 @@ ablation item (§7.4), not a settled v1 choice.
 | `diffusion.num_timesteps` | 5 | cosine schedule, START_X prediction |
 | `train.manager.stages` | [100000, 100000, 100000] | 3 stages, 300k total |
 | `train.manager.use_rollout` | true | Stage 1+ uses predicted history |
+| `train.manager.rollout_max_prob` | 1.0 | Stage 1 ramp endpoint; stage 2 holds this value |
 | `train.manager.use_full_sample` | false → true later | full DDPM sampling for rollout |
 | `train.manager.learning_rate` | 1e-4 | AdamW, cosine anneal |
 | `denoiser.cond_goal_mask_prob` | 0.1 | P(drop goal) — independent of scene |
@@ -557,13 +558,15 @@ them run on the active v1 path.
 ### 4.1.1 Three-Stage Rollout Schedule
 
 TextOp's `DARManager.should_rollout()` implements scheduled sampling over the
-three configured stages when `use_rollout=true`:
+three configured stages when `use_rollout=true`. The
+`train.manager.rollout_max_prob` setting controls the maximum probability of
+using generated history:
 
 | Stage | History used by the Denoiser |
 |-------|-------------------------------|
 | 0 | Pure ground-truth history |
-| 1 | Mixture; predicted-history probability increases linearly from 0 to 1 |
-| 2 | Predicted history after the GT seed primitive |
+| 1 | Mixture; predicted-history probability increases linearly from 0 to `rollout_max_prob` |
+| 2 | Predicted history after the GT seed primitive, with probability held at `rollout_max_prob` |
 
 Stage lengths count primitive optimizer steps because `manager.pre_step()` and
 `post_step()` run inside the primitive loop. P0 always uses its GT history because
@@ -572,7 +575,10 @@ During stages 1 and 2, the rollout
 must also carry the predicted absolute root pose. Goal canonicalization and the
 occupancy query use that predicted pose whenever predicted history is selected;
 using the corresponding GT primitive pose would make the conditions inconsistent
-with the selected history.
+with the selected history. TensorBoard logs `meta/self_rollout_prob` for the
+scheduled probability, `meta/self_rollout_used` for the actual per-primitive
+history choice, and `metric/train/self_rollout_ref_gt_dist_m` for the rollout
+current-state drift from the dataset GT reference.
 
 ### 4.2 Command
 

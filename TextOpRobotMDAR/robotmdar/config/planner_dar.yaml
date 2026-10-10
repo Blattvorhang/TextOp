@@ -40,6 +40,15 @@ generated_history:
   latency_plot_path: ${experiment_dir}/latency_compensation.png
   # null | spatial | residual_reanchor.
   align_to_g1: residual_reanchor
+  # State feedback at the residual-reanchor point: real | gate.
+  # In gate mode root pose is always real; only joints are gated.
+  anchor_state: gate
+  anchor_gate:
+    # Nearby generated phases used to detect ordinary execution lag.
+    window: 4
+    # Normalized joint RMSE below/above which feedback is off/on.
+    low_threshold: 5.0
+    high_threshold: 5.5
   # Replace the current state at a matched generated frame.
   phase_matching:
     enabled: false
@@ -74,6 +83,13 @@ denoiser:
 goal_clamp_enabled: false
 goal_clamp:
   quantile: 99
+  # Extra conservative factor at the lowest observed root height; the
+  # factor linearly returns to 1.0 at the highest height.
+  low_height_scale: 0.20
+  low_height: 0.50
+  speed_knee_height: 0.70
+  standing_height: 0.78
+  low_height_distance_max: 0.3
 
 # joint_state uses root pose, 29-DOF joints, velocity, and timestamp.
 goal_reference_path: null

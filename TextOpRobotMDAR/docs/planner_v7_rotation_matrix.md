@@ -1161,8 +1161,8 @@ into one of four tensorboard groups via `_classify_extra`
   (the `e_q_vel__walk` extras-dict keys become nested
   `metric_class/train/e_q_vel/walk` tags);
 - `meta/<k>` — schedule state (`stage`, `lr`, `feature_version`,
-  `grad_norm`, `scene_active`, `augmentation_active`; no per-phase
-  split).
+  `grad_norm`, `scene_active`, `augmentation_active`, `self_rollout_prob`,
+  `self_rollout_used`; no per-phase split).
 
 **Every individually logged term is the unweighted raw loss** — the
 weights enter only `total` (via the loss-weight lookup; goal weights may
