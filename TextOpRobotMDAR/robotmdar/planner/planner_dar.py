@@ -50,7 +50,7 @@ from robotmdar.utils.planner_convert import (
     g1_joint_limits_from_mjcf,
     match_generated_joint_phase,
     motion_dict_to_g1data,
-    residual_reanchor_generated_plan_at_frame,
+    history_reanchor_generated_plan_at_frame,
     state_goal_from_reference,
     state_to_ego_goal,
     state_to_model_input,
@@ -94,10 +94,10 @@ def _parse_generated_history_alignment_mode(value) -> str:
         return "null"
     if mode == "true":
         return "spatial"
-    if mode not in ("spatial", "residual_reanchor"):
+    if mode not in ("spatial", "history_reanchor"):
         raise ValueError(
             "generated_history.align_to_g1 must be one of "
-            "null, spatial, residual_reanchor, got "
+            "null, spatial, history_reanchor, got "
             f"{value!r}")
     return mode
 
@@ -1182,6 +1182,12 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(
             "generated_history.anchor_state must be one of real or gate, "
             f"got {anchor_state!r}")
+    history_reanchor_mode = str(generated_history_cfg.get(
+        "reanchor_mode", "se3_left")).strip().lower()
+    if history_reanchor_mode not in ("se3_left", "decoupled_world"):
+        raise ValueError(
+            "generated_history.reanchor_mode must be one of se3_left or "
+            f"decoupled_world, got {history_reanchor_mode!r}")
     anchor_gate_cfg = generated_history_cfg.get("anchor_gate", {})
     anchor_gate_window = int(anchor_gate_cfg.get("window", 4))
     anchor_gate_low = float(anchor_gate_cfg.get("low_threshold", 0.75))
@@ -1224,7 +1230,7 @@ def main(cfg: DictConfig) -> None:
             "max_velocity={} rad/s, ema_alpha={:.3f}",
             max_velocity_log, joint_smoothing_ema_alpha)
     generated_plans = {}
-    residual_joint_limits = None
+    reanchor_joint_limits = None
     next_ack_log_time = 0.0
     planning_latency_ema_ms = None
     latency_bias_ema_ms = None
@@ -1421,16 +1427,16 @@ def main(cfg: DictConfig) -> None:
                             :, matched_phase_index[0]]
                         generated_reference_rot = tracked_plan["root_rot"][
                             :, matched_phase_index[0]]
-                    if generated_history_align_mode == "residual_reanchor":
-                        if residual_joint_limits is None:
-                            residual_joint_limits = g1_joint_limits_from_mjcf(
+                    if generated_history_align_mode == "history_reanchor":
+                        if reanchor_joint_limits is None:
+                            reanchor_joint_limits = g1_joint_limits_from_mjcf(
                                 val_data, cfg.device)
                         (
                             history_motion, abs_pose,
                             generated_reference_pos, generated_reference_rot,
-                            residual_correction, residual_phase,
-                            residual_phase_error,
-                        ) = residual_reanchor_generated_plan_at_frame(
+                            reanchor_correction, _reanchor_phase,
+                            reanchor_phase_error,
+                        ) = history_reanchor_generated_plan_at_frame(
                             tracked_plan,
                             observed_tracked_frame,
                             tracked_frame,
@@ -1438,28 +1444,29 @@ def main(cfg: DictConfig) -> None:
                             latest_state,
                             val_data,
                             cfg.device,
-                            joint_limits=residual_joint_limits,
+                            joint_limits=reanchor_joint_limits,
                             phase_match_block_size=phase_match_block_size,
                             phase_index=matched_phase_index,
                             min_phase_index=history_len - 1,
+                            reanchor_mode=history_reanchor_mode,
                             anchor_state=anchor_state,
                             anchor_gate_window=anchor_gate_window,
                             anchor_gate_low=anchor_gate_low,
                             anchor_gate_high=anchor_gate_high)
                         history_translation = None
-                        alignment_mode = "residual_reanchor"
+                        alignment_mode = "history_reanchor"
                         logger.info(
-                            "Residual re-anchor frame={} phase_matching={} "
+                            "History re-anchor frame={} phase_matching={} "
                             "offset={} frames error={:.5f}",
                             matched_public_frame,
                             "on" if phase_matching_enabled else "off",
                             (f"{phase_offset_frames:+d}"
                              if phase_offset_frames is not None else "n/a"),
-                            float(residual_phase_error[0]))
+                            float(reanchor_phase_error[0]))
                         if anchor_state == "gate":
                             logger.info(
-                                "Residual anchor gate lambda={:.3f}",
-                                float(residual_correction.get(
+                                "History anchor gate lambda={:.3f}",
+                                float(reanchor_correction.get(
                                     "gate_lambda", torch.ones(1))[0]))
                         goal_builder = state_goal_from_reference
                         goal_builder_prefix = (

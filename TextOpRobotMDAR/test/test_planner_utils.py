@@ -13,8 +13,8 @@ from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
     G1_ISAACLAB_DOF_JOINT_NAMES,
     align_generated_history_pose,
     generated_history_at_frame,
-    residual_reanchor_generated_history,
-    residual_reanchor_generated_plan_at_frame,
+    history_reanchor_generated_history,
+    history_reanchor_generated_plan_at_frame,
     isaaclab_to_mujoco_dof,
     motion_dict_to_g1data,
     mujoco_to_isaaclab_dof,
@@ -882,7 +882,7 @@ def test_generated_history_v6_reconstructs_exact_published_window():
         package_motion_dtype.set_feature_version(old_package)
 
 
-def test_latency_residual_reanchor_matches_only_observed_past_then_rolls_forward():
+def test_latency_history_reanchor_matches_only_observed_past_then_transforms_future():
     old_runtime, old_package = _set_both_feature_versions(6)
     try:
         history_len = 4
@@ -927,7 +927,7 @@ def test_latency_residual_reanchor_matches_only_observed_past_then_rolls_forward
         limits = (torch.full((29,), -100.0), torch.full((29,), 100.0))
 
         (history, abs_pose, endpoint_pos, _, _, phase, _) = (
-            residual_reanchor_generated_plan_at_frame(
+            history_reanchor_generated_plan_at_frame(
                 plan, observed_frame, target_frame, history_len,
                 state, val_data, "cpu", joint_limits=limits))
         fused = motion_feature_to_dict_v6(history, abs_pose)
@@ -944,7 +944,7 @@ def test_latency_residual_reanchor_matches_only_observed_past_then_rolls_forward
         package_motion_dtype.set_feature_version(old_package)
 
 
-def test_residual_reanchor_v6_matches_full_position_and_so3_anchor():
+def test_history_reanchor_v6_matches_full_position_and_so3_anchor():
     old_runtime, old_package = _set_both_feature_versions(6)
     try:
         positions = torch.tensor([[
@@ -992,11 +992,67 @@ def test_residual_reanchor_v6_matches_full_position_and_so3_anchor():
         )
 
         aligned_pose, aligned_history, correction, phase, _ = (
-            residual_reanchor_generated_history(
+            history_reanchor_generated_history(
                 abs_pose, history, state, val_data, "cpu"))
         predicted_reconstructed = motion_feature_to_dict_v6(history, abs_pose)
         reconstructed = motion_feature_to_dict_v6(
             aligned_history, aligned_pose)
+
+        decoupled_pose, decoupled_history, decoupled_correction, _, _ = (
+            history_reanchor_generated_history(
+                abs_pose, history, state, val_data, "cpu",
+                reanchor_mode="decoupled_world"))
+        decoupled = motion_feature_to_dict_v6(
+            decoupled_history, decoupled_pose)
+        torch.testing.assert_close(
+            decoupled_correction["delta_pos"],
+            torch.as_tensor(real_pos) - predicted_reconstructed[
+                "root_trans_offset"][:, 1],
+            atol=3e-4, rtol=3e-4)
+        assert not torch.allclose(
+            decoupled_correction["delta_pos"], correction["delta_pos"],
+            atol=1e-3, rtol=1e-3)
+
+        expected_pos = torch.matmul(
+            correction["delta_rot_matrix"][:, None],
+            predicted_reconstructed["root_trans_offset"].unsqueeze(-1),
+        ).squeeze(-1) + correction["delta_pos"][:, None]
+        expected_rot = torch.matmul(
+            correction["delta_rot_matrix"][:, None],
+            quaternion_to_matrix(xyzw_to_wxyz(
+                predicted_reconstructed["root_rot"])),
+        )
+        torch.testing.assert_close(
+            reconstructed["root_trans_offset"], expected_pos,
+            atol=3e-4, rtol=3e-4)
+        torch.testing.assert_close(
+            quaternion_to_matrix(xyzw_to_wxyz(reconstructed["root_rot"])),
+            expected_rot, atol=3e-4, rtol=3e-4)
+        torch.testing.assert_close(
+            reconstructed["dof"],
+            predicted_reconstructed["dof"]
+            + correction["delta_joint"][:, None],
+            atol=2e-5, rtol=2e-5)
+        direct_pos, direct_rot, direct_joint = (
+            planner_convert.apply_state_deviation(
+                predicted_reconstructed["root_trans_offset"][:, 2],
+                quaternion_to_matrix(xyzw_to_wxyz(
+                    predicted_reconstructed["root_rot"][:, 2])),
+                predicted_reconstructed["dof"][:, 2],
+                correction,
+            )
+        )
+        torch.testing.assert_close(
+            direct_pos, reconstructed["root_trans_offset"][:, 2],
+            atol=3e-4, rtol=3e-4)
+        torch.testing.assert_close(
+            direct_rot,
+            quaternion_to_matrix(xyzw_to_wxyz(
+                reconstructed["root_rot"][:, 2])),
+            atol=3e-4, rtol=3e-4)
+        torch.testing.assert_close(
+            direct_joint, reconstructed["dof"][:, 2],
+            atol=2e-5, rtol=2e-5)
 
         assert int(phase[0]) == 1
         torch.testing.assert_close(
@@ -1043,8 +1099,8 @@ def test_residual_reanchor_v6_matches_full_position_and_so3_anchor():
             atol=2e-4,
             rtol=2e-4,
         )
-        # The next frame is integrated from the predicted local increment,
-        # transported by the real anchor orientation.
+        # The closed-form transform must match the former local-increment
+        # reconstruction at the next frame.
         real_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(real_rot))
         predicted_local_delta = torch.matmul(
             quaternion_to_matrix(
@@ -1074,7 +1130,7 @@ def test_residual_reanchor_v6_matches_full_position_and_so3_anchor():
         tied_motion["dof"] = tied_joints
         tied_history, tied_abs_pose = motion_dict_to_feature_v6(tied_motion)
         _, _, tied_correction, tied_phase, _ = (
-            residual_reanchor_generated_history(
+            history_reanchor_generated_history(
                 tied_abs_pose, tied_history, state, val_data, "cpu"))
         assert tied_phase.item() == tied_history.shape[1] - 1
         assert tied_correction["phase_offset_frames"].item() == 0
@@ -1083,7 +1139,7 @@ def test_residual_reanchor_v6_matches_full_position_and_so3_anchor():
         package_motion_dtype.set_feature_version(old_package)
 
 
-def test_residual_reanchor_treats_g1_joints_as_bounded_coordinates():
+def test_history_reanchor_clamps_offset_joints_independently():
     old_runtime, old_package = _set_both_feature_versions(6)
     try:
         num_states = 5
@@ -1122,7 +1178,7 @@ def test_residual_reanchor_treats_g1_joints_as_bounded_coordinates():
         )
 
         aligned_pose, aligned_history, correction, phase, _ = (
-            residual_reanchor_generated_history(
+            history_reanchor_generated_history(
                 abs_pose, history, state, val_data, "cpu"))
         reconstructed = motion_feature_to_dict_v6(
             aligned_history, aligned_pose)
@@ -1131,10 +1187,19 @@ def test_residual_reanchor_treats_g1_joints_as_bounded_coordinates():
         # coordinates as periodic would incorrectly choose +2.67.
         assert phase.item() == 0
         assert correction["phase_offset_frames"].item() == -3
-        expected_current = -3.08 + (2.67 - (-2.0))
+        # One additive deviation is applied to every reference state, then
+        # each state is independently projected onto the feasible range.
+        lower, upper = planner_convert.g1_joint_limits_from_mjcf(
+            val_data, device="cpu")
+        joint_delta = real_joints[0] - joints[0, 1]
+        expected = torch.clamp(
+            joints[:, 1:] + joint_delta,
+            min=lower,
+            max=upper,
+        )
         torch.testing.assert_close(
-            reconstructed["dof"][0, -1, shoulder_index],
-            torch.tensor(expected_current),
+            reconstructed["dof"],
+            expected,
             atol=2e-5,
             rtol=2e-5,
         )

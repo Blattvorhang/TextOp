@@ -394,9 +394,9 @@ pub_all_frames: false        # false = 8 frames (future only), true = 10 frames
 use_full_sample: false       # single-step denoising for the 20 Hz deadline
 generated_history:
   enabled: true
-  align_to_g1: false         # pure autoregressive debug mode
-  phase_lag_offset: 0        # compare to predicted frame t - phase_lag_offset
-  align_every: 1             # realign every N replans; inherit between
+  align_to_g1: history_reanchor  # null | spatial | history_reanchor
+  reanchor_mode: se3_left        # se3_left | decoupled_world
+  anchor_state: real              # real | gate
 
 # Communication
 comm_config: "robotmdar/config/communication/pubsub.yaml"
@@ -404,6 +404,17 @@ comm_config: "robotmdar/config/communication/pubsub.yaml"
 # Scene
 occ_grid: null               # null = all-zero voxel
 ```
+
+When `align_to_g1: history_reanchor`, the planner reconstructs the cached
+generated history as physical root poses and joint states, applies one measured
+state deviation, and then re-encodes the corrected states into the canonical
+motion representation. `se3_left` applies one rigid-body transform to the root
+trajectory and preserves root-local motion geometry. `decoupled_world`
+translates root positions in world coordinates while applying the orientation
+correction independently, preserving world-frame position differences. Joint
+offsets are applied in batch and projected onto the configured joint limits.
+`anchor_state: real` uses the measured joint state directly; `gate` scales only
+the joint correction according to nearby phase consistency.
 
 ---
 

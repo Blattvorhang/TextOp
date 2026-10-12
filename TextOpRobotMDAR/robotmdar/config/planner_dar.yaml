@@ -38,11 +38,14 @@ generated_history:
   latency_compensation_ema_alpha: 0.5
   latency_bias_ema_alpha: 0.2  # only for visualization; does not affect planning
   latency_plot_path: ${experiment_dir}/latency_compensation.png
-  # null | spatial | residual_reanchor.
-  align_to_g1: residual_reanchor
-  # State feedback at the residual-reanchor point: real | gate.
+  # null | spatial | history_reanchor.
+  align_to_g1: history_reanchor
+  # Reanchor mode: se3_left preserves root-local geometry;
+  # decoupled_world preserves world-frame position differences.
+  reanchor_mode: se3_left
+  # State feedback at the history anchor: real | gate.
   # In gate mode root pose is always real; only joints are gated.
-  anchor_state: gate
+  anchor_state: real
   anchor_gate:
     # Nearby generated phases used to detect ordinary execution lag.
     window: 4

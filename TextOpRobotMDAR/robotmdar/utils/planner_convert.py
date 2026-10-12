@@ -958,7 +958,7 @@ def g1_joint_limits_from_mjcf(
         mjcf_path = str(val_data.skeleton.fk.mjcf_file)
     except AttributeError as exc:
         raise ValueError(
-            "Residual re-anchoring requires val_data.skeleton.fk.mjcf_file "
+            "History re-anchoring requires val_data.skeleton.fk.mjcf_file "
             "to load G1 joint limits") from exc
     lower, upper = _g1_joint_limits_from_mjcf_path(mjcf_path)
     return (
@@ -967,7 +967,7 @@ def g1_joint_limits_from_mjcf(
     )
 
 
-def _residual_reanchor_real_state(
+def _history_reanchor_real_state(
         state_msg: Any,
         device: str | torch.device,
         dtype: torch.dtype,
@@ -1076,7 +1076,84 @@ def match_generated_joint_phase(
         phase_match_block_size=phase_match_block_size)
 
 
-def residual_reanchor_generated_history(
+def compute_state_deviation(
+        real_pos: torch.Tensor,
+        real_rot_matrix: torch.Tensor,
+        real_joint: torch.Tensor,
+        pred_pos: torch.Tensor,
+        pred_rot_matrix: torch.Tensor,
+        pred_joint: torch.Tensor,
+        joint_scale: torch.Tensor | None = None,
+        reanchor_mode: str = "se3_left",
+) -> dict[str, torch.Tensor]:
+    """Compute one of the supported state-space re-anchoring deviations."""
+    reanchor_mode = str(reanchor_mode).strip().lower()
+    if reanchor_mode not in ("se3_left", "decoupled_world"):
+        raise ValueError(
+            "reanchor_mode must be one of 'se3_left' or 'decoupled_world', "
+            f"got {reanchor_mode!r}")
+    delta_rot = torch.matmul(
+        real_rot_matrix, pred_rot_matrix.transpose(-1, -2))
+    if reanchor_mode == "se3_left":
+        # The translation block of T_real @ inverse(T_pred_anchor).
+        delta_pos = real_pos - torch.matmul(
+            delta_rot, pred_pos.unsqueeze(-1)).squeeze(-1)
+    else:
+        # Scheme B: position is a world-frame translation residual, while
+        # orientation is corrected independently by the same delta_rot.
+        delta_pos = real_pos - pred_pos
+    delta_joint = real_joint - pred_joint
+    if joint_scale is not None:
+        delta_joint = delta_joint * joint_scale.unsqueeze(-1)
+    return {
+        "delta_rot_matrix": delta_rot,
+        "delta_pos": delta_pos,
+        "delta_joint": delta_joint,
+    }
+
+
+def apply_state_deviation(
+        pred_pos: torch.Tensor,
+        pred_rot_matrix: torch.Tensor,
+        pred_joint: torch.Tensor,
+        deviation: dict[str, torch.Tensor],
+        joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
+        reanchor_mode: str = "se3_left",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply one state deviation independently to any selected states."""
+    reanchor_mode = str(reanchor_mode).strip().lower()
+    if reanchor_mode not in ("se3_left", "decoupled_world"):
+        raise ValueError(
+            "reanchor_mode must be one of 'se3_left' or 'decoupled_world', "
+            f"got {reanchor_mode!r}")
+    delta_rot = deviation["delta_rot_matrix"]
+    delta_pos = deviation["delta_pos"]
+    delta_joint = deviation["delta_joint"]
+    state_dims = pred_pos.ndim - 2
+    expand = (slice(None),) + (None,) * state_dims
+
+    hybrid_rot = torch.matmul(delta_rot[expand], pred_rot_matrix)
+    if reanchor_mode == "se3_left":
+        hybrid_pos = torch.matmul(
+            delta_rot[expand], pred_pos.unsqueeze(-1)).squeeze(-1)
+        hybrid_pos = hybrid_pos + delta_pos[expand]
+    else:
+        # Scheme B: preserve world-frame position differences and translate
+        # the trajectory without rotating its positions.
+        hybrid_pos = pred_pos + delta_pos[expand]
+    hybrid_joint = pred_joint + delta_joint[expand]
+    if joint_limits is not None:
+        lower, upper = joint_limits
+        limit_expand = (slice(None),) + (None,) * state_dims
+        hybrid_joint = torch.clamp(
+            hybrid_joint,
+            min=lower[limit_expand],
+            max=upper[limit_expand],
+        )
+    return hybrid_pos, hybrid_rot, hybrid_joint
+
+
+def history_reanchor_generated_history(
         abs_pose: dict,
         history_motion: torch.Tensor,
         state_msg: Any,
@@ -1088,14 +1165,15 @@ def residual_reanchor_generated_history(
         min_phase_index: int = 0,
         phase_match_block_size: int = 1,
         phase_index_override: torch.Tensor | None = None,
+        reanchor_mode: str = "se3_left",
         anchor_state: str = "real",
         anchor_gate_window: int = 4,
         anchor_gate_low: float = 0.75,
         anchor_gate_high: float = 1.5,
 ):
-    """Re-integrate predicted local increments from a measured state anchor."""
+    """Apply one measured state deviation uniformly to generated history."""
     if history_motion is None or val_data is None:
-        raise ValueError("Residual re-anchoring requires generated history data")
+        raise ValueError("History re-anchoring requires generated history data")
 
     device = torch.device(device)
     normalized_history = history_motion.to(device)
@@ -1123,7 +1201,7 @@ def residual_reanchor_generated_history(
     batch_size, num_frames = pred_pos.shape[:2]
     if batch_size != 1:
         raise ValueError(
-            "Residual re-anchoring currently expects one measured G1 state, "
+            "History re-anchoring currently expects one measured G1 state, "
             f"but generated history has batch size {batch_size}")
     if num_frames <= 0:
         raise ValueError("Generated history must contain at least one feature")
@@ -1133,7 +1211,7 @@ def residual_reanchor_generated_history(
             "phase_match_block_size must be positive, got "
             f"{phase_match_block_size}")
 
-    real_pos, real_rot, real_joint = _residual_reanchor_real_state(
+    real_pos, real_rot, real_joint = _history_reanchor_real_state(
         state_msg, device, pred_pos.dtype)
     if joint_limits is None:
         joint_limits = g1_joint_limits_from_mjcf(
@@ -1166,16 +1244,6 @@ def residual_reanchor_generated_history(
                                                  11 + dof_dim:11 + 2 * dof_dim]
         pred_full_joint[:, 0] = pred_joint[:, 0] - first_joint_delta
 
-    pred_delta_local = torch.matmul(
-        pred_full_rot_matrix[:, :-1].transpose(-1, -2),
-        (pred_full_pos[:, 1:] - pred_full_pos[:, :-1]).unsqueeze(-1),
-    ).squeeze(-1)
-    pred_relative_rot = torch.matmul(
-        pred_full_rot_matrix[:, :-1].transpose(-1, -2),
-        pred_full_rot_matrix[:, 1:],
-    )
-    pred_delta_joint = pred_full_joint[:, 1:] - pred_full_joint[:, :-1]
-
     real_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(real_rot))
     if correction is None:
         if phase_index_override is None:
@@ -1206,13 +1274,13 @@ def residual_reanchor_generated_history(
 
     real_pos = correction["real_pos"].to(dtype=pred_pos.dtype)
     real_joint = correction["real_joint"].to(dtype=pred_joint.dtype)
+    real_rot_matrix = correction["real_rot_matrix"].to(dtype=pred_pos.dtype)
 
     # The phase index addresses the generated states, while the integrated
     # sequence also contains the pre-history pose at index 0.
     phase_offset = correction["phase_offset_frames"].to(device)
-    # Never extrapolate beyond the cached generated window.  An out-of-range
-    # inherited phase is held at the nearest boundary; missing motion is thus
-    # a zero translation increment and an identity rotation increment.
+    # Never address beyond the cached generated window. An inherited phase
+    # outside this segment uses its nearest boundary state as the anchor.
     phase_index = num_frames - 1 + phase_offset
     phase_index = phase_index.clamp(0, num_frames - 1).long()
     anchor_state_index = phase_index + 1
@@ -1261,85 +1329,32 @@ def residual_reanchor_generated_history(
     else:
         gate_lambda = torch.ones(
             (batch_size,), device=device, dtype=pred_joint.dtype)
-    hybrid_pos = torch.zeros_like(pred_full_pos)
-    hybrid_rot_matrix = torch.zeros_like(pred_full_rot_matrix)
-    hybrid_joint = torch.zeros_like(pred_full_joint)
-    if anchor_state == "gate":
-        # Spatial state is always corrected from the measured robot pose so
-        # downstream world/ego goal computation remains closed-loop. Only the
-        # joint state, which carries motion-progress ambiguity, is gated.
-        blended_joint = pred_full_joint[:, anchor_state_index] + gate_lambda[:, None] * (
-            real_joint - pred_full_joint[:, anchor_state_index])
-        hybrid_pos[:, anchor_state_index] = real_pos
-        hybrid_rot_matrix[:, anchor_state_index] = real_rot_matrix
-        hybrid_joint[:, anchor_state_index] = blended_joint
-    else:
-        hybrid_pos[:, anchor_state_index] = real_pos
-        hybrid_rot_matrix[:, anchor_state_index] = real_rot_matrix
-        hybrid_joint[:, anchor_state_index] = real_joint
+    batch_index = torch.arange(batch_size, device=device)
+    pred_anchor_pos = pred_full_pos[batch_index, anchor_state_index]
+    pred_anchor_rot_matrix = pred_full_rot_matrix[
+        batch_index, anchor_state_index]
+    pred_anchor_joint = pred_full_joint[batch_index, anchor_state_index]
 
-    # Re-integrate exactly the predicted edge increments in both directions.
-    for edge_index in range(num_frames):
-        forward_mask = edge_index >= anchor_state_index
-        if bool(forward_mask.any()):
-            next_index = edge_index + 1
-            current_rot = hybrid_rot_matrix[:, edge_index]
-            hybrid_rot_matrix[:, next_index] = torch.where(
-                forward_mask[:, None, None],
-                torch.matmul(current_rot, pred_relative_rot[:, edge_index]),
-                hybrid_rot_matrix[:, next_index],
-            )
-            hybrid_pos[:, next_index] = torch.where(
-                forward_mask[:, None],
-                hybrid_pos[:, edge_index]
-                + torch.matmul(
-                    current_rot,
-                    pred_delta_local[:, edge_index].unsqueeze(-1),
-                ).squeeze(-1),
-                hybrid_pos[:, next_index],
-            )
-            hybrid_joint[:, next_index] = torch.where(
-                forward_mask[:, None],
-                torch.clamp(
-                    hybrid_joint[:, edge_index]
-                    + pred_delta_joint[:, edge_index],
-                    min=lower,
-                    max=upper,
-                ),
-                hybrid_joint[:, next_index],
-            )
-
-        backward_index = num_frames - 1 - edge_index
-        backward_mask = backward_index < anchor_state_index
-        if bool(backward_mask.any()):
-            current_rot = hybrid_rot_matrix[:, backward_index + 1]
-            hybrid_rot_matrix[:, backward_index] = torch.where(
-                backward_mask[:, None, None],
-                torch.matmul(
-                    current_rot,
-                    pred_relative_rot[:, backward_index].transpose(-1, -2),
-                ),
-                hybrid_rot_matrix[:, backward_index],
-            )
-            hybrid_pos[:, backward_index] = torch.where(
-                backward_mask[:, None],
-                hybrid_pos[:, backward_index + 1]
-                - torch.matmul(
-                    hybrid_rot_matrix[:, backward_index],
-                    pred_delta_local[:, backward_index].unsqueeze(-1),
-                ).squeeze(-1),
-                hybrid_pos[:, backward_index],
-            )
-            hybrid_joint[:, backward_index] = torch.where(
-                backward_mask[:, None],
-                torch.clamp(
-                    hybrid_joint[:, backward_index + 1]
-                    - pred_delta_joint[:, backward_index],
-                    min=lower,
-                    max=upper,
-                ),
-                hybrid_joint[:, backward_index],
-            )
+    # delta_T = T_real @ inverse(T_pred_anchor), then apply delta_T and the
+    # additive joint offset independently to every selected predicted state.
+    deviation = compute_state_deviation(
+        real_pos, real_rot_matrix, real_joint,
+        pred_anchor_pos, pred_anchor_rot_matrix, pred_anchor_joint,
+        joint_scale=gate_lambda,
+        reanchor_mode=reanchor_mode,
+    )
+    hybrid_pos, hybrid_rot_matrix, hybrid_joint = apply_state_deviation(
+        pred_full_pos,
+        pred_full_rot_matrix,
+        pred_full_joint,
+        deviation,
+        joint_limits=(lower, upper),
+        reanchor_mode=reanchor_mode,
+    )
+    correction.update({
+        key: value.detach().clone()
+        for key, value in deviation.items()
+    })
 
     hybrid_rot = wxyz_to_xyzw(matrix_to_quaternion(hybrid_rot_matrix))
     # Re-encode through the active feature definition. For V6 this projects
@@ -1361,7 +1376,7 @@ def residual_reanchor_generated_history(
             reencode_motion)
     else:
         raise ValueError(
-            "Residual re-anchoring supports FeatureVersion 3 and 6, got "
+            "History re-anchoring supports FeatureVersion 3 and 6, got "
             f"{motion_dtype.FeatureVersion}")
 
     return (
@@ -1373,7 +1388,7 @@ def residual_reanchor_generated_history(
     )
 
 
-def residual_reanchor_generated_plan_at_frame(
+def history_reanchor_generated_plan_at_frame(
         plan: dict,
         observed_frame: int,
         target_frame: int,
@@ -1385,6 +1400,7 @@ def residual_reanchor_generated_plan_at_frame(
         phase_match_block_size: int = 1,
         phase_index: torch.Tensor | None = None,
         min_phase_index: int = 0,
+        reanchor_mode: str = "se3_left",
         anchor_state: str = "real",
         anchor_gate_window: int = 4,
         anchor_gate_low: float = 0.75,
@@ -1393,8 +1409,8 @@ def residual_reanchor_generated_plan_at_frame(
     """Re-anchor at an observed phase, then crop at the future switch frame.
 
     Phase candidates are restricted to public plan frames at or before
-    ``observed_frame``. The re-anchored predicted trend is integrated through
-    ``target_frame`` before the terminal history window is selected.
+    ``observed_frame``. One state deviation is applied to the selected states,
+    including the suffix through ``target_frame``, before cropping the window.
     """
     observed_frame = int(observed_frame)
     target_frame = int(target_frame)
@@ -1413,7 +1429,7 @@ def residual_reanchor_generated_plan_at_frame(
             f"Target frame {target_frame} with history_len={history_len} "
             f"exceeds cached feature length {features.shape[1]}")
     if "input_abs_pose" not in plan:
-        raise ValueError("Residual re-anchoring requires cached input_abs_pose")
+        raise ValueError("History re-anchoring requires cached input_abs_pose")
 
     # Fast path: the selected H features plus their preceding absolute state
     # contain the replacement phase. Re-anchoring this local H+1-state window
@@ -1442,7 +1458,7 @@ def residual_reanchor_generated_plan_at_frame(
                 correction,
                 _,
                 phase_error,
-            ) = residual_reanchor_generated_history(
+            ) = history_reanchor_generated_history(
                 segment_abs_pose,
                 segment,
                 state_msg,
@@ -1451,6 +1467,7 @@ def residual_reanchor_generated_plan_at_frame(
                 joint_limits=joint_limits,
                 phase_match_block_size=phase_match_block_size,
                 phase_index_override=local_phase_index,
+                reanchor_mode=reanchor_mode,
                 anchor_state=anchor_state,
                 anchor_gate_window=anchor_gate_window,
                 anchor_gate_low=anchor_gate_low,
@@ -1487,7 +1504,7 @@ def residual_reanchor_generated_plan_at_frame(
         correction,
         phase_index,
         phase_error,
-    ) = residual_reanchor_generated_history(
+    ) = history_reanchor_generated_history(
         segment_abs_pose,
         segment,
         state_msg,
@@ -1498,6 +1515,7 @@ def residual_reanchor_generated_plan_at_frame(
         phase_match_block_size=phase_match_block_size,
         phase_index_override=phase_index,
         min_phase_index=min_phase_index,
+        reanchor_mode=reanchor_mode,
         anchor_state=anchor_state,
         anchor_gate_window=anchor_gate_window,
         anchor_gate_low=anchor_gate_low,
