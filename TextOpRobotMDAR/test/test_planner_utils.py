@@ -11,17 +11,14 @@ import TextOpRobotMDAR.robotmdar.dtype.motion as package_motion_dtype
 import TextOpRobotMDAR.robotmdar.utils.planner_convert as planner_convert
 from TextOpRobotMDAR.robotmdar.utils.planner_convert import (
     G1_ISAACLAB_DOF_JOINT_NAMES,
-    align_generated_history_pose,
-    generated_history_at_frame,
-    history_reanchor_generated_history,
-    history_reanchor_generated_plan_at_frame,
+    align_reference_history_pose,
+    reanchor_history_representation,
     isaaclab_to_mujoco_dof,
     motion_dict_to_g1data,
     mujoco_to_isaaclab_dof,
     state_goal_from_reference,
     state_to_ego_goal,
     state_to_model_input,
-    tracked_frame_from_timestamps,
 )
 from TextOpRobotMDAR.robotmdar.dtype.motion import (
     G1_MUJOCO_DOF_JOINT_NAMES,
@@ -545,7 +542,7 @@ def test_generated_goal_uses_translated_history_endpoint():
         atol=1e-6)
 
 
-def test_generated_history_alignment_translates_anchor_without_mutation():
+def test_reference_history_alignment_translates_anchor_without_mutation():
     abs_pose = {
         "root_trans_offset": torch.tensor([[1.0, 2.0, 0.7]]),
         "root_rot": torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
@@ -563,7 +560,7 @@ def test_generated_history_alignment_translates_anchor_without_mutation():
     })
 
     (aligned_pose, aligned_endpoint, aligned_rotation, translation,
-     aligned_history) = align_generated_history_pose(
+     aligned_history) = align_reference_history_pose(
         abs_pose, generated_endpoint, abs_pose["root_rot"], state, "cpu")
 
     torch.testing.assert_close(translation, torch.tensor([[8.0, 16.0, 0.1]]))
@@ -579,7 +576,7 @@ def test_generated_history_alignment_translates_anchor_without_mutation():
         abs_pose["root_trans_offset"], torch.tensor([[1.0, 2.0, 0.7]]))
 
 
-def test_generated_history_alignment_corrects_absolute_height_channel():
+def test_reference_history_alignment_corrects_absolute_height_channel():
     generated_pos = torch.tensor([
         [[1.0, 2.0, 0.7], [1.2, 2.1, 0.8], [1.4, 2.2, 0.9]],
     ])
@@ -602,13 +599,13 @@ def test_generated_history_alignment_corrects_absolute_height_channel():
         "g1_root_rot": _xyzw_to_wxyz_np(real_rot.numpy()),
     })
 
-    (aligned_pose, _, _, _, aligned_history) = align_generated_history_pose(
+    (aligned_pose, _, _, _, aligned_history) = align_reference_history_pose(
         abs_pose,
         generated_pos[:, 1],
         generated_rot[:, 1],
         state,
         "cpu",
-        history_motion=history,
+        history_repr=history,
         val_data=IdentityNormalization(),
     )
     reconstructed = motion_feature_to_dict_v3(
@@ -637,7 +634,7 @@ def _local_gravity_from_xyzw(root_rot: torch.Tensor) -> torch.Tensor:
     ).squeeze(-1)
 
 
-def test_generated_history_alignment_v6_corrects_h_and_g_only():
+def test_reference_history_alignment_v6_corrects_h_and_g_only():
     old_runtime, old_package = _set_both_feature_versions(6)
     try:
         generated_pos = torch.tensor([
@@ -665,13 +662,13 @@ def test_generated_history_alignment_v6_corrects_h_and_g_only():
         ))
 
         (aligned_pose, goal_reference_pos, goal_reference_rot, _,
-         aligned_history) = align_generated_history_pose(
+         aligned_history) = align_reference_history_pose(
             abs_pose,
             generated_pos[:, -1],
             generated_rot[:, -1],
             state,
             "cpu",
-            history_motion=history,
+         history_repr=history,
             val_data=IdentityNormalization(),
         )
 
@@ -718,227 +715,6 @@ def test_generated_history_alignment_v6_corrects_h_and_g_only():
             atol=1e-5,
             rtol=1e-5,
         )
-    finally:
-        runtime_motion_dtype.set_feature_version(old_runtime)
-        package_motion_dtype.set_feature_version(old_package)
-
-
-def test_tracking_timestamps_select_consumed_frame():
-    state = SimpleNamespace(
-        tracking=SimpleNamespace(start_t_ns=1_000_000_000),
-        history_meta=SimpleNamespace(publish_t_ns=1_061_000_000),
-    )
-    assert tracked_frame_from_timestamps(state, fps=50.0, future_len=8) == 3
-    state.history_meta.publish_t_ns = 2_000_000_000
-    assert tracked_frame_from_timestamps(state, fps=50.0, future_len=8) == 7
-
-
-def test_tracking_timestamps_include_inference_latency():
-    state = SimpleNamespace(
-        tracking=SimpleNamespace(start_t_ns=1_000_000_000),
-        history_meta=SimpleNamespace(publish_t_ns=1_061_000_000),
-    )
-    assert tracked_frame_from_timestamps(
-        state, fps=50.0, future_len=16, latency_ms=100.0) == 8
-    assert tracked_frame_from_timestamps(
-        state, fps=50.0, future_len=8, latency_ms=1000.0) == 7
-
-
-def test_tracking_timestamps_reject_invalid_inference_latency():
-    state = SimpleNamespace(
-        tracking=SimpleNamespace(start_t_ns=1_000_000_000),
-        history_meta=SimpleNamespace(publish_t_ns=1_061_000_000),
-    )
-    for latency_ms in (-1.0, float("nan"), float("inf")):
-        with np.testing.assert_raises(ValueError):
-            tracked_frame_from_timestamps(
-                state, fps=50.0, future_len=8, latency_ms=latency_ms)
-
-
-def test_generated_history_ends_at_tracked_future_frame():
-    features = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
-    root_pos = torch.zeros((1, 10, 3), dtype=torch.float32)
-    root_pos[0, :, 0] = torch.arange(10, dtype=torch.float32)
-    root_rot = torch.zeros((1, 10, 4), dtype=torch.float32)
-    root_rot[..., 3] = 1.0
-    plan = {"features": features, "root_pos": root_pos, "root_rot": root_rot}
-
-    history, abs_pose, reference_pos, _ = generated_history_at_frame(
-        plan, tracked_frame=0, history_len=2)
-    torch.testing.assert_close(history.flatten(), torch.tensor([0.0, 1.0]))
-    torch.testing.assert_close(
-        abs_pose["root_trans_offset"], torch.tensor([[0.0, 0.0, 0.0]]))
-    torch.testing.assert_close(reference_pos, torch.tensor([[1.0, 0.0, 0.0]]))
-
-    history, abs_pose, reference_pos, _ = generated_history_at_frame(
-        plan, tracked_frame=3, history_len=2)
-    torch.testing.assert_close(history.flatten(), torch.tensor([3.0, 4.0]))
-    torch.testing.assert_close(
-        abs_pose["root_trans_offset"], torch.tensor([[3.0, 0.0, 0.0]]))
-    torch.testing.assert_close(reference_pos, torch.tensor([[4.0, 0.0, 0.0]]))
-
-
-def test_generated_history_uses_public_frame_index_directly():
-    features = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
-    root_pos = torch.zeros((1, 10, 3), dtype=torch.float32)
-    root_pos[0, :, 0] = torch.arange(10, dtype=torch.float32)
-    root_rot = torch.zeros((1, 10, 4), dtype=torch.float32)
-    root_rot[..., 3] = 1.0
-    plan = {"features": features, "root_pos": root_pos, "root_rot": root_rot}
-
-    history, abs_pose, reference_pos, _ = generated_history_at_frame(
-        plan, tracked_frame=3, history_len=2)
-    torch.testing.assert_close(history.flatten(), torch.tensor([3.0, 4.0]))
-    torch.testing.assert_close(
-        abs_pose["root_trans_offset"], torch.tensor([[3.0, 0.0, 0.0]]))
-    torch.testing.assert_close(reference_pos, torch.tensor([[4.0, 0.0, 0.0]]))
-
-    history, _, reference_pos, _ = generated_history_at_frame(
-        plan, tracked_frame=1, history_len=2)
-    torch.testing.assert_close(history.flatten(), torch.tensor([1.0, 2.0]))
-    torch.testing.assert_close(reference_pos, torch.tensor([[2.0, 0.0, 0.0]]))
-
-
-def test_generated_history_v6_anchor_is_state_before_selected_features():
-    old_runtime, old_package = _set_both_feature_versions(6)
-    try:
-        features = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
-        root_pos = torch.zeros((1, 10, 3), dtype=torch.float32)
-        root_pos[0, :, 0] = torch.arange(10, dtype=torch.float32)
-        root_rot = torch.zeros((1, 10, 4), dtype=torch.float32)
-        root_rot[..., 3] = 1.0
-        plan = {
-            "features": features,
-            "root_pos": root_pos,
-            "root_rot": root_rot,
-            "input_abs_pose": {
-                "root_trans_offset": torch.tensor([[-1.0, 0.0, 0.0]]),
-                "root_rot": root_rot[:, 0].clone(),
-            },
-        }
-
-        history, abs_pose, reference_pos, _ = generated_history_at_frame(
-            plan, tracked_frame=0, history_len=2)
-        torch.testing.assert_close(history.flatten(), torch.tensor([0.0, 1.0]))
-        torch.testing.assert_close(
-            abs_pose["root_trans_offset"], torch.tensor([[-1.0, 0.0, 0.0]]))
-        torch.testing.assert_close(reference_pos, torch.tensor([[1.0, 0.0, 0.0]]))
-
-        history, abs_pose, reference_pos, _ = generated_history_at_frame(
-            plan, tracked_frame=3, history_len=2)
-        torch.testing.assert_close(history.flatten(), torch.tensor([3.0, 4.0]))
-        torch.testing.assert_close(
-            abs_pose["root_trans_offset"], torch.tensor([[2.0, 0.0, 0.0]]))
-        torch.testing.assert_close(reference_pos, torch.tensor([[4.0, 0.0, 0.0]]))
-    finally:
-        runtime_motion_dtype.set_feature_version(old_runtime)
-        package_motion_dtype.set_feature_version(old_package)
-
-
-def test_generated_history_v6_reconstructs_exact_published_window():
-    old_runtime, old_package = _set_both_feature_versions(6)
-    try:
-        num_states = 7
-        positions = torch.zeros((1, num_states, 3))
-        positions[0, :, 0] = torch.arange(num_states) * 0.1
-        positions[0, :, 2] = 0.8
-        rotations = torch.zeros((1, num_states, 4))
-        rotations[..., 3] = 1.0
-        joints = torch.zeros((1, num_states, 29))
-        joints[0, :, 0] = torch.arange(num_states) * 0.05
-        features, input_abs_pose = motion_dict_to_feature_v6({
-            "root_trans_offset": positions,
-            "root_rot": rotations,
-            "dof": joints,
-            "contact_mask": torch.ones((1, num_states, 2)),
-        })
-        reconstructed = motion_feature_to_dict_v6(features, input_abs_pose)
-        plan = {
-            "features": features,
-            "root_pos": reconstructed["root_trans_offset"],
-            "root_rot": reconstructed["root_rot"],
-            "input_abs_pose": input_abs_pose,
-        }
-
-        history, abs_pose, reference_pos, reference_rot = (
-            generated_history_at_frame(
-                plan, tracked_frame=3, history_len=2))
-        selected = motion_feature_to_dict_v6(history, abs_pose)
-
-        torch.testing.assert_close(
-            selected["root_trans_offset"],
-                reconstructed["root_trans_offset"][:, 3:5],
-        )
-        torch.testing.assert_close(
-            selected["root_rot"], reconstructed["root_rot"][:, 3:5])
-        torch.testing.assert_close(
-            selected["dof"], reconstructed["dof"][:, 3:5])
-        torch.testing.assert_close(
-            reference_pos, reconstructed["root_trans_offset"][:, 4])
-        torch.testing.assert_close(
-            reference_rot, reconstructed["root_rot"][:, 4])
-    finally:
-        runtime_motion_dtype.set_feature_version(old_runtime)
-        package_motion_dtype.set_feature_version(old_package)
-
-
-def test_latency_history_reanchor_matches_only_observed_past_then_transforms_future():
-    old_runtime, old_package = _set_both_feature_versions(6)
-    try:
-        history_len = 4
-        observed_frame = 2
-        target_frame = 4
-        num_states = 12
-        positions = torch.zeros((1, num_states, 3))
-        positions[0, :, 0] = torch.arange(num_states) * 0.1
-        positions[0, :, 2] = 0.8
-        rotations = torch.zeros((1, num_states, 4))
-        rotations[..., 3] = 1.0
-        joints = torch.zeros((1, num_states, 29))
-        # Output pose index 5 is public observed frame 2. Output index 6 is a
-        # closer match, but is in the predicted future and must be excluded.
-        joints[0, 6, 0] = 0.4
-        joints[0, 7:, 0] = 0.55
-        features, input_abs_pose = motion_dict_to_feature_v6({
-            "root_trans_offset": positions,
-            "root_rot": rotations,
-            "dof": joints,
-            "contact_mask": torch.ones((1, num_states, 2)),
-        })
-        reconstructed = motion_feature_to_dict_v6(features, input_abs_pose)
-        plan = {
-            "features": features,
-            "root_pos": reconstructed["root_trans_offset"],
-            "root_rot": reconstructed["root_rot"],
-            "dof": reconstructed["dof"],
-            "input_abs_pose": input_abs_pose,
-        }
-        real_joint = torch.zeros((1, 29))
-        real_joint[0, 0] = 0.55
-        state = SimpleNamespace(states=SimpleNamespace(
-            g1_pos=np.array([[10.0, 0.0, 0.8]], dtype=np.float32),
-            g1_root_rot=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
-            g1_joint_pos=mujoco_to_isaaclab_dof(real_joint.numpy()),
-        ))
-        val_data = SimpleNamespace(
-            normalize=lambda value: value,
-            denormalize=lambda value: value,
-        )
-        limits = (torch.full((29,), -100.0), torch.full((29,), 100.0))
-
-        (history, abs_pose, endpoint_pos, _, _, phase, _) = (
-            history_reanchor_generated_plan_at_frame(
-                plan, observed_frame, target_frame, history_len,
-                state, val_data, "cpu", joint_limits=limits))
-        fused = motion_feature_to_dict_v6(history, abs_pose)
-
-        assert phase.item() == history_len - 1 + observed_frame
-        torch.testing.assert_close(
-            endpoint_pos, torch.tensor([[10.2, 0.0, 0.8]]),
-            atol=2e-5, rtol=2e-5)
-        torch.testing.assert_close(
-            fused["root_trans_offset"][:, -1], endpoint_pos,
-            atol=2e-5, rtol=2e-5)
     finally:
         runtime_motion_dtype.set_feature_version(old_runtime)
         package_motion_dtype.set_feature_version(old_package)
@@ -992,14 +768,14 @@ def test_history_reanchor_v6_matches_full_position_and_so3_anchor():
         )
 
         aligned_pose, aligned_history, correction, phase, _ = (
-            history_reanchor_generated_history(
+            reanchor_history_representation(
                 abs_pose, history, state, val_data, "cpu"))
         predicted_reconstructed = motion_feature_to_dict_v6(history, abs_pose)
         reconstructed = motion_feature_to_dict_v6(
             aligned_history, aligned_pose)
 
         decoupled_pose, decoupled_history, decoupled_correction, _, _ = (
-            history_reanchor_generated_history(
+            reanchor_history_representation(
                 abs_pose, history, state, val_data, "cpu",
                 reanchor_mode="decoupled_world"))
         decoupled = motion_feature_to_dict_v6(
@@ -1008,6 +784,12 @@ def test_history_reanchor_v6_matches_full_position_and_so3_anchor():
             decoupled_correction["delta_pos"],
             torch.as_tensor(real_pos) - predicted_reconstructed[
                 "root_trans_offset"][:, 1],
+            atol=3e-4, rtol=3e-4)
+        expected_decoupled_pos = (
+            predicted_reconstructed["root_trans_offset"]
+            + decoupled_correction["delta_pos"][:, None])
+        torch.testing.assert_close(
+            decoupled["root_trans_offset"], expected_decoupled_pos,
             atol=3e-4, rtol=3e-4)
         assert not torch.allclose(
             decoupled_correction["delta_pos"], correction["delta_pos"],
@@ -1130,7 +912,7 @@ def test_history_reanchor_v6_matches_full_position_and_so3_anchor():
         tied_motion["dof"] = tied_joints
         tied_history, tied_abs_pose = motion_dict_to_feature_v6(tied_motion)
         _, _, tied_correction, tied_phase, _ = (
-            history_reanchor_generated_history(
+            reanchor_history_representation(
                 tied_abs_pose, tied_history, state, val_data, "cpu"))
         assert tied_phase.item() == tied_history.shape[1] - 1
         assert tied_correction["phase_offset_frames"].item() == 0
@@ -1178,7 +960,7 @@ def test_history_reanchor_clamps_offset_joints_independently():
         )
 
         aligned_pose, aligned_history, correction, phase, _ = (
-            history_reanchor_generated_history(
+            reanchor_history_representation(
                 abs_pose, history, state, val_data, "cpu"))
         reconstructed = motion_feature_to_dict_v6(
             aligned_history, aligned_pose)

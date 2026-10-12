@@ -30,8 +30,8 @@ motion_clip: null
 # Optional fixed recovery profile.
 is_recovery: false
 
-# Generated-history autoregressive chain.
-generated_history:
+# Controller reference history used to build the planner input representation.
+reference_history:
   enabled: true
   # Project the switch frame using recent planner latency.
   latency_compensation: true

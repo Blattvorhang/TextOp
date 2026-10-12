@@ -45,16 +45,15 @@ from robotmdar.utils.goal import (
     validate_goal_stats,
 )
 from robotmdar.utils.planner_convert import (
-    align_generated_history_pose,
-    generated_history_at_frame,
+    align_reference_history_pose,
     g1_joint_limits_from_mjcf,
-    match_generated_joint_phase,
+    match_reference_history_phase,
     motion_dict_to_g1data,
-    history_reanchor_generated_plan_at_frame,
+    reference_motion_to_history_repr,
+    reanchor_history_repr,
     state_goal_from_reference,
     state_to_ego_goal,
     state_to_model_input,
-    tracked_frame_from_timestamps,
 )
 from robotmdar.train.manager import DARManager
 
@@ -83,8 +82,8 @@ def _load_models(
     return vae, denoiser, diffusion, val_data
 
 
-def _parse_generated_history_alignment_mode(value) -> str:
-    """Normalize legacy bool config and the generated-history enum."""
+def _parse_reference_history_alignment_mode(value) -> str:
+    """Normalize the reference-history alignment mode."""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -96,7 +95,7 @@ def _parse_generated_history_alignment_mode(value) -> str:
         return "spatial"
     if mode not in ("spatial", "history_reanchor"):
         raise ValueError(
-            "generated_history.align_to_g1 must be one of "
+            "reference_history.align_to_g1 must be one of "
             "null, spatial, history_reanchor, got "
             f"{value!r}")
     return mode
@@ -1142,53 +1141,51 @@ def main(cfg: DictConfig) -> None:
     last_inferred_seq = None
     next_infer_time = time.perf_counter()
     inference_count = 0
-    generated_history_cfg = cfg.get("generated_history", {})
-    use_generated_history = bool(generated_history_cfg.get(
-        "enabled", cfg.get("use_generated_history", False)))
-    generated_history_align_mode = _parse_generated_history_alignment_mode(
-        generated_history_cfg.get(
-            "align_to_g1", cfg.get("align_generated_history_to_g1", False)))
-    align_generated_history = generated_history_align_mode != "null"
+    reference_history_cfg = cfg.get("reference_history", {})
+    use_reference_history = bool(reference_history_cfg.get("enabled", False))
+    reference_history_align_mode = _parse_reference_history_alignment_mode(
+        reference_history_cfg.get("align_to_g1", False))
+    align_reference_history = reference_history_align_mode != "null"
     latency_compensation = (
-        bool(generated_history_cfg.get("latency_compensation", False))
+        bool(reference_history_cfg.get("latency_compensation", False))
         and not synchronous_comm
     )
-    latency_compensation_ema_alpha = float(generated_history_cfg.get(
+    latency_compensation_ema_alpha = float(reference_history_cfg.get(
         "latency_compensation_ema_alpha", 0.5))
     if (not math.isfinite(latency_compensation_ema_alpha)
             or not 0.0 < latency_compensation_ema_alpha <= 1.0):
         raise ValueError(
-            "generated_history.latency_compensation_ema_alpha must be in "
+            "reference_history.latency_compensation_ema_alpha must be in "
             f"(0, 1], got {latency_compensation_ema_alpha}")
-    latency_bias_ema_alpha = float(generated_history_cfg.get(
+    latency_bias_ema_alpha = float(reference_history_cfg.get(
         "latency_bias_ema_alpha", 0.2))
     if (not math.isfinite(latency_bias_ema_alpha)
             or not 0.0 < latency_bias_ema_alpha <= 1.0):
         raise ValueError(
-            "generated_history.latency_bias_ema_alpha must be in (0, 1], "
+            "reference_history.latency_bias_ema_alpha must be in (0, 1], "
             f"got {latency_bias_ema_alpha}")
-    latency_plot_path = Path(to_absolute_path(str(generated_history_cfg.get(
+    latency_plot_path = Path(to_absolute_path(str(reference_history_cfg.get(
         "latency_plot_path",
         Path(str(cfg.experiment_dir)) / "latency_compensation.png"))))
-    phase_matching_cfg = generated_history_cfg.get("phase_matching", {})
+    phase_matching_cfg = reference_history_cfg.get("phase_matching", {})
     phase_matching_enabled = bool(phase_matching_cfg.get("enabled", False))
     phase_match_block_size = int(phase_matching_cfg.get("block_size", 1))
     if phase_match_block_size <= 0:
         raise ValueError(
-            "generated_history.phase_match_block_size must be positive, got "
+            "reference_history.phase_match_block_size must be positive, got "
             f"{phase_match_block_size}")
-    anchor_state = str(generated_history_cfg.get("anchor_state", "real")).strip().lower()
+    anchor_state = str(reference_history_cfg.get("anchor_state", "real")).strip().lower()
     if anchor_state not in ("real", "gate"):
         raise ValueError(
-            "generated_history.anchor_state must be one of real or gate, "
+            "reference_history.anchor_state must be one of real or gate, "
             f"got {anchor_state!r}")
-    history_reanchor_mode = str(generated_history_cfg.get(
+    history_reanchor_mode = str(reference_history_cfg.get(
         "reanchor_mode", "se3_left")).strip().lower()
     if history_reanchor_mode not in ("se3_left", "decoupled_world"):
         raise ValueError(
-            "generated_history.reanchor_mode must be one of se3_left or "
+            "reference_history.reanchor_mode must be one of se3_left or "
             f"decoupled_world, got {history_reanchor_mode!r}")
-    anchor_gate_cfg = generated_history_cfg.get("anchor_gate", {})
+    anchor_gate_cfg = reference_history_cfg.get("anchor_gate", {})
     anchor_gate_window = int(anchor_gate_cfg.get("window", 4))
     anchor_gate_low = float(anchor_gate_cfg.get("low_threshold", 0.75))
     anchor_gate_high = float(anchor_gate_cfg.get("high_threshold", 1.5))
@@ -1197,7 +1194,7 @@ def main(cfg: DictConfig) -> None:
             or anchor_gate_low < 0.0 \
             or anchor_gate_high <= anchor_gate_low:
         raise ValueError(
-            "generated_history.anchor_gate requires window >= 0 and "
+            "reference_history.anchor_gate requires window >= 0 and "
             "finite 0 <= low_threshold < high_threshold")
     joint_smoothing_cfg = cfg.get("history_joint_smoothing")
     joint_smoothing_enabled = (
@@ -1229,7 +1226,6 @@ def main(cfg: DictConfig) -> None:
             "Controller joint-history smoothing enabled: "
             "max_velocity={} rad/s, ema_alpha={:.3f}",
             max_velocity_log, joint_smoothing_ema_alpha)
-    generated_plans = {}
     reanchor_joint_limits = None
     next_ack_log_time = 0.0
     planning_latency_ema_ms = None
@@ -1268,8 +1264,7 @@ def main(cfg: DictConfig) -> None:
         next_ack_log_time = 0.0
         planning_latency_ema_ms = None
         latency_bias_ema_ms = None
-        generated_plans.clear()
-        logger.info("Planner episode reset: generated history cleared")
+        logger.info("Planner episode reset: latest state and timing cleared")
 
     node.set_reset_handler(_reset_episode_state)
 
@@ -1280,10 +1275,10 @@ def main(cfg: DictConfig) -> None:
         "latency_compensation={} (ema_alpha={:.2f})",
         1.0 / period, motion_fps, history_len, controller_history_states,
         future_len,
-        (f"generated+{generated_history_align_mode}"
-         if align_generated_history else "generated")
-        if use_generated_history else "controller",
-        generated_history_align_mode,
+        (f"reference+{reference_history_align_mode}"
+         if align_reference_history else "reference")
+        if use_reference_history else "controller",
+        reference_history_align_mode,
         latency_compensation, latency_compensation_ema_alpha)
 
     try:
@@ -1304,22 +1299,18 @@ def main(cfg: DictConfig) -> None:
             if state_seq == last_inferred_seq:
                 time.sleep(0.001)
                 continue
-            tracked_plan = None
-            if use_generated_history and generated_plans:
-                tracked_plan = generated_plans.get(
-                    latest_state.tracking.seq)
-                if tracked_plan is None:
-                    # Do not advance the autoregressive chain until the
-                    # controller acknowledges applying one of our plans.
+            reference_motion = None
+            if use_reference_history:
+                reference_motion = latest_state.reference_motion
+                if reference_motion is None:
                     if now >= next_ack_log_time:
-                        logger.info(
-                            "Waiting for controller plan acknowledgment: "
-                            "active={} cached={}",
-                            latest_state.tracking.seq,
-                            list(generated_plans))
+                        logger.info("Waiting for controller reference motion")
                         next_ack_log_time = now + 1.0
                     time.sleep(0.001)
                     continue
+                # Presence of the controller reference enables the reference
+                # window path; the window is materialized after cursor and
+                # latency compensation are resolved below.
             last_inferred_seq = state_seq
             scheduled_next = next_infer_time + period
 
@@ -1376,70 +1367,71 @@ def main(cfg: DictConfig) -> None:
                             logger.info(
                                 "Controller text enabled: {!r}",
                                 text)
-                using_generated_history = (
-                    use_generated_history and tracked_plan is not None)
+                using_reference_history = (
+                    use_reference_history and reference_motion is not None)
                 alignment_mode = "none"
                 phase_offset_frames = None
                 latency_compensation_ms = 0.0
                 latency_compensation_frames = 0
                 selected_history_frame = None
                 observed_tracked_frame = None
-                if using_generated_history:
-                    observed_tracked_frame = tracked_frame_from_timestamps(
-                        latest_state, motion_fps, future_len)
+                if using_reference_history:
+                    observed_tracked_frame = int(
+                        reference_motion.cursor_frame)
                     if (latency_compensation
                             and predicted_latency_ms is not None):
-                        # Advance the controller timestamp by the planner's
+                        # Advance the controller cursor by the planner's
                         # locally measured processing duration. Absolute
-                        # clocks are intentionally never compared.
+                        # clocks are intentionally not used for alignment.
                         latency_compensation_ms = predicted_latency_ms
                         latency_compensation_frames = round(
                             latency_compensation_ms * motion_fps / 1000.0)
-                    tracked_frame = tracked_frame_from_timestamps(
-                        latest_state, motion_fps, future_len,
-                        latency_ms=latency_compensation_ms)
+                    tracked_frame = observed_tracked_frame + int(
+                        round(latency_compensation_ms * motion_fps / 1000.0))
+                    tracked_frame = max(0, min(
+                        tracked_frame, reference_motion.num_frames - 2))
                     selected_history_frame = tracked_frame
-                    (history_motion, generated_abs_pose,
-                     generated_reference_pos, generated_reference_rot) = (
-                        generated_history_at_frame(
-                            tracked_plan, tracked_frame, history_len,
-                            ))
+                    ref_hist_repr = reference_motion_to_history_repr(
+                        reference_motion, tracked_frame, history_len,
+                        val_data, cfg.device)
+                    history_motion_repr = ref_hist_repr["history_repr"]
+                    reference_abs_pose = ref_hist_repr["input_abs_pose"]
+                    reference_pose_pos = ref_hist_repr["root_pos"][:, -1]
+                    reference_pose_rot = ref_hist_repr["root_rot"][:, -1]
                     matched_phase_index = torch.tensor(
-                        [history_len - 1 + observed_tracked_frame],
+                        [history_len - 1],
                         device=cfg.device, dtype=torch.long)
                     matched_public_frame = observed_tracked_frame
                     if (phase_matching_enabled
-                            and generated_history_align_mode != "null"):
-                        matched_phase_index, _ = match_generated_joint_phase(
-                            tracked_plan["dof"][:, :tracked_frame + history_len],
+                            and reference_history_align_mode != "null"):
+                        matched_phase_index, _ = match_reference_history_phase(
+                            ref_hist_repr["dof"],
                             latest_state,
                             cfg.device,
-                            min_phase_index=history_len - 1,
-                            max_phase_index=(
-                                history_len - 1 + observed_tracked_frame),
+                            min_phase_index=0,
+                            max_phase_index=history_len - 1,
                             phase_match_block_size=phase_match_block_size)
                         matched_public_frame = (
-                            int(matched_phase_index[0]) - history_len + 1)
+                            tracked_frame - history_len + 1
+                            + int(matched_phase_index[0]))
                         phase_offset_frames = (
                             matched_public_frame - observed_tracked_frame)
-                    if generated_history_align_mode == "spatial":
-                        generated_reference_pos = tracked_plan["root_pos"][
+                    if reference_history_align_mode == "spatial":
+                        reference_pose_pos = ref_hist_repr["root_pos"][
                             :, matched_phase_index[0]]
-                        generated_reference_rot = tracked_plan["root_rot"][
+                        reference_pose_rot = ref_hist_repr["root_rot"][
                             :, matched_phase_index[0]]
-                    if generated_history_align_mode == "history_reanchor":
+                    if reference_history_align_mode == "history_reanchor":
                         if reanchor_joint_limits is None:
                             reanchor_joint_limits = g1_joint_limits_from_mjcf(
                                 val_data, cfg.device)
                         (
-                            history_motion, abs_pose,
-                            generated_reference_pos, generated_reference_rot,
+                            history_motion_repr, abs_pose,
+                            reference_pose_pos, reference_pose_rot,
                             reanchor_correction, _reanchor_phase,
                             reanchor_phase_error,
-                        ) = history_reanchor_generated_plan_at_frame(
-                            tracked_plan,
-                            observed_tracked_frame,
-                            tracked_frame,
+                        ) = reanchor_history_repr(
+                            ref_hist_repr,
                             history_len,
                             latest_state,
                             val_data,
@@ -1447,7 +1439,6 @@ def main(cfg: DictConfig) -> None:
                             joint_limits=reanchor_joint_limits,
                             phase_match_block_size=phase_match_block_size,
                             phase_index=matched_phase_index,
-                            min_phase_index=history_len - 1,
                             reanchor_mode=history_reanchor_mode,
                             anchor_state=anchor_state,
                             anchor_gate_window=anchor_gate_window,
@@ -1470,24 +1461,24 @@ def main(cfg: DictConfig) -> None:
                                     "gate_lambda", torch.ones(1))[0]))
                         goal_builder = state_goal_from_reference
                         goal_builder_prefix = (
-                            latest_state, generated_reference_pos,
-                            generated_reference_rot, cfg.device)
+                            latest_state, reference_pose_pos,
+                            reference_pose_rot, cfg.device)
                         goal_builder_extra = {
                             "reference_time_offset_s": (
                                 latency_compensation_ms / 1000.0
                                 if latency_compensation else 0.0)
                         }
-                    elif generated_history_align_mode == "spatial":
+                    elif reference_history_align_mode == "spatial":
                         (
                             abs_pose, _, _, history_translation,
-                            history_motion,
-                        ) = align_generated_history_pose(
-                            generated_abs_pose,
-                            generated_reference_pos,
-                            generated_reference_rot,
+                            history_motion_repr,
+                        ) = align_reference_history_pose(
+                            reference_abs_pose,
+                            reference_pose_pos,
+                            reference_pose_rot,
                             latest_state,
                             cfg.device,
-                            history_motion=history_motion,
+                            history_repr=history_motion_repr,
                             val_data=val_data)
                         alignment_mode = "spatial"
                         goal_builder = state_to_ego_goal
@@ -1496,13 +1487,13 @@ def main(cfg: DictConfig) -> None:
                     else:
                         abs_pose = {
                             key: value.to(cfg.device)
-                            for key, value in generated_abs_pose.items()
+                            for key, value in reference_abs_pose.items()
                         }
                         history_translation = None
                         goal_builder = state_goal_from_reference
                         goal_builder_prefix = (
-                            latest_state, generated_reference_pos,
-                            generated_reference_rot, cfg.device)
+                            latest_state, reference_pose_pos,
+                            reference_pose_rot, cfg.device)
                         goal_builder_extra = {
                             "reference_time_offset_s": (
                                 latency_compensation_ms / 1000.0
@@ -1541,7 +1532,7 @@ def main(cfg: DictConfig) -> None:
                             f"{latest_state.history_meta.n_states} "
                             "entries; need at least "
                             f"{controller_history_states}")
-                    history_motion, abs_pose = state_to_model_input(
+                    history_motion_repr, abs_pose = state_to_model_input(
                         latest_state, history_len, val_data, cfg.device,
                         fps=motion_fps,
                         joint_smoothing_max_velocity_rad_s=(
@@ -1567,27 +1558,27 @@ def main(cfg: DictConfig) -> None:
                     history_translation = None
                     alignment_mode = "none"
 
-                if (using_generated_history and latency_compensation
-                        and generated_history_align_mode == "spatial"):
+                if (using_reference_history and latency_compensation
+                        and reference_history_align_mode == "spatial"):
                     # Latency compensation changes the semantic "current" state
                     # to the anticipated plan-switch endpoint. Always derive
                     # the goal from the final history actually sent to the
                     # model, independent of the optional spatial/reanchor mode.
                     final_history_motion = val_data.reconstruct_motion(
-                        history_motion,
+                        history_motion_repr,
                         abs_pose={
                             key: value.to(cfg.device)
                             for key, value in abs_pose.items()
                         },
                         ret_fk=False,
                     )
-                    generated_reference_pos = final_history_motion[
+                    reference_pose_pos = final_history_motion[
                         "root_trans_offset"][:, -1]
-                    generated_reference_rot = final_history_motion[
+                    reference_pose_rot = final_history_motion[
                         "root_rot"][:, -1]
                     ego_goal_raw = state_goal_from_reference(
-                        latest_state, generated_reference_pos,
-                        generated_reference_rot, cfg.device,
+                        latest_state, reference_pose_pos,
+                        reference_pose_rot, cfg.device,
                         goal_type=goal_type,
                         goal_reference_path=goal_reference_path,
                         goal_encoding=GoalEncoding.LEGACY40,
@@ -1599,8 +1590,8 @@ def main(cfg: DictConfig) -> None:
                         ego_goal_raw
                         if goal_encoding is GoalEncoding.LEGACY40
                         else state_goal_from_reference(
-                            latest_state, generated_reference_pos,
-                            generated_reference_rot, cfg.device,
+                            latest_state, reference_pose_pos,
+                            reference_pose_rot, cfg.device,
                             goal_type=goal_type,
                             goal_reference_path=goal_reference_path,
                             goal_encoding=goal_encoding,
@@ -1682,7 +1673,7 @@ def main(cfg: DictConfig) -> None:
                                 latest_state, motion_fps, cfg.device,
                                 reference_time_offset_s=(
                                     latency_compensation_ms / 1000.0
-                                    if using_generated_history
+                                    if using_reference_history
                                     and latency_compensation else 0.0)))
                     else:
                         time_to_arrival_s = 0.0
@@ -1724,7 +1715,7 @@ def main(cfg: DictConfig) -> None:
                     val_data=val_data,
                     goal=ego_goal,
                     voxel=voxel,
-                    history_motion=history_motion,
+                    history_motion=history_motion_repr,
                     abs_pose=abs_pose,
                     future_len=future_len,
                     use_full_sample=bool(cfg.use_full_sample),
@@ -1834,14 +1825,10 @@ def main(cfg: DictConfig) -> None:
                 chain_seam_root_error = float("nan")
                 chain_seam_angle_deg = float("nan")
                 chain_seam_joint_error = float("nan")
-                if using_generated_history:
-                    cached_pose_index = (
-                        history_len - 1 + selected_history_frame)
-                    cached_root_pos = tracked_plan["root_pos"][
-                        0, cached_pose_index]
-                    cached_root_rot = tracked_plan["root_rot"][
-                        0, cached_pose_index]
-                    cached_dof = tracked_plan["dof"][0, cached_pose_index]
+                if using_reference_history:
+                    cached_root_pos = ref_hist_repr["root_pos"][0, -1]
+                    cached_root_rot = ref_hist_repr["root_rot"][0, -1]
+                    cached_dof = ref_hist_repr["dof"][0, -1]
                     new_root_pos = motion_dict["root_trans_offset"][
                         0, skip_history]
                     new_root_rot = motion_dict["root_rot"][0, skip_history]
@@ -1900,28 +1887,12 @@ def main(cfg: DictConfig) -> None:
                             * planning_latency_ema_ms
                         )
 
-                if use_generated_history:
-                    generated_plans[published_seq] = {
-                        "features": torch.cat(
-                            (history_motion, future_motion), dim=1
-                        ).detach().clone(),
-                        "root_pos": motion_dict[
-                            "root_trans_offset"].detach().clone(),
-                        "root_rot": motion_dict["root_rot"].detach().clone(),
-                        "dof": motion_dict["dof"].detach().clone(),
-                        "input_abs_pose": input_abs_pose,
-                        # Future replans select history and pose directly from
-                        # this generated plan.
-                    }
-                    while len(generated_plans) > 16:
-                        del generated_plans[next(iter(generated_plans))]
-
                 inference_count += 1
                 if inference_count == 1 or inference_count % log_every == 0:
                     logger.info(
                         "plan={} state={} motion={} frames infer={:.1f} ms "
                         "(latency_ema={:.1f} ms) "
-                        "history={} tracked_plan={} frame={} shift={:.3f} m "
+                        "history={} ref_hist_repr={} frame={} shift={:.3f} m "
                         "align={} phase_offset={} frames "
                         "latency_compensation={:.1f} ms/{:+d} frames "
                         "bias={} ms (ema={} ms) "
@@ -1931,9 +1902,9 @@ def main(cfg: DictConfig) -> None:
                         "goal_r=({:.3f}->{:.3f}) m",
                         published_seq, state_seq, motion.num_frames, infer_ms,
                         latency_ema_log_ms,
-                        "generated" if using_generated_history else "controller",
+                        "reference" if using_reference_history else "controller",
                         (latest_state.tracking.seq
-                         if using_generated_history else -1),
+                         if using_reference_history else -1),
                         tracked_frame if tracked_frame is not None else -1,
                         (float(torch.linalg.vector_norm(history_translation))
                          if history_translation is not None else 0.0),

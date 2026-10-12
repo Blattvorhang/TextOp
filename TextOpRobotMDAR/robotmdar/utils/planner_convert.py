@@ -347,6 +347,107 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
     return val_data.normalize(feature), abs_pose
 
 
+def reference_motion_to_history_repr(controller_reference_motion: Any,
+                                     cursor_frame: int,
+                                     history_len: int, val_data: Any,
+                                     device: str | torch.device) -> dict:
+    """Convert a controller reference-motion window to planner representation."""
+    history_len = int(history_len)
+    positions = np.asarray(controller_reference_motion.root_pos, dtype=np.float32)
+    rotations = _normalized_wire_quaternions_wxyz_as_xyzw(
+        np.asarray(controller_reference_motion.root_ori, dtype=np.float32))
+    joints = isaaclab_to_mujoco_dof(
+        np.asarray(controller_reference_motion.joint_pos, dtype=np.float32))
+    if history_len <= 0 or len(positions) < history_len + 1:
+        raise ValueError(
+            f"Reference has {len(positions)} physical frames; need at least "
+            f"{history_len + 1}")
+    if not (len(positions) == len(rotations) == len(joints)):
+        raise ValueError("Reference motion arrays have inconsistent lengths")
+    model_dof_dim = int(getattr(val_data, "dof_dim", 29))
+    if model_dof_dim == 23:
+        joints = _reduce_mujoco_29_to_23(joints)
+    elif model_dof_dim != 29:
+        raise ValueError(f"Planner supports model dof_dim 23 or 29, got {model_dof_dim}")
+    n_frames = len(positions)
+    cursor = min(max(int(cursor_frame), 0), n_frames - 2)
+    start = max(0, cursor - history_len + 1)
+    end = min(n_frames, start + history_len + 1)
+    start = end - history_len - 1
+    positions = positions[start:end]
+    rotations = rotations[start:end]
+    joints = joints[start:end]
+    motion_dict = {
+        "root_trans_offset": torch.as_tensor(positions, dtype=torch.float32,
+                                              device=device).unsqueeze(0),
+        "root_rot": torch.as_tensor(rotations, dtype=torch.float32,
+                                     device=device).unsqueeze(0),
+        "dof": torch.as_tensor(joints, dtype=torch.float32,
+                                device=device).unsqueeze(0),
+        "contact_mask": torch.ones((1, history_len + 1, 2), dtype=torch.float32,
+                                    device=device),
+    }
+    features, abs_pose = motion_dtype.motion_dict_to_feature(motion_dict)
+    abs_pose = {
+        "root_trans_offset": motion_dict["root_trans_offset"][:, 0].detach().clone(),
+        "root_rot": motion_dict["root_rot"][:, 0].detach().clone(),
+    }
+    return {
+        "history_repr": val_data.normalize(features),
+        "root_pos": motion_dict["root_trans_offset"],
+        "root_rot": motion_dict["root_rot"],
+        "dof": motion_dict["dof"],
+        "input_abs_pose": abs_pose,
+        "cursor_frame": cursor,
+        "window_start": start,
+    }
+
+
+def reanchor_history_repr(
+        reference_history_repr: dict, history_len: int,
+        state_msg: Any,
+        val_data: Any, device: str | torch.device,
+        joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
+        phase_index: torch.Tensor | None = None,
+        phase_match_block_size: int = 1,
+        reanchor_mode: str = "se3_left",
+        anchor_state: str = "real",
+        anchor_gate_window: int = 4,
+        anchor_gate_low: float = 0.75,
+        anchor_gate_high: float = 1.5):
+    """Re-anchor a planner history representation to the measured state."""
+    history_repr = reference_history_repr["history_repr"]
+    abs_pose = reference_history_repr["input_abs_pose"]
+    aligned_abs_pose, aligned_history, correction, matched_phase, phase_error = (
+        reanchor_history_representation(
+            abs_pose, history_repr, state_msg, val_data, device,
+            joint_limits=joint_limits,
+            phase_match_block_size=phase_match_block_size,
+            phase_index_override=phase_index,
+            min_phase_index=0,
+            max_phase_index=history_len - 1,
+            reanchor_mode=reanchor_mode,
+            anchor_state=anchor_state,
+            anchor_gate_window=anchor_gate_window,
+            anchor_gate_low=anchor_gate_low,
+            anchor_gate_high=anchor_gate_high))
+    if hasattr(val_data, "reconstruct_motion"):
+        aligned_motion = val_data.reconstruct_motion(
+            aligned_history, abs_pose=aligned_abs_pose, ret_fk=False)
+    else:
+        aligned_motion = motion_dtype.motion_feature_to_dict(
+            val_data.denormalize(aligned_history), aligned_abs_pose)
+    return (
+        aligned_history,
+        aligned_abs_pose,
+        aligned_motion["root_trans_offset"][:, -1],
+        aligned_motion["root_rot"][:, -1],
+        correction,
+        matched_phase,
+        phase_error,
+    )
+
+
 def state_to_ego_goal(state_msg: Any,
                       device: str | torch.device,
                       goal_type: GoalType | str = GoalType.ROOT,
@@ -580,7 +681,7 @@ def state_goal_from_reference(state_msg: Any,
                               goal_include_log_d_hor: bool = True,
                               reference_time_offset_s: float = 0.0,
                               ) -> torch.Tensor:
-    """Convert the state goal relative to an explicit generated-history pose."""
+    """Convert the state goal relative to an explicit reference pose."""
     goal_type = GoalType.parse(goal_type)
     parsed_encoding = (
         GoalEncoding.parse(goal_encoding)
@@ -1019,49 +1120,20 @@ def _match_phase_from_predicted_joints(
     phase_error[:, block_size - 1:] = block_errors
     min_phase_index = int(min_phase_index)
     if not 0 <= min_phase_index < num_frames:
-        raise ValueError(f"min_phase_index must address generated history, got {min_phase_index}")
+        raise ValueError(f"min_phase_index must address reference history representation, got {min_phase_index}")
     phase_error[:, :min_phase_index] = float("inf")
     if max_phase_index is not None:
         max_phase_index = int(max_phase_index)
         if not 0 <= max_phase_index < num_frames:
             raise ValueError(
-                f"max_phase_index must address generated history, got {max_phase_index}")
+                f"max_phase_index must address reference history representation, got {max_phase_index}")
         phase_error[:, max_phase_index + 1:] = float("inf")
     reverse_index = torch.flip(phase_error, dims=(1,)).argmin(dim=-1)
     phase_index = num_frames - 1 - reverse_index
     return phase_index, phase_error.gather(1, phase_index[:, None]).squeeze(1)
 
 
-def match_generated_history_phase(
-        history_motion: torch.Tensor,
-        abs_pose: dict,
-        state_msg: Any,
-        val_data: Any,
-        device: str | torch.device,
-        min_phase_index: int = 0,
-        max_phase_index: int | None = None,
-        phase_match_block_size: int = 1,
-):
-    """Find the generated state best suited for replacement by measured state."""
-    if hasattr(val_data, "reconstruct_motion"):
-        predicted = val_data.reconstruct_motion(
-            history_motion.to(device),
-            abs_pose={key: value.to(device) for key, value in abs_pose.items()},
-            ret_fk=False,
-        )
-    else:
-        predicted = motion_dtype.motion_feature_to_dict(
-            val_data.denormalize(history_motion.to(device)),
-            {key: value.to(device) for key, value in abs_pose.items()},
-        )
-    return _match_phase_from_predicted_joints(
-        predicted["dof"].to(device), state_msg, device,
-        min_phase_index=min_phase_index,
-        max_phase_index=max_phase_index,
-        phase_match_block_size=phase_match_block_size)
-
-
-def match_generated_joint_phase(
+def match_reference_history_phase(
         predicted_joints: torch.Tensor,
         state_msg: Any,
         device: str | torch.device,
@@ -1153,9 +1225,9 @@ def apply_state_deviation(
     return hybrid_pos, hybrid_rot, hybrid_joint
 
 
-def history_reanchor_generated_history(
+def reanchor_history_representation(
         abs_pose: dict,
-        history_motion: torch.Tensor,
+        history_repr: torch.Tensor,
         state_msg: Any,
         val_data: Any,
         device: str | torch.device,
@@ -1171,15 +1243,15 @@ def history_reanchor_generated_history(
         anchor_gate_low: float = 0.75,
         anchor_gate_high: float = 1.5,
 ):
-    """Apply one measured state deviation uniformly to generated history."""
-    if history_motion is None or val_data is None:
-        raise ValueError("History re-anchoring requires generated history data")
+    """Apply one measured state deviation to a planner history representation."""
+    if history_repr is None or val_data is None:
+        raise ValueError("History re-anchoring requires a planner history representation")
 
     device = torch.device(device)
-    normalized_history = history_motion.to(device)
+    normalized_history_repr = history_repr.to(device)
     if hasattr(val_data, "reconstruct_motion"):
         predicted = val_data.reconstruct_motion(
-            normalized_history,
+            normalized_history_repr,
             abs_pose={
                 key: value.to(device)
                 for key, value in abs_pose.items()
@@ -1188,7 +1260,7 @@ def history_reanchor_generated_history(
         )
     else:
         predicted = motion_dtype.motion_feature_to_dict(
-            val_data.denormalize(normalized_history),
+            val_data.denormalize(normalized_history_repr),
             {
                 key: value.to(device)
                 for key, value in abs_pose.items()
@@ -1202,7 +1274,7 @@ def history_reanchor_generated_history(
     if batch_size != 1:
         raise ValueError(
             "History re-anchoring currently expects one measured G1 state, "
-            f"but generated history has batch size {batch_size}")
+            f"but reference history representation has batch size {batch_size}")
     if num_frames <= 0:
         raise ValueError("Generated history must contain at least one feature")
     phase_match_block_size = int(phase_match_block_size)
@@ -1222,7 +1294,7 @@ def history_reanchor_generated_history(
     )
     if lower.shape[-1] != pred_joint.shape[-1]:
         raise ValueError(
-            "G1 MJCF joint limit count does not match generated history: "
+            "G1 MJCF joint limit count does not match reference history representation: "
             f"{lower.shape[-1]} != {pred_joint.shape[-1]}")
 
     pred_anchor_pos = abs_pose["root_trans_offset"].to(
@@ -1238,7 +1310,7 @@ def history_reanchor_generated_history(
     # the current joint state, so its synthetic pre-history joint is unused.
     pred_full_joint = torch.cat([pred_joint[:, :1], pred_joint], dim=1)
     if motion_dtype.FeatureVersion == 3:
-        denormalized_history = val_data.denormalize(normalized_history)
+        denormalized_history = val_data.denormalize(normalized_history_repr)
         dof_dim = pred_joint.shape[-1]
         first_joint_delta = denormalized_history[:, 0,
                                                  11 + dof_dim:11 + 2 * dof_dim]
@@ -1260,7 +1332,8 @@ def history_reanchor_generated_history(
             "real_joint": real_joint.detach().clone(),
             "real_rot_matrix": real_rot_matrix.detach().clone(),
             "phase_index": phase_index.detach().clone(),
-            # The generated-history window ends at the current tracked frame.
+            # The selected reference-history window ends at the current
+            # tracked frame.
             # Earlier phase matches therefore have a negative signed offset.
             "phase_offset_frames": (
                 phase_index - (num_frames - 1)).detach().clone(),
@@ -1388,188 +1461,16 @@ def history_reanchor_generated_history(
     )
 
 
-def history_reanchor_generated_plan_at_frame(
-        plan: dict,
-        observed_frame: int,
-        target_frame: int,
-        history_len: int,
-        state_msg: Any,
-        val_data: Any,
-        device: str | torch.device,
-        joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
-        phase_match_block_size: int = 1,
-        phase_index: torch.Tensor | None = None,
-        min_phase_index: int = 0,
-        reanchor_mode: str = "se3_left",
-        anchor_state: str = "real",
-        anchor_gate_window: int = 4,
-        anchor_gate_low: float = 0.75,
-        anchor_gate_high: float = 1.5,
-):
-    """Re-anchor at an observed phase, then crop at the future switch frame.
-
-    Phase candidates are restricted to public plan frames at or before
-    ``observed_frame``. One state deviation is applied to the selected states,
-    including the suffix through ``target_frame``, before cropping the window.
-    """
-    observed_frame = int(observed_frame)
-    target_frame = int(target_frame)
-    history_len = int(history_len)
-    if observed_frame < 0 or target_frame < observed_frame:
-        raise ValueError(
-            "Expected 0 <= observed_frame <= target_frame, got "
-            f"{observed_frame} and {target_frame}")
-    if history_len <= 0:
-        raise ValueError(f"history_len must be positive, got {history_len}")
-
-    features = plan["features"]
-    segment_end = target_frame + history_len
-    if segment_end > features.shape[1]:
-        raise ValueError(
-            f"Target frame {target_frame} with history_len={history_len} "
-            f"exceeds cached feature length {features.shape[1]}")
-    if "input_abs_pose" not in plan:
-        raise ValueError("History re-anchoring requires cached input_abs_pose")
-
-    # Fast path: the selected H features plus their preceding absolute state
-    # contain the replacement phase. Re-anchoring this local H+1-state window
-    # is mathematically identical to re-anchoring the prefix and cropping it.
-    if phase_index is not None:
-        local_phase_index = phase_index.to(device=device).long() - target_frame
-        if bool(((local_phase_index >= 0)
-                 & (local_phase_index < history_len)).all()):
-            segment = features[:, target_frame:segment_end]
-            if motion_dtype.FeatureVersion == 6 and target_frame == 0:
-                segment_abs_pose = {
-                    key: value.detach().clone()
-                    for key, value in plan["input_abs_pose"].items()
-                }
-            else:
-                anchor_index = (
-                    target_frame - 1
-                    if motion_dtype.FeatureVersion == 6 else target_frame)
-                segment_abs_pose = {
-                    "root_trans_offset": plan["root_pos"][:, anchor_index],
-                    "root_rot": plan["root_rot"][:, anchor_index],
-                }
-            (
-                aligned_abs_pose,
-                aligned_segment,
-                correction,
-                _,
-                phase_error,
-            ) = history_reanchor_generated_history(
-                segment_abs_pose,
-                segment,
-                state_msg,
-                val_data,
-                device,
-                joint_limits=joint_limits,
-                phase_match_block_size=phase_match_block_size,
-                phase_index_override=local_phase_index,
-                reanchor_mode=reanchor_mode,
-                anchor_state=anchor_state,
-                anchor_gate_window=anchor_gate_window,
-                anchor_gate_low=anchor_gate_low,
-                anchor_gate_high=anchor_gate_high,
-            )
-            if hasattr(val_data, "reconstruct_motion"):
-                aligned_motion = val_data.reconstruct_motion(
-                    aligned_segment, abs_pose=aligned_abs_pose, ret_fk=False)
-            else:
-                aligned_motion = motion_dtype.motion_feature_to_dict(
-                    val_data.denormalize(aligned_segment), aligned_abs_pose)
-            correction["phase_index"] = phase_index.detach().clone()
-            return (
-                aligned_segment,
-                aligned_abs_pose,
-                aligned_motion["root_trans_offset"][:, -1],
-                aligned_motion["root_rot"][:, -1],
-                correction,
-                phase_index,
-                phase_error,
-            )
-
-    segment = features[:, :segment_end]
-    segment_abs_pose = {
-        key: value.detach().clone()
-        for key, value in plan["input_abs_pose"].items()
-    }
-    # Cached pose H-1+k is public frame k. Restrict matching to k<=t while
-    # retaining the predicted suffix needed to roll forward through t+d.
-    max_phase_index = history_len - 1 + observed_frame
-    (
-        aligned_segment_abs_pose,
-        aligned_segment,
-        correction,
-        phase_index,
-        phase_error,
-    ) = history_reanchor_generated_history(
-        segment_abs_pose,
-        segment,
-        state_msg,
-        val_data,
-        device,
-        joint_limits=joint_limits,
-        max_phase_index=max_phase_index,
-        phase_match_block_size=phase_match_block_size,
-        phase_index_override=phase_index,
-        min_phase_index=min_phase_index,
-        reanchor_mode=reanchor_mode,
-        anchor_state=anchor_state,
-        anchor_gate_window=anchor_gate_window,
-        anchor_gate_low=anchor_gate_low,
-        anchor_gate_high=anchor_gate_high,
-    )
-
-    if hasattr(val_data, "reconstruct_motion"):
-        aligned_motion = val_data.reconstruct_motion(
-            aligned_segment,
-            abs_pose=aligned_segment_abs_pose,
-            ret_fk=False,
-        )
-    else:
-        aligned_motion = motion_dtype.motion_feature_to_dict(
-            val_data.denormalize(aligned_segment), aligned_segment_abs_pose)
-
-    history = aligned_segment[:, target_frame:segment_end]
-    if motion_dtype.FeatureVersion == 6 and target_frame == 0:
-        abs_pose = {
-            key: value.detach().clone()
-            for key, value in aligned_segment_abs_pose.items()
-        }
-    else:
-        anchor_index = (
-            target_frame - 1
-            if motion_dtype.FeatureVersion == 6 else target_frame
-        )
-        abs_pose = {
-            "root_trans_offset": aligned_motion["root_trans_offset"][
-                :, anchor_index],
-            "root_rot": aligned_motion["root_rot"][:, anchor_index],
-        }
-    endpoint_index = segment_end - 1
-    return (
-        history,
-        abs_pose,
-        aligned_motion["root_trans_offset"][:, endpoint_index],
-        aligned_motion["root_rot"][:, endpoint_index],
-        correction,
-        phase_index,
-        phase_error,
-    )
-
-
-def align_generated_history_pose(abs_pose: dict,
-                                 generated_reference_pos: torch.Tensor,
-                                 generated_reference_rot: torch.Tensor,
+def align_reference_history_pose(abs_pose: dict,
+                                 reference_pose_pos: torch.Tensor,
+                                 reference_pose_rot: torch.Tensor,
                                  state_msg: Any,
                                  device: str | torch.device,
-                                 history_motion: torch.Tensor | None = None,
+                                 history_repr: torch.Tensor | None = None,
                                  val_data: Any = None):
-    """Translate and rotate generated history so its reference pose matches the real G1 root.
+    """Align a planner history representation to the measured G1 root.
 
-    When *history_motion* and *val_data* are provided, version-specific
+    When *history_repr* and *val_data* are provided, version-specific
     absolute pose channels are also corrected so every reconstructed frame
     carries the current G1 seam state.
 
@@ -1592,15 +1493,15 @@ def align_generated_history_pose(abs_pose: dict,
     real_current_rot = torch.as_tensor(
         real_current_rot_q, dtype=torch.float32, device=device).reshape(1, 4)
 
-    generated_reference_pos = generated_reference_pos.to(device).reshape(1, 3)
-    generated_reference_rot = generated_reference_rot.to(device).reshape(1, 4)
+    reference_pose_pos = reference_pose_pos.to(device).reshape(1, 3)
+    reference_pose_rot = reference_pose_rot.to(device).reshape(1, 4)
 
     # Rotation delta: q_delta = q_real * q_gen^{-1}
-    q_gen_inv = quat_inverse(generated_reference_rot, w_last=True)
+    q_gen_inv = quat_inverse(reference_pose_rot, w_last=True)
     q_delta = quat_mul(real_current_rot, q_gen_inv, w_last=True)
     feature_translation = (
         real_current_pos
-        - quat_apply(q_delta, generated_reference_pos, w_last=True)
+        - quat_apply(q_delta, reference_pose_pos, w_last=True)
     )
     feature_height_delta = None
     feature_gravity_rotation = None
@@ -1608,7 +1509,7 @@ def align_generated_history_pose(abs_pose: dict,
     # Rotate the generated position *around* the reference pivot, then add
     # the real translation.
     rel_pos = (abs_pose["root_trans_offset"].to(device)
-               - generated_reference_pos)
+               - reference_pose_pos)
     rotated_rel_pos = quat_apply(q_delta, rel_pos, w_last=True)
 
     aligned_abs_pose = {
@@ -1619,12 +1520,12 @@ def align_generated_history_pose(abs_pose: dict,
 
     # Also correct history-frame features when the representation contains
     # absolute pose channels that would otherwise keep the generated seam.
-    aligned_history_motion = history_motion
+    aligned_history_repr = history_repr
     if (motion_dtype.FeatureVersion == 6
-            and history_motion is not None and val_data is not None):
+            and history_repr is not None and val_data is not None):
         from robotmdar.dtype.rotation import quaternion_to_matrix, xyzw_to_wxyz
 
-        raw = val_data.denormalize(history_motion.to(device)).clone()
+        raw = val_data.denormalize(history_repr.to(device)).clone()
         B, T = raw.shape[:2]
         if T <= 0:
             raise ValueError("Generated history must contain at least one feature")
@@ -1647,7 +1548,7 @@ def align_generated_history_pose(abs_pose: dict,
         if real_height.shape[0] != B:
             if real_height.shape[0] != 1:
                 raise ValueError(
-                    "Real current state batch does not match generated history: "
+                    "Real current state batch does not match reference history representation: "
                     f"{real_height.shape[0]} != {B}")
             real_height = real_height.expand(B)
             real_gravity = real_gravity.expand(B, 3)
@@ -1672,7 +1573,7 @@ def align_generated_history_pose(abs_pose: dict,
         if abs_root_pos.shape[0] != B:
             if abs_root_pos.shape[0] != 1:
                 raise ValueError(
-                    "Generated abs_pose batch does not match generated history: "
+                    "Reference history abs_pose batch does not match its representation: "
                     f"{abs_root_pos.shape[0]} != {B}")
             abs_root_pos = abs_root_pos.expand(B, 3)
         aligned_root_pos = aligned_abs_pose["root_trans_offset"].to(
@@ -1680,7 +1581,7 @@ def align_generated_history_pose(abs_pose: dict,
         if aligned_root_pos.shape[0] != B:
             if aligned_root_pos.shape[0] != 1:
                 raise ValueError(
-                    "Aligned abs_pose batch does not match generated history: "
+                    "Aligned abs_pose batch does not match reference history representation: "
                     f"{aligned_root_pos.shape[0]} != {B}")
             aligned_root_pos = aligned_root_pos.expand(B, 3)
         aligned_root_pos = aligned_root_pos.clone()
@@ -1692,7 +1593,7 @@ def align_generated_history_pose(abs_pose: dict,
         if aligned_root_rot.shape[0] != B:
             if aligned_root_rot.shape[0] != 1:
                 raise ValueError(
-                    "Aligned root rotation batch does not match generated history: "
+                    "Aligned root rotation batch does not match reference history representation: "
                     f"{aligned_root_rot.shape[0]} != {B}")
             aligned_root_rot = aligned_root_rot.expand(B, 4)
         aligned_abs_pose["root_rot"] = aligned_root_rot.clone()
@@ -1706,7 +1607,7 @@ def align_generated_history_pose(abs_pose: dict,
         if real_endpoint_rot.shape[0] != B:
             if real_endpoint_rot.shape[0] != 1:
                 raise ValueError(
-                    "Real root rotation batch does not match generated history: "
+                    "Real root rotation batch does not match reference history representation: "
                     f"{real_endpoint_rot.shape[0]} != {B}")
             real_endpoint_rot = real_endpoint_rot.expand(B, 4)
         root_rot_residual = quat_mul(
@@ -1732,16 +1633,16 @@ def align_generated_history_pose(abs_pose: dict,
         if real_endpoint_pos.shape[0] != B:
             if real_endpoint_pos.shape[0] != 1:
                 raise ValueError(
-                    "Real root position batch does not match generated history: "
+                    "Real root position batch does not match reference history representation: "
                     f"{real_endpoint_pos.shape[0]} != {B}")
             real_endpoint_pos = real_endpoint_pos.expand(B, 3)
         aligned_abs_pose["root_trans_offset"][:, :2] += (
             real_endpoint_pos[:, :2] - decoded_endpoint[:, :2])
 
-        aligned_history_motion = val_data.normalize(raw)
-    elif history_motion is not None and val_data is not None:
+        aligned_history_repr = val_data.normalize(raw)
+    elif history_repr is not None and val_data is not None:
         raw = val_data.denormalize(
-            history_motion.to(device)).clone()  # (B, T, 57 or 69)
+            history_repr.to(device)).clone()  # (B, T, 57 or 69)
         B, T = raw.shape[:2]
 
         # V3 stores absolute roll/pitch sincos and a forward delta_yaw.
@@ -1834,12 +1735,12 @@ def align_generated_history_pose(abs_pose: dict,
         root_pos_old[..., 2] = raw[..., 10]
         root_pos_corrected = real_current_pos.unsqueeze(1) + quat_apply(
             q_delta.unsqueeze(1).expand(B, T, 4),
-            root_pos_old - generated_reference_pos.unsqueeze(1),
+            root_pos_old - reference_pose_pos.unsqueeze(1),
             w_last=True,
         )
         raw[..., 10] = root_pos_corrected[..., 2]
 
-        aligned_history_motion = val_data.normalize(raw)
+        aligned_history_repr = val_data.normalize(raw)
 
     # Goal reference pose is the *real* G1 pose so ego-goal is computed
     # relative to where the robot actually is.
@@ -1847,82 +1748,10 @@ def align_generated_history_pose(abs_pose: dict,
         aligned_abs_pose,
         real_current_pos,       # goal_reference_pos
         real_current_rot,       # goal_reference_rot
-        real_current_pos - generated_reference_pos,  # translation
-        aligned_history_motion,
+        real_current_pos - reference_pose_pos,  # translation
+        aligned_history_repr,
     )
     return result
-
-
-def tracked_frame_from_timestamps(state_msg: Any, fps: float,
-                                  future_len: int, *,
-                                  latency_ms: float = 0.0) -> int:
-    """Resolve the active plan frame, optionally projected past inference."""
-    if fps <= 0:
-        raise ValueError(f"Motion fps must be positive, got {fps}")
-    if future_len <= 0:
-        raise ValueError(f"future_len must be positive, got {future_len}")
-    latency_ms = float(latency_ms)
-    if not math.isfinite(latency_ms) or latency_ms < 0.0:
-        raise ValueError(
-            f"latency_ms must be finite and non-negative, got {latency_ms}")
-    start_t_ns = int(state_msg.tracking.start_t_ns)
-    state_t_ns = int(state_msg.history_meta.publish_t_ns)
-    if start_t_ns <= 0:
-        raise ValueError("Controller has not reported an active plan start time")
-    if state_t_ns < start_t_ns:
-        raise ValueError(
-            f"State timestamp {state_t_ns} precedes plan start {start_t_ns}")
-    projected_state_t_ns = state_t_ns + round(latency_ms * 1e6)
-    elapsed_frames = round((projected_state_t_ns - start_t_ns) * fps / 1e9)
-    return min(int(elapsed_frames), future_len - 1)
-
-
-def generated_history_at_frame(plan: dict, tracked_frame: int,
-                               history_len: int):
-    """Select the generated history ending at a public controller frame."""
-    features = plan["features"]
-    root_pos = plan["root_pos"]
-    root_rot = plan["root_rot"]
-    if history_len <= 0:
-        raise ValueError(f"history_len must be positive, got {history_len}")
-    if tracked_frame < 0:
-        raise ValueError(f"tracked_frame must be non-negative, got {tracked_frame}")
-    # The controller holds the final reference frame after the cached plan
-    # ends, so latency projection saturates rather than failing at the edge.
-    max_public_frame = features.shape[1] - history_len - 1
-    selected_frame = min(max(0, tracked_frame), max_public_frame)
-    # Published frame 0 is cached pose history_len - 1 because the planner
-    # retains the terminal history pose as the exact seam. Therefore published
-    # frame f ends at cached feature/pose history_len - 1 + f.
-    feature_start = selected_frame
-    feature_end = feature_start + history_len - 1
-    if feature_end >= features.shape[1]:
-        raise ValueError("Cached plan does not cover the selected history")
-    if root_pos.shape[1] <= feature_end or root_rot.shape[1] <= feature_end:
-        raise ValueError("Cached plan poses do not cover the selected history")
-    history = features[:, feature_start:feature_end + 1]
-    if history.shape[1] != history_len:
-        raise ValueError(
-            f"Selected {history.shape[1]} history frames, expected {history_len}")
-    if motion_dtype.FeatureVersion == 6 and feature_start == 0:
-        if "input_abs_pose" not in plan:
-            raise ValueError(
-                "FeatureVersion 6 generated history at frame 0 requires the "
-                "cached input_abs_pose before feature 0")
-        abs_pose = {
-            key: value.detach().clone()
-            for key, value in plan["input_abs_pose"].items()
-        }
-    else:
-        anchor_index = (
-            feature_start - 1
-            if motion_dtype.FeatureVersion == 6 else feature_start
-        )
-        abs_pose = {
-            "root_trans_offset": root_pos[:, anchor_index],
-            "root_rot": root_rot[:, anchor_index],
-        }
-    return history, abs_pose, root_pos[:, feature_end], root_rot[:, feature_end]
 
 
 def _forward_velocity(values: np.ndarray, fps: float) -> np.ndarray:
