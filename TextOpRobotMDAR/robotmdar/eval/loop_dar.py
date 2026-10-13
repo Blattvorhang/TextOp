@@ -5,7 +5,7 @@ Continuously generates motion using DAR model in an autoregressive manner.
 Starts from a zero pose and generates an infinite trajectory from the
 text condition alone: the goal and scene conditions are force-dropped, and
 the history is fed back from the generated blocks (the same regime as
-planner_dar's generated_history with align_to_g1=null).
+planner_dar's reference_history with align_to_g1=null).
 
 Usage:
 - python eval/loop_dar.py --config-name=loop_dar
@@ -359,8 +359,6 @@ def main(cfg: DictConfig):
             # is incorrect for V6 transition features when history is already
             # anchored at this pose (it would integrate the 16 history frames
             # a second time).
-            future_start_abs_pose = abs_pose
-            # breakpoint()
             future_motion, motion_dict, abs_pose = generate_next_motion(
                 vae=vae_trt,
                 denoiser=cfg_denoiser,
@@ -387,14 +385,6 @@ def main(cfg: DictConfig):
                 time_to_arrival_frame=time_to_arrival_frame,
                 ret_fk=True)
 
-            # Reconstruct only the newly generated future from the current
-            # absolute pose.  This is the sequence that is played, saved, and
-            # used to anchor the next autoregressive block.
-            motion_dict = val_data.reconstruct_motion(
-                future_motion,
-                abs_pose=future_start_abs_pose,
-                ret_fk=True,
-            )
             # Advance only through the execution horizon. Predicted states
             # after this frame are deliberately discarded.
             abs_pose = motion_dict_to_abs_pose(

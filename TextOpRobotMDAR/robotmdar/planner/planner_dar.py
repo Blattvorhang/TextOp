@@ -50,7 +50,7 @@ from robotmdar.utils.planner_convert import (
     match_reference_history_phase,
     motion_dict_to_g1data,
     reference_motion_to_history_repr,
-    reanchor_history_repr,
+    reanchor_reference_motion,
     state_goal_from_reference,
     state_to_ego_goal,
     state_to_model_input,
@@ -230,7 +230,7 @@ def _state_bool_field(state_msg, name: str, default: bool = True) -> bool:
             goal_validity.end_effector.right_foot),
     }
     if name not in validity_fields:
-        raise KeyError(f"Unknown protocol-12 validity field: {name}")
+        raise KeyError(f"Unknown controller validity field: {name}")
     return bool(validity_fields[name])
 
 
@@ -1375,6 +1375,7 @@ def main(cfg: DictConfig) -> None:
                 latency_compensation_frames = 0
                 selected_history_frame = None
                 observed_tracked_frame = None
+                seam_abs_pose = None
                 if using_reference_history:
                     observed_tracked_frame = int(
                         reference_motion.cursor_frame)
@@ -1425,25 +1426,26 @@ def main(cfg: DictConfig) -> None:
                         if reanchor_joint_limits is None:
                             reanchor_joint_limits = g1_joint_limits_from_mjcf(
                                 val_data, cfg.device)
-                        (
-                            history_motion_repr, abs_pose,
-                            reference_pose_pos, reference_pose_rot,
-                            reanchor_correction, _reanchor_phase,
-                            reanchor_phase_error,
-                        ) = reanchor_history_repr(
+                        reanchored = reanchor_reference_motion(
                             ref_hist_repr,
-                            history_len,
                             latest_state,
                             val_data,
                             cfg.device,
                             joint_limits=reanchor_joint_limits,
-                            phase_match_block_size=phase_match_block_size,
                             phase_index=matched_phase_index,
                             reanchor_mode=history_reanchor_mode,
-                            anchor_state=anchor_state,
-                            anchor_gate_window=anchor_gate_window,
-                            anchor_gate_low=anchor_gate_low,
-                            anchor_gate_high=anchor_gate_high)
+                        )
+                        history_motion_repr = reanchored["history_repr"]
+                        abs_pose = reanchored["abs_pose"]
+                        seam_abs_pose = reanchored["seam_abs_pose"]
+                        reference_pose_pos = (
+                            reanchored["hybrid_motion"]["root_trans_offset"][:, -1])
+                        reference_pose_rot = (
+                            reanchored["hybrid_motion"]["root_rot"][:, -1])
+                        reanchor_correction = reanchored["correction"]
+                        _reanchor_phase = reanchored["phase_index"]
+                        reanchor_phase_error = torch.zeros(
+                            1, device=cfg.device)
                         history_translation = None
                         alignment_mode = "history_reanchor"
                         logger.info(
@@ -1728,6 +1730,7 @@ def main(cfg: DictConfig) -> None:
                     initial_noise=fixed_sampling_noise,
                     ret_fk=False,
                     time_to_arrival_frame=time_to_arrival_frame,
+                    seam_abs_pose=seam_abs_pose,
                 )
                 _cuda_synchronize(str(cfg.device))
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
@@ -1795,7 +1798,8 @@ def main(cfg: DictConfig) -> None:
                 # Keep the current measured history frame as that exact seam;
                 # dropping all history would jump directly to stochastic t+1.
                 skip_history = (
-                    0 if bool(cfg.pub_all_frames) else history_len - 1)
+                    0 if seam_abs_pose is not None else
+                    (0 if bool(cfg.pub_all_frames) else history_len - 1))
                 new_to_old_ref_offset = int(
                     (observed_tracked_frame or 0)
                     + latency_compensation_frames)

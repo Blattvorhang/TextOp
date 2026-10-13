@@ -242,7 +242,8 @@ def generate_next_motion(
         force_drop_goal_end_effector_right_foot: bool = False,
         force_drop_scene: bool = False,
         force_drop_arrival_time: bool = False,
-        time_to_arrival_frame: Optional[torch.Tensor] = None):
+        time_to_arrival_frame: Optional[torch.Tensor] = None,
+        seam_abs_pose: Optional[Dict[str, torch.Tensor]] = None):
     """
     Generate next motion segment using DAR model.
 
@@ -440,12 +441,32 @@ def generate_next_motion(
         else:
             future_motion_pred = x_start_pred[:, -future_len:]
 
-        # Reconstruct motion dictionary
-        motion_dict = val_data.reconstruct_motion(torch.cat(
-            [history_motion, future_motion_pred], dim=1),
-                                                  abs_pose=abs_pose,
-                                                  ret_fk=ret_fk,
-                                                  ret_fk_full=ret_fk_full)
+        # Reconstruct only the newly generated future.  The closed-loop path
+        # supplies a physical seam and prepends it below; offline callers use
+        # the future dictionary directly.
+        future_dict = val_data.reconstruct_motion(
+            future_motion_pred,
+            abs_pose=abs_pose if seam_abs_pose is None else seam_abs_pose,
+            ret_fk=ret_fk if seam_abs_pose is None else False,
+            ret_fk_full=ret_fk_full)
+        if seam_abs_pose is None:
+            motion_dict = future_dict
+        else:
+            # The controller reference starts with the seam state.
+            motion_dict = {
+                "root_trans_offset": torch.cat(
+                    (seam_abs_pose["root_trans_offset"][:, None],
+                     future_dict["root_trans_offset"]), dim=1),
+                "root_rot": torch.cat(
+                    (seam_abs_pose["root_rot"][:, None],
+                     future_dict["root_rot"]), dim=1),
+                "dof": torch.cat(
+                    (seam_abs_pose["dof"][:, None], future_dict["dof"]),
+                    dim=1),
+                "contact_mask": torch.cat(
+                    (seam_abs_pose["contact_mask"][:, None],
+                     future_dict["contact_mask"]), dim=1),
+            }
 
         # Update absolute pose for next primitive.  The next block's history
         # is the tail of this block's generated future, and V6 reconstructs

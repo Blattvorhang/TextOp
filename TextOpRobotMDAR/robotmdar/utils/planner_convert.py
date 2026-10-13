@@ -394,12 +394,82 @@ def reference_motion_to_history_repr(controller_reference_motion: Any,
     }
     return {
         "history_repr": val_data.normalize(features),
+        "raw_motion": motion_dict,
         "root_pos": motion_dict["root_trans_offset"],
         "root_rot": motion_dict["root_rot"],
         "dof": motion_dict["dof"],
         "input_abs_pose": abs_pose,
         "cursor_frame": cursor,
         "window_start": start,
+    }
+
+
+def reanchor_reference_motion(
+        reference_history_repr: dict, state_msg: Any, val_data: Any,
+        device: str | torch.device,
+        joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
+        phase_index: torch.Tensor | None = None,
+        reanchor_mode: str = "se3_left") -> dict:
+    """Re-anchor raw reference states, then encode the hybrid history once.
+
+    The controller reference already contains physical root/joint states.  We
+    apply the measured-state deviation to that window directly instead of
+    decoding a history representation back to states first.
+    """
+    raw = reference_history_repr["raw_motion"]
+    pred_pos = raw["root_trans_offset"].to(device)
+    pred_rot = raw["root_rot"].to(device)
+    pred_joint = raw["dof"].to(device)
+    batch_size, num_states = pred_pos.shape[:2]
+    if batch_size != 1 or num_states < 2:
+        raise ValueError("Reference re-anchor expects one window with >=2 states")
+    phase_index = (torch.tensor([num_states - 2], device=device)
+                   if phase_index is None else phase_index.to(device).long())
+    phase_index = phase_index.clamp(0, num_states - 2)
+
+    real_pos, real_rot, real_joint = _history_reanchor_real_state(
+        state_msg, device, pred_pos.dtype)
+    if joint_limits is None:
+        joint_limits = g1_joint_limits_from_mjcf(
+            val_data, device=device, dtype=pred_joint.dtype)
+    lower, upper = (limit.to(device=device, dtype=pred_joint.dtype).reshape(1, -1)
+                    for limit in joint_limits)
+    pred_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(pred_rot))
+    anchor = phase_index + 1
+    deviation = compute_state_deviation(
+        real_pos, quaternion_to_matrix(xyzw_to_wxyz(real_rot)), real_joint,
+        pred_pos[torch.arange(batch_size, device=device), anchor],
+        pred_rot_matrix[torch.arange(batch_size, device=device), anchor],
+        pred_joint[torch.arange(batch_size, device=device), anchor],
+        reanchor_mode=reanchor_mode)
+    hybrid_pos, hybrid_rot_matrix, hybrid_joint = apply_state_deviation(
+        pred_pos, pred_rot_matrix, pred_joint, deviation,
+        joint_limits=(lower, upper), reanchor_mode=reanchor_mode)
+    hybrid_rot = wxyz_to_xyzw(matrix_to_quaternion(hybrid_rot_matrix))
+    hybrid_motion = {
+        "root_trans_offset": hybrid_pos,
+        "root_rot": hybrid_rot,
+        "dof": hybrid_joint,
+        "contact_mask": raw["contact_mask"].to(device),
+    }
+    if motion_dtype.FeatureVersion == 6:
+        history_features, abs_pose = motion_dict_to_feature_v6(hybrid_motion)
+    elif motion_dtype.FeatureVersion == 3:
+        history_features, abs_pose = motion_dict_to_feature_v3(hybrid_motion)
+    else:
+        raise ValueError(f"Unsupported feature version {motion_dtype.FeatureVersion}")
+    return {
+        "history_repr": val_data.normalize(history_features),
+        "abs_pose": abs_pose,
+        "seam_abs_pose": {
+            "root_trans_offset": hybrid_pos[:, -1].detach().clone(),
+            "root_rot": hybrid_rot[:, -1].detach().clone(),
+            "dof": hybrid_joint[:, -1].detach().clone(),
+            "contact_mask": hybrid_motion["contact_mask"][:, -1].detach().clone(),
+        },
+        "hybrid_motion": hybrid_motion,
+        "correction": deviation,
+        "phase_index": phase_index,
     }
 
 
@@ -511,7 +581,7 @@ def _end_effectors_from_goal_state(
 
 
 def _state_field(state_msg: Any, name: str):
-    """Read a field from the latest protocol-12 nested StateMessage."""
+    """Read a field from the current nested controller state message."""
     state_fields = {
         "g1_pos": state_msg.states.g1_pos,
         "g1_root_rot": state_msg.states.g1_root_rot,
@@ -524,10 +594,6 @@ def _state_field(state_msg: Any, name: str):
         return state_msg.history_meta.timestamps_ns
     if name == "publish_t_ns":
         return state_msg.history_meta.publish_t_ns
-    if name == "tracked_plan_seq":
-        return state_msg.tracking.seq
-    if name == "tracked_plan_start_t_ns":
-        return state_msg.tracking.start_t_ns
     if name == "text":
         return state_msg.condition.text
     if name == "ego_occ":
@@ -576,7 +642,7 @@ def _state_field(state_msg: Any, name: str):
     if name in goal_fields:
         return goal_fields[name]
 
-    raise KeyError(f"Unknown protocol-12 state field: {name}")
+    raise KeyError(f"Unknown controller state field: {name}")
 
 
 def _state_bool_field(state_msg: Any, name: str, default: bool = True) -> bool:
@@ -1754,34 +1820,9 @@ def align_reference_history_pose(abs_pose: dict,
     return result
 
 
-def _forward_velocity(values: np.ndarray, fps: float) -> np.ndarray:
-    if fps <= 0:
-        raise ValueError(f"Motion fps must be positive, got {fps}")
-    velocity = np.zeros_like(values)
-    if len(values) > 1:
-        velocity[:-1] = (values[1:] - values[:-1]) * fps
-        velocity[-1] = velocity[-2]
-    return velocity
-
-
-def _textop_bodies_to_sonic(values: np.ndarray) -> np.ndarray:
-    """Build SONIC's documented root-only 30-body representation.
-
-    TextOp's hands are synthetic extensions of its locked-wrist skeleton and
-    are not valid SONIC VR targets. Replicating the pelvis disables VR guidance
-    while retaining the root and 29-joint tracking inputs used by the policy.
-    """
-    values = np.asarray(values)
-    if values.ndim < 3 or values.shape[-2] < 1:
-        raise ValueError(
-            f"Expected at least one TextOp FK body, got {values.shape}")
-    return np.ascontiguousarray(np.repeat(values[..., :1, :], 30, axis=-2))
-
-
 def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
                           fps: float = 50.0,
                           locked_joint_pos: np.ndarray | None = None,
-                          include_body: bool = False,
                           new_to_old_ref_offset: int = 0):
     """Convert one reconstructed MuJoCo batch to planner reference data."""
     from sonicmsg.messages import PlannerReferenceMotionData
@@ -1804,7 +1845,7 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
     dof_pos = np.asarray(batch_numpy(dof_key), dtype=np.float32)
     body_pos = None
     body_ori_xyzw = None
-    if include_body or not has_direct_root:
+    if not has_direct_root:
         body_pos = np.asarray(
             batch_numpy("global_translation_extend"), dtype=np.float32)
         body_ori_xyzw = np.asarray(
@@ -1816,16 +1857,12 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
         raise ValueError(
             f"skip_history must be in [0, {len(dof_pos) - 1}], got {skip_history}")
 
-    # Derive velocity before slicing so the history/future boundary remains
-    # available if the velocity convention is changed to backward difference.
     model_dof_dim = int(dof_pos.shape[-1])
     if model_dof_dim not in (23, 29):
         raise ValueError(
             f"Reconstructed motion must contain 23 or 29 DoFs, got "
             f"{dof_pos.shape}")
-    dof_vel = _forward_velocity(dof_pos, fps)
     joint_pos = mujoco_to_isaaclab_dof(dof_pos)[skip_history:]
-    joint_vel = mujoco_to_isaaclab_dof(dof_vel)[skip_history:]
     if model_dof_dim == 23 and locked_joint_pos is not None:
         locked_joint_pos = np.asarray(locked_joint_pos, dtype=np.float32)
         if locked_joint_pos.shape != (29,):
@@ -1833,10 +1870,9 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
                 f"locked_joint_pos must have shape (29,), got "
                 f"{locked_joint_pos.shape}")
         # The 23-DoF model does not predict wrists. Preserve the measured
-        # SONIC wrist pose and command zero wrist velocity across the plan.
+        # SONIC wrist pose across the plan.
         joint_pos[:, _WRIST_ISAACLAB_INDICES] = locked_joint_pos[
             _WRIST_ISAACLAB_INDICES]
-        joint_vel[:, _WRIST_ISAACLAB_INDICES] = 0.0
     if has_direct_root:
         root_pos = np.ascontiguousarray(
             batch_numpy("root_trans_offset")[skip_history:])
@@ -1846,30 +1882,10 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
         root_pos = np.ascontiguousarray(body_pos[skip_history:, 0, :])
         root_ori = np.ascontiguousarray(
             body_ori_xyzw[skip_history:, 0, :][..., [3, 0, 1, 2]])
-    body_pos_packet = None
-    body_ori_packet = None
-    if include_body or not supports_root_payload:
-        body_pos_packet = _textop_bodies_to_sonic(body_pos[skip_history:])
-        body_ori_packet = np.ascontiguousarray(
-            _textop_bodies_to_sonic(body_ori_xyzw[skip_history:])[
-                ..., [3, 0, 1, 2]])
-    if not supports_root_payload:
-        return PlannerReferenceMotionData(
-            joint_pos=joint_pos,
-            joint_vel=joint_vel,
-            body_pos=body_pos_packet,
-            body_ori=body_ori_packet,
-            framerate=float(fps),
-            new_to_old_ref_offset=int(new_to_old_ref_offset),
-        )
-
     return PlannerReferenceMotionData(
         joint_pos=joint_pos,
-        joint_vel=joint_vel,
         root_pos=root_pos,
         root_ori=root_ori,
-        body_pos=body_pos_packet,
-        body_ori=body_ori_packet,
         framerate=float(fps),
         new_to_old_ref_offset=int(new_to_old_ref_offset),
     )
