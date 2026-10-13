@@ -55,6 +55,13 @@ reference history window. If latency compensation is enabled, the planner
 adds the estimated inference latency as an explicit frame offset and clamps
 the result to the available reference window.
 
+The planner output carries the corresponding integer `new_to_old_ref_offset`. This
+is the offset from the source controller state to the first returned reference
+frame (the seam). With a two-frame latency offset, the selected history ends
+at frame 2 and the reconstructed 65-frame motion starts at that frame. The
+controller-side snapshot and planner-side result are separate protocol
+objects; neither uses a generic `start_t_ns` field for alignment.
+
 `state.tracking.start_t_ns` is retained as plan metadata and
 `state.history_meta.publish_t_ns` remains part of the measured-state history,
 but neither timestamp is used to infer the reference cursor.

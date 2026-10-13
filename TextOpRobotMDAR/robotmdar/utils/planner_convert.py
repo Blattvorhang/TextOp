@@ -1781,9 +1781,10 @@ def _textop_bodies_to_sonic(values: np.ndarray) -> np.ndarray:
 def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
                           fps: float = 50.0,
                           locked_joint_pos: np.ndarray | None = None,
-                          include_body: bool = False):
-    """Convert one reconstructed MuJoCo batch to ``G1MotionData``."""
-    from sonicmsg.messages import G1MotionData
+                          include_body: bool = False,
+                          new_to_old_ref_offset: int = 0):
+    """Convert one reconstructed MuJoCo batch to planner reference data."""
+    from sonicmsg.messages import PlannerReferenceMotionData
 
     def batch_numpy(key: str) -> np.ndarray:
         value = motion_dict[key]
@@ -1791,7 +1792,7 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
             raise ValueError(f"Planner supports batch size 1, got {key} {value.shape}")
         return value[0].detach().cpu().numpy()
 
-    g1_fields = getattr(G1MotionData, "model_fields", {})
+    g1_fields = getattr(PlannerReferenceMotionData, "model_fields", {})
     supports_root_payload = (
         "root_pos" in g1_fields and "root_ori" in g1_fields)
     has_direct_root = (
@@ -1853,15 +1854,16 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
             _textop_bodies_to_sonic(body_ori_xyzw[skip_history:])[
                 ..., [3, 0, 1, 2]])
     if not supports_root_payload:
-        return G1MotionData(
+        return PlannerReferenceMotionData(
             joint_pos=joint_pos,
             joint_vel=joint_vel,
             body_pos=body_pos_packet,
             body_ori=body_ori_packet,
             framerate=float(fps),
+            new_to_old_ref_offset=int(new_to_old_ref_offset),
         )
 
-    return G1MotionData(
+    return PlannerReferenceMotionData(
         joint_pos=joint_pos,
         joint_vel=joint_vel,
         root_pos=root_pos,
@@ -1869,4 +1871,5 @@ def motion_dict_to_g1data(motion_dict: dict, skip_history: int,
         body_pos=body_pos_packet,
         body_ori=body_ori_packet,
         framerate=float(fps),
+        new_to_old_ref_offset=int(new_to_old_ref_offset),
     )

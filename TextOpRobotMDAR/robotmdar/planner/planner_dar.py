@@ -1301,7 +1301,7 @@ def main(cfg: DictConfig) -> None:
                 continue
             reference_motion = None
             if use_reference_history:
-                reference_motion = latest_state.reference_motion
+                reference_motion = latest_state.controller_reference_motion
                 if reference_motion is None:
                     if now >= next_ack_log_time:
                         logger.info("Waiting for controller reference motion")
@@ -1796,8 +1796,12 @@ def main(cfg: DictConfig) -> None:
                 # dropping all history would jump directly to stochastic t+1.
                 skip_history = (
                     0 if bool(cfg.pub_all_frames) else history_len - 1)
+                new_to_old_ref_offset = int(
+                    (observed_tracked_frame or 0)
+                    + latency_compensation_frames)
                 motion = motion_dict_to_g1data(
                     motion_dict, skip_history=skip_history, fps=motion_fps,
+                    new_to_old_ref_offset=new_to_old_ref_offset,
                     locked_joint_pos=np.asarray(
                         latest_state.states.g1_joint_pos[-1],
                         dtype=np.float32))
