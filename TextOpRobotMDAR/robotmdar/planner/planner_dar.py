@@ -1373,12 +1373,11 @@ def main(cfg: DictConfig) -> None:
                 phase_offset_frames = None
                 latency_compensation_ms = 0.0
                 latency_compensation_frames = 0
-                selected_history_frame = None
-                observed_tracked_frame = None
+                controller_playback_frame = None
                 lookahead_offset_frames = 0
                 seam_abs_pose = None
                 if using_reference_history:
-                    observed_tracked_frame = int(
+                    controller_playback_frame = int(
                         reference_motion.cursor_frame)
                     lookahead_offset_frames = int(
                         getattr(reference_motion,
@@ -1391,15 +1390,14 @@ def main(cfg: DictConfig) -> None:
                         latency_compensation_ms = predicted_latency_ms
                         latency_compensation_frames = round(
                             latency_compensation_ms * motion_fps / 1000.0)
-                    tracked_frame = (
-                        observed_tracked_frame
+                    history_terminal_frame = (
+                        controller_playback_frame
                         + lookahead_offset_frames
                         + int(round(latency_compensation_ms * motion_fps / 1000.0)))
-                    tracked_frame = max(0, min(
-                        tracked_frame, reference_motion.num_frames - 2))
-                    selected_history_frame = tracked_frame
+                    history_terminal_frame = max(0, min(
+                        history_terminal_frame, reference_motion.num_frames - 2))
                     ref_hist_repr = reference_motion_to_history_repr(
-                        reference_motion, tracked_frame, history_len,
+                        reference_motion, history_terminal_frame, history_len,
                         val_data, cfg.device)
                     history_motion_repr = ref_hist_repr["history_repr"]
                     reference_abs_pose = ref_hist_repr["input_abs_pose"]
@@ -1408,7 +1406,7 @@ def main(cfg: DictConfig) -> None:
                     matched_phase_index = torch.tensor(
                         [history_len - 1],
                         device=cfg.device, dtype=torch.long)
-                    matched_public_frame = observed_tracked_frame
+                    matched_public_frame = controller_playback_frame
                     if (phase_matching_enabled
                             and reference_history_align_mode != "null"):
                         matched_phase_index, _ = match_reference_history_phase(
@@ -1419,10 +1417,10 @@ def main(cfg: DictConfig) -> None:
                             max_phase_index=history_len - 1,
                             phase_match_block_size=phase_match_block_size)
                         matched_public_frame = (
-                            tracked_frame - history_len + 1
+                            history_terminal_frame - history_len + 1
                             + int(matched_phase_index[0]))
                         phase_offset_frames = (
-                            matched_public_frame - observed_tracked_frame)
+                            matched_public_frame - controller_playback_frame)
                     if reference_history_align_mode == "spatial":
                         reference_pose_pos = ref_hist_repr["root_pos"][
                             :, matched_phase_index[0]]
@@ -1528,7 +1526,7 @@ def main(cfg: DictConfig) -> None:
                             **goal_builder_extra)
                     )
                 else:
-                    tracked_frame = None
+                    history_terminal_frame = None
                     if (latest_state.history_meta.n_states
                             < controller_history_states):
                         raise ValueError(
@@ -1798,7 +1796,7 @@ def main(cfg: DictConfig) -> None:
                     0 if seam_abs_pose is not None else
                     (0 if bool(cfg.pub_all_frames) else history_len - 1))
                 new_to_old_ref_offset = int(
-                    (observed_tracked_frame or 0)
+                    (controller_playback_frame or 0)
                     + (lookahead_offset_frames if using_reference_history else 0)
                     + latency_compensation_frames)
                 motion = motion_dict_to_g1data(
@@ -1911,7 +1909,8 @@ def main(cfg: DictConfig) -> None:
                         "reference" if using_reference_history else "controller",
                         (latest_state.tracking.seq
                          if using_reference_history else -1),
-                        tracked_frame if tracked_frame is not None else -1,
+                        history_terminal_frame
+                        if history_terminal_frame is not None else -1,
                         (float(torch.linalg.vector_norm(history_translation))
                          if history_translation is not None else 0.0),
                         alignment_mode,

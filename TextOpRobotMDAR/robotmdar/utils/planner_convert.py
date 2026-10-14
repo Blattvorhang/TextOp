@@ -348,7 +348,7 @@ def state_to_model_input(state_msg: Any, history_len: int, val_data: Any,
 
 
 def reference_motion_to_history_repr(controller_reference_motion: Any,
-                                     cursor_frame: int,
+                                     playback_frame: int,
                                      history_len: int, val_data: Any,
                                      device: str | torch.device) -> dict:
     """Convert a controller reference-motion window to planner representation."""
@@ -370,8 +370,8 @@ def reference_motion_to_history_repr(controller_reference_motion: Any,
     elif model_dof_dim != 29:
         raise ValueError(f"Planner supports model dof_dim 23 or 29, got {model_dof_dim}")
     n_frames = len(positions)
-    cursor = min(max(int(cursor_frame), 0), n_frames - 2)
-    start = max(0, cursor - history_len + 1)
+    playback_frame = min(max(int(playback_frame), 0), n_frames - 2)
+    start = max(0, playback_frame - history_len + 1)
     end = min(n_frames, start + history_len + 1)
     start = end - history_len - 1
     positions = positions[start:end]
@@ -399,7 +399,7 @@ def reference_motion_to_history_repr(controller_reference_motion: Any,
         "root_rot": motion_dict["root_rot"],
         "dof": motion_dict["dof"],
         "input_abs_pose": abs_pose,
-        "cursor_frame": cursor,
+        "playback_frame": playback_frame,
         "window_start": start,
     }
 
