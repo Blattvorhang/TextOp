@@ -1375,10 +1375,14 @@ def main(cfg: DictConfig) -> None:
                 latency_compensation_frames = 0
                 selected_history_frame = None
                 observed_tracked_frame = None
+                lookahead_offset_frames = 0
                 seam_abs_pose = None
                 if using_reference_history:
                     observed_tracked_frame = int(
                         reference_motion.cursor_frame)
+                    lookahead_offset_frames = int(
+                        getattr(reference_motion,
+                                "lookahead_offset_frame", 0))
                     if (latency_compensation
                             and predicted_latency_ms is not None):
                         # Advance the controller cursor by the planner's
@@ -1387,8 +1391,10 @@ def main(cfg: DictConfig) -> None:
                         latency_compensation_ms = predicted_latency_ms
                         latency_compensation_frames = round(
                             latency_compensation_ms * motion_fps / 1000.0)
-                    tracked_frame = observed_tracked_frame + int(
-                        round(latency_compensation_ms * motion_fps / 1000.0))
+                    tracked_frame = (
+                        observed_tracked_frame
+                        + lookahead_offset_frames
+                        + int(round(latency_compensation_ms * motion_fps / 1000.0)))
                     tracked_frame = max(0, min(
                         tracked_frame, reference_motion.num_frames - 2))
                     selected_history_frame = tracked_frame
@@ -1466,9 +1472,7 @@ def main(cfg: DictConfig) -> None:
                             latest_state, reference_pose_pos,
                             reference_pose_rot, cfg.device)
                         goal_builder_extra = {
-                            "reference_time_offset_s": (
-                                latency_compensation_ms / 1000.0
-                                if latency_compensation else 0.0)
+                            "reference_time_offset_s": 0.0
                         }
                     elif reference_history_align_mode == "spatial":
                         (
@@ -1497,9 +1501,7 @@ def main(cfg: DictConfig) -> None:
                             latest_state, reference_pose_pos,
                             reference_pose_rot, cfg.device)
                         goal_builder_extra = {
-                            "reference_time_offset_s": (
-                                latency_compensation_ms / 1000.0
-                                if latency_compensation else 0.0)
+                            "reference_time_offset_s": 0.0
                         }
 
                     ego_goal_raw = goal_builder(
@@ -1586,8 +1588,7 @@ def main(cfg: DictConfig) -> None:
                         goal_encoding=GoalEncoding.LEGACY40,
                         goal_clamp=runtime_goal_clamp, fps=motion_fps,
                         val_data=val_data,
-                        reference_time_offset_s=(
-                            latency_compensation_ms / 1000.0))
+                        reference_time_offset_s=0.0)
                     ego_goal = (
                         ego_goal_raw
                         if goal_encoding is GoalEncoding.LEGACY40
@@ -1600,8 +1601,7 @@ def main(cfg: DictConfig) -> None:
                             goal_stats=goal_stats,
                             goal_clamp=runtime_goal_clamp, fps=motion_fps,
                             val_data=val_data,
-                            reference_time_offset_s=(
-                                latency_compensation_ms / 1000.0),
+                            reference_time_offset_s=0.0,
                             goal_include_log_d_hor=(
                                 goal_include_log_d_hor))
                     )
@@ -1673,10 +1673,7 @@ def main(cfg: DictConfig) -> None:
                         time_to_arrival_s, time_to_arrival_frame = (
                             _time_to_arrival_from_state(
                                 latest_state, motion_fps, cfg.device,
-                                reference_time_offset_s=(
-                                    latency_compensation_ms / 1000.0
-                                    if using_reference_history
-                                    and latency_compensation else 0.0)))
+                                reference_time_offset_s=0.0))
                     else:
                         time_to_arrival_s = 0.0
                         time_to_arrival_frame = torch.zeros(
@@ -1802,6 +1799,7 @@ def main(cfg: DictConfig) -> None:
                     (0 if bool(cfg.pub_all_frames) else history_len - 1))
                 new_to_old_ref_offset = int(
                     (observed_tracked_frame or 0)
+                    + (lookahead_offset_frames if using_reference_history else 0)
                     + latency_compensation_frames)
                 motion = motion_dict_to_g1data(
                     motion_dict, skip_history=skip_history, fps=motion_fps,
