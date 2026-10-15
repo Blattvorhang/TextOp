@@ -1123,12 +1123,25 @@ def main(cfg: DictConfig) -> None:
     elif _goal_clamp_cfg is not None:
         logger.info("Goal clamp disabled (goal_clamp_enabled=false)")
 
-    period = float(cfg.infer_period_ms) / 1000.0
-    if period <= 0:
-        raise ValueError(f"infer_period_ms must be positive, got {cfg.infer_period_ms}")
     state_timeout_ms = int(cfg.state_timeout_ms)
     log_every = max(1, int(cfg.log_every))
     comm_config = to_absolute_path(str(cfg.comm_config))
+    comm_cfg = OmegaConf.load(comm_config)
+    comm_mode = str(comm_cfg.get("comm_mode", "pubsub")).lower()
+    if comm_mode == "pubsub":
+        # Async cadence belongs to the communication contract so the
+        # controller and planner have one source of truth.  The value is in
+        # seconds; the planner uses it only to gate inference, while the
+        # controller continues publishing the latest state.
+        period = float(comm_cfg.get("replan_period", 0.0))
+        if period <= 0:
+            raise ValueError(
+                "communication replan_period must be positive in pubsub "
+                f"mode, got {period} from {comm_config}")
+    else:
+        # In synchronous REQ/REP mode each received request is one planning
+        # event.  No planner-side cadence is needed.
+        period = 0.0
     node = PlannerNode(comm_config)
     synchronous_comm = bool(getattr(node, "is_synchronous", False))
 
@@ -1273,7 +1286,8 @@ def main(cfg: DictConfig) -> None:
         "history={} features/{} states, future={} frames, history_source={}, "
         "align_mode={}, "
         "latency_compensation={} (ema_alpha={:.2f})",
-        1.0 / period, motion_fps, history_len, controller_history_states,
+        (1.0 / period if period > 0.0 else float("inf")), motion_fps,
+        history_len, controller_history_states,
         future_len,
         (f"reference+{reference_history_align_mode}"
          if align_reference_history else "reference")
@@ -1395,7 +1409,8 @@ def main(cfg: DictConfig) -> None:
                         + lookahead_offset_frames
                         + int(round(latency_compensation_ms * motion_fps / 1000.0)))
                     history_terminal_frame = max(0, min(
-                        history_terminal_frame, reference_motion.num_frames - 2))
+                        history_terminal_frame, reference_motion.num_frames
+                        - (2 if motion_dtype.FeatureVersion == 3 else 1)))
                     ref_hist_repr = reference_motion_to_history_repr(
                         reference_motion, history_terminal_frame, history_len,
                         val_data, cfg.device)
@@ -1403,10 +1418,9 @@ def main(cfg: DictConfig) -> None:
                     reference_abs_pose = ref_hist_repr["input_abs_pose"]
                     reference_pose_pos = ref_hist_repr["root_pos"][:, -1]
                     reference_pose_rot = ref_hist_repr["root_rot"][:, -1]
-                    matched_phase_index = torch.tensor(
-                        [history_len - 1],
-                        device=cfg.device, dtype=torch.long)
+                    matched_phase_index = None
                     matched_public_frame = controller_playback_frame
+                    phase_offset_frames = 0
                     if (phase_matching_enabled
                             and reference_history_align_mode != "null"):
                         matched_phase_index, _ = match_reference_history_phase(
@@ -1414,18 +1428,24 @@ def main(cfg: DictConfig) -> None:
                             latest_state,
                             cfg.device,
                             min_phase_index=0,
-                            max_phase_index=history_len - 1,
+                            max_phase_index=ref_hist_repr["dof"].shape[1] - 1,
                             phase_match_block_size=phase_match_block_size)
                         matched_public_frame = (
-                            history_terminal_frame - history_len + 1
+                            ref_hist_repr["window_start"]
                             + int(matched_phase_index[0]))
                         phase_offset_frames = (
                             matched_public_frame - controller_playback_frame)
                     if reference_history_align_mode == "spatial":
-                        reference_pose_pos = ref_hist_repr["root_pos"][
-                            :, matched_phase_index[0]]
-                        reference_pose_rot = ref_hist_repr["root_rot"][
-                            :, matched_phase_index[0]]
+                        if matched_phase_index is None:
+                            reference_pose_pos = ref_hist_repr["tracking_state"][
+                                "root_trans_offset"]
+                            reference_pose_rot = ref_hist_repr["tracking_state"][
+                                "root_rot"]
+                        else:
+                            reference_pose_pos = ref_hist_repr["root_pos"][
+                                :, matched_phase_index[0]]
+                            reference_pose_rot = ref_hist_repr["root_rot"][
+                                :, matched_phase_index[0]]
                     if reference_history_align_mode == "history_reanchor":
                         if reanchor_joint_limits is None:
                             reanchor_joint_limits = g1_joint_limits_from_mjcf(
@@ -1932,9 +1952,10 @@ def main(cfg: DictConfig) -> None:
                 node.publish_error(str(exc), traceback.format_exc())
 
             finished = time.perf_counter()
-            next_infer_time = (
-                finished + period if finished > scheduled_next
-                else scheduled_next)
+            if period > 0.0:
+                next_infer_time = (
+                    finished + period if finished > scheduled_next
+                    else scheduled_next)
     except KeyboardInterrupt:
         logger.info("Planner interrupted")
     finally:

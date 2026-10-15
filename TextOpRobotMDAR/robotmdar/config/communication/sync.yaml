@@ -11,7 +11,6 @@ current_state_port: 28703
 motion_port: 28701
 controller_host: "localhost"
 
-replan_period: 0.5
 # FeatureVersion 6 prepends a zero-delta feature to 16 physical states.
 history_size: 16
 planner_request_timeout_ms: 300000
