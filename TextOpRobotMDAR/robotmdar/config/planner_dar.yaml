@@ -40,9 +40,19 @@ reference_history:
   align_to_g1: history_reanchor
   # Reanchor mode: se3_left preserves root-local geometry;
   # decoupled_world preserves world-frame position differences.
-  reanchor_mode: se3_left
-  # State feedback at the history anchor: real | gate.
-  # In gate mode root pose is always real; only joints are gated.
+  reanchor_mode: decoupled_world
+  # decoupled_world only: choose independently for each component:
+  # open_loop (no correction), full, gravity_weighted (lambda correction).
+  reanchor_components:
+    hor_pos: full
+    vert_pos: full
+    orientation: gravity_weighted
+    joint: open_loop
+  # Used by gravity_weighted components: reference | world.
+  # reference: real vs reference gravity; world: real vs [0, 0, -1].
+  gravity_angle_source: reference
+  # Legacy representation-based joint gate settings (not used by the raw
+  # reference-history path above).
   anchor_state: real
   anchor_gate:
     # Nearby generated phases used to detect ordinary execution lag.
@@ -50,7 +60,8 @@ reference_history:
     # Normalized joint RMSE below/above which feedback is off/on.
     low_threshold: 5.0
     high_threshold: 5.5
-  # Replace the current state at a matched generated frame.
+  # Optional joint phase search in raw reference states. When disabled, the
+  # tracking anchor is cursor_frame, independent of lookahead/latency.
   phase_matching:
     enabled: false
     block_size: 8

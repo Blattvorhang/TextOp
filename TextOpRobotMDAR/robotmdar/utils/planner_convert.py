@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
 import math
 from pathlib import Path
@@ -370,10 +371,27 @@ def reference_motion_to_history_repr(controller_reference_motion: Any,
     elif model_dof_dim != 29:
         raise ValueError(f"Planner supports model dof_dim 23 or 29, got {model_dof_dim}")
     n_frames = len(positions)
-    playback_frame = min(max(int(playback_frame), 0), n_frames - 2)
-    start = max(0, playback_frame - history_len + 1)
-    end = min(n_frames, start + history_len + 1)
-    start = end - history_len - 1
+    tracking_frame = int(controller_reference_motion.cursor_frame)
+    if not 0 <= tracking_frame < n_frames:
+        raise ValueError(
+            f"Reference cursor {tracking_frame} is outside {n_frames} states")
+    # The measured state corresponds to the controller cursor, even when the
+    # selected generation window is shifted ahead by lookahead/latency. Keep
+    # this state separately: the cursor can be outside that window entirely.
+    tracking_state = {
+        "root_trans_offset": torch.as_tensor(
+            positions[tracking_frame].copy(), device=device).reshape(1, 3),
+        "root_rot": torch.as_tensor(
+            rotations[tracking_frame].copy(), device=device).reshape(1, 4),
+        "dof": torch.as_tensor(
+            joints[tracking_frame].copy(), device=device).reshape(1, -1),
+    }
+    # V6 features arrive at each physical state; V3 needs an extra departure
+    # edge. Near the beginning, shift the window forward to obtain H+1 states.
+    terminal_edge = 1 if motion_dtype.FeatureVersion == 3 else 0
+    playback_frame = min(max(int(playback_frame), 0), n_frames - 1 - terminal_edge)
+    start = max(0, playback_frame + terminal_edge - history_len)
+    end = start + history_len + 1
     positions = positions[start:end]
     rotations = rotations[start:end]
     joints = joints[start:end]
@@ -401,6 +419,9 @@ def reference_motion_to_history_repr(controller_reference_motion: Any,
         "input_abs_pose": abs_pose,
         "playback_frame": playback_frame,
         "window_start": start,
+        "window_end": end - 1,
+        "tracking_frame": tracking_frame,
+        "tracking_state": tracking_state,
     }
 
 
@@ -408,43 +429,70 @@ def reanchor_reference_motion(
         reference_history_repr: dict, state_msg: Any, val_data: Any,
         device: str | torch.device,
         joint_limits: tuple[torch.Tensor, torch.Tensor] | None = None,
-        phase_index: torch.Tensor | None = None,
-        reanchor_mode: str = "se3_left") -> dict:
+        anchor_state_index: torch.Tensor | None = None,
+        reanchor_mode: str = "se3_left",
+        reanchor_components: Mapping[str, str] | None = None,
+        gravity_angle_source: str = "reference") -> dict:
     """Re-anchor raw reference states, then encode the hybrid history once.
 
     The controller reference already contains physical root/joint states.  We
     apply the measured-state deviation to that window directly instead of
-    decoding a history representation back to states first.
+    decoding a history representation back to states first. By default the
+    deviation is measured at the original controller cursor. An optional
+    phase match addresses raw physical window states directly (no +1 shift).
+    ``reanchor_components`` selects open_loop, full, or gravity_weighted for
+    each component; ``gravity_angle_source`` selects reference or world.
     """
     raw = reference_history_repr["raw_motion"]
+    reanchor_mode = str(reanchor_mode).strip().lower()
     pred_pos = raw["root_trans_offset"].to(device)
     pred_rot = raw["root_rot"].to(device)
     pred_joint = raw["dof"].to(device)
     batch_size, num_states = pred_pos.shape[:2]
     if batch_size != 1 or num_states < 2:
         raise ValueError("Reference re-anchor expects one window with >=2 states")
-    phase_index = (torch.tensor([num_states - 2], device=device)
-                   if phase_index is None else phase_index.to(device).long())
-    phase_index = phase_index.clamp(0, num_states - 2)
-
     real_pos, real_rot, real_joint = _history_reanchor_real_state(
         state_msg, device, pred_pos.dtype)
+    if pred_joint.shape[-1] == 23:
+        real_joint = real_joint[:, G1_23DOF_FROM_29DOF_INDICES]
     if joint_limits is None:
         joint_limits = g1_joint_limits_from_mjcf(
             val_data, device=device, dtype=pred_joint.dtype)
     lower, upper = (limit.to(device=device, dtype=pred_joint.dtype).reshape(1, -1)
                     for limit in joint_limits)
     pred_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(pred_rot))
-    anchor = phase_index + 1
+    real_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(real_rot))
+    if anchor_state_index is None:
+        tracking_state = reference_history_repr["tracking_state"]
+        anchor_pos = tracking_state["root_trans_offset"].to(pred_pos)
+        anchor_rot_matrix = quaternion_to_matrix(xyzw_to_wxyz(
+            tracking_state["root_rot"].to(pred_rot)))
+        anchor_joint = tracking_state["dof"].to(pred_joint)
+        anchor_frame = int(reference_history_repr["tracking_frame"])
+    else:
+        anchor = anchor_state_index.to(device=device).long().reshape(batch_size)
+        if torch.any((anchor < 0) | (anchor >= num_states)):
+            raise ValueError("Re-anchor index must address a raw window state")
+        batch = torch.arange(batch_size, device=device)
+        anchor_pos = pred_pos[batch, anchor]
+        anchor_rot_matrix = pred_rot_matrix[batch, anchor]
+        anchor_joint = pred_joint[batch, anchor]
+        anchor_frame = int(reference_history_repr["window_start"]) + int(anchor[0])
     deviation = compute_state_deviation(
-        real_pos, quaternion_to_matrix(xyzw_to_wxyz(real_rot)), real_joint,
-        pred_pos[torch.arange(batch_size, device=device), anchor],
-        pred_rot_matrix[torch.arange(batch_size, device=device), anchor],
-        pred_joint[torch.arange(batch_size, device=device), anchor],
+        real_pos, real_rot_matrix, real_joint,
+        anchor_pos, anchor_rot_matrix, anchor_joint,
         reanchor_mode=reanchor_mode)
+    if reanchor_mode == "decoupled_world":
+        deviation = _gravity_weighted_decoupled_deviation(
+            deviation, real_rot_matrix, anchor_rot_matrix,
+            reanchor_components=reanchor_components,
+            gravity_angle_source=gravity_angle_source)
     hybrid_pos, hybrid_rot_matrix, hybrid_joint = apply_state_deviation(
         pred_pos, pred_rot_matrix, pred_joint, deviation,
         joint_limits=(lower, upper), reanchor_mode=reanchor_mode)
+    if reanchor_mode == "decoupled_world" and reanchor_components["joint"] == "open_loop":
+        # Open-loop joints retain the reference exactly, including its limits.
+        hybrid_joint = pred_joint
     hybrid_rot = wxyz_to_xyzw(matrix_to_quaternion(hybrid_rot_matrix))
     hybrid_motion = {
         "root_trans_offset": hybrid_pos,
@@ -469,7 +517,7 @@ def reanchor_reference_motion(
         },
         "hybrid_motion": hybrid_motion,
         "correction": deviation,
-        "phase_index": phase_index,
+        "anchor_frame": anchor_frame,
     }
 
 
@@ -1247,6 +1295,82 @@ def compute_state_deviation(
         "delta_rot_matrix": delta_rot,
         "delta_pos": delta_pos,
         "delta_joint": delta_joint,
+    }
+
+
+def _gravity_weighted_decoupled_deviation(
+        deviation: dict[str, torch.Tensor],
+        real_rot_matrix: torch.Tensor,
+        reference_rot_matrix: torch.Tensor,
+        reanchor_components: Mapping[str, str],
+        gravity_angle_source: str = "reference",
+) -> dict[str, torch.Tensor]:
+    """Apply a zero, full, or gravity-weighted correction per component."""
+    if not isinstance(reanchor_components, Mapping):
+        raise TypeError("reanchor_components must be a mapping")
+    required_components = ("hor_pos", "vert_pos", "orientation", "joint")
+    missing = [key for key in required_components if key not in reanchor_components]
+    if missing:
+        raise ValueError("reanchor_components is missing components: " + ", ".join(missing))
+    invalid = [key for key in required_components
+               if reanchor_components[key] not in ("open_loop", "full", "gravity_weighted")]
+    if invalid:
+        raise ValueError(
+            "reanchor_components entries must be open_loop, full, or gravity_weighted: "
+            + ", ".join(invalid))
+    if gravity_angle_source not in ("reference", "world"):
+        raise ValueError(
+            "gravity_angle_source must be reference or world, "
+            f"got {gravity_angle_source!r}")
+    # R maps body to world, so R.T @ [0, 0, -1] is minus its third row.
+    real_g = F.normalize(-real_rot_matrix[..., 2, :], dim=-1)
+    if gravity_angle_source == "reference":
+        ref_g = F.normalize(-reference_rot_matrix[..., 2, :], dim=-1)
+    else:
+        # Compare projected gravity to the nominal upright body direction.
+        ref_g = real_g.new_tensor([0.0, 0.0, -1.0])
+    cosine = (real_g * ref_g).sum(dim=-1).clamp(-1.0, 1.0)
+    # f(theta) = 1-cos(theta) up to 90 degrees, then saturate at one.
+    weight = (1.0 - cosine).clamp(0.0, 1.0)
+
+    def component_weight(component):
+        mode = reanchor_components[component]
+        if mode == "open_loop":
+            return torch.zeros_like(weight)
+        if mode == "full":
+            return torch.ones_like(weight)
+        return weight
+
+    if reanchor_components["orientation"] != "full":
+        delta_quat = F.normalize(
+            matrix_to_quaternion(deviation["delta_rot_matrix"]), dim=-1)
+        delta_quat = torch.where(
+            delta_quat[..., :1] < 0, -delta_quat, delta_quat)
+        half_angle = torch.atan2(
+            delta_quat[..., 1:].norm(dim=-1), delta_quat[..., 0])
+        orientation_weight = component_weight("orientation")
+        weighted_half_angle = orientation_weight * half_angle
+        vector_scale = (
+            orientation_weight * torch.sinc(weighted_half_angle / math.pi)
+            / torch.sinc(half_angle / math.pi))
+        weighted_quat = torch.cat([
+            torch.cos(weighted_half_angle).unsqueeze(-1),
+            delta_quat[..., 1:] * vector_scale.unsqueeze(-1),
+        ], dim=-1)
+        delta_rot = quaternion_to_matrix(weighted_quat)
+    else:
+        delta_rot = deviation["delta_rot_matrix"]
+
+    delta_pos = deviation["delta_pos"].clone()
+    delta_pos[..., :2] *= component_weight("hor_pos").unsqueeze(-1)
+    delta_pos[..., 2:] *= component_weight("vert_pos").unsqueeze(-1)
+
+    return {
+        "delta_rot_matrix": delta_rot,
+        "delta_pos": delta_pos,
+        "delta_joint": deviation["delta_joint"] * component_weight("joint").unsqueeze(-1),
+        "gravity_angle_rad": torch.acos(cosine),
+        "feedback_weight": weight,
     }
 
 

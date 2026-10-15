@@ -1198,6 +1198,33 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(
             "reference_history.reanchor_mode must be one of se3_left or "
             f"decoupled_world, got {history_reanchor_mode!r}")
+    if "gravity_weighting" in reference_history_cfg:
+        raise ValueError(
+            "reference_history.gravity_weighting was replaced by reanchor_components "
+            "and gravity_angle_source")
+    reanchor_components = reference_history_cfg.get("reanchor_components", {
+        "hor_pos": "full", "vert_pos": "full",
+        "orientation": "gravity_weighted", "joint": "gravity_weighted",
+    })
+    if not isinstance(reanchor_components, Mapping):
+        raise ValueError("reference_history.reanchor_components must be a mapping")
+    required_components = ("hor_pos", "vert_pos", "orientation", "joint")
+    missing = [key for key in required_components if key not in reanchor_components]
+    if missing:
+        raise ValueError("reference_history.reanchor_components is missing components: "
+                         + ", ".join(missing))
+    invalid = [key for key in required_components
+               if reanchor_components[key] not in ("open_loop", "full", "gravity_weighted")]
+    if invalid:
+        raise ValueError(
+            "reference_history.reanchor_components entries must be open_loop, full, "
+            "or gravity_weighted: " + ", ".join(invalid))
+    reanchor_components = {key: reanchor_components[key] for key in required_components}
+    gravity_angle_source = reference_history_cfg.get("gravity_angle_source", "reference")
+    if gravity_angle_source not in ("reference", "world"):
+        raise ValueError(
+            "reference_history.gravity_angle_source must be reference or world, "
+            f"got {gravity_angle_source!r}")
     anchor_gate_cfg = reference_history_cfg.get("anchor_gate", {})
     anchor_gate_window = int(anchor_gate_cfg.get("window", 4))
     anchor_gate_low = float(anchor_gate_cfg.get("low_threshold", 0.75))
@@ -1456,8 +1483,10 @@ def main(cfg: DictConfig) -> None:
                             val_data,
                             cfg.device,
                             joint_limits=reanchor_joint_limits,
-                            phase_index=matched_phase_index,
+                            anchor_state_index=matched_phase_index,
                             reanchor_mode=history_reanchor_mode,
+                            reanchor_components=reanchor_components,
+                            gravity_angle_source=gravity_angle_source,
                         )
                         history_motion_repr = reanchored["history_repr"]
                         abs_pose = reanchored["abs_pose"]
@@ -1467,7 +1496,6 @@ def main(cfg: DictConfig) -> None:
                         reference_pose_rot = (
                             reanchored["hybrid_motion"]["root_rot"][:, -1])
                         reanchor_correction = reanchored["correction"]
-                        _reanchor_phase = reanchored["phase_index"]
                         reanchor_phase_error = torch.zeros(
                             1, device=cfg.device)
                         history_translation = None
@@ -1480,11 +1508,15 @@ def main(cfg: DictConfig) -> None:
                             (f"{phase_offset_frames:+d}"
                              if phase_offset_frames is not None else "n/a"),
                             float(reanchor_phase_error[0]))
-                        if anchor_state == "gate":
+                        if "feedback_weight" in reanchor_correction:
                             logger.info(
-                                "History anchor gate lambda={:.3f}",
-                                float(reanchor_correction.get(
-                                    "gate_lambda", torch.ones(1))[0]))
+                                "History gravity angle={:.2f} deg lambda={:.3f} "
+                                "tracking_anchor={} window_end={}",
+                                math.degrees(float(reanchor_correction[
+                                    "gravity_angle_rad"][0])),
+                                float(reanchor_correction["feedback_weight"][0]),
+                                reanchored["anchor_frame"],
+                                ref_hist_repr["window_end"])
                         goal_builder = state_goal_from_reference
                         goal_builder_prefix = (
                             latest_state, reference_pose_pos,
@@ -1810,12 +1842,14 @@ def main(cfg: DictConfig) -> None:
                         occ_count, infer_ms, latency_ema_log_ms)
 
                 # SonicRunner resets each newly received G1 plan to frame 0.
-                # Keep the current measured history frame as that exact seam;
-                # dropping all history would jump directly to stochastic t+1.
+                # Keep the hybrid history endpoint as the seam, followed by
+                # future states; it can be ahead of the measured cursor.
                 skip_history = (
                     0 if seam_abs_pose is not None else
                     (0 if bool(cfg.pub_all_frames) else history_len - 1))
                 new_to_old_ref_offset = int(
+                    ref_hist_repr["window_end"]
+                    if using_reference_history and seam_abs_pose is not None else
                     (controller_playback_frame or 0)
                     + (lookahead_offset_frames if using_reference_history else 0)
                     + latency_compensation_frames)
