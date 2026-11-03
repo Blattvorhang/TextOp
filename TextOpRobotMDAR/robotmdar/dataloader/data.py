@@ -59,6 +59,10 @@ from robotmdar.utils.goal import (
     validate_goal_stats,
 )
 import robotmdar.dtype.motion as motion_dtype
+from robotmdar.utils.goal_time import clamp_goal_time
+from robotmdar.utils.goal_distribution import (
+    REFERENCE_HEIGHT_RANGE, height_goal_distribution, reference_goal_distribution,
+)
 from robotmdar.dtype.motion import (
     AbsolutePose,
     G1_23DOF_FROM_29DOF_INDICES,
@@ -322,6 +326,10 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             )
         self.goal_per_primitive = goal_per_primitive
         self.goal_include_log_d_hor = bool(goal_include_log_d_hor)
+        # Offline calibration selection; independent of runtime height shaping.
+        self.goal_clamp_reference_height_range = tuple(kwargs.get(
+            'goal_clamp_reference_height_range', REFERENCE_HEIGHT_RANGE))
+        self.goal_clamp_time_min = float(kwargs.get('goal_clamp_time_min', 0.4))
         if time_to_arrival_mode is not None:
             goal_timestep_mode = time_to_arrival_mode
         self.goal_timestep_mode = str(goal_timestep_mode).lower()
@@ -1653,6 +1661,7 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
         clamp_dist_terms = []
         clamp_speed_terms = []
         clamp_height_terms = []
+        clamp_arrival_terms = []
 
         for primitive in batch_data:
             if self.goal_encoding.uses_end_effectors:
@@ -1723,11 +1732,16 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             velocity_terms.append(velocity)
 
             goal_radius = hor[..., 3:4]
-            time_budget = torch.as_tensor(
+            arrival_time = torch.as_tensor(
                 primitive['time_to_arrival'],
                 device=goal_radius.device,
                 dtype=goal_radius.dtype,
-            ).reshape(goal_radius.shape).clamp_min(1.0 / float(self.fps))
+            ).reshape(goal_radius.shape)
+            time_budget = clamp_goal_time(
+                arrival_time, float(self.fps),
+                time_min=getattr(self, 'goal_clamp_time_min', 0.4),
+                time_max=self.future_len / float(self.fps))
+            clamp_arrival_terms.append(arrival_time)
             clamp_dist_terms.append(goal_radius)
             clamp_speed_terms.append(goal_radius / time_budget)
             clamp_height_terms.append(
@@ -1870,9 +1884,8 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             [round(float(v), 3) for v in clamp_speed_quantiles],
             [round(float(v), 1) for v in clamp_levels_percent],
         )
-        # Height-conditioned envelope.  Quantile-based centers keep each
-        # bucket populated across mixed locomotion/posture datasets; runtime
-        # interpolates between neighboring centers.
+        # Preserve the legacy rank buckets for compatibility with GoalClamp.
+        # Separate fixed-width diagnostics below expose actual height occupancy.
         clamp_height = torch.cat(clamp_height_terms, dim=0).reshape(-1)
         # Rank-based buckets avoid empty/sparse tails when many clips share
         # an identical quantized root height.  Runtime still interpolates
@@ -1909,6 +1922,11 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
                 'dist_quantiles': [[float(v) for v in row] for row in h_dist_rows],
                 'speed_quantiles': [[float(v) for v in row] for row in h_speed_rows],
                 'n_samples': h_counts,
+                'binning': 'equal_sample_count_rank_buckets',
+                'height_min': [float(clamp_height[bucket == i].min())
+                               for i in range(height_centers.numel())],
+                'height_max': [float(clamp_height[bucket == i].max())
+                               for i in range(height_centers.numel())],
             }
         stats = {
             's_p': torch.as_tensor(float(s_p)),
@@ -1918,10 +1936,22 @@ class SkeletonPrimitiveDataset(data.IterableDataset):
             'q_mean': q_mean,
             'q_std': q_std,
             'goal_clamp': {
+                'time_min': getattr(self, 'goal_clamp_time_min', 0.4),
+                'time_max': self.future_len / float(self.fps),
                 'quantile_levels': [float(v) for v in clamp_levels_percent],
                 'dist_quantiles': [float(v) for v in clamp_dist_quantiles],
                 'speed_quantiles': [float(v) for v in clamp_speed_quantiles],
                 'n_samples': int(clamp_dist.numel()),
+                'height_distribution': height_goal_distribution(
+                    clamp_height, clamp_dist, torch.cat(clamp_arrival_terms),
+                    fps=float(self.fps), time_min=getattr(self, 'goal_clamp_time_min', 0.4),
+                    time_max=self.future_len / float(self.fps)),
+                'reference_distribution': reference_goal_distribution(
+                    clamp_height, clamp_dist, torch.cat(clamp_arrival_terms),
+                    fps=float(self.fps), height_range=getattr(
+                        self, 'goal_clamp_reference_height_range', REFERENCE_HEIGHT_RANGE),
+                    time_min=getattr(self, 'goal_clamp_time_min', 0.4),
+                    time_max=self.future_len / float(self.fps)),
             },
             'meta': self._goal_stats_meta(),
         }

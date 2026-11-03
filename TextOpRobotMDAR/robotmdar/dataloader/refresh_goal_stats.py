@@ -32,3 +32,6 @@ def main(cfg: DictConfig) -> None:
     out_path = target_dir / "goal_stats.pkl"
     torch.save(stats, out_path)
     print(f"Saved goal stats (incl. goal-clamp quantiles) to {out_path}")
+    reference = stats['goal_clamp']['reference_distribution']
+    print(f"Pooled reference goals: N={reference['n_samples']}/{reference['n_total']}, "
+          f"height range={reference['height_range']} m; {reference['motion_filter']}")

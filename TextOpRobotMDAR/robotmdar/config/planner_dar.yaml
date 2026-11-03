@@ -91,17 +91,14 @@ denoiser:
 
 # Controller validity fields are passed to the denoiser as masks.
 
-# Optional training-distribution goal clamp.
-goal_clamp_enabled: false
+# Manual horizontal average-speed limits; statistics are diagnostic only.
+goal_clamp_enabled: true
 goal_clamp:
-  quantile: 99
-  # Extra conservative factor at the lowest observed root height; the
-  # factor linearly returns to 1.0 at the highest height.
-  low_height_scale: 0.20
-  low_height: 0.50
-  speed_knee_height: 0.70
-  standing_height: 0.78
-  low_height_distance_max: 0.3
+  height_low: 0.45  # m
+  height_full: 0.70  # m; quintic transition between the two heights
+  speed_low: 0.6  # m/s at/below height_low
+  speed_full: 2.5  # m/s at/above height_full
+  time_min: 0.4  # s; minimum transition duration, including overdue valid goals
 
 # joint_state uses root pose, 29-DOF joints, velocity, and timestamp.
 goal_reference_path: null
