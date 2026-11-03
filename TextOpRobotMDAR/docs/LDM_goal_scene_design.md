@@ -516,7 +516,7 @@ ablation item (§7.4), not a settled v1 choice.
 ### 4.1.0 Action Category Balancing (deferred)
 
 BONES-SEED contains 71,132 motion clips spanning ~20 coarse action categories
-(see `dataset/data_analyze/analyze_action_distribution.py` for the full
+(see `dataset/data_analyze/action_distribution/analyze_action_distribution.py` for the full
 breakdown). The distribution is long-tailed — locomotion (walk, jog) accounts
 for ~24% while critical categories like `step_over` are only 0.2% of the data.
 
@@ -825,4 +825,4 @@ frame is in bounds.
 - **MOB** (`papers/MOB.pdf`, `Motion-Occupancy-Base/`): pseudo-scene occupancy is the complement of swept body occupancy; controls are re-canonicalized and occupancy is queried at every autoregressive step
 - **TRUMANS** (`trumans_utils/`): scene as 32³ voxel via ViT → prepended token; goal via `fix_mode` clamp in diffusion loop
 - **TextOp original**: text-conditioned via CLIP embedding → replaced by goal + scene here
-- **BONES-SEED**: 120 Hz, 29 DOF, cm+deg → 50 Hz, 23/29 DOF, m+rad via `convert_soma_csv_to_motion_lib.py`. 71K clips, 20 coarse action categories — distribution analyzed in `dataset/data_analyze/analyze_action_distribution.py`
+- **BONES-SEED**: 120 Hz, 29 DOF, cm+deg → 50 Hz, 23/29 DOF, m+rad via `convert_soma_csv_to_motion_lib.py`. 71K clips, 20 coarse action categories — distribution analyzed in `dataset/data_analyze/action_distribution/analyze_action_distribution.py`

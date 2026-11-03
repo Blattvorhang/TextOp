@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -55,7 +55,7 @@ VERSION_OPTION_TOKEN_RE = re.compile(
     r"|(?<![a-z0-9])v\d+(?![a-z0-9])"
 )
 SKIP_MIRRORED = True
-OUTPUT_DIR = Path(__file__).resolve().parent / "analysis_output" / "action_distribution"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "analysis_output" / "action_distribution"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"

@@ -118,7 +118,7 @@ def main():
             transform=ax.transAxes, ha="right", va="top", family="monospace",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85))
     fig.tight_layout()
-    output = Path(args.output) if args.output else Path(__file__).resolve().parent / "analysis_output" / "hiphi_duration_histogram.png"
+    output = Path(args.output) if args.output else Path(__file__).resolve().parents[1] / "analysis_output" / "hiphi_duration_histogram.png"
     output.parent.mkdir(exist_ok=True)
     fig.savefig(output, dpi=150)
     plt.close(fig)

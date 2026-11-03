@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 from clip.simple_tokenizer import SimpleTokenizer
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -39,7 +39,7 @@ from robotmdar.model.clip import encode_text, load_and_freeze_clip  # noqa: E402
 
 METADATA_CSV = "/home/lenovo/data/bones-seed/metadata/seed_metadata_v004.csv"
 TEMPORAL_JSONL = "/home/lenovo/data/bones-seed/metadata/seed_metadata_v002_temporal_labels.jsonl"
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "analysis_output" / "text_description_similarity_simple"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "analysis_output" / "text_description_similarity_simple"
 DEFAULT_CLIP_VERSION = "ViT-B/32"
 DEFAULT_SAMPLE_SIZE = 400  # roughly ~1k expanded event samples on BONES-SEED
 DEFAULT_SEED = 42

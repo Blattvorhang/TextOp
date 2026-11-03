@@ -20,7 +20,7 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 BASE = "/home/lenovo/data/bones-seed/g1/csv"
-OUTPUT_DIR = Path(__file__).resolve().parent / "analysis_output"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "analysis_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 MAX_FRAMES = 273  # < 273 frames at 50Hz ≈ 5.46 seconds

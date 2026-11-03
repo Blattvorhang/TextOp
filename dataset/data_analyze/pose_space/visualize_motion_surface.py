@@ -13,7 +13,10 @@ from pathlib import Path
 
 import numpy as np
 
-from visualize_motion_manifold import DEFAULT_LIMITS_XML, embed, load_csv
+if __package__:
+    from .visualize_motion_manifold import DEFAULT_LIMITS_XML, embed, load_csv
+else:
+    from visualize_motion_manifold import DEFAULT_LIMITS_XML, embed, load_csv
 
 
 def resample_curve(curve: np.ndarray, samples: int) -> np.ndarray:

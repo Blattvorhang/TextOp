@@ -46,7 +46,7 @@ import yaml
 from tqdm import tqdm
 
 try:
-    from dataset.data_analyze.analyze_action_distribution import (  # noqa: E402
+    from dataset.data_analyze.action_distribution.analyze_action_distribution import (  # noqa: E402
         classify_coarse as _shared_classify_coarse,
     )
 except Exception:  # pragma: no cover - optional fallback

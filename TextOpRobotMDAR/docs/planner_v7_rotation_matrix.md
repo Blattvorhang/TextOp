@@ -11,7 +11,7 @@ singular — yaw is no longer well-defined and the roll/yaw pair exchanges
 roles discontinuously (gimbal lock).
 
 This is demonstrated empirically in
-[dataset/data_analyze/analyze_rpy.py](../../dataset/data_analyze/analyze_rpy.py):
+[dataset/data_analyze/pose_space/analyze_rpy.py](../../dataset/data_analyze/pose_space/analyze_rpy.py):
 for a continuous roll-over motion `R(α) = Rx(90°) · Rz(α)`, `α ∈ [0°, 180°]`
 (side-lying start, continuous body-z roll), the ZYX decomposition exhibits a
 singularity exactly at `α = 90°` (pitch = 90°), where yaw jumps
@@ -618,7 +618,7 @@ rot6d = matrix_to_rot6d(R)       # [..., 3, 3] -> [..., 6]
 **silently corrupts rotations**. PyTorch3D is deliberately not introduced;
 if it ever appears in the pipeline, the conversion functions must still
 always be used as a pair from this repo.
-`dataset/data_analyze/analyze_rpy.py` concatenates the two columns
+`dataset/data_analyze/pose_space/analyze_rpy.py` concatenates the two columns
 column-major (`[r11, r21, r31, r12, r22, r32]`) — a third ordering that is
 only used for the continuity figure and never feeds these functions (its
 continuity conclusion is convention-independent).

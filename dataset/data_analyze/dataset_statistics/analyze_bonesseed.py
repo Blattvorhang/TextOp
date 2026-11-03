@@ -48,7 +48,7 @@ WORLD_VEL_THRESH = np.sqrt(0.002)  # ≈ 0.0447 m/frame (world-frame)
 WORLD_HEIGHT_THRESH = 0.08         # absolute Z threshold (m)
 
 # Output
-OUTPUT_DIR = Path(__file__).resolve().parent / "analysis_output"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "analysis_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 RANDOM_SEED = 42
@@ -391,9 +391,9 @@ def init_skeleton():
     """延迟初始化 RobotSkeleton (G1, 23 DOF, wrists locked)."""
     import torch
     from omegaconf import OmegaConf
+    project_root = Path(__file__).resolve().parents[3]
+    sys.path.insert(0, str(project_root / "TextOpRobotMDAR"))
     from robotmdar.skeleton.robot import RobotSkeleton
-
-    project_root = Path(__file__).resolve().parent
     skel_cfg_path = project_root / "TextOpRobotMDAR/robotmdar/config/skeleton/g1.yaml"
     asset_root = str((project_root / "TextOpRobotMDAR/description/robots/g1/").resolve())
 

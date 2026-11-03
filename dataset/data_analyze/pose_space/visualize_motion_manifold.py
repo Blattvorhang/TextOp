@@ -8,17 +8,17 @@ TextOp/motion-lib pickle containing ``dof``, ``root_trans_offset`` and
 
 Examples
 --------
-python dataset/data_analyze/visualize_motion_manifold.py \
+python dataset/data_analyze/pose_space/visualize_motion_manifold.py \
     --input /home/lenovo/data/bones-seed/g1/csv --motion walk \
     --output dataset/data_analyze/analysis_output/walk_manifold.png \
     --html dataset/data_analyze/analysis_output/walk_manifold.html
 
-python dataset/data_analyze/visualize_motion_manifold.py \
+python dataset/data_analyze/pose_space/visualize_motion_manifold.py \
     --input data/motion_lib/221010/walk_ff_loop_180_R_003__A045_M.pkl \
     --show
 
 # Several motions in ONE shared UMAP embedding:
-python dataset/data_analyze/visualize_motion_manifold.py \
+python dataset/data_analyze/pose_space/visualize_motion_manifold.py \
     --input /home/lenovo/data/bones-seed/g1/csv --motion walk --num-motions 10 \
     --output dataset/data_analyze/analysis_output/walk_manifold_multi.png \
     --html dataset/data_analyze/analysis_output/walk_manifold_multi.html
@@ -49,7 +49,7 @@ DOF_COLUMNS = [
     "right_shoulder_yaw_joint_dof", "right_elbow_joint_dof", "right_wrist_roll_joint_dof",
     "right_wrist_pitch_joint_dof", "right_wrist_yaw_joint_dof",
 ]
-DEFAULT_LIMITS_XML = Path(__file__).resolve().parents[2] / "TextOpRobotMDAR/description/robots/g1/g1_29dof.xml"
+DEFAULT_LIMITS_XML = Path(__file__).resolve().parents[3] / "TextOpRobotMDAR/description/robots/g1/g1_29dof.xml"
 # Categorical colors for distinct motions, assigned in this fixed order (light surface).
 CURVE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 

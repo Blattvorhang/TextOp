@@ -10,7 +10,7 @@ product, so the result lies in SO(3) for any non-degenerate input.
 
 NOTE: ``pytorch3d.transforms.matrix_to_rotation_6d`` uses the first two
 ROWS instead; the conventions differ and must never be mixed.
-``dataset/data_analyze/analyze_rpy.py`` concatenates the two columns
+``dataset/data_analyze/pose_space/analyze_rpy.py`` concatenates the two columns
 directly ([r11, r21, r31, r12, r22, r32]) — a third ordering that is only
 used for the continuity figure and never feeds these functions.
 
