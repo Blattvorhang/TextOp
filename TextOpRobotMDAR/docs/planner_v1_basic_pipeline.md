@@ -389,7 +389,7 @@ defaults:
 task: planner-dar
 
 # Planner loop
-infer_period_ms: 50          # inference period (ms), i.e. 20 Hz
+# Async replanning cadence is configured in communication/pubsub.yaml.
 pub_all_frames: false        # false = 8 frames (future only), true = 10 frames
 use_full_sample: false       # single-step denoising for the 20 Hz deadline
 generated_history:
