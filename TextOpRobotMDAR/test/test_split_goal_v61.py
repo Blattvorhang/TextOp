@@ -832,6 +832,7 @@ def test_split_goal_stats_handles_batched_time_to_arrival(tmp_path):
     assert stats["goal_clamp"]["n_samples"] == 2
     assert stats["goal_clamp"]["dist_quantiles"][0] == pytest.approx(7.5)
     assert stats["goal_clamp"]["speed_quantiles"][0] == pytest.approx((5 + 10 / 1.28) / 2)
+    assert "height_conditioned" not in stats["goal_clamp"]
     distribution = stats["goal_clamp"]["height_distribution"]
     assert distribution["n_samples"] == [2]
     assert distribution["n_excluded"] == 0

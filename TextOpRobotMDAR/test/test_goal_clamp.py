@@ -377,5 +377,5 @@ def test_manual_config_has_no_statistics_or_distance_overrides():
     assert set(config.goal_clamp) == {'height_low', 'height_full', 'speed_low', 'speed_full', 'time_min'}
     clamp = GoalClamp(**dict(config.goal_clamp), fps=50, time_max=1.28)
     assert clamp.radius_for_height(torch.tensor(.3), .4).item() == pytest.approx(.24)
-    assert clamp.radius_for_height(torch.tensor(.8), .4).item() == pytest.approx(1.2)
-    assert clamp.radius_for_height(torch.tensor(.8), 1.28).item() == pytest.approx(3.84)
+    assert clamp.radius_for_height(torch.tensor(.8), .4).item() == pytest.approx(float(config.goal_clamp.speed_full) * .4)
+    assert clamp.radius_for_height(torch.tensor(.8), 1.28).item() == pytest.approx(float(config.goal_clamp.speed_full) * 1.28)

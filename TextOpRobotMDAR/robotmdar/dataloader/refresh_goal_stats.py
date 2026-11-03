@@ -1,15 +1,7 @@
-"""Refresh goal_stats.pkl including the goal-clamp quantile tables.
+"""Recompute goal normalization and diagnostic distributions in goal_stats.pkl.
 
-Recomputes the frozen goal statistics from the training dataset and writes
-them to ``target_dir/goal_stats.pkl`` — typically the checkpoint directory —
-so the planner's data-driven goal clamp can read its envelope from the same
-distribution the model was trained on.
-
-Usage:
-    robotmdar --config-name=refresh_goal_stats \\
-        data.datadir=./dataset/BONES-SEED-29dof-FULL-50fps \\
-        target_dir=./logs/pretrained/0827_goal_reaching \\
-        skeleton.asset.assetRoot=./description/robots/g1/
+Uses raw sampled goals with the dataset's statistics sampling path. Runtime
+clamp limits remain manually configured in planner_dar.yaml.
 """
 
 from pathlib import Path
@@ -31,7 +23,7 @@ def main(cfg: DictConfig) -> None:
     stats = dataset._compute_goal_stats()
     out_path = target_dir / "goal_stats.pkl"
     torch.save(stats, out_path)
-    print(f"Saved goal stats (incl. goal-clamp quantiles) to {out_path}")
+    print(f"Saved goal statistics and diagnostic distributions to {out_path}")
     reference = stats['goal_clamp']['reference_distribution']
     print(f"Pooled reference goals: N={reference['n_samples']}/{reference['n_total']}, "
           f"height range={reference['height_range']} m; {reference['motion_filter']}")

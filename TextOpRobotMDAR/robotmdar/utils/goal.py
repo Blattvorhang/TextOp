@@ -360,7 +360,9 @@ def _world_to_ego(world_delta: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class GoalClamp:
-    """Manually configured horizontal average-speed limit.
+    """Manual goal-displacement envelope informed by diagnostics and motion priors.
+
+    This limits encoded goal distance per time budget, not actual robot speed.
 
     v(h) = speed_low + (speed_full-speed_low)*smootherstep(h)
     R(h,T) = v(h)*T_eff. No quantile-derived distance cap or height release.

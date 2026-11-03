@@ -7,7 +7,7 @@
 Clamp curves use only YAML/manual settings: R(h,T) = v(h)*T_eff.
 Optional goal_stats.pkl provides observational height counts and quantiles;
 it never determines the runtime envelope or the model's time horizon.
-When supplied, observed P95 speed and displacement are overlaid on goal_clamp.png.
+When supplied, observed P95 speed is overlaid on goal_clamp.png.
 Observed displacement mixes arrival horizons; it is not a fixed-time radius.
 Counts refer to sampled goal windows, not unique frames or motion duration.
 """
@@ -33,7 +33,21 @@ from robotmdar.utils.goal_time import clamp_goal_time
 CLAMP_OPTIONS = ("height_low", "height_full", "speed_low", "speed_full", "time_min")
 
 
-def overlay_observed_p95(stats, speed_ax, radius_ax):
+def plot_supported_quantile(ax, heights, values, counts, min_samples, label, **kwargs):
+    """Break lines at sparse bins; show their observations as hollow markers."""
+    import numpy as np
+
+    heights, values = np.asarray(heights, dtype=float), np.asarray(values, dtype=float)
+    counts = np.asarray(counts)
+    supported = counts >= min_samples
+    line, = ax.plot(heights, np.where(supported, values, np.nan), ".-",
+                    label=label, **kwargs)
+    sparse = (counts > 0) & ~supported & np.isfinite(values)
+    ax.scatter(heights[sparse], values[sparse], facecolors="none",
+               edgecolors=line.get_color(), s=30)
+
+
+def overlay_observed_p95(stats, speed_ax, min_samples):
     """Show stored P95 observations without fitting, resampling or clamping data."""
     import numpy as np
 
@@ -52,14 +66,11 @@ def overlay_observed_p95(stats, speed_ax, radius_ax):
     # Preserve gaps in empty height bins; do not substitute global quantiles.
     heights = np.asarray(table["centers"], dtype=float)
     source = "height bins" if fixed else "legacy rank buckets"
-    for ax, key, label in (
-        (speed_ax, "speed_quantiles", "Observed P95 average speed"),
-        (radius_ax, "dist_quantiles", "Observed P95 distance (mixed times)"),
-    ):
-        if key in table:
-            values = np.asarray(table[key], dtype=float)[:, column]
-            ax.plot(heights, values, "o--", color="tab:red", markersize=3,
-                    linewidth=1.7, label=f"{label}; {source}", zorder=5)
+    if "speed_quantiles" in table:
+        values = np.asarray(table["speed_quantiles"], dtype=float)[:, column]
+        plot_supported_quantile(
+            speed_ax, heights, values, table["n_samples"], min_samples,
+            f"Observed P95 implied speed; {source}", color="tab:red")
     if table.get("time_max") is not None:
         time_note = f"stored speed budget=[{table.get('time_min', 0):g}, {table['time_max']:g}] s"
     else:
@@ -68,7 +79,7 @@ def overlay_observed_p95(stats, speed_ax, radius_ax):
     return f"P95: {time_note}; observed distance mixes arrival times."
 
 
-def plot_height_distribution(stats, output, percentiles, count_log=False):
+def plot_height_distribution(stats, output, percentiles, count_log=False, min_samples=100):
     """Plot/export fixed-height diagnostics, or explicitly labeled legacy buckets."""
     import numpy as np
     import matplotlib.pyplot as plt
@@ -127,7 +138,8 @@ def plot_height_distribution(stats, output, percentiles, count_log=False):
             values = np.asarray(table[key], dtype=float)
             for percentile, column in selected:
                 # Null quantiles in empty bins become NaN and break the curve.
-                ax.plot(centers, values[:, column], ".-", label=f"P{percentile:g}")
+                plot_supported_quantile(ax, centers, values[:, column], counts,
+                                        min_samples, f"P{percentile:g}")
             if selected:
                 ax.legend()
         ax.set(title=title, xlabel="Reference root height (m)", ylabel=unit)
@@ -136,7 +148,8 @@ def plot_height_distribution(stats, output, percentiles, count_log=False):
         ax.grid(True, alpha=0.2)
     time_note = (f"speed uses time budget [{table['time_min']:g}, {table['time_max']:g}] s"
                  if table.get("time_max") is not None else "speed uses stored arrival budget")
-    fig.suptitle(source + f"\nRaw goal windows; {time_note}; no action filtering")
+    fig.suptitle(source + f"\nRaw goal windows; {time_note}; no action filtering"
+                 + f"\nHollow markers: N < {min_samples}; window counts are not independent samples")
     image_path = output.with_name(output.stem + "_height_distribution" + output.suffix)
     fig.savefig(image_path, dpi=180, bbox_inches="tight")
     csv_path = output.with_name(output.stem + "_height_distribution.csv")
@@ -144,7 +157,7 @@ def plot_height_distribution(stats, output, percentiles, count_log=False):
         writer = csv.writer(handle)
         writer.writerow(["height_lower_m", "height_upper_m", "height_center_m", "n_samples",
                          "sample_fraction", "percentile", "distance_m", "implied_speed_m_s",
-                         "arrival_time_s", "effective_time_budget_s"])
+                         "arrival_time_s", "effective_time_budget_s", "sparse_bin"])
         for i, count in enumerate(counts):
             for j, percentile in enumerate(levels):
                 writer.writerow([
@@ -154,6 +167,7 @@ def plot_height_distribution(stats, output, percentiles, count_log=False):
                     percentile, table["dist_quantiles"][i][j], table["speed_quantiles"][i][j],
                     table["arrival_time_quantiles"][i][j] if "arrival_time_quantiles" in table else None,
                     table["time_budget_quantiles"][i][j] if "time_budget_quantiles" in table else None,
+                    0 < count < min_samples,
                 ])
     print(f"Saved: {image_path.resolve()}")
     print(f"Saved: {csv_path.resolve()}")
@@ -173,12 +187,16 @@ def main() -> None:
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--distribution-quantiles", type=float, nargs="+", default=[50, 75, 90, 95, 99])
     parser.add_argument("--count-log", action="store_true")
+    parser.add_argument("--min-bin-samples", type=int, default=100,
+                        help="Display threshold for sparse bins; not a confidence bound")
     parser.add_argument("--arrival-times", type=float, nargs="+",
                         help="Positive arrival times (s); default: minimum, half and full horizon")
     for key in CLAMP_OPTIONS:
         parser.add_argument("--" + key.replace("_", "-"), type=float,
                             help=f"Override goal_clamp.{key} from the YAML")
     args = parser.parse_args()
+    if args.min_bin_samples < 1:
+        parser.error("--min-bin-samples must be >= 1")
     config = OmegaConf.load(args.config)
     options = dict(config.get("goal_clamp", {}))
     for key in CLAMP_OPTIONS:
@@ -217,7 +235,7 @@ def main() -> None:
         if abs(effective - arrival) > 1e-6:
             label += f"; used {effective:g} s"
         radius_ax.plot(heights.numpy(), radius.numpy(), label=label + " radius")
-    observation_note = overlay_observed_p95(stats, speed_ax, radius_ax) if stats is not None else ""
+    observation_note = overlay_observed_p95(stats, speed_ax, args.min_bin_samples) if stats is not None else ""
     for ax, label in ((speed_ax, "Horizontal average-speed limit (m/s)"),
                       (radius_ax, "Allowed horizontal radius (m)")):
         for height in (clamp.height_low, clamp.height_full):
@@ -246,6 +264,17 @@ def main() -> None:
         writer.writerow(["height_m", "speed_limit_m_s"]
                         + [f"radius_T{t:g}s_m" for t in arrival_times])
         writer.writerows(zip(heights.tolist(), speeds.tolist(), *radius_curves))
+    provenance = {
+        "planner_config": str(args.config.resolve()),
+        "goal_clamp": options,
+        "fps": fps, "time_max": clamp.time_max,
+        "stats_path": str(args.goal_stats.resolve()) if args.goal_stats else None,
+        "stats_meta": stats.get("meta", {}) if stats else {},
+        "min_bin_samples": args.min_bin_samples,
+        "arrival_times": arrival_times,
+    }
+    OmegaConf.save(OmegaConf.create(provenance),
+                   output.with_name(output.stem + "_calibration.yaml"))
     print(f"Config: {args.config.resolve()}")
     print(f"goal_clamp_enabled={enabled}; plotting the enabled envelope.")
     print(f"Manual limits: speeds=[{clamp.speed_low:g}, {clamp.speed_full:g}] m/s; "
@@ -254,7 +283,15 @@ def main() -> None:
     print(f"Saved: {output.resolve()}")
     print(f"Saved: {csv_path.resolve()}")
     if stats is not None:
-        plot_height_distribution(stats, output, args.distribution_quantiles, args.count_log)
+        plot_height_distribution(stats, output, args.distribution_quantiles,
+                                 args.count_log, args.min_bin_samples)
+        reference = stats.get("goal_clamp", {}).get("reference_distribution")
+        if reference:
+            print(f"Reference height proxy {reference['height_range']} m: "
+                  f"N={reference['n_samples']}/{reference['n_total']}; "
+                  f"{reference['motion_filter']}")
+            print(f"Reference percentiles {reference['quantile_levels']}: "
+                  f"implied speed={reference['speed_quantiles']} m/s")
     if args.show:
         plt.show()
     plt.close("all")

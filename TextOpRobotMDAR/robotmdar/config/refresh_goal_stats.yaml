@@ -5,11 +5,13 @@ defaults:
 
 task: refresh-goal-stats
 
-# Recompute goal_stats.pkl (including the goal-clamp quantile tables) from
-# the training split and write it to target_dir/goal_stats.pkl. Point
-# target_dir at the checkpoint directory the planner loads its frozen stats
-# from (e.g. logs/pretrained/0827_goal_reaching).
+# Recompute normalization and diagnostic distributions together from raw goals.
+# Use the same dataset, sampling/goal configuration and seed to reproduce stats.
+# Writes target_dir/goal_stats.pkl.
 target_dir: null  # required
+
+goal_clamp:
+  time_min: 0.4
 
 data:
   dof_dim: 29
@@ -21,3 +23,8 @@ data:
   # The task recomputes the stats explicitly; keep the dataset init from
   # loading (or silently caching) the datadir copy.
   load_goal_stats: false
+  train:
+    goal_clamp_time_min: ${goal_clamp.time_min}
+    # Pool raw goals in this interval; do not average per-bin quantiles.
+    # A height proxy only: no locomotion/action-label filtering is implied.
+    goal_clamp_reference_height_range: [0.70, 0.775]
