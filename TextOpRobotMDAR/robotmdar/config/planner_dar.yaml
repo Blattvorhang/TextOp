@@ -68,6 +68,16 @@ reference_history:
 # Single-step denoising.
 use_full_sample: false
 
+# EE guidance is computed with joints masked, then joint guidance is added.
+# 1/1 preserves the original prediction. Set joint=0 to use EE without joints;
+# use end_effector>1 to strengthen EE. Zero hard-drops the selected modality.
+# Four EE tokens share this scale and keep their individual validity masks.
+# CFG runs only when joint is valid and at least one EE is valid; otherwise
+# use the original prediction. Existing force-drop masks also disable CFG.
+goal_guidance:
+  joint: 1.0
+  end_effector: 1.0
+
 comm_config: ${hydra:runtime.cwd}/robotmdar/config/communication/pubsub.yaml
 
 occ_grid: null

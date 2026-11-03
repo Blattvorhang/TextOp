@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from robotmdar.utils.goal_time import clamp_goal_time
 from hydra.utils import instantiate, to_absolute_path
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -185,6 +186,7 @@ def _time_to_arrival_from_state(
     motion_fps: float,
     device: str | torch.device,
     reference_time_offset_s: float = 0.0,
+    goal_clamp: GoalClamp | None = None,
 ) -> tuple[float, torch.Tensor]:
     goal_timestamp_ns = state_msg.condition.goal.timestamp_ns
     timestamps_ns = state_msg.history_meta.timestamps_ns
@@ -197,11 +199,13 @@ def _time_to_arrival_from_state(
         (int(goal_timestamp_ns) - int(timestamps_ns[-1])) / 1e9
         - float(reference_time_offset_s),
     )
-    time_to_arrival_frame = torch.round(torch.tensor(
-        [time_to_arrival_s * float(motion_fps)],
-        dtype=torch.float32,
-        device=device,
-    )).to(dtype=torch.long)
+    duration = torch.tensor([time_to_arrival_s], dtype=torch.float32, device=device)
+    if goal_clamp is not None:
+        duration = clamp_goal_time(duration, motion_fps, goal_clamp.time_min, goal_clamp.time_max)
+        logger.debug("Goal time: remaining={:.3f}s transition={:.3f}s",
+                     time_to_arrival_s, float(duration.item()))
+        time_to_arrival_s = float(duration.item())
+    time_to_arrival_frame = torch.round(duration * float(motion_fps)).to(torch.long)
     return time_to_arrival_s, time_to_arrival_frame
 
 
@@ -543,7 +547,10 @@ def _checkpoint_contract(model_cfg: DictConfig) -> dict[str, object]:
         else:
             goal_encoding = {
                 40: GoalEncoding.LEGACY40,
+                LEGACY45_SPLIT_GOAL_DIM: GoalEncoding.SPLIT,
+                SPLIT_GOAL_NO_LOG_DIM: GoalEncoding.SPLIT,
                 55: GoalEncoding.SPLIT,
+                SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM: GoalEncoding.SPLIT_END_EFFECTOR,
                 67: GoalEncoding.SPLIT_END_EFFECTOR,
             }.get(int(goal_dim_value))
             if goal_encoding is None:
@@ -590,6 +597,10 @@ def _checkpoint_contract(model_cfg: DictConfig) -> dict[str, object]:
     )
     no_log_split_layout = goal_dim in (
         SPLIT_GOAL_NO_LOG_DIM, SPLIT_END_EFFECTOR_NO_LOG_GOAL_DIM)
+    if no_log_split_layout:
+        # These layouts physically omit the log-distance slot, including
+        # checkpoints whose cfg.yaml predates the ablation flag.
+        goal_include_log_d_hor = False
     goal_schema = (
         LEGACY45_SPLIT_GOAL_SCHEMA if legacy_split_goal45_layout
         else "rotmat_v7" if legacy_split_goal_layout
@@ -775,6 +786,7 @@ def _apply_checkpoint_config(
         cfg.data.future_len = int(contract["future_len"])
         cfg.data.goal_type = contract["goal_type"].value
         cfg.data.goal_encoding = contract["goal_encoding"].value
+        cfg.data.goal_dim = int(contract["goal_dim"])
         cfg.data.goal_per_primitive = bool(contract["goal_per_primitive"])
         cfg.data.goal_timestep_mode = contract["goal_timestep_mode"]
         cfg.data.goal_include_log_d_hor = bool(
@@ -1076,50 +1088,22 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(
             f"Dataset fps ({val_data.fps}) must match motion_fps ({motion_fps})")
 
-    # Clamp the controller goal back into the training distribution before
-    # encoding: r_max(T) = clip(speed_max * clip(T, 1/fps, time_max),
-    # r_min, r_max), with x,y scaled proportionally (direction preserved).
-    # The same time cap feeds the arrival-time PE and the goal urgency.
-    # The envelope is DERIVED from the frozen goal_stats.pkl shipped with the
-    # checkpoint (per-window ego goal distance and implied speed r/T
-    # quantiles): goal_clamp.quantile selects the training-distribution
-    # percentile to admit — lower is stricter. r_min = speed_max/fps and
-    # time_max = future_len/fps are derived as well. goal_clamp_enabled is
-    # the runtime switch; without it the goal_clamp block (or a null
-    # override) leaves the planner unclamped.
+    # The clamp uses manual height/speed settings, independently of goal stats.
+    # The checkpoint horizon remains the upper time budget for model encoding.
     goal_clamp = None
     _goal_clamp_cfg = cfg.get("goal_clamp")
-    if _goal_clamp_cfg is not None and bool(
-            cfg.get("goal_clamp_enabled", False)):
+    if _goal_clamp_cfg is not None and bool(cfg.get("goal_clamp_enabled", False)):
         if bool(checkpoint_compatibility["legacy_split_goal45_layout"]):
-            # The 0827-era 45-D goal predates the data-driven clamp and its
-            # quantile tables are absent from the frozen goal_stats.pkl.
+            logger.info("Goal clamp disabled: the legacy 45-D checkpoint is unsupported")
+        else:
+            goal_clamp = GoalClamp(
+                **dict(_goal_clamp_cfg), fps=motion_fps, time_max=future_len / motion_fps)
             logger.info(
-                "Goal clamp disabled: the checkpoint uses the 0827-era "
-                "45-D split goal, which predates the data-driven clamp")
-        elif goal_stats is None:
-            raise ValueError(
-                "goal_clamp_enabled requires frozen goal statistics; it is "
-                "only supported for the split goal encoding")
-        _clamp_quantile = float(_goal_clamp_cfg.get("quantile", 99.0))
-        goal_clamp = GoalClamp.from_stats(
-            goal_stats,
-            _clamp_quantile,
-            low_height_scale=float(
-                _goal_clamp_cfg.get("low_height_scale", 0.6)),
-            low_height=float(_goal_clamp_cfg.get("low_height", 0.20)),
-            speed_knee_height=float(
-                _goal_clamp_cfg.get("speed_knee_height", 0.70)),
-            standing_height=float(
-                _goal_clamp_cfg.get("standing_height", 0.78)),
-            low_height_distance_max=float(
-                _goal_clamp_cfg.get("low_height_distance_max", 0.5)),
-        )
-        logger.info(
-            "Goal clamp enabled from frozen stats at percentile {:.1f}: "
-            "r_max(T)=clip({:.3f}*T, {:.3f}, {:.3f}) m with T<= {:.2f} s",
-            _clamp_quantile, goal_clamp.speed_max, goal_clamp.r_min,
-            goal_clamp.r_max, goal_clamp.time_max)
+                "Goal clamp (manual average speed): heights=[{}, {}] m "
+                "speeds=[{}, {}] m/s time=[{:.3f}, {:.3f}] s",
+                goal_clamp.height_low, goal_clamp.height_full,
+                goal_clamp.speed_low, goal_clamp.speed_full,
+                goal_clamp.time_min, goal_clamp.time_max)
     elif _goal_clamp_cfg is not None:
         logger.info("Goal clamp disabled (goal_clamp_enabled=false)")
 
@@ -1374,14 +1358,9 @@ def main(cfg: DictConfig) -> None:
                 _goal_yaw_valid = bool(goal_valid["yaw"])
                 _goal_orientation_valid = bool(goal_valid["orientation"])
                 _goal_time_valid = bool(goal_valid["time"])
-                # A missing/invalid arrival time must not collapse the
-                # navigation goal to the one-frame clamp floor. The goal
-                # encoder may still use its numerical time floor for urgency,
-                # but distance clamping is meaningful only with a valid
-                # arrival-time budget.
-                # Invalid arrival time is represented by T=0 and masked in
-                # the goal encoding; the XY clamp still applies its fixed
-                # height-dependent distance cap in that case.
+                # planner_convert binds measured height and the explicit time
+                # validity flag. Masked time uses the horizon; expired valid
+                # time gets the minimum transition duration, matching urgency.
                 runtime_goal_clamp = goal_clamp
                 controller_text_valid = _state_bool_field(
                     latest_state, "text_valid", False)
@@ -1416,7 +1395,7 @@ def main(cfg: DictConfig) -> None:
                 latency_compensation_frames = 0
                 controller_playback_frame = None
                 lookahead_offset_frames = 0
-                seam_abs_pose = None
+                seam_state = None
                 if using_reference_history:
                     controller_playback_frame = int(
                         reference_motion.cursor_frame)
@@ -1490,7 +1469,7 @@ def main(cfg: DictConfig) -> None:
                         )
                         history_motion_repr = reanchored["history_repr"]
                         abs_pose = reanchored["abs_pose"]
-                        seam_abs_pose = reanchored["seam_abs_pose"]
+                        seam_state = reanchored["seam_state"]
                         reference_pose_pos = (
                             reanchored["hybrid_motion"]["root_trans_offset"][:, -1])
                         reference_pose_rot = (
@@ -1544,6 +1523,23 @@ def main(cfg: DictConfig) -> None:
                         abs_pose = {
                             key: value.to(cfg.device)
                             for key, value in reference_abs_pose.items()
+                        }
+                        # Keep the raw reference-history path on the same
+                        # physical seam as history_reanchor with every
+                        # component set to open_loop.  The generated future
+                        # is future-only; without an explicit seam it would
+                        # be reconstructed from the first history pose and
+                        # then cropped with skip_history, which is a
+                        # different (and discontinuous) publish path.
+                        raw_history = ref_hist_repr["raw_motion"]
+                        seam_state = {
+                            "root_trans_offset": raw_history[
+                                "root_trans_offset"][:, -1].detach().clone(),
+                            "root_rot": raw_history[
+                                "root_rot"][:, -1].detach().clone(),
+                            "dof": raw_history["dof"][:, -1].detach().clone(),
+                            "contact_mask": raw_history[
+                                "contact_mask"][:, -1].detach().clone(),
                         }
                         history_translation = None
                         goal_builder = state_goal_from_reference
@@ -1723,17 +1719,11 @@ def main(cfg: DictConfig) -> None:
                         time_to_arrival_s, time_to_arrival_frame = (
                             _time_to_arrival_from_state(
                                 latest_state, motion_fps, cfg.device,
-                                reference_time_offset_s=0.0))
+                                reference_time_offset_s=0.0, goal_clamp=goal_clamp))
                     else:
                         time_to_arrival_s = 0.0
                         time_to_arrival_frame = torch.zeros(
                             1, dtype=torch.long, device=cfg.device)
-                    if goal_clamp is not None and _goal_time_valid:
-                        # Keep the arrival PE inside the training horizon
-                        # (same cap the goal builder applies to urgency).
-                        time_to_arrival_frame = time_to_arrival_frame.clamp(
-                            max=int(round(goal_clamp.time_max * motion_fps)))
-
                 _cuda_synchronize(str(cfg.device))
                 infer_start = time.perf_counter()
                 input_abs_pose = {
@@ -1769,6 +1759,7 @@ def main(cfg: DictConfig) -> None:
                     future_len=future_len,
                     use_full_sample=bool(cfg.use_full_sample),
                     guidance_scale=cfg.guidance_scale,
+                    goal_guidance=cfg.get('goal_guidance'),
                     text_embedding=text_embedding,
                     text_valid=text_valid,
                     goal_valid=goal_valid,
@@ -1777,7 +1768,7 @@ def main(cfg: DictConfig) -> None:
                     initial_noise=fixed_sampling_noise,
                     ret_fk=False,
                     time_to_arrival_frame=time_to_arrival_frame,
-                    seam_abs_pose=seam_abs_pose,
+                    seam_state=seam_state,
                 )
                 _cuda_synchronize(str(cfg.device))
                 infer_ms = (time.perf_counter() - infer_start) * 1000.0
@@ -1845,11 +1836,11 @@ def main(cfg: DictConfig) -> None:
                 # Keep the hybrid history endpoint as the seam, followed by
                 # future states; it can be ahead of the measured cursor.
                 skip_history = (
-                    0 if seam_abs_pose is not None else
+                    0 if seam_state is not None else
                     (0 if bool(cfg.pub_all_frames) else history_len - 1))
                 new_to_old_ref_offset = int(
                     ref_hist_repr["window_end"]
-                    if using_reference_history and seam_abs_pose is not None else
+                    if using_reference_history and seam_state is not None else
                     (controller_playback_frame or 0)
                     + (lookahead_offset_frames if using_reference_history else 0)
                     + latency_compensation_frames)

@@ -8,6 +8,8 @@ Functions:
 - generate_next_motion: Generate next motion segment using DAR model
 """
 
+import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Tuple, Dict, Any, Optional, Union
 
@@ -19,9 +21,16 @@ from torch import nn
 
 import robotmdar.dtype.motion as motion_dtype
 from robotmdar.dtype.motion import motion_dict_to_abs_pose
+from robotmdar.model.mld_denoiser import (
+    _condition_valid_mask,
+    _force_drop_end_effector,
+    _goal_valid_mask,
+)
 from robotmdar.utils.goal import (
     EXTENDED_BODY_GOAL_DIM,
+    GoalEncoding,
     SPLIT_END_EFFECTOR_GOAL_DIM,
+    SPLIT_END_EFFECTOR_TOKEN_ORDER,
     SPLIT_GOAL_DIM,
     SPLIT_TIME_SLICE,
 )
@@ -69,6 +78,138 @@ class ClassifierFreeWrapper(nn.Module):
         out_uncond = self.model(x_t=x_t, timesteps=timesteps, y=y_uncond)
         scale = y.get('scale', 1.0)
         return out_uncond + (scale * (out - out_uncond))
+
+    @property
+    def noise_shape(self):
+        return self.model.noise_shape
+
+
+class GoalClassifierFreeWrapper(nn.Module):
+    """Guide EE without joints, then add the joint-conditioned increment.
+
+    With other conditions fixed, use f0 (no joint/EE), fE (EE only), and
+    fJE (joint + EE): f0 + end_effector*(fE-f0) + joint*(fJE-fE).
+    Apply CFG only to samples with valid joints and at least one valid EE.
+    Other samples use the original prediction, regardless of CFG scales.
+    Both scales at one recover fJE. For eligible samples a zero scale masks
+    that modality in every branch, including the EE context of joint guidance.
+    Existing validity and force-drop masks always remain authoritative.
+    """
+
+    def __init__(self, model, joint: float = 1.0,
+                 end_effector: float = 1.0):
+        super().__init__()
+        self.model = model
+        self.joint = float(joint)
+        self.end_effector = float(end_effector)
+        for name in ('joint', 'end_effector'):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'goal_guidance.{name} must be finite and >= 0')
+        if self.joint != 1.0 or self.end_effector != 1.0:
+            base_model = (model.model if isinstance(model, ClassifierFreeWrapper)
+                          else model)
+            if not GoalEncoding.parse(
+                    getattr(base_model, 'goal_encoding', None)).uses_end_effectors:
+                raise ValueError('Goal CFG requires split_end_effector encoding')
+
+    def forward(self, x_t=None, timesteps=None, y=None, **kwargs):
+        if x_t is None:
+            x_t = kwargs.pop('x', None)
+        if kwargs:
+            raise TypeError(f'Unexpected Goal CFG argument: {next(iter(kwargs))!r}')
+        if x_t is None or timesteps is None or y is None:
+            raise ValueError('Goal CFG requires x_t, timesteps, and conditions')
+
+        # Do not carry model-written masks between branches or diffusion steps.
+        conditions = {
+            key: value for key, value in y.items()
+            if not key.endswith('_condition_keep_mask')
+            and key != '_condition_sampling_plan'
+        }
+        if self.joint == 1.0 and self.end_effector == 1.0:
+            return self.model(x_t=x_t, timesteps=timesteps, y=conditions)
+
+        active = self._active_mask(conditions, x_t.shape[0], x_t.device)
+        if not active.any():
+            return self.model(x_t=x_t, timesteps=timesteps, y=conditions)
+        if active.all():
+            return self._guided_forward(x_t, timesteps, conditions)
+
+        # Keep inactive samples out of all additional CFG branches. Slice the
+        # whole condition tree so per-sample validity, history, and text agree.
+        result = torch.empty_like(x_t)
+        for selected, guided in ((~active, False), (active, True)):
+            indices = selected.nonzero(as_tuple=False).flatten()
+            batch_conditions = self._slice_batch(conditions, indices, len(active))
+            batch_x = x_t.index_select(0, indices)
+            batch_t = self._slice_batch(timesteps, indices, len(active))
+            prediction = (
+                self._guided_forward(batch_x, batch_t, batch_conditions)
+                if guided else self.model(
+                    x_t=batch_x, timesteps=batch_t, y=batch_conditions)
+            )
+            result.index_copy_(0, indices, prediction)
+        return result
+
+    @staticmethod
+    def _active_mask(y, batch_size, device):
+        def valid(name):
+            value = _goal_valid_mask(y, name, batch_size, device)
+            return (torch.ones(batch_size, dtype=torch.bool, device=device)
+                    if value is None else value)
+
+        joint_valid = valid('joint') & ~_condition_valid_mask(
+            y.get('force_drop_goal_joint', False), batch_size, device)
+        ee_parent_valid = valid('end_effector')
+        ee_valid = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        for name in SPLIT_END_EFFECTOR_TOKEN_ORDER:
+            if not _force_drop_end_effector(y, name):
+                ee_valid |= ee_parent_valid & valid(f'end_effector_{name}')
+        return joint_valid & ee_valid
+
+    @classmethod
+    def _slice_batch(cls, value, indices, batch_size):
+        if torch.is_tensor(value):
+            if value.ndim and value.shape[0] == batch_size:
+                return value.index_select(0, indices.to(value.device))
+        elif isinstance(value, Mapping):
+            return {key: cls._slice_batch(item, indices, batch_size)
+                    for key, item in value.items()}
+        elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+            return type(value)(value[index] for index in indices.tolist())
+        return value
+
+    def _guided_forward(self, x_t, timesteps, conditions):
+        conditions = dict(conditions)
+        if self.joint == 0:
+            conditions['force_drop_goal_joint'] = True
+        if self.end_effector == 0:
+            conditions['force_drop_goal_end_effector'] = True
+
+        # Expanded coefficients skip unused branches and preserve the exact
+        # single-call result at (1, 1), (0, 1), and (0, 0).
+        branches = (
+            (1.0 - self.end_effector, True, True),
+            (self.end_effector - self.joint, True, False),
+            (self.joint, False, False),
+        )
+        if self.end_effector == 0:
+            branches = ((1.0 - self.joint, True, True),
+                        (self.joint, False, True))
+        result = None
+        for coefficient, drop_joint, drop_ee in branches:
+            if coefficient == 0:
+                continue
+            branch = dict(conditions)
+            if drop_joint:
+                branch['force_drop_goal_joint'] = True
+            if drop_ee:
+                branch['force_drop_goal_end_effector'] = True
+            prediction = self.model(x_t=x_t, timesteps=timesteps, y=branch)
+            weighted = prediction if coefficient == 1 else coefficient * prediction
+            result = weighted if result is None else result + weighted
+        return result
 
     @property
     def noise_shape(self):
@@ -243,7 +384,8 @@ def generate_next_motion(
         force_drop_scene: bool = False,
         force_drop_arrival_time: bool = False,
         time_to_arrival_frame: Optional[torch.Tensor] = None,
-        seam_abs_pose: Optional[Dict[str, torch.Tensor]] = None):
+        seam_state: Optional[Dict[str, torch.Tensor]] = None,
+        goal_guidance: Optional[Dict[str, float]] = None):
     """
     Generate next motion segment using DAR model.
 
@@ -260,6 +402,9 @@ def generate_next_motion(
         voxel: Scene occupancy tensor [B, grid_size^3]
         history_motion: History motion tensor [B, T_hist, D]
         abs_pose: Current absolute pose
+        seam_state: Optional physical state at the published plan seam;
+            when provided, it is prepended to the generated future and is
+            used as the future reconstruction anchor.
         future_len: Length of future motion to generate
         use_full_sample: Whether to use full DDPM sampling loop
         force_drop_goal_root: Mask the root-position component at inference.
@@ -282,6 +427,10 @@ def generate_next_motion(
         is_recovery: Optional per-sample get-up profile selector.  This is
             omitted by default so deployment keeps the locomotion profile.
         time_to_arrival_frame: Optional frame index passed to the arrival PE.
+        goal_guidance: Optional joint/end_effector CFG scales (default 1).
+            Applied only with valid joints and at least one valid EE. EE
+            guidance is evaluated with joints masked. For eligible samples,
+            zero drops the modality; controller validity is preserved.
 
     Returns:
         Tuple of (future_motion_pred, motion_dict, new_abs_pose)
@@ -380,6 +529,9 @@ def generate_next_motion(
         if (guidance_scale is not None and text_embedding is not None
                 and denoiser_supports_text_guidance(denoiser)):
             denoiser_for_sampling = ClassifierFreeWrapper(denoiser)
+        if goal_guidance is not None:
+            denoiser_for_sampling = GoalClassifierFreeWrapper(
+                denoiser_for_sampling, **goal_guidance)
 
         # print(diffusion.num_timesteps)
         if use_full_sample:
@@ -446,25 +598,25 @@ def generate_next_motion(
         # the future dictionary directly.
         future_dict = val_data.reconstruct_motion(
             future_motion_pred,
-            abs_pose=abs_pose if seam_abs_pose is None else seam_abs_pose,
-            ret_fk=ret_fk if seam_abs_pose is None else False,
+            abs_pose=abs_pose if seam_state is None else seam_state,
+            ret_fk=ret_fk if seam_state is None else False,
             ret_fk_full=ret_fk_full)
-        if seam_abs_pose is None:
+        if seam_state is None:
             motion_dict = future_dict
         else:
             # The controller reference starts with the seam state.
             motion_dict = {
                 "root_trans_offset": torch.cat(
-                    (seam_abs_pose["root_trans_offset"][:, None],
+                    (seam_state["root_trans_offset"][:, None],
                      future_dict["root_trans_offset"]), dim=1),
                 "root_rot": torch.cat(
-                    (seam_abs_pose["root_rot"][:, None],
+                    (seam_state["root_rot"][:, None],
                      future_dict["root_rot"]), dim=1),
                 "dof": torch.cat(
-                    (seam_abs_pose["dof"][:, None], future_dict["dof"]),
+                    (seam_state["dof"][:, None], future_dict["dof"]),
                     dim=1),
                 "contact_mask": torch.cat(
-                    (seam_abs_pose["contact_mask"][:, None],
+                    (seam_state["contact_mask"][:, None],
                      future_dict["contact_mask"]), dim=1),
             }
 

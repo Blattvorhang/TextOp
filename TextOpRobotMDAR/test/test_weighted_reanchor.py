@@ -108,7 +108,7 @@ def test_cursor_gravity_and_full_root_feedback_independent_of_window_end(lead, d
         + snapshot.root_pos[end_frame]
         - snapshot.root_pos[snapshot.cursor_frame])
     np.testing.assert_allclose(
-        result["seam_abs_pose"]["root_trans_offset"][0], expected_xyz, atol=2e-6)
+        result["seam_state"]["root_trans_offset"][0], expected_xyz, atol=2e-6)
     # Full yaw feedback reexpresses position deltas in the corrected body
     # frames. Encoding and decoding must still preserve the world trajectory.
     decoded = motion_dtype.motion_feature_to_dict(
@@ -277,7 +277,7 @@ def test_all_component_mode_combinations(modes):
         atol=2e-6, rtol=2e-6)
     # The goal/generation seam must follow the hybrid endpoint in every mode.
     torch.testing.assert_close(
-        result["seam_abs_pose"]["root_trans_offset"], hybrid["root_trans_offset"][:, -1])
+        result["seam_state"]["root_trans_offset"], hybrid["root_trans_offset"][:, -1])
 
 
 @pytest.mark.parametrize("invalid_mode", [True, False, "invalid"])

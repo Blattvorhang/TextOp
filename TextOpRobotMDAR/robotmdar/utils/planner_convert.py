@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import lru_cache
 import math
 from pathlib import Path
@@ -21,6 +22,7 @@ from robotmdar.utils.goal import (
     build_ego_joint_state_goal_v6,
     quaternion_yaw,
 )
+from robotmdar.utils.goal_time import clamp_goal_time
 import robotmdar.dtype.motion as motion_dtype
 from robotmdar.skeleton.end_effector import (
     extract_end_effector_positions,
@@ -509,7 +511,7 @@ def reanchor_reference_motion(
     return {
         "history_repr": val_data.normalize(history_features),
         "abs_pose": abs_pose,
-        "seam_abs_pose": {
+        "seam_state": {
             "root_trans_offset": hybrid_pos[:, -1].detach().clone(),
             "root_rot": hybrid_rot[:, -1].detach().clone(),
             "dof": hybrid_joint[:, -1].detach().clone(),
@@ -829,6 +831,14 @@ def state_goal_from_reference(state_msg: Any,
         state_msg, 'goal_velocity_valid', True)
     goal_time_valid = _state_bool_field(
         state_msg, 'goal_time_valid', True)
+    if goal_clamp is not None:
+        # The goal frame may be predicted or latency-compensated. Budget
+        # horizontal motion from measured height, independently of that frame.
+        measured_height = torch.as_tensor(
+            state_msg.states.g1_pos[-1], dtype=torch.float32, device=device,
+        ).reshape(1, 3)[..., 2]
+        goal_clamp = replace(goal_clamp, current_height=measured_height,
+                             arrival_time_valid=goal_time_valid)
 
     state_root_pos = _state_field(state_msg, 'goal_root_pos_world')
     state_yaw = _state_field(state_msg, 'goal_yaw_world')
@@ -940,6 +950,9 @@ def state_goal_from_reference(state_msg: Any,
             remaining_seconds = 0.0
         timestep = torch.tensor(
             [[remaining_seconds]], dtype=torch.float32, device=device)
+        if goal_clamp is not None and goal_time_valid:
+            timestep = clamp_goal_time(timestep, float(fps or 50),
+                                       goal_clamp.time_min, goal_clamp.time_max)
 
     if goal_type is GoalType.JOINT_STATE:
         state_goal_rot = _state_field(state_msg, 'goal_root_rot_world')
