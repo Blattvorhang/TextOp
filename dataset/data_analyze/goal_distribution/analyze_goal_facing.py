@@ -50,7 +50,7 @@ DOF_29_TO_23_MASK_ARR = np.array([
     False, False, False,
 ])
 
-OUTPUT_DIR = Path(__file__).resolve().parent / "analysis_output"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "analysis_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 RANDOM_SEED = 42
 MAX_FILES = 5000

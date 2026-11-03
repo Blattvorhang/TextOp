@@ -80,7 +80,7 @@ import robotmdar.dtype.motion as motion_dtype
 # The mode (peak of KDE) is ~0.02 m — most goals lie near the origin.
 # 0.2 gives a tight 0.4×0.4 m view centred on the reference frame;
 # expands dynamically when a trajectory or goal exceeds it.
-# See dataset/data_analyze/analyze_64f_goal_xy.py
+# See dataset/data_analyze/goal_distribution/analyze_64f_goal_xy.py
 _DEFAULT_XY_LIMIT = 0.2
 _PREFETCH_ERROR = object()
 

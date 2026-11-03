@@ -27,8 +27,16 @@ TARGET_FPS = 50.0
 CHUNK_LEN = 64
 RANDOM_SEED = 42
 END_EFFECTOR_NAMES = ("left_hand", "right_hand", "left_foot", "right_foot")
-COLORS = ("#d62728", "#1f77b4", "#2ca02c", "#ff7f0e")
+CENTER_BODY_NAMES = {
+    "left_hand": "left_shoulder_pitch_link",
+    "right_hand": "right_shoulder_pitch_link",
+    "left_foot": "left_hip_pitch_link",
+    "right_foot": "right_hip_pitch_link",
+}
+COLORS = ("#FEA735", "#00C3FF", "#FE7235", "#0077FF")
 WAIST_DOF_INDICES = (12, 13, 14)  # MuJoCo order: yaw, roll, pitch
+WAIST_BODY_NAME = "waist_yaw_link"
+WAIST_Z_OFFSET = 0.044
 
 
 def collect_npz_files(base_dir):
@@ -57,7 +65,7 @@ def load_npz(filepath):
     if dof.ndim != 2 or dof.shape[1] != 29:
         return None
     # HiPhi stores IsaacLab order; RobotSkeleton consumes MuJoCo order.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "TextOpRobotMDAR"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "TextOpRobotMDAR"))
     from robotmdar.utils.planner_convert import isaaclab_to_mujoco_dof
     dof = isaaclab_to_mujoco_dof(dof)
     if trans.shape != (len(dof), 3) or quat.shape != (len(dof), 4) or len(dof) < CHUNK_LEN:
@@ -67,18 +75,27 @@ def load_npz(filepath):
 
 def init_skeleton():
     """Construct the 29-DoF G1 skeleton used by the planner."""
-    repo = Path(__file__).resolve().parents[2]
+    repo = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo / "TextOpRobotMDAR"))
     from omegaconf import OmegaConf
     from robotmdar.skeleton.robot import RobotSkeleton
 
     cfg = OmegaConf.load(str(repo / "TextOpRobotMDAR/robotmdar/config/skeleton/g1.yaml"))
     cfg.asset.assetRoot = str((repo / "TextOpRobotMDAR/description/robots/g1").resolve())
-    return RobotSkeleton(device="cpu", cfg=cfg)
+    skeleton = RobotSkeleton(device="cpu", cfg=cfg)
+    waist_index = skeleton.body_names.index(WAIST_BODY_NAME)
+    waist_offset = skeleton.fk.local_translations[0, waist_index]
+    if not np.isclose(float(waist_offset[2]), WAIST_Z_OFFSET):
+        raise ValueError(
+            f"Expected {WAIST_BODY_NAME} Z offset {WAIST_Z_OFFSET}, "
+            f"got {float(waist_offset[2])}"
+        )
+    skeleton.fk.local_translations[0, waist_index, 2] = 0.0
+    return skeleton
 
 
 def fk_end_effectors(skeleton, trans, quat, dof):
-    """Compute canonical end-effectors in root coordinates, shape [T, 4, 3]."""
+    """Compute end effectors and their shoulder/hip centers in root coordinates."""
     import torch
     from robotmdar.skeleton.end_effector import (
         extract_end_effector_positions,
@@ -97,13 +114,21 @@ def fk_end_effectors(skeleton, trans, quat, dof):
     world = extract_end_effector_positions(
         fk, skeleton, anchors=resolve_end_effector_anchors(skeleton)
     )[0]
+    center_indices = [
+        skeleton.body_names.index(CENTER_BODY_NAMES[name])
+        for name in END_EFFECTOR_NAMES
+    ]
+    center_world = fk["global_translation"][0, :, center_indices, :]
     root_pos = torch.from_numpy(trans)
     root_rot = fk["global_rotation_mat"][..., 0, :, :][0]
     # This is build_ego_end_effector_goal's exact world -> reference-root map.
-    return torch.matmul(
-        root_rot.transpose(-1, -2).unsqueeze(1),
-        (world - root_pos.unsqueeze(1)).unsqueeze(-1),
-    ).squeeze(-1).numpy()
+    def to_reference_root(positions):
+        return torch.matmul(
+            root_rot.transpose(-1, -2).unsqueeze(1),
+            (positions - root_pos.unsqueeze(1)).unsqueeze(-1),
+        ).squeeze(-1).numpy()
+
+    return to_reference_root(world), to_reference_root(center_world)
 
 
 def plot(points, output, max_points=100000, seed=RANDOM_SEED):
@@ -112,12 +137,17 @@ def plot(points, output, max_points=100000, seed=RANDOM_SEED):
         raise RuntimeError("No valid 64-frame chunks were found")
 
     fig = plt.figure(figsize=(16, 8))
-    views = ((0, 180, "-X view: looking toward +X"),
-             (90, 0, "+Z view: looking toward -Z"))
+    views = ((0, 0, "+X view: looking toward -X"),
+             (90, 180, "+Z view rotated 180 degrees"))
     for subplot, (elev, azim, title) in enumerate(views, start=1):
         ax = fig.add_subplot(1, 2, subplot, projection="3d")
         ax.set_proj_type("ortho")
         ax.view_init(elev=elev, azim=azim)
+        ax.grid(False)
+        if subplot == 1:
+            ax.xaxis.set_visible(False)
+        else:
+            ax.zaxis.set_visible(False)
         for i, name in enumerate(END_EFFECTOR_NAMES):
             # points shape: [chunks, frames, end_effectors, xyz].
             xyz = points[:, :, i, :].reshape(-1, 3)
@@ -151,6 +181,32 @@ def plot(points, output, max_points=100000, seed=RANDOM_SEED):
     print(f"Saved {output} ({len(points)} chunks, {len(points) * CHUNK_LEN * 4:,} points)")
 
 
+def save_points(points, centers, output):
+    """Save end effectors and matching shoulder/hip centers for reuse."""
+    points = np.asarray(points, dtype=np.float32)
+    centers = np.asarray(centers, dtype=np.float32)
+    if points.ndim != 4 or points.shape[1:] != (CHUNK_LEN, 4, 3):
+        raise ValueError(
+            f"Expected points shaped [chunks, {CHUNK_LEN}, 4, 3], got {points.shape}"
+        )
+    if centers.shape != points.shape:
+        raise ValueError(
+            f"Expected centers shaped {points.shape}, got {centers.shape}"
+        )
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {}
+    for index, name in enumerate(END_EFFECTOR_NAMES):
+        arrays[name] = points[:, :, index, :].reshape(-1, 3)
+        arrays[f"{name}_center"] = centers[:, :, index, :].reshape(-1, 3)
+    np.savez_compressed(
+        output,
+        **arrays,
+        waist_z_offset_removed=np.float32(WAIST_Z_OFFSET),
+    )
+    print(f"Saved reusable end-effector points to {output}")
+
+
 def _process_file(task):
     path, seed, skeleton = task
     try:
@@ -175,6 +231,11 @@ def main():
     parser.add_argument("--max-points", type=int, default=100000,
                         help="Maximum plotted points per end-effector (default: 100000)")
     parser.add_argument("--output", default="dataset/data_analyze/analysis_output/end_effector_xyz_64f.png")
+    parser.add_argument(
+        "--points-output",
+        default=None,
+        help="Reusable NPZ output (default: same path as --output with .npz suffix)",
+    )
     args = parser.parse_args()
 
     files = collect_npz_files(args.base_dir)
@@ -190,13 +251,18 @@ def main():
     seeds = rng.integers(0, np.iinfo(np.int64).max, size=len(files), dtype=np.int64)
     tasks = [(path, int(seed), skeleton) for path, seed in zip(files, seeds)]
     chunks = []
+    center_chunks = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for result in tqdm(pool.map(_process_file, tasks), total=len(tasks), desc=f"HiPhi FK ({workers} workers)"):
             if result is not None:
-                chunks.append(result)
+                points, centers = result
+                chunks.append(points)
+                center_chunks.append(centers)
     print(f"Valid chunks: {len(chunks):,} / {len(files):,}")
     if args.max_points < 1:
         raise ValueError(f"--max-points must be positive, got {args.max_points}")
+    points_output = args.points_output or str(Path(args.output).with_suffix(".npz"))
+    save_points(chunks, center_chunks, points_output)
     plot(chunks, args.output, max_points=args.max_points, seed=args.seed)
 
 

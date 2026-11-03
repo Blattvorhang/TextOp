@@ -89,7 +89,7 @@ BBOX_XMAX, BBOX_YMAX =  1.5,  1.0
 GOAL_OFFSETS = [0, 4, 8, 16, 24, 32, 48, 64, 80, 96, 128, 192]
 
 # Output
-OUTPUT_DIR = Path(__file__).resolve().parent / "analysis_output"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "analysis_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 RANDOM_SEED = 42

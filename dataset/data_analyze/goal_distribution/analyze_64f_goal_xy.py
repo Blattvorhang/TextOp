@@ -33,11 +33,16 @@ FUTURE_LEN = 64
 NUM_PRIMITIVE = 1
 SEGMENT_LEN = HISTORY_LEN + FUTURE_LEN * NUM_PRIMITIVE  # = 80
 
-OUTPUT_DIR = Path(__file__).resolve().parent / "analysis_output"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "analysis_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 RANDOM_SEED = 42
 MAX_FILES = 3000
 SLIDE_STEP = FUTURE_LEN  # non-overlapping windows
+ACTION_COLORS = {
+    'jogging': '#f1cfed',
+    'walking': '#7181c8',
+    'other': '#fc9a6b',
+}
 
 # RobotMDAR train_dar.yaml / SkeletonPrimitiveDataset contract.
 TRAIN_NUM_PRIMITIVE = 3
@@ -120,12 +125,14 @@ def _report_and_plot(ego_points, title, output_name, point_types=None, trajector
         for idx, category in enumerate(categories):
             mask = point_types[shown] == category
             ax.scatter(plot_x[shown][mask], plot_y[shown][mask], s=2, alpha=.28,
-                       color=colors[idx % len(colors)], edgecolors='none',
+                       color=ACTION_COLORS.get(category, colors[idx % len(colors)]),
+                       edgecolors='none',
                        rasterized=True, label=str(category))
     else:
         # Draw each primitive's 64-frame future as one line; use one legend
         # handle per coarse action type while keeping all trajectories visible.
-        category_colors = {category: colors[idx % len(colors)]
+        category_colors = {category: ACTION_COLORS.get(
+                               category, colors[idx % len(colors)])
                            for idx, category in enumerate(categories)}
         legend_seen = set()
         for trajectory, category in zip(trajectories, point_types):
@@ -160,12 +167,39 @@ def _report_and_plot(ego_points, title, output_name, point_types=None, trajector
     return out
 
 
-def analyze_bones_seed(base_dir, max_files=MAX_FILES):
+def save_trajectories(trajectories, categories, output, dataset):
+    """Save all sampled 64-frame ego-XY trajectories for later replay."""
+    trajectories = np.asarray(trajectories, dtype=np.float32)
+    categories = np.asarray(categories, dtype="<U16")
+    if trajectories.ndim != 3 or trajectories.shape[1:] != (FUTURE_LEN, 2):
+        raise ValueError(
+            f"Expected trajectories shaped [N, {FUTURE_LEN}, 2], "
+            f"got {trajectories.shape}"
+        )
+    if len(categories) != len(trajectories):
+        raise ValueError(
+            f"Category count {len(categories)} does not match "
+            f"trajectory count {len(trajectories)}"
+        )
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output,
+        trajectories=trajectories,
+        categories=categories,
+        coordinate_frame=np.array("ego_xy_forward_left"),
+        future_len=np.int32(FUTURE_LEN),
+        dataset=np.array(dataset),
+    )
+    print(f"Saved {len(trajectories):,} reusable trajectories to {output}")
+
+
+def analyze_bones_seed(base_dir, max_files=MAX_FILES, trajectories_output=None):
     all_files = collect_csv_files(base_dir)
     print(f'Found {len(all_files):,} CSV files')
     np.random.seed(RANDOM_SEED)
     files = np.random.choice(all_files, max_files, replace=False).tolist() if len(all_files) > max_files else all_files
-    points, n_windows, n_short = [], 0, 0
+    points, trajectories, n_windows, n_short = [], [], 0, 0
     for fp in tqdm(files, desc='Processing BONES-SEED'):
         motion = load_and_downsample_csv(fp)
         if motion is None: continue
@@ -173,10 +207,23 @@ def analyze_bones_seed(base_dir, max_files=MAX_FILES):
         if T < SEGMENT_LEN: n_short += 1; continue
         fwd = get_root_forward(quat)
         for start in range(0, T - SEGMENT_LEN + 1, SLIDE_STEP):
-            ref = start + HISTORY_LEN - 1; goal = start + SEGMENT_LEN - 1
-            points.append(world_to_ego(trans[goal,:2], trans[ref,:2], fwd[ref])); n_windows += 1
+            ref = start + HISTORY_LEN - 1
+            trajectory = world_to_ego(
+                trans[ref + 1:ref + FUTURE_LEN + 1, :2],
+                trans[ref, :2],
+                fwd[ref],
+            )
+            trajectories.append(trajectory)
+            points.extend(trajectory)
+            n_windows += 1
     print(f'Windows: {n_windows:,} | Too-short files: {n_short:,}')
-    return _report_and_plot(points, 'BONES-SEED 64-frame goal XY distribution', 'bones_seed_goal_xy.png')
+    categories = ['other'] * len(trajectories)
+    cache = trajectories_output or OUTPUT_DIR / 'bones_seed_goal_xy.npz'
+    save_trajectories(trajectories, categories, cache, 'bones-seed')
+    return _report_and_plot(
+        points, 'BONES-SEED 64-frame goal XY distribution',
+        'bones_seed_goal_xy.png', categories, trajectories)
+
 
 
 def collect_hiphi_files(base_dir):
@@ -247,7 +294,7 @@ def classify_hiphi_category(top_category, subcategory=''):
 
 
 def analyze_hiphi(base_dir='/ALG/hanyi/dataset/hiphi', samples=MAX_FILES,
-                  workers=None):
+                  workers=None, trajectories_output=None):
     """Analyze hiphi with RobotMDAR's file/start sampling, in parallel."""
     files = collect_hiphi_files(os.path.join(base_dir, 'motions'))
     if not files:
@@ -284,6 +331,8 @@ def analyze_hiphi(base_dir='/ALG/hanyi/dataset/hiphi', samples=MAX_FILES,
     print(
         f'Files: {len(files):,} | sampled chunks: {samples:,} | '
         f'skipped: {skipped:,}')
+    cache = trajectories_output or OUTPUT_DIR / 'hiphi_goal_xy.npz'
+    save_trajectories(trajectories, point_types, cache, 'hiphi')
     return _report_and_plot(
         points,
         'HiPhi RobotMDAR training-chunk 64-frame trajectory XY',
@@ -307,11 +356,17 @@ def main():
     parser.add_argument(
         '--workers', type=int, default=None,
         help='hiphi loading threads (default: min(16, CPU count))')
+    parser.add_argument(
+        '--trajectories-output', type=Path, default=None,
+        help=('Reusable trajectory NPZ output (default: '
+              'analysis_output/<dataset>_goal_xy.npz)'))
     args = parser.parse_args()
     if args.dataset == 'hiphi':
-        analyze_hiphi(args.hiphi_dir, args.max_files, args.workers)
+        analyze_hiphi(args.hiphi_dir, args.max_files, args.workers,
+                      args.trajectories_output)
     else:
-        analyze_bones_seed(args.base_dir, args.max_files)
+        analyze_bones_seed(args.base_dir, args.max_files,
+                           args.trajectories_output)
 
 
 if __name__ == '__main__':
