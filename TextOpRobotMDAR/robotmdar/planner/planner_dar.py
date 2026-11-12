@@ -1276,11 +1276,19 @@ def main(cfg: DictConfig) -> None:
         logger.info("Seeded diffusion latent from {} shape={}",
                     motion_path, tuple(fixed_sampling_noise.shape))
 
-    def _reset_episode_state() -> None:
+    def _reset_episode_state(sampling_seed: int | None = None) -> None:
         """Restore the same planner-side state as a fresh first request."""
         nonlocal latest_state, last_inferred_seq, next_infer_time
         nonlocal inference_count, next_ack_log_time
         nonlocal planning_latency_ema_ms, latency_bias_ema_ms
+        nonlocal fixed_sampling_noise
+        if sampling_seed is not None:
+            if motion_path is not None:
+                raise ValueError("A motion_path noise seed cannot be varied by sampling_seed")
+            seed.set(sampling_seed)
+            if not bool(cfg.get("resample_noise_each_plan", False)):
+                fixed_sampling_noise = torch.randn(
+                    (1, *denoiser.noise_shape), device=cfg.device)
         latest_state = None
         last_inferred_seq = None
         next_infer_time = time.perf_counter()
@@ -1288,7 +1296,7 @@ def main(cfg: DictConfig) -> None:
         next_ack_log_time = 0.0
         planning_latency_ema_ms = None
         latency_bias_ema_ms = None
-        logger.info("Planner episode reset: latest state and timing cleared")
+        logger.info("Planner episode reset: sampling_seed={}", sampling_seed)
 
     node.set_reset_handler(_reset_episode_state)
 
