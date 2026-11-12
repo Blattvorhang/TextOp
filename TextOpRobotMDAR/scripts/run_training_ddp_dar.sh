@@ -57,6 +57,8 @@ SAVE_EVERY=5000
 EVAL_EVERY=500
 
 AUGMENTATION_START_STEP=15000
+DOMAIN_RANDOMIZATION=false
+DOMAIN_RANDOMIZATION_BASE_NOISE_SCALE=0.03
 # SCENE_START_STEP=$((120000 / NUM_GPUS * SCALE_FACTOR))
 SCENE_START_STEP=$((TOTAL_STEPS + 1))  # disable scene occupancy
 
@@ -64,6 +66,7 @@ echo "Scaled for ${NUM_GPUS} GPUs:"
 echo "  stages:      [${STAGE0}, ${STAGE1}, ${STAGE2}] (total: ${TOTAL_STEPS})"
 echo "  save_every:  ${SAVE_EVERY}"
 echo "  eval_every:  ${EVAL_EVERY}"
+echo "  domain_randomization: ${DOMAIN_RANDOMIZATION} (base scale: ${DOMAIN_RANDOMIZATION_BASE_NOISE_SCALE})"
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 torchrun \
@@ -74,6 +77,8 @@ torchrun \
     timestamp="'${TIMESTAMP}'" \
     ckpt.vae=${VAE_CKPT} \
     data.augmentation_start_step=${AUGMENTATION_START_STEP} \
+    data.domain_randomization=${DOMAIN_RANDOMIZATION} \
+    data.domain_randomization_base_noise_scale=${DOMAIN_RANDOMIZATION_BASE_NOISE_SCALE} \
     data.scene_start_step=${SCENE_START_STEP} \
     "train.manager.stages=[${STAGE0},${STAGE1},${STAGE2}]" \
     train.manager.save_every=${SAVE_EVERY} \

@@ -54,6 +54,10 @@ augmentation_enabled: false
 augmentation_start_step: 50000
 augmentation_prob: 0.5
 
+# ReactiveBFM-style Gaussian noise on normalized planner history.
+domain_randomization: false
+domain_randomization_base_noise_scale: 0.03
+
 # Scene conditioning curriculum (DAR training): before this global step the
 # denoiser sees zeroed scene occupancy in training, eval and visualization
 # to learn basic goal-driven locomotion; after it, the denoiser's

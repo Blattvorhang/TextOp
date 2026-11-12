@@ -85,6 +85,22 @@ _DEFAULT_XY_LIMIT = 0.2
 _PREFETCH_ERROR = object()
 
 
+def _domain_randomization(history_motion, feature_std, step, total_steps,
+                          base_noise_scale=0.03):
+    """Apply ReactiveBFM's prefix Gaussian-noise curriculum to normalized history."""
+    progress = max(0.0, min(step / total_steps, 1.0))
+    current_prob = 0.5 / (1.0 + math.exp(-10.0 * (progress - 0.5)))
+    apply_mask = torch.rand(history_motion.shape[0], device=history_motion.device) < current_prob
+    if not apply_mask.any():
+        return history_motion
+
+    std = feature_std.to(device=history_motion.device,
+                         dtype=history_motion.dtype).view(1, 1, -1)
+    noise = torch.randn_like(history_motion) * std * (base_noise_scale * progress)
+    return torch.where(apply_mask[:, None, None], history_motion + noise,
+                       history_motion)
+
+
 class _BackgroundPrefetchIterator:
     """Generate one CPU batch ahead while the current batch trains."""
 
@@ -2386,6 +2402,12 @@ def main(cfg: DictConfig):
                 train_data, future_motion_gt, gt_history,
                 history_motion if used_rollout else gt_history)
             manager.extra['self_rollout_used'] = float(used_rollout)
+            if cfg.data.domain_randomization:
+                history_motion = _domain_randomization(
+                    history_motion, train_data.std, manager.step,
+                    manager.max_steps,
+                    cfg.data.domain_randomization_base_noise_scale,
+                )
 
             if used_rollout:
                 if any(value is None for value in (
