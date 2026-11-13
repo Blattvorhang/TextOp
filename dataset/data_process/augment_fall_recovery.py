@@ -31,6 +31,7 @@ from dataset.data_process.pack_motion_lib_to_textop import TARGET_DOF_NAMES
 
 DEFAULT_INPUT_DIR = REPO_ROOT / "data/motion_lib_filtered"
 DEFAULT_OUTPUT_SUBDIR = "aug_fall_recovery"
+PREFIX_ONLY_OUTPUT_SUBDIR = "aug_fall_recovery_prefix_only"
 DEFAULT_OCC_HIPC_ROOT = REPO_ROOT / "occHIPC"
 DEFAULT_G1_XML = (
     REPO_ROOT / "TextOpRobotMDAR/description/robots/g1/g1_29dof.xml"
@@ -68,6 +69,7 @@ class AugmentConfig:
     device: str
     onnx_num_threads: int
     validate: bool
+    prefix_only: bool
     recompute_contact: bool
     quiet_policy_init: bool
 
@@ -79,6 +81,7 @@ class SourceResult:
     accepted_entries: list[tuple[str, dict]]
     rejects: list[str]
     candidates: int
+    sonic_successes: int
 
 
 _WORKER_CONFIG: AugmentConfig | None = None
@@ -90,9 +93,15 @@ def _smoothstep(u: np.ndarray) -> np.ndarray:
     return 3.0 * u * u - 2.0 * u * u * u
 
 
-def _window_weights(window_len: int) -> np.ndarray:
+def _smootherstep(u: np.ndarray) -> np.ndarray:
+    return u * u * u * (u * (6.0 * u - 15.0) + 10.0)
+
+
+def _window_weights(window_len: int, prefix_only: bool = False) -> np.ndarray:
+    if prefix_only:
+        return np.ones(window_len + 1, dtype=np.float32)
     u = np.linspace(0.0, 1.0, window_len + 1, dtype=np.float32)
-    return (1.0 - _smoothstep(u)).astype(np.float32)
+    return (1.0 - _smootherstep(u)).astype(np.float32)
 
 
 def _quat_mul_xyzw(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -175,7 +184,7 @@ def _iter_source_entries(
     output_dir: Path,
 ) -> Iterable[tuple[Path, str, dict]]:
     for path in sorted(input_dir.rglob("stand_up_lying*.pkl")):
-        if _is_under(path, output_dir):
+        if _is_under(path, output_dir) or path.stem.rsplit("_aug_", 1)[-1].isdigit():
             continue
         raw = joblib.load(path)
         if not isinstance(raw, dict) or not raw:
@@ -236,6 +245,7 @@ def _augment_entry(
     rng: np.random.Generator,
     n_lying: int,
     joint_limits: np.ndarray,
+    prefix_only: bool = False,
 ) -> tuple[dict, dict]:
     _validate_entry_shape(source_name, entry)
     out = _copy_motion_entry(entry)
@@ -246,7 +256,7 @@ def _augment_entry(
             f"n_lying={n_lying} unperturbed"
         )
 
-    w = _window_weights(n_lying)[:n_lying]
+    w = _window_weights(n_lying, prefix_only=prefix_only)[:n_lying]
     amps = _dof_amp_vector()
 
     x = out["dof"][:n_lying]
@@ -534,6 +544,7 @@ def _augment_source_task(
 
     accepted = 0
     candidates = 0
+    sonic_successes = 0
     accepted_entries = []
     rejects = []
     T = int(np.asarray(source_entry["dof"]).shape[0])
@@ -556,6 +567,7 @@ def _augment_source_task(
             rng,
             n_lying,
             joint_limits,
+            prefix_only=config.prefix_only,
         )
         if config.recompute_contact:
             _recompute_contact(
@@ -569,8 +581,9 @@ def _augment_source_task(
             ok, final_h, var_h = True, float("nan"), float("nan")
         else:
             ok, final_h, var_h = validator.validate(candidate)
+            sonic_successes += int(ok)
 
-        if ok:
+        if ok or config.prefix_only:
             aug_name = f"{source_name}_aug_{accepted:03d}"
             accepted_entries.append((aug_name, candidate))
             accepted += 1
@@ -596,6 +609,7 @@ def _augment_source_task(
         accepted_entries=accepted_entries,
         rejects=rejects,
         candidates=candidates,
+        sonic_successes=sonic_successes,
     )
 
 
@@ -703,6 +717,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--n-lying-min", type=int, default=20)
     parser.add_argument("--n-lying-max", type=int, default=50)
+    parser.add_argument(
+        "--prefix-only", "--wo-decay",
+        dest="prefix_only",
+        action="store_true",
+        help=(
+            "Keep full deviation throughout the prefix; save all candidates "
+            "and report SONIC success rate."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--g1-xml", type=Path, default=DEFAULT_G1_XML)
     parser.add_argument("--collision-xml", type=Path, default=DEFAULT_COLLISION_XML)
@@ -759,12 +782,19 @@ def main() -> None:
         raise SystemExit("Invalid n_lying bounds")
     if args.onnx_num_threads < 0:
         raise SystemExit("--onnx-num-threads must be >= 0")
+    if args.prefix_only and not args.validate:
+        raise SystemExit(
+            "--prefix-only requires SONIC validation to report success rate"
+        )
 
     input_dir = args.input_dir.resolve()
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir is not None
-        else input_dir / DEFAULT_OUTPUT_SUBDIR
+        else (
+            input_dir.parent / PREFIX_ONLY_OUTPUT_SUBDIR
+            if args.prefix_only else input_dir / DEFAULT_OUTPUT_SUBDIR
+        )
     )
     sources = list(_iter_source_entries(input_dir, output_dir))
     if not sources:
@@ -790,7 +820,11 @@ def main() -> None:
         f"n_lying=[{args.n_lying_min}, {args.n_lying_max}], "
         f"max candidates/original={max_candidates}"
     )
-    print(f"[Validate] {'SONIC one-trial acceptance' if args.validate else 'disabled'}")
+    if args.prefix_only:
+        validation_mode = "SONIC success-rate measurement (all candidates saved)"
+    else:
+        validation_mode = "SONIC one-trial acceptance" if args.validate else "disabled"
+    print(f"[Validate] {validation_mode}")
     worker_mode = "auto" if args.num_workers == 0 else "requested"
     print(f"[Workers]  {num_workers} process(es) ({worker_mode})")
     sys.stdout.flush()
@@ -833,6 +867,7 @@ def main() -> None:
         device=args.device,
         onnx_num_threads=args.onnx_num_threads,
         validate=args.validate,
+        prefix_only=args.prefix_only,
         recompute_contact=args.recompute_contact,
         quiet_policy_init=num_workers > 1,
     )
@@ -851,6 +886,12 @@ def main() -> None:
         f"single-motion PKL file(s) "
         f"from {total_candidates} candidate(s)."
     )
+    if args.prefix_only:
+        successes = sum(result.sonic_successes for result in results)
+        print(
+            f"[SONIC] Stood up: {successes}/{total_candidates} "
+            f"({successes / total_candidates:.1%})"
+        )
 
 
 if __name__ == "__main__":
