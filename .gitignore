@@ -194,3 +194,5 @@ _build
 *.npz
 
 artifacts/
+
+dataset/data_analyze/analysis_output/

@@ -7,7 +7,7 @@ expname: HIPHI-FUTURE-64-ROT-MAT-VAE
 task: train-mvae
 
 data:
-  datadir: ./dataset/HIPHI-29dof-50fps
+  datadir: ./dataset/HIPHI-29dof-FULL-50fps
   dof_dim: 29
   load_goal_stats: false
   preload_ram: true

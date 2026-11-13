@@ -19,7 +19,7 @@ denoiser:
       composition: 0.45
       full_condition: 0.10
     single_preference:
-      text: 2.0
+      text: 2.5
       position_hor: 1.0
       position_vert: 0.25
       orientation_rot6d: 0.45

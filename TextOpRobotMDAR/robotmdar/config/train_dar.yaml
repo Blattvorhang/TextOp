@@ -5,7 +5,7 @@ defaults:
   - _self_
   # Select the condition/loss profile through Hydra. Rollout timing is
   # intentionally separate and remains controlled by train.manager.stages.
-  - condition_stage: text_prior
+  - condition_stage: text_goal_finetune
 
 expname: BONES-SEED-FUTURE-64-TEXT
 task: train-dar
